@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+*.iml
+.idea/
+
+# Local runtime state. Keep only the placeholder so the directory exists in clones.
+runs/*
+!runs/.gitkeep
+.slots/
+.agent-work/
+.worktrees/
+
+# Machine-local configuration. Commit config/workspaces.example.toml instead.
+config/workspaces.toml
+config/*.local.toml
+*.sqlite3
+*.sqlite3-*

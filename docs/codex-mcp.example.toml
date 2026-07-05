@@ -1,0 +1,20 @@
+# Copy this block into your Codex config.toml after installing the package.
+# Replace C:\\path\\to\\agent-control-plane with your local clone path.
+
+[mcp_servers.agent_control_plane]
+command = "python"
+args = [
+  "-m",
+  "agent_control_plane.app.runtime.mcp_server",
+  "--config",
+  "C:\\path\\to\\agent-control-plane\\config\\workspaces.toml",
+]
+cwd = "C:\\path\\to\\agent-control-plane"
+enabled = true
+required = false
+startup_timeout_sec = 60
+tool_timeout_sec = 30
+
+# Keep this env block when you use an editable installation or run from source.
+[mcp_servers.agent_control_plane.env]
+PYTHONPATH = "C:\\path\\to\\agent-control-plane\\src"

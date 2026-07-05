@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-control-plane"
+version = "0.1.0"
+description = "Local agent job control plane for Codex CLI and Google Antigravity CLI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["agents", "codex", "antigravity", "mcp", "worktrees"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "pywinpty>=2.0; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.10"]
+dev = [
+  "bandit[toml]>=1.8",
+  "mypy>=1.11",
+  "pytest>=8",
+  "pytest-fsd>=0.2.1",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+agent-control = "agent_control_plane.app.runtime.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.setuptools.package-data]
+agent_control_plane = ["features/antigravity_accounts/lib/antigravity_manager_helper.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.pytest_fsd]
+base_path = "agent_control_plane"
+layers = ["app", "features", "entities", "shared"]
+extra_rules = [
+  "excessive-slicing",
+  "shared-lib-grouping",
+  "no-reserved-folder-names",
+]
+
+[tool.ruff]
+src = ["src", "tests"]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "A", "BLE", "SIM", "RUF", "N", "TID"]
+ignore = ["E501"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "parents"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+check_untyped_defs = true
+warn_unused_ignores = true
+exclude = [".venv", "build", "dist"]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "build", "dist"]

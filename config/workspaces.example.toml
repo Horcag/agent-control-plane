@@ -1,0 +1,68 @@
+# Copy this file to config/workspaces.toml and edit the paths for your machine.
+# All relative paths are resolved from the repository root, not from this file.
+# Keep slots and generated worktrees next to this repository, not inside it.
+
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "../agent-control-plane-worktrees"
+worktree_base = "../my-project"
+slot_root = "../agent-control-plane-slots"
+agy_command = "agy"
+codex_command = "codex"
+
+[control.defaults]
+timeout_sec = 3600
+idle_timeout_sec = 900
+print_timeout = "60m"
+max_restarts = 0
+yolo = false
+allow_dirty = false
+runs_layout = "date"
+auto_archive_days = 14
+auto_archive_limit = 200
+backend = "codex"
+codex_model = "gpt-5"
+codex_reasoning_effort = "low"
+codex_sandbox_mode = "workspace-write"
+codex_disabled_mcp_servers = []
+codex_no_progress_timeout_sec = 600
+guardrail_poll_sec = 2
+prepare_slots = true
+auto_switch_agy_on_quota = false
+auto_switch_agy_strategy = "best"
+auto_switch_agy_electron_command = ["cmd", "/c", "npx", "--no-install", "electron"]
+forbidden_status_globs = [
+  "uv.lock",
+  "poetry.lock",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  ".venv/**",
+]
+
+[routes.app]
+path = "../my-project"
+required_branch = "main"
+worktree_root = "../agent-control-plane-worktrees"
+worktree_base = "../my-project"
+source_roots = ["."]
+test_roots = ["tests"]
+exclude_dirs = [
+  ".git",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache",
+  ".venv",
+  "build",
+  "dist",
+  "node_modules",
+]
+codex_forbidden_tool_markers = []
+
+[slots."app-1"]
+route = "app"
+path = "../agent-control-plane-slots/app-1"
