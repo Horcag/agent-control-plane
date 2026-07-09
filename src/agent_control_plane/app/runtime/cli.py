@@ -151,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(control.sync_slots())
                 return 0
             if args.slot_command == "list":
-                _print_json(control.list_slots())
+                _print_json(control.list_slots(include_deleted=args.include_deleted))
                 return 0
             if args.slot_command == "create":
                 _print_json(
@@ -374,7 +374,16 @@ def _build_parser() -> argparse.ArgumentParser:
     slot_subparsers = slots.add_subparsers(dest="slot_command", required=True)
 
     slot_subparsers.add_parser("sync", parents=[common], help="Register configured slots in SQLite")
-    slot_subparsers.add_parser("list", parents=[common], help="List slots, usage, and git state")
+    list_slots = slot_subparsers.add_parser(
+        "list",
+        parents=[common],
+        help="List slots, usage, and git state",
+    )
+    list_slots.add_argument(
+        "--include-deleted",
+        action="store_true",
+        help="Include deleted slot registry records",
+    )
 
     create = slot_subparsers.add_parser("create", parents=[common], help="Create a slot worktree")
     create.add_argument("name")

@@ -816,8 +816,10 @@ class AgentControlPlane:
         )
         return result.as_dict()
 
-    def list_slots(self) -> list[dict[str, Any]]:
-        return [status.as_dict() for status in self.slots.list_slots()]
+    def list_slots(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
+        return [
+            status.as_dict() for status in self.slots.list_slots(include_deleted=include_deleted)
+        ]
 
     def create_slot(
         self,
@@ -1093,6 +1095,8 @@ class AgentControlPlane:
         route_config: Any,
     ) -> WorkspaceDirtyBaseline | None:
         if not job.slot_name or route_config is None:
+            return None
+        if not getattr(route_config, "monitor_route_root", True):
             return None
         route_root = route_config.path.resolve(strict=False)
         if route_root == job.workspace_path.resolve(strict=False):

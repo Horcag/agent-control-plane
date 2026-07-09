@@ -31,6 +31,7 @@ class RouteConfig:
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] | None = None
+    monitor_route_root: bool = True
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             codex_forbidden_tool_markers=_optional_string_tuple(
                 value.get("codex_forbidden_tool_markers")
             ),
+            monitor_route_root=bool(value.get("monitor_route_root", True)),
         )
 
     if not routes:

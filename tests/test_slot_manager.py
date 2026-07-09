@@ -126,6 +126,24 @@ class SlotManagerTest(unittest.TestCase):
             with self.assertRaisesRegex(SlotError, "not available"):
                 manager.acquire_for_job("main-1", job_id="job-2", route="main")
 
+    def test_list_slots_hides_deleted_records_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            config = _config(root, slot_root)
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("active", "main", slot_root / "active")
+            store.register_slot("deleted", "main", slot_root / "deleted")
+            store.mark_deleted("deleted", note="deleted")
+            manager = SlotManager(config, store)
+
+            visible_names = [status.name for status in manager.list_slots()]
+            all_statuses = manager.list_slots(include_deleted=True)
+
+            self.assertEqual(visible_names, ["active"])
+            self.assertEqual([status.name for status in all_statuses], ["active", "deleted"])
+            self.assertEqual(all_statuses[1].status, "deleted")
+
 
 def _config(
     root: Path,

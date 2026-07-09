@@ -19,10 +19,12 @@ def build_task_prompt(
     progress_path = task_dir / "agent-progress.md"
     protocol_path = config.coordination_root / "agent-protocol.md"
     routing_path = config.coordination_root / "workspace-routing.md"
+    agentbridge_edit_root = _agentbridge_edit_root(config, workspace_path)
 
     return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
+AgentBridge edit root: {agentbridge_edit_root}
 Expected branch: {expected_branch}
 
 Read before acting:
@@ -65,15 +67,17 @@ Mandatory execution rules:
   `mcp__agentbridge_ide.edit_text`; if it is unexpectedly missing, create it
   immediately at that exact path.
 - For AgentBridge `read_file`, `write_file`, `edit_text`, diagnostics, and git
-  calls that target repository files under the assigned workspace, always pass
-  absolute paths that start with `{workspace_path}`. Never pass repository-relative
-  paths like `backend/...`, `frontend/...`, or `docs/...` for repository files in
-  slot/worktree jobs; IDEA may resolve them against the canonical project root
-  instead of the assigned workspace.
+  calls that target repository files under the assigned workspace, use the
+  AgentBridge edit root from this prompt: `{agentbridge_edit_root}`.
+- If the AgentBridge edit root differs from the workspace path, it is a
+  project-relative junction to the same slot workspace. Use it for editor tools;
+  do not pass direct absolute slot paths to `write_file`.
+- For AgentBridge `git_*` calls that require a `repo` parameter, use the physical
+  workspace path: `{workspace_path}`.
 - Before each repository edit, confirm the target path string starts with
-  `{workspace_path}`. If AgentBridge cannot access that absolute path, write
-  Status: blocked in the result file. Do not retry the edit against the route
-  root or canonical checkout.
+  `{agentbridge_edit_root}` and maps to the assigned workspace `{workspace_path}`.
+  If AgentBridge cannot access that edit root, write Status: blocked in the result
+  file. Do not retry the edit against the route root or canonical checkout.
 - For coordination files under `{config.coordination_root}`, write to the exact
   absolute paths shown in this prompt: `{progress_path}` and `{result_path}`.
   Do not substitute `.agent-work/tasks/...` under the active IDE project unless it
@@ -166,3 +170,11 @@ Mandatory result file format:
 - If blocked or partial, include the exact blocker and the next concrete action.
 - When done, write the result file and stop.
 """
+
+
+def _agentbridge_edit_root(config: ControlConfig, workspace_path: Path) -> str:
+    workspace = workspace_path.resolve(strict=False)
+    slot_root = config.slot_root.resolve(strict=False)
+    if workspace != slot_root and workspace.is_relative_to(slot_root):
+        return f".agent-work/slot-links/{workspace.name}"
+    return str(workspace_path)

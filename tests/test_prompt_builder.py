@@ -69,8 +69,8 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("agentbridge ide read_file edit_text write_file get_problems", prompt)
             self.assertIn("mcp__agentbridge_ide", prompt)
             self.assertIn("Do not use DataSpell AgentBridge tools", prompt)
-            self.assertIn("absolute paths that start with", prompt)
-            self.assertIn("Never pass repository-relative", prompt)
+            self.assertIn("AgentBridge edit root", prompt)
+            self.assertIn("project-relative junction", prompt)
             self.assertIn("canonical checkout", prompt)
             self.assertIn("forbidden tool usage", prompt)
             self.assertIn("mcp__agentbridge_ide.run_command", prompt)
@@ -104,6 +104,48 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Treat unresolved imports as real diagnostics", prompt)
             self.assertIn("Do not write Status: completed", prompt)
             self.assertIn("formatting problem", prompt)
+
+    def test_prompt_uses_slot_link_edit_root_for_slot_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = ControlConfig(
+                config_path=root / "workspaces.toml",
+                project_root=root,
+                coordination_root=root / ".agent-work",
+                runs_root=root / "runs",
+                database_path=root / "runs" / "jobs.sqlite3",
+                worktree_root=root / "worktrees",
+                worktree_base=root / "main",
+                slot_root=root / "slots",
+                agy_command="agy",
+                codex_command="codex",
+                defaults=ControlDefaults(
+                    timeout_sec=10,
+                    idle_timeout_sec=5,
+                    print_timeout="10s",
+                    max_restarts=0,
+                    yolo=False,
+                    allow_dirty=False,
+                    prepare_slots=True,
+                    guardrail_poll_sec=2.0,
+                    forbidden_status_globs=("uv.lock", ".venv/**"),
+                ),
+                routes=MappingProxyType({}),
+                slots=MappingProxyType({}),
+                slot_prepare=(),
+            )
+
+            prompt = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=root / "slots" / "work-slot-11",
+                expected_branch="slot/work-slot-11",
+                result_path=root / ".agent-work" / "tasks" / "task-1" / "result.md",
+            )
+
+            self.assertIn("AgentBridge edit root: .agent-work/slot-links/work-slot-11", prompt)
+            self.assertIn("do not pass direct absolute slot paths", prompt)
 
 
 if __name__ == "__main__":

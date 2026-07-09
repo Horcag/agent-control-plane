@@ -107,12 +107,19 @@ class SlotManager:
             )
         return self.list_slots(sync=False)
 
-    def list_slots(self, *, sync: bool = True) -> list[SlotStatus]:
+    def list_slots(
+        self,
+        *,
+        sync: bool = True,
+        include_deleted: bool = False,
+    ) -> list[SlotStatus]:
         if sync:
             self.sync_configured_slots()
         records = {record.name: record for record in self._store.list_slots()}
         statuses: list[SlotStatus] = []
-        for name in sorted(records):
+        for name, record in sorted(records.items()):
+            if record.status == "deleted" and not include_deleted:
+                continue
             statuses.append(self.inspect_slot(name, sync=False))
         return statuses
 

@@ -49,6 +49,7 @@ timeout_sec = 1200
 path = "repo"
 required_branch = "main"
 codex_forbidden_tool_markers = ["raw_exec", "web_search"]
+monitor_route_root = false
 
 [routes.reports]
 path = "reports"
@@ -115,7 +116,9 @@ path = "slots/reports-1"
                 config.routes["main"].codex_forbidden_tool_markers,
                 ("raw_exec", "web_search"),
             )
+            self.assertFalse(config.routes["main"].monitor_route_root)
             self.assertIsNone(config.routes["reports"].codex_forbidden_tool_markers)
+            self.assertTrue(config.routes["reports"].monitor_route_root)
             self.assertEqual(
                 config.routes["reports"].worktree_base,
                 (root / "reports").resolve(strict=False),
