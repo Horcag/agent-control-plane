@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import json
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from agent_control_plane.entities.job import AttemptMetrics
+
+CODEX_RATE_CARD_VERSION = "2026-07-09"
+
+
+@dataclass(frozen=True)
+class _RateCard:
+    input: float
+    cached_input: float
+    output: float
+
+
+_CREDIT_RATES = {
+    "gpt-5.6": _RateCard(125.0, 12.5, 750.0),
+    "gpt-5.6-sol": _RateCard(125.0, 12.5, 750.0),
+    "gpt-5.6-terra": _RateCard(62.5, 6.25, 375.0),
+    "gpt-5.6-luna": _RateCard(25.0, 2.5, 150.0),
+    "gpt-5.5": _RateCard(125.0, 12.5, 750.0),
+}
+
+_API_USD_RATES = {
+    "gpt-5.6": _RateCard(5.0, 0.5, 30.0),
+    "gpt-5.6-sol": _RateCard(5.0, 0.5, 30.0),
+    "gpt-5.6-terra": _RateCard(2.5, 0.25, 15.0),
+    "gpt-5.6-luna": _RateCard(1.0, 0.1, 6.0),
+}
+
+_TOOL_ITEM_TYPES = {
+    "command_execution",
+    "file_change",
+    "image_generation",
+    "web_search",
+}
+
+
+def parse_codex_jsonl(
+    path: Path,
+    *,
+    model: str,
+    duration_sec: float,
+) -> AttemptMetrics:
+    event_count = 0
+    thread_id: str | None = None
+    turn_completed = False
+    usage_available = False
+    input_tokens = 0
+    cached_input_tokens = 0
+    output_tokens = 0
+    reasoning_output_tokens = 0
+    tool_calls = 0
+    failed_tool_calls = 0
+    error_events = 0
+    tool_counts: Counter[str] = Counter()
+
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+
+    for line in lines:
+        event = _parse_event(line)
+        if event is None:
+            continue
+        event_count += 1
+        event_type = str(event.get("type") or "")
+        if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            thread_id = event["thread_id"]
+        if event_type in {"error", "turn.failed"}:
+            error_events += 1
+        if event_type == "turn.completed":
+            turn_completed = True
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                usage_available = True
+                input_tokens += _integer(usage.get("input_tokens"))
+                cached_input_tokens += _integer(usage.get("cached_input_tokens"))
+                output_tokens += _integer(usage.get("output_tokens"))
+                reasoning_output_tokens += _integer(usage.get("reasoning_output_tokens"))
+        if event_type != "item.completed":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        tool_key = _tool_key(item)
+        if tool_key is None:
+            continue
+        tool_calls += 1
+        tool_counts[tool_key] += 1
+        if item.get("error") or str(item.get("status") or "") in {"error", "failed"}:
+            failed_tool_calls += 1
+
+    uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+    estimated_credits = _estimate(
+        _CREDIT_RATES.get(model),
+        usage_available=usage_available,
+        uncached_input_tokens=uncached_input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+    )
+    estimated_api_usd = _estimate(
+        _API_USD_RATES.get(model),
+        usage_available=usage_available,
+        uncached_input_tokens=uncached_input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+    )
+
+    return AttemptMetrics(
+        duration_sec=max(0.0, duration_sec),
+        thread_id=thread_id,
+        event_count=event_count,
+        turn_completed=turn_completed,
+        usage_available=usage_available,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        reasoning_output_tokens=reasoning_output_tokens,
+        tool_calls=tool_calls,
+        failed_tool_calls=failed_tool_calls,
+        error_events=error_events,
+        tool_counts=tuple(sorted(tool_counts.items())),
+        estimated_credits=estimated_credits,
+        estimated_api_usd=estimated_api_usd,
+        rate_card_version=CODEX_RATE_CARD_VERSION,
+        event_log_path=path,
+    )
+
+
+def codex_turn_completed(path: Path) -> bool:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    return any(
+        (event := _parse_event(line)) is not None and event.get("type") == "turn.completed"
+        for line in lines
+    )
+
+
+def render_codex_json_line(line: str) -> str:
+    event = _parse_event(line)
+    if event is None:
+        return line.rstrip("\r\n") + "\n"
+
+    event_type = str(event.get("type") or "event")
+    item = event.get("item")
+    if isinstance(item, dict):
+        item_type = str(item.get("type") or "item")
+        state = (
+            "started" if event_type == "item.started" else str(item.get("status") or "completed")
+        )
+        if item_type == "mcp_tool_call":
+            return f"mcp: {item.get('server')}/{item.get('tool')} {state}\n"
+        if item_type == "command_execution":
+            return f"exec\n{item.get('command') or ''}\n[{state}]\n"
+        if item_type == "web_search":
+            return f"web search: {item.get('query') or item.get('url') or ''} [{state}]\n"
+        if item_type == "agent_message":
+            return str(item.get("text") or "").rstrip("\r\n") + "\n"
+        return f"{item_type}: {state}\n"
+    if event_type == "turn.completed":
+        return f"turn.completed usage={json.dumps(event.get('usage') or {}, sort_keys=True)}\n"
+    if event_type in {"error", "turn.failed"}:
+        message = event.get("message") or event.get("error") or "unknown error"
+        return f"ERROR {message}\n"
+    return f"{event_type}\n"
+
+
+def _parse_event(line: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _tool_key(item: dict[str, Any]) -> str | None:
+    item_type = str(item.get("type") or "")
+    if item_type == "mcp_tool_call":
+        return f"mcp:{item.get('server')}/{item.get('tool')}"
+    if item_type in _TOOL_ITEM_TYPES or item_type.endswith("_tool_call"):
+        return item_type
+    return None
+
+
+def _integer(value: Any) -> int:
+    return int(value) if isinstance(value, int | float) else 0
+
+
+def _estimate(
+    rates: _RateCard | None,
+    *,
+    usage_available: bool,
+    uncached_input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+) -> float | None:
+    if rates is None or not usage_available:
+        return None
+    total = (
+        uncached_input_tokens * rates.input
+        + cached_input_tokens * rates.cached_input
+        + output_tokens * rates.output
+    )
+    return total / 1_000_000

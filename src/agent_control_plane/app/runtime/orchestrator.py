@@ -527,9 +527,19 @@ class AgentControlPlane:
                 job_id,
                 attempt_no,
                 result.status,
+                result_status=result.result_status,
                 exit_code=result.exit_code,
                 message=result.message,
             )
+            if result.metrics is not None:
+                self.store.record_attempt_metrics(
+                    job_id,
+                    attempt_no,
+                    backend=job.backend,
+                    model=job.codex_model,
+                    reasoning_effort=job.codex_reasoning_effort,
+                    metrics=result.metrics,
+                )
             self.store.update_job(job_id, runner_pid=None, agy_pid=None)
             self.store.add_event(job_id, "info", f"Attempt {attempt_no} ended: {result.status}")
             last_result_message = result.message
@@ -617,6 +627,7 @@ class AgentControlPlane:
 
     def status_job(self, job_id: str) -> dict[str, Any]:
         job = self._refresh_stale_worker_if_needed(job_id)
+        metrics = self.store.attempt_metrics(job_id, limit=1)
         return {
             "job_id": job.job_id,
             "task_id": job.task_id,
@@ -640,11 +651,13 @@ class AgentControlPlane:
             "cancel_requested": job.cancel_requested,
             "read_only": job.read_only,
             "slot_name": job.slot_name,
+            "latest_attempt_metrics": metrics[0] if metrics else None,
             "events": format_events(self.store.recent_events(job_id)),
         }
 
     def summary_job(self, job_id: str, log_lines: int = 20) -> dict[str, Any]:
         job = self._refresh_stale_worker_if_needed(job_id)
+        metrics = self.store.attempt_metrics(job_id, limit=1)
         status = ""
         forbidden: list[str] = []
         try:
@@ -686,7 +699,32 @@ class AgentControlPlane:
             "log_tail": self.tail_job(job_id, log_lines) if job.log_path else "",
             "result_path": str(job.result_path),
             "run_dir": str(job.run_dir),
+            "latest_attempt_metrics": metrics[0] if metrics else None,
         }
+
+    def analytics(
+        self,
+        *,
+        limit: int = 100,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        valid_only: bool = False,
+    ) -> dict[str, Any]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        report = self.store.metrics_report(
+            limit=limit,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            valid_only=valid_only,
+        )
+        report["filters"] = {
+            "limit": limit,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "valid_only": valid_only,
+        }
+        return report
 
     def tail_job(self, job_id: str, lines: int = 80) -> str:
         job = self.store.get_job(job_id)

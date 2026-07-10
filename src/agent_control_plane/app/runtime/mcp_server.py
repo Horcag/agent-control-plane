@@ -130,6 +130,21 @@ def build_server(config_path: str | None = None) -> Any:
         return control.summary_job(job_id, lines)
 
     @mcp.tool()
+    def agent_analytics(
+        limit: int = 100,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        valid_only: bool = False,
+    ) -> dict[str, Any]:
+        """Aggregate duration, token, cache, tool, and estimated cost metrics."""
+        return control.analytics(
+            limit=limit,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            valid_only=valid_only,
+        )
+
+    @mcp.tool()
     def agent_tail_job(job_id: str, lines: int = 80) -> str:
         """Return the end of the active attempt log."""
         return control.tail_job(job_id, lines)

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from agent_control_plane.entities.job import AttemptMetrics
 from agent_control_plane.shared.agent_backends import (
     AGY_BACKEND,
     CODEX_BACKEND,
@@ -54,6 +55,7 @@ class AgentRunResult:
     exit_code: int | None
     result_status: str | None
     message: str
+    metrics: AttemptMetrics | None = None
 
 
 class AgentRunner(Protocol):

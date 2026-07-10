@@ -4,10 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.features.agent_runner.lib.codex_runner import (
-    CodexExecRunner,
+from agent_control_plane.features.agent_runner.lib.codex_process_monitor import (
+    CodexProcessMonitor,
+)
+from agent_control_plane.features.agent_runner.lib.codex_runner import CodexExecRunner
+from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     dirty_file_markers_from_porcelain,
     porcelain_changed_path,
+    productive_log_activity_if_needed,
 )
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
 
@@ -21,6 +25,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
         self.assertEqual(command[0:4], ["codex", "exec", "--model", "gpt-5"])
         self.assertIn('model_reasoning_effort="low"', command)
         self.assertIn('approval_policy="never"', command)
+        self.assertIn("--json", command)
         self.assertIn("--disable", command)
         self.assertIn("image_generation", command)
         self.assertIn("--cd", command)
@@ -64,11 +69,26 @@ class CodexRunnerCommandTest(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertNotIn("--sandbox", command)
 
+    def test_completed_wait_observes_usage_event_before_stopping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "attempt-001.log"
+            log_path.with_suffix(".events.jsonl").write_text(
+                '{"type":"turn.completed","usage":{}}\n',
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+            spec = _spec(read_only=True, yolo=False, log_path=log_path)
+
+            CodexProcessMonitor()._await_completed_process(proc, spec)
+
+            self.assertEqual(proc.wait_timeout, 1.0)
+            self.assertFalse(proc.terminated)
+
     def test_timeout_result_stops_clean_workspace_without_any_activity(self) -> None:
         proc = _FakeProc()
         spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
 
-        result = CodexExecRunner()._timeout_result_if_needed(
+        result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
             spec,
             now=10.0,
@@ -87,7 +107,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
         proc = _FakeProc()
         spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
 
-        result = CodexExecRunner()._timeout_result_if_needed(
+        result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
             spec,
             now=10.0,
@@ -107,7 +127,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
         proc = _FakeProc()
         spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
 
-        result = CodexExecRunner()._timeout_result_if_needed(
+        result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
             spec,
             now=10.0,
@@ -127,7 +147,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
         proc = _FakeProc()
         spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
 
-        result = CodexExecRunner()._timeout_result_if_needed(
+        result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
             spec,
             now=10.0,
@@ -151,7 +171,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             proc = _FakeProc()
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
 
-            result, scan_size, timeout_count = CodexExecRunner()._tool_timeout_result_if_needed(
+            result, scan_size, timeout_count = CodexProcessMonitor()._tool_timeout_result_if_needed(
                 proc,
                 spec,
                 scan_size=0,
@@ -178,7 +198,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 codex_forbidden_tool_markers=("web_search",),
             )
 
-            result, scan_size = CodexExecRunner()._forbidden_tool_result_if_needed(
+            result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
                 proc,
                 spec,
                 scan_size=0,
@@ -203,7 +223,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 codex_forbidden_tool_markers=("raw_exec",),
             )
 
-            result, scan_size = CodexExecRunner()._forbidden_tool_result_if_needed(
+            result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
                 proc,
                 spec,
                 scan_size=0,
@@ -223,7 +243,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             proc = _FakeProc()
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
 
-            result, scan_size = CodexExecRunner()._forbidden_tool_result_if_needed(
+            result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
                 proc,
                 spec,
                 scan_size=0,
@@ -243,7 +263,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             )
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
 
-            productive, scan_size = CodexExecRunner._productive_log_activity_if_needed(
+            productive, scan_size = productive_log_activity_if_needed(
                 spec,
                 scan_size=0,
             )
@@ -260,7 +280,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             )
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
 
-            productive, scan_size = CodexExecRunner._productive_log_activity_if_needed(
+            productive, scan_size = productive_log_activity_if_needed(
                 spec,
                 scan_size=0,
             )

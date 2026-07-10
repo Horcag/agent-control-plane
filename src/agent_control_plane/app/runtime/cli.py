@@ -91,6 +91,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "summary":
             _print_json(control.summary_job(args.job_id, args.lines))
             return 0
+        if args.command == "analytics":
+            _print_json(
+                control.analytics(
+                    limit=args.limit,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                    valid_only=args.valid_only,
+                )
+            )
+            return 0
         if args.command == "watch":
             if args.live:
                 _print_json(
@@ -324,6 +334,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     summary.add_argument("job_id")
     summary.add_argument("--lines", type=int, default=20)
+
+    analytics = subparsers.add_parser(
+        "analytics",
+        parents=[common],
+        help="Aggregate Codex duration, token, cache, tool, and cost metrics",
+    )
+    analytics.add_argument("--limit", type=int, default=100)
+    analytics.add_argument("--model")
+    analytics.add_argument("--reasoning-effort")
+    analytics.add_argument(
+        "--valid-only",
+        action="store_true",
+        help="Include only completed attempts with a final usage event",
+    )
 
     watch = subparsers.add_parser(
         "watch",

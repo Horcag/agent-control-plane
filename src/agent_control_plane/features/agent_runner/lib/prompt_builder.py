@@ -43,12 +43,14 @@ Maintain live progress/state in:
 
 Mandatory execution rules:
 - Use AgentBridge/IDE tools for repository edits and diagnostics when available.
-- In Codex / `codex exec`, MCP tools can be lazily exposed. Before deciding
-  that AgentBridge is unavailable, call `tool_search` with this query:
-  `agentbridge ide read_file edit_text write_file get_problems git_status
-  git_diff git_stage git_commit run_command`.
-- If `tool_search` exposes `mcp__agentbridge_ide` tools, use those ordinary
-  AgentBridge IDEA tools for repository reads, edits, git inspection, and diagnostics.
+- In Codex / `codex exec`, first call `mcp__agentbridge_ide.read_file` directly
+  on the first path under "Read before acting". Registered AgentBridge HTTP MCP tools
+  are normally available without a discovery call.
+- Only use `tool_search` as an optional fallback when that function is actually
+  available and the direct AgentBridge call reports an unknown or unavailable tool.
+  Never block merely because `tool_search` is absent.
+- After a successful direct or discovered call, use ordinary `mcp__agentbridge_ide`
+  tools for repository reads, edits, git inspection, and diagnostics.
 - Do not use DataSpell AgentBridge tools. The presence of a disabled `dataspell_ide`
   server in config or logs is not evidence that ordinary AgentBridge is unavailable.
 - Do not use web search, raw shell `exec`, `list_mcp_resources`, or
@@ -59,8 +61,9 @@ Mandatory execution rules:
 - Do not treat `codex mcp list`, `list_mcp_resources`, or raw HTTP probes of `/mcp`
   as sufficient evidence that AgentBridge edit/diagnostic tools are unavailable;
   those checks do not lazy-load deferred tool metadata.
-- Only block for missing AgentBridge tools after the `tool_search` discovery step
-  fails, and include the exact discovery output in the result.
+- Only block for missing AgentBridge tools after one direct AgentBridge call fails.
+  If `tool_search` exists, use it once as a fallback. Include the exact direct-call and
+  optional discovery output in the result.
 - The control-plane initializes the progress file before runner start. Your first
   coordination action is to update the exact progress file path shown above:
   `{progress_path}` through `mcp__agentbridge_ide.write_file` or

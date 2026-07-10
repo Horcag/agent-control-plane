@@ -85,8 +85,8 @@ codex_command = "codex"
 
 [control.defaults]
 backend = "codex"
-codex_model = "gpt-5"
-codex_reasoning_effort = "low"
+codex_model = "gpt-5.6-terra"
+codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
 allow_dirty = false
 yolo = false
@@ -226,11 +226,17 @@ optionally `AGENT_CONTROL_PLANE_OAUTH_CLIENT_KEY`.
 agent-control list --config .\config\workspaces.toml --limit 20
 agent-control status <job-id> --config .\config\workspaces.toml
 agent-control summary <job-id> --config .\config\workspaces.toml --lines 40
+agent-control analytics --config .\config\workspaces.toml --model gpt-5.6-terra --valid-only
 agent-control watch <job-id> --config .\config\workspaces.toml --live --lines 120
 agent-control tail <job-id> --config .\config\workspaces.toml --lines 120
 agent-control result <job-id> --config .\config\workspaces.toml
 agent-control cancel <job-id> --config .\config\workspaces.toml
 ```
+
+Codex attempts keep raw `attempt-*.events.jsonl` streams and persist duration, token,
+cache-hit, tool-call, result-status, failure, and estimated credit/API-cost metrics in
+SQLite. `status` and `summary` include the latest attempt; `analytics` aggregates
+comparable model/effort runs.
 
 Archive old terminal runs:
 
@@ -250,6 +256,7 @@ The MCP server exposes tools such as:
 - `agent_watch_job`
 - `agent_status_job`
 - `agent_summary_job`
+- `agent_analytics`
 - `agent_tail_job`
 - `agent_result_job`
 - `agent_cancel_job`

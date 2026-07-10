@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.entities.job.model.attempt_metrics import (
+    AttemptMetrics,
+    build_metrics_report,
+    create_attempt_metrics_table,
+    load_attempt_metrics,
+    save_attempt_metrics,
+)
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, normalize_backend
 from agent_control_plane.shared.clock import utc_now
 
@@ -114,6 +121,7 @@ class JobStore:
                     job_id text not null references jobs(job_id),
                     attempt_no integer not null,
                     status text not null,
+                    result_status text,
                     started_at text not null,
                     finished_at text,
                     log_path text not null,
@@ -131,7 +139,9 @@ class JobStore:
                 );
                 """
             )
+            create_attempt_metrics_table(db)
             self._ensure_columns(db)
+            self._ensure_attempt_columns(db)
 
     def create_job(
         self,
@@ -253,6 +263,7 @@ class JobStore:
         attempt_no: int,
         status: str,
         *,
+        result_status: str | None = None,
         exit_code: int | None = None,
         message: str | None = None,
     ) -> None:
@@ -260,10 +271,18 @@ class JobStore:
             db.execute(
                 """
                 update attempts
-                set status = ?, finished_at = ?, exit_code = ?, message = ?
+                set status = ?, result_status = ?, finished_at = ?, exit_code = ?, message = ?
                 where job_id = ? and attempt_no = ?
                 """,
-                (status, utc_now(), exit_code, message, job_id, attempt_no),
+                (
+                    status,
+                    result_status,
+                    utc_now(),
+                    exit_code,
+                    message,
+                    job_id,
+                    attempt_no,
+                ),
             )
 
     def finish_running_attempts(
@@ -283,6 +302,52 @@ class JobStore:
                 """,
                 (status, utc_now(), exit_code, message, job_id),
             )
+
+    def record_attempt_metrics(
+        self,
+        job_id: str,
+        attempt_no: int,
+        *,
+        backend: str,
+        model: str | None,
+        reasoning_effort: str | None,
+        metrics: AttemptMetrics,
+    ) -> None:
+        self.initialize()
+        with self._connect() as db:
+            save_attempt_metrics(
+                db,
+                job_id=job_id,
+                attempt_no=attempt_no,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                metrics=metrics,
+            )
+
+    def attempt_metrics(self, job_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        self.initialize()
+        with self._connect() as db:
+            return load_attempt_metrics(db, job_id=job_id, limit=limit)
+
+    def metrics_report(
+        self,
+        *,
+        limit: int = 100,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        valid_only: bool = False,
+    ) -> dict[str, Any]:
+        self.initialize()
+        with self._connect() as db:
+            rows = load_attempt_metrics(
+                db,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                valid_only=valid_only,
+                limit=limit,
+            )
+        return build_metrics_report(rows)
 
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as db:
@@ -341,6 +406,12 @@ class JobStore:
             db.execute("alter table jobs add column codex_reasoning_effort text")
         if "archived_at" not in columns:
             db.execute("alter table jobs add column archived_at text")
+
+    @staticmethod
+    def _ensure_attempt_columns(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(attempts)").fetchall()}
+        if "result_status" not in columns:
+            db.execute("alter table attempts add column result_status text")
 
 
 def new_job_id(task_id: str) -> str:
