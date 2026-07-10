@@ -17,8 +17,12 @@ Use overrides intentionally:
 - `gpt-5.6-terra` + `medium`: normal implementation, debugging, and bounded refactors.
 - `gpt-5.6-terra` + `high`: complex edge cases or a second-opinion review when Sol is
   unnecessary.
-- `gpt-5.6-sol` + `max`: final owner review, ambiguous architecture, security-sensitive
-  work, or recovery after cheaper workers repeatedly fail.
+- `gpt-5.6-sol` + `low`: selective high-value second opinion after a Terra pass. It is
+  not a cheaper general worker.
+- `gpt-5.6-sol` + `medium` or higher: ambiguous architecture, security-sensitive work,
+  or recovery after cheaper workers repeatedly fail.
+- `gpt-5.6-sol` + `max`: final quality-first owner review when latency and credits are
+  secondary.
 
 Do not use Luna `high` or `xhigh` as a routine substitute for Terra. Escalate from Luna
 medium to Terra medium when the task needs materially deeper reasoning. Do not use
@@ -108,6 +112,27 @@ counts MCP call errors; a command can return a non-zero exit code inside a succe
 `run_command` call, which explains partial results with zero failed MCP calls. Each row is
 still one canary, not a statistical benchmark. Cached-input ratios dominate the single-run
 credit estimate, so credits are not expected to increase monotonically with effort.
+
+### Sol versus Terra, Strict Head-to-Head
+
+These three runs used the same six files, acceptance criteria, physical-path protocol,
+commit, and read-only sandbox:
+
+| Model / effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Terra medium | completed | 152.3 s | 637,842 / 518,656 | 5,103 / 1,605 | 20 / 1 failed | 12.60 |
+| Sol low | completed | 179.1 s | 574,675 / 507,904 | 4,560 / 668 | 19 / 0 failed | 18.12 |
+| Sol medium | partial | 251.0 s | 776,079 / 711,168 | 7,043 / 1,705 | 24 / 0 failed | 22.29 |
+
+Against the strict Terra medium run, Sol low was 18% slower and used 44% more credits.
+It did surface a distinct detail-budget starvation risk, so it remains useful as a
+selective second opinion. Sol medium was 65% slower, used 77% more credits, and finished
+partial after unnecessary test-runner attempts. This canary supports Terra medium as the
+general worker default and rejects lower-effort Sol as a cost-saving default.
+
+The current Codex rate card explains the result: Sol input and cached input cost twice
+Terra, while Sol output costs twelve times Terra. A lower Sol effort can reduce reasoning
+tokens, but it does not change the model's token rates.
 
 ## Telemetry
 
