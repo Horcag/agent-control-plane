@@ -13,6 +13,11 @@ CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "raw_exec": "\nexec\n",
     "codex_list_mcp_resources": "mcp: codex/list_mcp_resources",
     "codex_list_mcp_resource_templates": "mcp: codex/list_mcp_resource_templates",
+    "agentbridge_global_search": "mcp: agentbridge-ide/search_text",
+    "agentbridge_global_symbols": "mcp: agentbridge-ide/search_symbols",
+    "agentbridge_global_files": "mcp: agentbridge-ide/list_project_files",
+    "agentbridge_global_tree": "mcp: agentbridge-ide/list_directory_tree",
+    "agentbridge_external_attach": "mcp: agentbridge-ide/attach_external_dir",
 }
 CODEX_PRODUCTIVE_LOG_MARKERS = ("mcp: agentbridge-ide/",)
 

@@ -69,18 +69,30 @@ Mandatory execution rules:
   `{progress_path}` through `mcp__agentbridge_ide.write_file` or
   `mcp__agentbridge_ide.edit_text`; if it is unexpectedly missing, create it
   immediately at that exact path.
-- For AgentBridge `read_file`, `write_file`, `edit_text`, diagnostics, and git
-  calls that target repository files under the assigned workspace, use the
-  AgentBridge edit root from this prompt: `{agentbridge_edit_root}`.
-- If the AgentBridge edit root differs from the workspace path, it is a
-  project-relative junction to the same slot workspace. Use it for editor tools;
-  do not pass direct absolute slot paths to `write_file`.
-- For AgentBridge `git_*` calls that require a `repo` parameter, use the physical
-  workspace path: `{workspace_path}`.
-- Before each repository edit, confirm the target path string starts with
-  `{agentbridge_edit_root}` and maps to the assigned workspace `{workspace_path}`.
-  If AgentBridge cannot access that edit root, write Status: blocked in the result
-  file. Do not retry the edit against the route root or canonical checkout.
+- The IDE indexes multiple checkouts. For every repository `read_file` and every
+  `git_*` call, use the exact absolute physical workspace prefix:
+  `{workspace_path}`. Relative repository paths and another checkout are forbidden.
+- Before discovery, verify the physical workspace with `git_status` and `git_log`,
+  both using `repo="{workspace_path}"`, then read one known file through an
+  absolute path under `{workspace_path}`.
+- Do not use project-wide AgentBridge `search_text`, `search_symbols`,
+  `list_project_files`, `list_directory_tree`, or `attach_external_dir` in a
+  delegated workspace. They can mix indexed checkouts. Use
+  `mcp__agentbridge_ide.run_command` with path-scoped `rg`/`rg --files` against
+  `{workspace_path}`, then read each discovered file by its absolute physical path.
+- For repository `write_file` and `edit_text`, first read the exact physical file.
+  When the AgentBridge edit root differs from the workspace path, it is the only
+  permitted project-relative junction for the edit itself:
+  `{agentbridge_edit_root}`. Do not pass direct absolute slot paths to `write_file`.
+- Before each repository edit, confirm the physical source path starts with
+  `{workspace_path}`, the edit path starts with `{agentbridge_edit_root}`, and both
+  identify the same existing file. If either check fails, write Status: blocked.
+  Never retry against the route root or canonical checkout.
+- After each edit, re-read the absolute physical path and inspect `git_diff` with
+  `repo="{workspace_path}"`. A successful junction write without a physical-slot
+  diff is a routing failure, not a completed edit.
+- In the final result, state the exact physical workspace, branch, and HEAD commit.
+  Every cited repository path must begin with `{workspace_path}`.
 - For coordination files under `{config.coordination_root}`, write to the exact
   absolute paths shown in this prompt: `{progress_path}` and `{result_path}`.
   Do not substitute `.agent-work/tasks/...` under the active IDE project unless it

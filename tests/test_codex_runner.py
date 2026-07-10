@@ -236,6 +236,42 @@ class CodexRunnerCommandTest(unittest.TestCase):
             self.assertGreater(scan_size, 0)
             self.assertTrue(proc.terminated)
 
+    def test_forbidden_agentbridge_project_discovery_stops_runner(self) -> None:
+        cases = {
+            "agentbridge_global_search": "search_text",
+            "agentbridge_global_symbols": "search_symbols",
+            "agentbridge_global_files": "list_project_files",
+            "agentbridge_global_tree": "list_directory_tree",
+            "agentbridge_external_attach": "attach_external_dir",
+        }
+        for marker_name, tool_name in cases.items():
+            with self.subTest(marker_name=marker_name), tempfile.TemporaryDirectory() as temp:
+                log_path = Path(temp) / "attempt-001.log"
+                log_path.write_text(
+                    f"mcp: agentbridge-ide/{tool_name} started\n",
+                    encoding="utf-8",
+                )
+                proc = _FakeProc()
+                spec = _spec(
+                    read_only=True,
+                    yolo=False,
+                    log_path=log_path,
+                    codex_forbidden_tool_markers=(marker_name,),
+                )
+
+                result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
+                    proc,
+                    spec,
+                    scan_size=0,
+                )
+
+                self.assertIsNotNone(result)
+                assert result is not None
+                self.assertEqual(result.status, "forbidden_tool_usage")
+                self.assertIn(marker_name, result.message)
+                self.assertGreater(scan_size, 0)
+                self.assertTrue(proc.terminated)
+
     def test_forbidden_markers_are_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             log_path = Path(temp) / "attempt-001.log"

@@ -70,7 +70,10 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("mcp__agentbridge_ide", prompt)
             self.assertIn("Do not use DataSpell AgentBridge tools", prompt)
             self.assertIn("AgentBridge edit root", prompt)
-            self.assertIn("project-relative junction", prompt)
+            self.assertIn("exact absolute physical workspace prefix", prompt)
+            self.assertIn("Do not use project-wide AgentBridge", prompt)
+            self.assertIn("path-scoped `rg`/`rg --files`", prompt)
+            self.assertIn("successful junction write without a physical-slot", prompt)
             self.assertIn("canonical checkout", prompt)
             self.assertIn("forbidden tool usage", prompt)
             self.assertIn("mcp__agentbridge_ide.run_command", prompt)
@@ -145,7 +148,7 @@ class PromptBuilderTest(unittest.TestCase):
             )
 
             self.assertIn("AgentBridge edit root: .agent-work/slot-links/work-slot-11", prompt)
-            self.assertIn("do not pass direct absolute slot paths", prompt)
+            self.assertIn("Do not pass direct absolute slot paths", prompt)
 
 
 if __name__ == "__main__":

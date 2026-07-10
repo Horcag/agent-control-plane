@@ -8,8 +8,10 @@ the balanced starting point for most agents.
 
 Use overrides intentionally:
 
-- `gpt-5.6-luna` + `low`: mechanical edits, formatting, repetitive test updates, or
-  high-volume read-only extraction with an explicit acceptance test.
+- `gpt-5.6-luna` + `low`: strictly mechanical edits, formatting, repetitive test
+  updates, or high-volume extraction with an explicit acceptance test.
+- `gpt-5.6-luna` + `medium`: bounded, repeatable implementation or audit work with
+  exact files and acceptance criteria. This is the Luna default when Luna is selected.
 - `gpt-5.6-terra` + `low`: latency-sensitive, already-specified work where the worker
   does not need to resolve architectural ambiguity.
 - `gpt-5.6-terra` + `medium`: normal implementation, debugging, and bounded refactors.
@@ -18,9 +20,28 @@ Use overrides intentionally:
 - `gpt-5.6-sol` + `max`: final owner review, ambiguous architecture, security-sensitive
   work, or recovery after cheaper workers repeatedly fail.
 
-Do not use `ultra` inside this control plane. Ultra can delegate internally, while this
-runner already owns external slot fan-out; combining both makes attribution, cost, and
-workspace ownership harder to control.
+Do not use Luna `high` or `xhigh` as a routine substitute for Terra. Escalate from Luna
+medium to Terra medium when the task needs materially deeper reasoning. Do not use
+`ultra` inside this control plane: Ultra delegates to internal subagents, while this
+runner already owns external slot fan-out. Combining both makes attribution, cost,
+concurrency, and workspace ownership harder to control.
+
+## Effort Names
+
+The Codex UI and CLI use different labels for two settings:
+
+| UI | CLI / config | Intended use |
+| --- | --- | --- |
+| Light | `low` | Fast, constrained, low-ambiguity work |
+| Medium | `medium` | Balanced default |
+| High | `high` | Difficult multi-step work and deeper verification |
+| Extra High | `xhigh` | Maximum single-agent reasoning below Max |
+| Max | `max` | Give one model more time for the hardest tasks |
+| Ultra | `ultra` | Maximum reasoning plus proactive internal subagents |
+
+Luna exposes Light through Extra High. Terra also exposes Ultra on eligible accounts.
+The absence of Luna Ultra is meaningful: Ultra is an orchestration mode, not merely one
+more reasoning step.
 
 ## Why Medium
 
@@ -45,23 +66,48 @@ tools, acceptance criteria, and target files fixed. Evaluate:
 Do not select `low` only because it is faster. Promote it for a task class only when it
 matches `medium` on the acceptance rubric over multiple representative runs.
 
-## Local Canary (2026-07-10)
+## Local Canaries (2026-07-10)
 
-Three read-only HH vacancy-state audits ran on commit `38639981` with identical
-acceptance criteria and clean AgentBridge slots:
+Read-only HH vacancy-state audits ran on commit `38639981` with identical acceptance
+criteria and clean AgentBridge slots.
 
-| Effort | Duration | Input / cached | Output / reasoning | Tools | Credits |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| low | 223.2 s | 828,161 / 567,808 | 4,537 / 1,329 | 28 | 21.52 |
-| medium | 221.7 s | 1,046,168 / 945,664 | 5,282 / 1,716 | 25 | 14.17 |
-| high | 309.8 s | 900,926 / 725,504 | 8,692 / 4,851 | 21 | 18.76 |
+### Terra
 
-All three completed without tool failures. Medium traced the full pipeline and found the
-same material risk classes as high. Low was not faster in this sample and its report was
-slightly less complete around the outer CLI entry point. This is a single canary per effort,
-not a statistical benchmark; keep collecting representative runs through `--valid-only`.
-It is enough to retain Terra medium as the default and require measured evidence before
-promoting a task class to low or high.
+| Effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| low | completed | 223.2 s | 828,161 / 567,808 | 4,537 / 1,329 | 28 / 0 failed | 21.52 |
+| medium | completed | 221.7 s | 1,046,168 / 945,664 | 5,282 / 1,716 | 25 / 0 failed | 14.17 |
+| high | completed | 309.8 s | 900,926 / 725,504 | 8,692 / 4,851 | 21 / 0 failed | 18.76 |
+| xhigh | completed | 346.9 s | 1,103,937 / 843,008 | 11,748 / 7,062 | 22 / 0 failed | 25.98 |
+
+Terra medium traced the full pipeline and found the same material risk classes as high.
+Low was not faster in this sample, while high and xhigh took substantially longer without
+changing the routing decision.
+
+### Luna, Strict Path Protocol
+
+| Effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| low | partial | 152.1 s | 855,522 / 645,632 | 5,002 / 1,007 | 24 / 1 failed | 7.61 |
+| medium | completed | 181.9 s | 746,148 / 556,032 | 6,771 / 1,959 | 22 / 0 failed | 7.16 |
+| high | completed | 222.5 s | 877,465 / 742,912 | 9,189 / 4,129 | 26 / 1 failed | 6.60 |
+| xhigh | partial | 342.5 s | 1,216,448 / 1,000,704 | 14,455 / 7,947 | 28 / 0 failed | 10.06 |
+
+Luna medium found the core application-state and employer-matching risks and completed
+without tool failures. High was 22% slower and added a useful stale-report boundary.
+Extra High was 88% slower than medium, did not add another material risk class, and
+finished partial after unnecessary verification commands failed. Low was faster but also
+partial. Luna medium is therefore the best current Luna setting for bounded work; collect
+three to five clean implementation canaries before making Luna the implementation
+default.
+
+The first Luna medium and xhigh attempts were excluded: project-wide IDE discovery read
+files from another indexed checkout. That failure produced the strict physical-path
+protocol and watchdog rules now enforced by the runner. The table's failed-tool value
+counts MCP call errors; a command can return a non-zero exit code inside a successful
+`run_command` call, which explains partial results with zero failed MCP calls. Each row is
+still one canary, not a statistical benchmark. Cached-input ratios dominate the single-run
+credit estimate, so credits are not expected to increase monotonically with effort.
 
 ## Telemetry
 
@@ -74,12 +120,18 @@ agent-control analytics --config .\config\workspaces.toml
 agent-control analytics --config .\config\workspaces.toml --model gpt-5.6-terra --reasoning-effort medium --valid-only
 ```
 
+`--valid-only` means the telemetry record is structurally complete. It does not prove
+that a worker read the assigned checkout or produced a semantically comparable result.
+For routing decisions, also verify the result's exact physical workspace, branch, HEAD,
+result status, and reviewer rubric.
+
 Credit estimates use the Codex per-million-token rate card dated 2026-07-09. API cost
 estimates use the GPT-5.6 API prices and the documented 90% cached-input discount. Raw
 token counts remain authoritative if pricing changes.
 
 ## Sources
 
+- [Codex model and effort descriptions](https://learn.chatgpt.com/docs/models)
 - [Codex subagent model and reasoning guidance](https://learn.chatgpt.com/docs/agent-configuration/subagents#choosing-models-and-reasoning)
 - [GPT-5.6 migration and effort guidance](https://developers.openai.com/api/docs/guides/latest-model)
 - [Codex token credit rate card](https://learn.chatgpt.com/docs/pricing#what-are-tokens-and-credits)
