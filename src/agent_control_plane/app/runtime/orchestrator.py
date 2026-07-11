@@ -113,6 +113,7 @@ class StartOptions:
 class GuardrailBaseline:
     entries: tuple[ForbiddenStatusEntry, ...]
     fingerprints: dict[tuple[str, str, str], str]
+    diff_changed_lines: int = 0
 
 
 @dataclass(frozen=True)
@@ -495,7 +496,9 @@ class AgentControlPlane:
                         route_root_baseline,
                     )
                 if guardrail_message is None:
-                    guardrail_message = self._codex_dirty_diff_guardrail_message(job)
+                    guardrail_message = self._codex_dirty_diff_guardrail_message(
+                        job, guardrail_baseline
+                    )
                 if guardrail_message:
                     self._preserve_dirty_state_if_needed(job, prefix="guardrail")
                     self.store.add_event(job_id, "error", guardrail_message)
@@ -1134,6 +1137,10 @@ class AgentControlPlane:
                 self.config.defaults.forbidden_status_globs,
             )
         )
+        try:
+            baseline_patch = diff_patch(job.workspace_path) if state.dirty else ""
+        except GitError:
+            baseline_patch = ""
         return GuardrailBaseline(
             entries=entries,
             fingerprints={
@@ -1143,6 +1150,7 @@ class AgentControlPlane:
                 )
                 for entry in entries
             },
+            diff_changed_lines=self._diff_changed_line_count(baseline_patch),
         )
 
     def _route_root_dirty_baseline(
@@ -1238,9 +1246,13 @@ class AgentControlPlane:
         )
         return f"Forbidden workspace change detected: {details}"
 
-    def _codex_dirty_diff_guardrail_message(self, job: JobRecord) -> str | None:
+    def _codex_dirty_diff_guardrail_message(
+        self,
+        job: JobRecord,
+        baseline: GuardrailBaseline,
+    ) -> str | None:
         """Stops Codex when it expands a dirty diff without a valid result."""
-        if normalize_backend(job.backend) != CODEX_BACKEND or job.allow_dirty:
+        if normalize_backend(job.backend) != CODEX_BACKEND:
             return None
 
         result_state = inspect_result(job.result_path, 0.0)
@@ -1260,13 +1272,15 @@ class AgentControlPlane:
             return f"Codex dirty diff guardrail could not inspect git diff: {exc}"
 
         changed_lines = self._diff_changed_line_count(patch)
-        if changed_lines <= CODEX_DIRTY_DIFF_MAX_CHANGED_LINES:
+        growth = max(0, changed_lines - baseline.diff_changed_lines)
+        if growth <= CODEX_DIRTY_DIFF_MAX_CHANGED_LINES:
             return None
 
         return (
             "Codex dirty diff exceeded "
-            f"{CODEX_DIRTY_DIFF_MAX_CHANGED_LINES} changed lines "
-            f"without a valid result ({changed_lines} changed lines). "
+            f"{CODEX_DIRTY_DIFF_MAX_CHANGED_LINES} changed-line growth "
+            f"without a valid result (baseline {baseline.diff_changed_lines}, "
+            f"current {changed_lines}, growth {growth}). "
             f"Dirty status: {_compact_status_preview(state.porcelain)}"
         )
 

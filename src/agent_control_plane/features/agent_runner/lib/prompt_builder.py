@@ -24,7 +24,7 @@ def build_task_prompt(
     idea_edit_path = workspace_path.resolve(strict=False)
     idea_edit_root = str(idea_edit_path)
     idea_project_root = config.coordination_root.parent.resolve(strict=False)
-    idea_create_root = Path(os.path.relpath(idea_edit_path, idea_project_root)).as_posix()
+    idea_create_root = _idea_create_root(idea_edit_path, idea_project_root)
     idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config)
 
     return f"""Task ID: {task_id}
@@ -204,6 +204,17 @@ Mandatory result file format:
 - If blocked or partial, include the exact blocker and the next concrete action.
 - When done, write the result file and stop.
 """
+
+
+def _idea_create_root(workspace_path: Path, project_root: Path) -> str:
+    try:
+        relative_path = os.path.relpath(workspace_path, project_root)
+    except ValueError as exc:
+        raise ValueError(
+            "IDEA MCP repository file creation requires the workspace and IDEA "
+            "project root to be on the same filesystem volume"
+        ) from exc
+    return Path(relative_path).as_posix()
 
 
 def _idea_mcp_settings(config: ControlConfig) -> tuple[str, str, str]:

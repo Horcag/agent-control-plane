@@ -212,6 +212,52 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn("guardrail.patch", result_text)
             self.assertTrue((job.run_dir / "guardrail.patch").exists())
 
+    def test_codex_dirty_diff_guardrail_limits_growth_for_resumed_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            tracked_file = workspace / "tracked.py"
+            tracked_file.write_text("base\n", encoding="utf-8")
+            _run(["git", "add", "tracked.py"], workspace)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Agy Test",
+                    "-c",
+                    "user.email=agy@example.test",
+                    "commit",
+                    "-m",
+                    "seed",
+                ],
+                workspace,
+            )
+            tracked_file.write_text(
+                "".join(f"baseline {index}\n" for index in range(10)),
+                encoding="utf-8",
+            )
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-1",
+                backend=CODEX_BACKEND,
+                allow_dirty=True,
+            )
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=_LargeDirtyCodexRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "guardrail_violation")
+            self.assertIn("Codex dirty diff exceeded", finished.last_error or "")
+            self.assertIn("baseline", finished.last_error or "")
+            self.assertIn("growth", finished.last_error or "")
+
     def test_slot_job_guardrail_detects_route_root_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

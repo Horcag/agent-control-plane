@@ -24,8 +24,12 @@ class AntigravityManagerAdapterTest(unittest.TestCase):
 
             state = AntigravityManagerAdapter(database_path=db_path).load_state()
 
-            self.assertEqual(state.active_account("agy").email, "old@example.test")
-            self.assertEqual(state.active_account("ide").email, "fresh@example.test")
+            agy_account = state.active_account("agy")
+            ide_account = state.active_account("ide")
+            assert agy_account is not None
+            assert ide_account is not None
+            self.assertEqual(agy_account.email, "old@example.test")
+            self.assertEqual(ide_account.email, "fresh@example.test")
             self.assertTrue(state.as_dict()["active_targets"]["agy"]["found"])
 
     def test_best_strategy_prefers_ide_active_account_different_from_agy(self) -> None:

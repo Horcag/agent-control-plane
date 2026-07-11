@@ -5,12 +5,26 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
+from unittest.mock import patch
 
-from agent_control_plane.features.agent_runner.lib.prompt_builder import build_task_prompt
+from agent_control_plane.features.agent_runner.lib.prompt_builder import (
+    _idea_create_root,
+    build_task_prompt,
+)
 from agent_control_plane.shared.config import ControlConfig, ControlDefaults, RouteConfig
 
 
 class PromptBuilderTest(unittest.TestCase):
+    def test_idea_create_root_reports_cross_volume_error(self) -> None:
+        with (
+            patch(
+                "agent_control_plane.features.agent_runner.lib.prompt_builder.os.path.relpath",
+                side_effect=ValueError("different drives"),
+            ),
+            self.assertRaisesRegex(ValueError, "same filesystem volume"),
+        ):
+            _idea_create_root(Path("D:/slot"), Path("C:/project"))
+
     def test_prompt_contains_route_paths_and_idea_mcp_rule(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

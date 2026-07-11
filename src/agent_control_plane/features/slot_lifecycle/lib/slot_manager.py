@@ -406,7 +406,8 @@ class SlotManager:
         if status.status == "deleted":
             raise SlotError(f"Slot {name} is marked deleted")
         resumable_statuses = {"dirty", "dirty_after_job", "dirty_after_failure"}
-        if status.status != "available" and not (
+        clean_resumable = status.status == "dirty_after_job" and not status.dirty
+        if status.status != "available" and not clean_resumable and not (
             allow_dirty and status.status in resumable_statuses
         ):
             raise SlotError(f"Slot {name} is {status.status!r}, not available")
