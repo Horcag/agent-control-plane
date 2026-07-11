@@ -143,6 +143,41 @@ class SlotManagerTest(unittest.TestCase):
             self.assertEqual(record.status, "active")
             self.assertEqual(record.active_job_id, "job-2")
 
+    def test_inspect_slot_reconciles_clean_dirty_after_job_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            slot_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            config = _config(root, slot_root)
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", slot_path)
+            store.acquire_slot("main-1", "job-1")
+            store.release_slot("main-1", "job-1", status="dirty_after_job")
+            manager = SlotManager(config, store)
+
+            status = manager.inspect_slot("main-1")
+
+            self.assertEqual(status.status, "available")
+            self.assertEqual(status.note, "reconciled clean workspace")
+            self.assertEqual(store.require_slot("main-1").status, "available")
+
+    def test_inspect_slot_preserves_clean_dirty_after_failure_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            slot_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            config = _config(root, slot_root)
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", slot_path)
+            store.acquire_slot("main-1", "job-1")
+            store.release_slot("main-1", "job-1", status="dirty_after_failure")
+            manager = SlotManager(config, store)
+
+            status = manager.inspect_slot("main-1")
+
+            self.assertEqual(status.status, "dirty_after_failure")
+            self.assertEqual(store.require_slot("main-1").status, "dirty_after_failure")
+
     def test_acquire_for_job_can_resume_explicit_dirty_after_job_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -179,6 +179,17 @@ class SlotManager:
                     problems.append(f"git status failed: {exc}")
 
         display_status = status
+        if (
+            status == "dirty_after_job"
+            and active_job_id is None
+            and is_git
+            and not dirty
+            and not problems
+        ):
+            record = self._store.mark_available(name, note="reconciled clean workspace")
+            status = record.status
+            note = record.note
+            display_status = status
         if dirty and status == "available" and active_job_id is None:
             display_status = "dirty"
 
