@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from agent_control_plane.shared.config import ControlConfig
 
 
 def build_task_prompt(
-        *,
-        config: ControlConfig,
-        task_id: str,
-        route: str,
-        workspace_path: Path,
-        expected_branch: str,
-        result_path: Path,
+    *,
+    config: ControlConfig,
+    task_id: str,
+    route: str,
+    workspace_path: Path,
+    expected_branch: str,
+    result_path: Path,
 ) -> str:
     task_dir = config.coordination_root / "tasks" / task_id
     brief_path = task_dir / "brief.md"
@@ -20,12 +21,17 @@ def build_task_prompt(
     protocol_path = _protocol_path(config.coordination_root)
     routing_path = _required_file(config.coordination_root / "workspace-routing.md")
     _required_file(brief_path)
-    idea_edit_root = str(workspace_path.resolve(strict=False))
+    idea_edit_path = workspace_path.resolve(strict=False)
+    idea_edit_root = str(idea_edit_path)
+    idea_project_root = config.coordination_root.parent.resolve(strict=False)
+    idea_create_root = Path(os.path.relpath(idea_edit_path, idea_project_root)).as_posix()
+    idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config)
 
     return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 IDEA MCP edit root: {idea_edit_root}
+IDEA MCP create root: {idea_create_root}
 Expected branch: {expected_branch}
 
 Read before acting:
@@ -43,23 +49,23 @@ Maintain live progress/state in:
 - {progress_path}
 
 Mandatory execution rules:
-- Use only the IDEA MCP server `ide-mcp-server` through native
-  `mcp__ide_mcp_server__*` tools for repository reads, edits, Git inspection,
+- Use only the IDEA MCP server `{idea_server}` through native
+  `{tool_namespace}*` tools for repository reads, edits, Git inspection,
   terminals, tests, and diagnostics.
-- `agentbridge-ide` and `dataspell_ide` are forbidden for this job. Do not
+- {forbidden_idea_servers} are forbidden for this job. Do not
   discover, call, configure, or fall back to either server.
-- In Codex / `codex exec`, first call `mcp__ide_mcp_server__read_file` directly
+- In Codex / `codex exec`, first call `{tool_namespace}read_file` directly
   on the first path under "Read before acting". Registered IDEA MCP tools are
   normally available without a discovery call.
 - Only use `tool_search` as an optional fallback when that function is actually
   available and the direct IDEA MCP call reports an unknown or unavailable tool.
   Never block merely because `tool_search` is absent.
 - After a successful direct or discovered call, use only ordinary
-  `mcp__ide_mcp_server__*` tools for local repository/IDE work.
+  `{tool_namespace}*` tools for local repository/IDE work.
 - Do not use web search, raw shell `exec`, `list_mcp_resources`, or
   `list_mcp_resource_templates` for delegated repository work. The runner treats
   those markers as forbidden tool usage and will stop the attempt.
-- Use `mcp__ide_mcp_server__run_in_terminal` for necessary local commands such
+- Use `{tool_namespace}run_in_terminal` for necessary local commands such
   as path-scoped `rg`, tests, linters, and formatters. Use dedicated IDEA MCP
   `git_*` tools exclusively for Git; terminal Git is forbidden.
 - Only block for missing IDEA MCP tools after one direct IDEA MCP call fails.
@@ -67,8 +73,8 @@ Mandatory execution rules:
   direct-call and optional discovery output in the result.
 - The control-plane initializes the progress file before runner start. Your first
   coordination action is to update the exact progress file path shown above:
-  `{progress_path}` through `mcp__ide_mcp_server__write_file` or
-  `mcp__ide_mcp_server__edit_text`; if it is unexpectedly missing, create it
+  `{progress_path}` through `{tool_namespace}write_file` or
+  `{tool_namespace}edit_text`; if it is unexpectedly missing, create it
   immediately at that exact path.
 - The IDEA project indexes multiple checkouts. For every repository `read_file`
   and every `git_*` call, use the exact absolute physical workspace prefix:
@@ -78,15 +84,29 @@ Mandatory execution rules:
   absolute path under `{workspace_path}`.
 - Do not use project-wide `search_text`, `search_symbols`, `list_project_files`,
   or `list_directory_tree` across all indexed checkouts. Use
-  `mcp__ide_mcp_server__run_in_terminal` with path-scoped `rg`/`rg --files`
+  `{tool_namespace}run_in_terminal` with path-scoped `rg`/`rg --files`
   against `{workspace_path}`, then read each discovered file by its exact
   absolute physical path.
-- For repository `write_file` and `edit_text`, first read the exact physical file.
-  Use the exact physical workspace path for repository edits:
-  `{idea_edit_root}`. Synthetic junction edit paths are forbidden.
-- Before each repository edit, confirm the source and edit paths both start with
-  `{idea_edit_root}` and identify the same existing file. If either check
-  fails, write Status: blocked. Never retry against the route root or canonical checkout.
+- Read existing repository files by their absolute physical paths under
+  `{idea_edit_root}` and edit them through `edit_text` using the same absolute
+  path. Synthetic junction edit paths are forbidden.
+- Use the exact physical workspace path for repository edits to existing files.
+- Before each edit of an existing repository file, confirm the source and edit
+  paths both start with `{idea_edit_root}` and identify the same existing file.
+  If either check fails, write Status: blocked. Never retry against the route
+  root or canonical checkout.
+- To create a new repository file through `write_file`, use its project-relative
+  path under the IDEA MCP create root `{idea_create_root}`, for example
+  `{idea_create_root}/path/to/new_file.py`.
+- Do not pass its absolute path to `write_file`: IDEA rebases non-existing
+  absolute Windows paths against the project root.
+- Immediately after creating a repository file, re-read it through its absolute physical path under `{idea_edit_root}`.
+- Then inspect `git_status(repo="{workspace_path}")` and require that exact
+  new path to appear as untracked (`??`) in the assigned workspace.
+- An empty `git_diff` is expected for a new untracked file. Do not stage it
+  merely to make the diff visible, and do not treat that empty diff as a routing
+  failure. If the absolute reread fails or `git_status` does not list the exact
+  new path in the assigned workspace, write Status: blocked.
 - After each edit, re-read the absolute physical path and inspect `git_diff` with
   `repo="{workspace_path}"`. A write without a diff in the assigned physical
   workspace is a routing failure, not a completed edit.
@@ -140,9 +160,11 @@ Mandatory execution rules:
   focused verification command or two failed verification attempts. Do not keep
   trying alternate command spellings; write Status: partial/blocked with the exact
   blocker.
-- Hard cap each attempt at roughly 25 IDEA MCP tool calls after the first
-  progress update. If you reach that cap, immediately write Status: partial or
-  Status: completed using the evidence already collected.
+- Keep bounded discovery under roughly 25 IDEA MCP calls after the first progress
+  update. For implementation tasks with explicit target files, continue through
+  edits and verification with a total budget of roughly 60 calls; do not stop at
+  the discovery cap before attempting the requested change. Audit-only tasks keep
+  the lower cap.
 - If the progress file already says the verification/conclusion is complete, the
   next action must be writing result.md, not another search/read/test command.
 - Do not edit files until the progress file names the intended target files and
@@ -182,6 +204,21 @@ Mandatory result file format:
 - If blocked or partial, include the exact blocker and the next concrete action.
 - When done, write the result file and stop.
 """
+
+
+def _idea_mcp_settings(config: ControlConfig) -> tuple[str, str, str]:
+    disabled = set(config.defaults.codex_disabled_mcp_servers)
+    if "ide-mcp-server" in disabled and "agentbridge-ide" not in disabled:
+        return (
+            "agentbridge-ide",
+            "mcp__agentbridge_ide__",
+            "`ide-mcp-server` and `dataspell_ide`",
+        )
+    return (
+        "ide-mcp-server",
+        "mcp__ide_mcp_server__",
+        "`agentbridge-ide` and `dataspell_ide`",
+    )
 
 
 def _protocol_path(coordination_root: Path) -> Path:

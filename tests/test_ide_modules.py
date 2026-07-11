@@ -7,6 +7,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import cast
 
+from agent_control_plane.entities.slot import SlotStore
 from agent_control_plane.features.slot_lifecycle.lib.ide_modules import (
     ensure_slot_ide_module,
     ensure_slot_ide_vcs_mappings,
@@ -14,6 +15,7 @@ from agent_control_plane.features.slot_lifecycle.lib.ide_modules import (
     remove_slot_ide_module,
     unload_slot_ide_module,
 )
+from agent_control_plane.features.slot_lifecycle.lib.slot_manager import SlotManager
 from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
@@ -108,6 +110,7 @@ class IdeModulesTest(unittest.TestCase):
             self.assertTrue(result.loaded)
             self.assertTrue(result.module_file.exists())
             module_text = result.module_file.read_text(encoding="utf-8")
+            self.assertIn('<content url="file://$MODULE_DIR$">', module_text)
             self.assertIn('<content url="file://$MODULE_DIR$/../slots/dev-1">', module_text)
             self.assertIn("dev-1/frontend/node_modules", module_text)
             modules_text = result.modules_xml.read_text(encoding="utf-8")
@@ -155,13 +158,33 @@ class IdeModulesTest(unittest.TestCase):
 
             result = ensure_slot_root_ide_module(config)
 
-            module_text = result.module_file.read_text(encoding="utf-8")
-            self.assertNotIn("reports-1", module_text)
-            self.assertNotIn("reports-1/backend/src", module_text)
-            self.assertNotIn("reports-1/frontend/src", module_text)
-            self.assertNotIn("reports-1/scripts", module_text)
-            self.assertNotIn("reports-1/backend/tests", module_text)
-            self.assertNotIn("reports-1/frontend/tests", module_text)
+            self.assertFalse(result.present)
+            self.assertFalse(result.loaded)
+            self.assertFalse(result.module_file.exists())
+
+    def test_ensure_slot_root_ide_module_removes_stale_empty_container(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dev_path = root / "slots" / "dev-1"
+            reports_path = root / "slots" / "reports-1"
+            dev_path.mkdir(parents=True)
+            reports_path.mkdir(parents=True)
+            ensure_slot_root_ide_module(_config(root, dev_path))
+
+            result = ensure_slot_root_ide_module(_config(root, reports_path, route="reports"))
+            second = ensure_slot_root_ide_module(_config(root, reports_path, route="reports"))
+
+            self.assertTrue(result.changed)
+            self.assertFalse(result.present)
+            self.assertFalse(result.loaded)
+            self.assertFalse(result.module_file.exists())
+            self.assertNotIn(
+                "agentbridge-slots-root.iml",
+                result.modules_xml.read_text(encoding="utf-8"),
+            )
+            workspace_text = result.workspace_xml.read_text(encoding="utf-8")
+            self.assertNotIn('name="agentbridge-slots-root"', workspace_text)
+            self.assertFalse(second.changed)
 
     def test_ensure_slot_ide_module_uses_route_specific_sdk_and_source_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -174,10 +197,54 @@ class IdeModulesTest(unittest.TestCase):
 
             module_text = result.module_file.read_text(encoding="utf-8")
             self.assertIn('jdkName="Python 3.12 (.venv)"', module_text)
-            self.assertIn('reports-1" isTestSource="false', module_text)
-            self.assertIn('reports-1/frontend" isTestSource="false', module_text)
-            self.assertIn("reports-1/scripts", module_text)
-            self.assertIn("reports-1/frontend/tests", module_text)
+            self.assertIn(
+                'reports-1/backend/src" isTestSource="false"',
+                module_text,
+            )
+            self.assertIn(
+                'reports-1/frontend/tests" isTestSource="true"',
+                module_text,
+            )
+
+    def test_manager_separates_sdk_slots_from_shared_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dev_path = root / "slots" / "dev-1"
+            reports_path = root / "slots" / "reports-1"
+            dev_path.mkdir(parents=True)
+            reports_path.mkdir(parents=True)
+            base_config = _config(root, dev_path)
+            config = replace(
+                base_config,
+                slots=MappingProxyType(
+                    {
+                        "dev-1": base_config.slots["dev-1"],
+                        "reports-1": SlotConfig(
+                            name="reports-1",
+                            route="reports",
+                            path=reports_path,
+                        ),
+                    }
+                ),
+            )
+            manager = SlotManager(config, SlotStore(config.database_path))
+
+            result = manager.ensure_ide_root_module()
+
+            root_result = cast(dict[str, object], result["root_module"])
+            self.assertTrue(root_result["present"])
+            root_module = _read_result_file(root_result, "module_file")
+            self.assertIn("dev-1/backend", root_module)
+            self.assertNotIn("reports-1", root_module)
+            dedicated = cast(list[dict[str, object]], result["dedicated_slot_modules"])
+            self.assertEqual(len(dedicated), 1)
+            self.assertEqual(dedicated[0]["module_name"], "agentbridge-slot-reports-1")
+            dedicated_module = _read_result_file(dedicated[0], "module_file")
+            self.assertIn('jdkName="Python 3.12 (.venv)"', dedicated_module)
+            self.assertIn('reports-1/backend/src" isTestSource="false"', dedicated_module)
+            inspection = cast(dict[str, object], result["duplicate_inspection"])
+            inspection_text = _read_result_file(inspection, "profile_file")
+            self.assertIn('restrictedDuplicateScope="SAME_MODULE"', inspection_text)
 
     def test_ensure_slot_ide_vcs_mappings_adds_each_configured_slot_as_git_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -272,6 +339,10 @@ def _config(root: Path, slot_path: Path, route: str = "dev") -> ControlConfig:
         slots=MappingProxyType({slot_name: slot}),
         slot_prepare=(),
     )
+
+
+def _read_result_file(result: dict[str, object], key: str) -> str:
+    return Path(cast(str, result[key])).read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":

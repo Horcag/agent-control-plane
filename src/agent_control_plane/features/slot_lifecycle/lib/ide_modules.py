@@ -63,6 +63,9 @@ MODULE_DIR_EXPR = "$MODULE_DIR$"
 
 
 def ensure_slot_root_ide_module(config: ControlConfig) -> IdeModuleResult:
+    if not _shared_ide_slots(config):
+        return remove_slot_root_ide_module(config)
+
     module_name = slot_root_module_name()
     module_file = slot_root_module_file(config)
     modules_xml = project_modules_xml(config)
@@ -124,6 +127,28 @@ def unload_slot_root_ide_module(config: ControlConfig) -> IdeModuleResult:
         workspace_xml=workspace_xml,
         changed=changed,
         present=_has_project_module_entry(config, module_file),
+        loaded=False,
+    )
+
+
+def remove_slot_root_ide_module(config: ControlConfig) -> IdeModuleResult:
+    module_file = slot_root_module_file(config)
+    modules_xml = project_modules_xml(config)
+    workspace_xml = project_workspace_xml(config)
+    module_name = slot_root_module_name()
+    file_changed = False
+    if module_file.exists():
+        module_file.unlink()
+        file_changed = True
+    project_changed = _remove_project_module_entry(config, module_file)
+    workspace_changed = _remove_module_load_state(config, module_name)
+    return IdeModuleResult(
+        module_name=module_name,
+        module_file=module_file,
+        modules_xml=modules_xml,
+        workspace_xml=workspace_xml,
+        changed=file_changed or project_changed or workspace_changed,
+        present=False,
         loaded=False,
     )
 
@@ -258,7 +283,11 @@ def _slot_module_content(config: ControlConfig, slot: SlotConfig) -> str:
 def _slot_root_module_content(config: ControlConfig) -> str:
     module_dir_expr = MODULE_DIR_EXPR
     slot_root_url = _module_relative_url(config, config.slot_root)
-    content_blocks: list[str] = []
+    # Agents must update progress/result files through the IDE before touching a
+    # slot. Make the coordination directory project-owned as part of the shared
+    # slot module so JetBrains does not block those writes with non-project-file
+    # protection dialogs.
+    content_blocks = [_slot_content_block(f"file://{MODULE_DIR_EXPR}", (), (), ())]
     for slot in sorted(config.slots.values(), key=lambda item: item.name):
         route = config.routes.get(slot.route)
         if route is None or route.ide_sdk_name:
@@ -283,6 +312,14 @@ def _slot_root_module_content(config: ControlConfig) -> str:
         "  </component>\n"
         "</module>\n"
     ).replace(MODULE_DIR_EXPR, module_dir_expr)
+
+
+def _shared_ide_slots(config: ControlConfig) -> tuple[SlotConfig, ...]:
+    return tuple(
+        slot
+        for slot in config.slots.values()
+        if (route := config.routes.get(slot.route)) is not None and not route.ide_sdk_name
+    )
 
 
 def _slot_content_block(

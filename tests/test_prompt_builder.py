@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -54,11 +55,12 @@ class PromptBuilderTest(unittest.TestCase):
                 slot_prepare=(),
             )
 
+            workspace = root.parent / "main-tiger-agent-slots" / "dev-3"
             prompt = build_task_prompt(
                 config=config,
                 task_id="task-1",
                 route="main",
-                workspace_path=Path("D:/repo/worktree"),
+                workspace_path=workspace,
                 expected_branch="review/pr",
                 result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
             )
@@ -70,7 +72,19 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Only use `tool_search` as an optional fallback", prompt)
             self.assertIn("mcp__ide_mcp_server__*", prompt)
             self.assertIn("`agentbridge-ide` and `dataspell_ide` are forbidden", prompt)
-            self.assertIn(f"IDEA MCP edit root: {Path('D:/repo/worktree')}", prompt)
+            self.assertIn(f"IDEA MCP edit root: {workspace}", prompt)
+            self.assertIn(
+                "IDEA MCP create root: ../main-tiger-agent-slots/dev-3",
+                prompt,
+            )
+            self.assertIn("existing repository files by their absolute physical paths", prompt)
+            self.assertIn("new repository file through `write_file`", prompt)
+            self.assertIn("Do not pass its absolute path to `write_file`", prompt)
+            self.assertIn("re-read it through its absolute physical path", prompt)
+            self.assertIn("inspect `git_diff` with", prompt)
+            self.assertIn(f'`git_status(repo="{workspace}")`', prompt)
+            self.assertIn("empty `git_diff` is expected", prompt)
+            self.assertIn("appear as untracked (`??`)", prompt)
             self.assertIn("exact absolute physical workspace prefix", prompt)
             self.assertIn("Do not use project-wide `search_text`", prompt)
             self.assertIn("path-scoped `rg`/`rg --files`", prompt)
@@ -93,7 +107,8 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Keep each search/read round narrow", prompt)
             self.assertIn("returns exit code 124", prompt)
             self.assertIn("For smoke/audit tasks", prompt)
-            self.assertIn("roughly 25 IDEA MCP tool calls", prompt)
+            self.assertIn("bounded discovery under roughly 25 IDEA MCP calls", prompt)
+            self.assertIn("total budget of roughly 60 calls", prompt)
             self.assertIn("next action must be writing result.md", prompt)
             self.assertIn("Do not rewrite whole files", prompt)
             self.assertIn("unrelated formatting churn", prompt)
@@ -109,7 +124,27 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Do not write Status: completed", prompt)
             self.assertIn("formatting problem", prompt)
 
-    def test_prompt_uses_physical_edit_root_and_legacy_protocol_for_slot(self) -> None:
+            agentbridge_config = replace(
+                config,
+                defaults=replace(
+                    config.defaults,
+                    codex_disabled_mcp_servers=("dataspell_ide", "ide-mcp-server"),
+                ),
+            )
+            agentbridge_prompt = build_task_prompt(
+                config=agentbridge_config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+            )
+            self.assertIn("IDEA MCP server `agentbridge-ide`", agentbridge_prompt)
+            self.assertIn("mcp__agentbridge_ide__read_file", agentbridge_prompt)
+            self.assertIn("`ide-mcp-server` and `dataspell_ide` are forbidden", agentbridge_prompt)
+            self.assertNotIn("mcp__ide_mcp_server__read_file", agentbridge_prompt)
+
+    def test_prompt_uses_absolute_edit_root_and_relative_create_root_for_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             _coordination_files(root, "task-1", protocol_name="agy-protocol.md")
@@ -151,6 +186,7 @@ class PromptBuilderTest(unittest.TestCase):
 
             workspace = root / "slots" / "work-slot-11"
             self.assertIn(f"IDEA MCP edit root: {workspace}", prompt)
+            self.assertIn("IDEA MCP create root: slots/work-slot-11", prompt)
             self.assertIn(str(root / ".agent-work" / "agy-protocol.md"), prompt)
             self.assertNotIn("slot-links", prompt)
             self.assertNotIn("Do not pass direct absolute slot paths", prompt)
@@ -227,10 +263,10 @@ class PromptBuilderTest(unittest.TestCase):
 
 
 def _coordination_files(
-        root: Path,
-        task_id: str,
-        *,
-        protocol_name: str = "agent-protocol.md",
+    root: Path,
+    task_id: str,
+    *,
+    protocol_name: str = "agent-protocol.md",
 ) -> None:
     coordination_root = root / ".agent-work"
     task_dir = coordination_root / "tasks" / task_id

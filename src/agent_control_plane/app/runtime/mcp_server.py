@@ -276,7 +276,7 @@ def build_server(config_path: str | None = None) -> Any:
     def agent_slots_ensure_root_module(
         remove_slot_modules: bool = False,
     ) -> dict[str, Any]:
-        """Ensure slot_root is registered as one IDEA module for all managed slots."""
+        """Ensure managed IDEA modules, SDK roots, and module-scoped duplicate analysis."""
         try:
             return {
                 "ok": True,

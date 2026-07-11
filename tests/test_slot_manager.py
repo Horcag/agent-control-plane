@@ -126,6 +126,29 @@ class SlotManagerTest(unittest.TestCase):
             with self.assertRaisesRegex(SlotError, "not available"):
                 manager.acquire_for_job("main-1", job_id="job-2", route="main")
 
+    def test_acquire_for_job_can_resume_explicit_dirty_after_job_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            slot_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            (slot_path / "README.md").write_text("dirty\n", encoding="utf-8")
+            config = _config(root, slot_root)
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", slot_path)
+            store.acquire_slot("main-1", "job-1")
+            store.release_slot("main-1", "job-1", status="dirty_after_job")
+            manager = SlotManager(config, store)
+
+            record = manager.acquire_for_job(
+                "main-1",
+                job_id="job-2",
+                route="main",
+                allow_dirty=True,
+            )
+
+            self.assertEqual(record.status, "active")
+            self.assertEqual(record.active_job_id, "job-2")
+
     def test_list_slots_hides_deleted_records_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

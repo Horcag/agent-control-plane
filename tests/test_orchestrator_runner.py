@@ -309,7 +309,7 @@ class _MutatingForbiddenFileRunner:
 
 class _LargeDirtyCodexRunner:
     def run(self, spec: Any, **kwargs: Any) -> AgyRunResult:
-        changed_lines = "".join(f"changed {index}\n" for index in range(260))
+        changed_lines = "".join(f"changed {index}\n" for index in range(520))
         (spec.workspace_path / "tracked.py").write_text(changed_lines, encoding="utf-8")
         kwargs["cancel_requested"]()
         return AgyRunResult(

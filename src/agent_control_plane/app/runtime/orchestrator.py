@@ -63,7 +63,7 @@ TERMINAL_STATUSES = frozenset(
         "stopped_dirty_after_failure",
     }
 )
-CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 240
+CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 500
 
 
 def _compact_status_preview(porcelain: str, *, limit: int = 8) -> str:
@@ -166,8 +166,8 @@ class AgentControlPlane:
 
     @classmethod
     def from_config_path(
-            cls,
-            config_path: str | os.PathLike[str] | None = None,
+        cls,
+        config_path: str | os.PathLike[str] | None = None,
     ) -> AgentControlPlane:
         return cls(load_config(config_path))
 
@@ -208,7 +208,7 @@ class AgentControlPlane:
                     "backend": route.backend or self.config.defaults.backend,
                     "codex_model": route.codex_model or self.config.defaults.codex_model,
                     "codex_reasoning_effort": (
-                            route.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
+                        route.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
                     ),
                     "worktree_root": str(route.worktree_root) if route.worktree_root else None,
                     "worktree_base": str(route.worktree_base),
@@ -236,12 +236,12 @@ class AgentControlPlane:
 
     @staticmethod
     def _initialize_task_artifacts(
-            *,
-            task_id: str,
-            job_id: str,
-            workspace_path: Path,
-            expected_branch: str,
-            result_path: Path,
+        *,
+        task_id: str,
+        job_id: str,
+        workspace_path: Path,
+        expected_branch: str,
+        result_path: Path,
     ) -> None:
         task_dir = result_path.parent
         progress_path = task_dir / "agent-progress.md"
@@ -257,8 +257,8 @@ class AgentControlPlane:
             "Target files:\n"
             "- none yet\n"
             "Next action:\n"
-            "- Agent runner must update this file through IDEA MCP "
-            "(`mcp__ide_mcp_server__*`) before repository exploration or edits.\n"
+            "- Agent runner must update this file through the IDEA MCP selected "
+            "in the generated prompt before repository exploration or edits.\n"
             "Changed files:\n"
             "- none\n"
             "Open risks:\n"
@@ -289,7 +289,7 @@ class AgentControlPlane:
                     f"not {options.route!r}"
                 )
             if workspace_path and workspace_path.resolve(strict=False) != slot_status.path.resolve(
-                    strict=False
+                strict=False
             ):
                 raise PolicyError(
                     f"Slot {options.slot} resolves to {slot_status.path}, "
@@ -390,7 +390,12 @@ class AgentControlPlane:
         self.store.add_event(job.job_id, "info", "Job created")
         if options.slot:
             try:
-                self.slots.acquire_for_job(options.slot, job_id=job.job_id, route=options.route)
+                self.slots.acquire_for_job(
+                    options.slot,
+                    job_id=job.job_id,
+                    route=options.route,
+                    allow_dirty=allow_dirty,
+                )
             except SlotError as exc:
                 self.store.add_event(job.job_id, "error", str(exc))
                 return self._finish_job(job.job_id, "blocked", str(exc))
@@ -516,7 +521,7 @@ class AgentControlPlane:
                     codex_command=self.config.codex_command,
                     codex_model=job.codex_model or self.config.defaults.codex_model,
                     codex_reasoning_effort=(
-                            job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
+                        job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
                     ),
                     codex_sandbox_mode=self.config.defaults.codex_sandbox_mode,
                     codex_disabled_mcp_servers=self.config.defaults.codex_disabled_mcp_servers,
@@ -718,12 +723,12 @@ class AgentControlPlane:
         }
 
     def analytics(
-            self,
-            *,
-            limit: int = 100,
-            model: str | None = None,
-            reasoning_effort: str | None = None,
-            valid_only: bool = False,
+        self,
+        *,
+        limit: int = 100,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        valid_only: bool = False,
     ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit must be positive")
@@ -756,12 +761,12 @@ class AgentControlPlane:
         return job.result_path.read_text(encoding="utf-8", errors="replace")
 
     def watch_job(
-            self,
-            job_id: str,
-            *,
-            poll_interval_sec: float = 30.0,
-            timeout_sec: float | None = None,
-            log_lines: int = 80,
+        self,
+        job_id: str,
+        *,
+        poll_interval_sec: float = 30.0,
+        timeout_sec: float | None = None,
+        log_lines: int = 80,
     ) -> dict[str, Any]:
         """Poll a job until it reaches a terminal state or the optional timeout expires."""
         if poll_interval_sec < 0:
@@ -810,11 +815,11 @@ class AgentControlPlane:
         return self.config.runs_root / _date_bucket_from_timestamp(time.time()) / job_id
 
     def archive_jobs(
-            self,
-            *,
-            older_than_days: int = 14,
-            limit: int = 50,
-            apply: bool = False,
+        self,
+        *,
+        older_than_days: int = 14,
+        limit: int = 50,
+        apply: bool = False,
     ) -> list[dict[str, Any]]:
         if older_than_days < 0:
             raise ValueError("older_than_days must be non-negative")
@@ -842,12 +847,12 @@ class AgentControlPlane:
         )
 
     def switch_agy_account(
-            self,
-            *,
-            account_id: str | None = None,
-            email: str | None = None,
-            strategy: str | None = None,
-            dry_run: bool = True,
+        self,
+        *,
+        account_id: str | None = None,
+        email: str | None = None,
+        strategy: str | None = None,
+        dry_run: bool = True,
     ) -> dict[str, Any]:
         result = AntigravityManagerAdapter(
             electron_command=self.config.defaults.auto_switch_agy_electron_command,
@@ -865,12 +870,12 @@ class AgentControlPlane:
         ]
 
     def create_slot(
-            self,
-            name: str,
-            *,
-            route: str | None = None,
-            branch: str | None = None,
-            start_point: str | None = None,
+        self,
+        name: str,
+        *,
+        route: str | None = None,
+        branch: str | None = None,
+        start_point: str | None = None,
     ) -> dict[str, Any]:
         return self.slots.create_slot(
             name,
@@ -880,18 +885,18 @@ class AgentControlPlane:
         ).as_dict()
 
     def bootstrap_slot(
-            self,
-            name: str,
-            *,
-            route: str,
-            repo_path: Path | None = None,
-            required_branch: str | None = None,
-            slot_path: Path | None = None,
-            branch: str | None = None,
-            start_point: str | None = None,
-            create: bool = True,
-            ensure_ide: bool = True,
-            remove_slot_modules: bool = True,
+        self,
+        name: str,
+        *,
+        route: str,
+        repo_path: Path | None = None,
+        required_branch: str | None = None,
+        slot_path: Path | None = None,
+        branch: str | None = None,
+        start_point: str | None = None,
+        create: bool = True,
+        ensure_ide: bool = True,
+        remove_slot_modules: bool = True,
     ) -> dict[str, Any]:
         config_result = bootstrap_slot_config(
             self.config,
@@ -920,11 +925,11 @@ class AgentControlPlane:
         return self.slots.delete_slot(name, force=force).as_dict()
 
     def checkout_slot(
-            self,
-            name: str,
-            *,
-            branch: str,
-            start_point: str | None = None,
+        self,
+        name: str,
+        *,
+        branch: str,
+        start_point: str | None = None,
     ) -> dict[str, Any]:
         return self.slots.checkout_slot(name, branch=branch, start_point=start_point).as_dict()
 
@@ -932,9 +937,9 @@ class AgentControlPlane:
         return self.slots.ensure_ide_module(name)
 
     def ensure_slot_root_ide_module(
-            self,
-            *,
-            remove_slot_modules: bool = False,
+        self,
+        *,
+        remove_slot_modules: bool = False,
     ) -> dict[str, object]:
         return self.slots.ensure_ide_root_module(remove_configured_slot_modules=remove_slot_modules)
 
@@ -951,11 +956,11 @@ class AgentControlPlane:
         return self.slots.prepare_slot(name)
 
     def cleanup_slots(
-            self,
-            *,
-            max_per_route: int,
-            apply: bool = False,
-            force: bool = False,
+        self,
+        *,
+        max_per_route: int,
+        apply: bool = False,
+        force: bool = False,
     ) -> list[dict[str, str]]:
         return [
             decision.as_dict()
@@ -967,11 +972,11 @@ class AgentControlPlane:
         ]
 
     def _archive_decision(
-            self,
-            job: JobRecord,
-            cutoff: float,
-            *,
-            apply: bool,
+        self,
+        job: JobRecord,
+        cutoff: float,
+        *,
+        apply: bool,
     ) -> dict[str, Any] | None:
         if not self._is_terminal(job) or job.archived_at is not None:
             return None
@@ -980,10 +985,10 @@ class AgentControlPlane:
             return None
 
         archive_dir = (
-                self.config.runs_root
-                / "_archive"
-                / _date_bucket_from_timestamp(archived_from_timestamp)
-                / job.job_id
+            self.config.runs_root
+            / "_archive"
+            / _date_bucket_from_timestamp(archived_from_timestamp)
+            / job.job_id
         )
         decision: dict[str, Any] = {
             "job_id": job.job_id,
@@ -1141,9 +1146,9 @@ class AgentControlPlane:
         )
 
     def _route_root_dirty_baseline(
-            self,
-            job: JobRecord,
-            route_config: Any,
+        self,
+        job: JobRecord,
+        route_config: Any,
     ) -> WorkspaceDirtyBaseline | None:
         if not job.slot_name or route_config is None:
             return None
@@ -1165,9 +1170,9 @@ class AgentControlPlane:
         )
 
     def _route_root_guardrail_message(
-            self,
-            job: JobRecord,
-            baseline: WorkspaceDirtyBaseline | None,
+        self,
+        job: JobRecord,
+        baseline: WorkspaceDirtyBaseline | None,
     ) -> str | None:
         if baseline is None:
             return None
@@ -1205,9 +1210,9 @@ class AgentControlPlane:
         )
 
     def _guardrail_violation_message(
-            self,
-            job: JobRecord,
-            baseline: GuardrailBaseline,
+        self,
+        job: JobRecord,
+        baseline: GuardrailBaseline,
     ) -> str | None:
         try:
             state = workspace_state(job.workspace_path)
@@ -1275,10 +1280,10 @@ class AgentControlPlane:
         )
 
     def _changed_baseline_forbidden_entries(
-            self,
-            job: JobRecord,
-            baseline: GuardrailBaseline,
-            current_entries: list[ForbiddenStatusEntry],
+        self,
+        job: JobRecord,
+        baseline: GuardrailBaseline,
+        current_entries: list[ForbiddenStatusEntry],
     ) -> list[ForbiddenStatusEntry]:
         changed: list[ForbiddenStatusEntry] = []
         for entry in current_entries:
@@ -1293,8 +1298,8 @@ class AgentControlPlane:
 
     @classmethod
     def _dedupe_forbidden_entries(
-            cls,
-            entries: list[ForbiddenStatusEntry],
+        cls,
+        entries: list[ForbiddenStatusEntry],
     ) -> list[ForbiddenStatusEntry]:
         seen: set[tuple[str, str, str]] = set()
         deduped: list[ForbiddenStatusEntry] = []
@@ -1362,12 +1367,12 @@ class AgentControlPlane:
         )
 
     def _auto_switch_agy_after_quota_failure(
-            self,
-            job: JobRecord,
-            log_path: Path,
-            diagnostic_message: str,
-            *,
-            already_used: bool,
+        self,
+        job: JobRecord,
+        log_path: Path,
+        diagnostic_message: str,
+        *,
+        already_used: bool,
     ) -> str | None:
         if already_used or not self.config.defaults.auto_switch_agy_on_quota:
             return None
@@ -1403,12 +1408,12 @@ class AgentControlPlane:
         if job.result_path.exists():
             text = job.result_path.read_text(encoding="utf-8", errors="replace")
             is_placeholder = (
-                    "Awaiting `agy`" in text
-                    or "Awaiting execution" in text
-                    or "Awaiting agent execution" in text
+                "Awaiting `agy`" in text
+                or "Awaiting execution" in text
+                or "Awaiting agent execution" in text
             )
             is_placeholder = is_placeholder or (
-                    "Not reviewed yet" in text and "Status: blocked" in text
+                "Not reviewed yet" in text and "Status: blocked" in text
             )
             if not is_placeholder:
                 return

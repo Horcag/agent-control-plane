@@ -12,6 +12,7 @@ from agent_control_plane.features.slot_lifecycle.lib.ide_modules import (
     ensure_slot_ide_vcs_mappings,
     ensure_slot_root_ide_module,
     remove_slot_ide_module,
+    remove_slot_root_ide_module,
     unload_slot_ide_module,
     unload_slot_root_ide_module,
 )
@@ -53,6 +54,7 @@ __all__ = [
     "infer_repo_layout",
     "prepare_workspace_slot",
     "remove_slot_ide_module",
+    "remove_slot_root_ide_module",
     "remove_worktree",
     "unload_slot_ide_module",
     "unload_slot_root_ide_module",

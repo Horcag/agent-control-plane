@@ -101,6 +101,8 @@ worktree_base = "../my-project"
 source_roots = ["."]
 test_roots = ["tests"]
 exclude_dirs = [".venv", "build", "dist", "node_modules"]
+ide_sdk_name = "Python 3.12 (my-project)"
+ide_sdk_type = "Python SDK"
 
 [slots."app-1"]
 route = "app"
@@ -108,7 +110,15 @@ path = "../agent-control-plane-slots/app-1"
 ```
 
 Config paths may be absolute or relative. Relative paths are resolved from the repository
-root containing the `config/` directory.
+root containing the `config/` directory. `ide_sdk_name` must exactly match an SDK already
+registered in IDEA.
+
+Routes that expose overlapping package or symbol names, such as several checkouts of the
+same repository, must use a configured SDK. The control plane then creates one isolated
+IDEA module per slot, without dependencies between slot modules. Shared modules remain
+available only for non-overlapping routes. The generated inspection profile limits duplicate
+analysis to `SAME_MODULE`, preserving useful duplicate detection inside a slot while ignoring
+identical files in sibling checkouts.
 
 Validate the config before starting jobs:
 
@@ -143,6 +153,7 @@ Create or synchronize slots after editing the config:
 agent-control slots sync --config .\config\workspaces.toml
 agent-control slots list --config .\config\workspaces.toml
 agent-control slots create app-1 --config .\config\workspaces.toml
+agent-control slots ensure-root-module --remove-slot-modules --config .\config\workspaces.toml
 ```
 
 For a new route or a new slot, `bootstrap` can add the missing config and optionally

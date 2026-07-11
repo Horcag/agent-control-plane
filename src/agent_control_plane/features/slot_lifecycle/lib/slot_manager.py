@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 from agent_control_plane.entities.slot import SlotRecord, SlotStore, SlotStoreError
+from agent_control_plane.features.slot_lifecycle.lib.ide_inspections import (
+    ensure_duplicate_inspection_same_module,
+)
 from agent_control_plane.features.slot_lifecycle.lib.ide_modules import (
     ensure_slot_ide_module,
     ensure_slot_ide_vcs_mappings,
@@ -329,6 +332,7 @@ class SlotManager:
         result: dict[str, object] = {
             "root_module": ensure_slot_root_ide_module(self._config).as_dict(),
             "vcs_mappings": ensure_slot_ide_vcs_mappings(self._config),
+            "duplicate_inspection": ensure_duplicate_inspection_same_module(self._config).as_dict(),
             "dedicated_slot_modules": [
                 ensure_slot_ide_module(self._config, slot).as_dict() for slot in dedicated_slots
             ],
@@ -386,7 +390,14 @@ class SlotManager:
         except SlotPrepareError as exc:
             raise SlotError(f"Could not prepare slot {name}: {exc}") from exc
 
-    def acquire_for_job(self, name: str, *, job_id: str, route: str) -> SlotRecord:
+    def acquire_for_job(
+        self,
+        name: str,
+        *,
+        job_id: str,
+        route: str,
+        allow_dirty: bool = False,
+    ) -> SlotRecord:
         status = self.inspect_slot(name)
         if status.route != route:
             raise SlotError(f"Slot {name} belongs to route {status.route!r}, not {route!r}")
@@ -394,9 +405,12 @@ class SlotManager:
             raise SlotError(f"Slot {name} is already active for job {status.active_job_id}")
         if status.status == "deleted":
             raise SlotError(f"Slot {name} is marked deleted")
-        if status.status != "available":
+        resumable_statuses = {"dirty", "dirty_after_job", "dirty_after_failure"}
+        if status.status != "available" and not (
+            allow_dirty and status.status in resumable_statuses
+        ):
             raise SlotError(f"Slot {name} is {status.status!r}, not available")
-        if status.dirty:
+        if status.dirty and not allow_dirty:
             raise SlotError(f"Slot {name} is dirty:\n{status.dirty}")
         if not status.exists or not status.is_git_workspace:
             raise SlotError(f"Slot {name} is not an existing git workspace")
