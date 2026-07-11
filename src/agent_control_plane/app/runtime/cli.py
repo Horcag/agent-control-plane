@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
                     backend=args.backend,
                     codex_model=args.codex_model,
                     codex_reasoning_effort=args.codex_reasoning_effort,
+                    codex_quality_tier=args.codex_quality_tier,
                     slot=args.slot,
                     workspace_path=Path(args.workspace_path) if args.workspace_path else None,
                     expected_branch=args.expected_branch,
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
                         poll_interval_sec=args.poll_interval_sec,
                         timeout_sec=args.wait_timeout_sec,
                         log_lines=args.lines,
+                        include_details=True,
                     )
             _print_json(payload)
             return 0
@@ -119,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:
                         poll_interval_sec=args.poll_interval_sec,
                         timeout_sec=args.timeout_sec,
                         log_lines=args.lines,
+                        include_details=True,
                     )
                 )
             return 0
@@ -287,6 +290,11 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--codex-reasoning-effort",
         help="Codex reasoning effort to use when --backend=codex",
+    )
+    start.add_argument(
+        "--codex-quality-tier",
+        choices=("mechanical", "balanced", "deep"),
+        help="Opt into a quality tier; deep remains the safe default",
     )
     start.add_argument("--slot", help="Use a managed IDE-indexed slot by name")
     start.add_argument("--workspace-path")
@@ -645,6 +653,7 @@ def _job_payload(job: Any) -> dict[str, Any]:
         "backend": job.backend,
         "codex_model": job.codex_model,
         "codex_reasoning_effort": job.codex_reasoning_effort,
+        "codex_quality_tier": job.codex_quality_tier,
         "worker_pid": job.worker_pid,
         "runner_pid": job.runner_pid,
         "read_only": job.read_only,

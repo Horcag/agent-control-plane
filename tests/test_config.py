@@ -37,6 +37,18 @@ prepare_slots = true
 runs_layout = "date"
 auto_archive_days = 7
 auto_archive_limit = 200
+codex_quality_tier = "deep"
+codex_mechanical_model = "gpt-5.6-luna"
+codex_mechanical_reasoning_effort = "low"
+codex_balanced_model = "gpt-5.6-terra"
+codex_balanced_reasoning_effort = "medium"
+codex_deep_model = "gpt-5.6-terra"
+codex_deep_reasoning_effort = "medium"
+codex_global_quota_database = "global/quota.sqlite3"
+codex_global_max_concurrent_jobs = 2
+codex_five_hour_soft_limit_percent = 75
+codex_quota_poll_sec = 30
+codex_sessions_root = "sessions"
 
 [slot_prepare.frontend_node_modules]
 routes = ["main", "dev"]
@@ -95,6 +107,24 @@ path = "slots/reports-1"
             self.assertEqual(config.defaults.codex_disabled_mcp_servers, ())
             self.assertEqual(config.defaults.codex_forbidden_tool_markers, ())
             self.assertEqual(config.defaults.codex_no_progress_timeout_sec, 240)
+            self.assertEqual(config.defaults.codex_quality_tier, "deep")
+            self.assertEqual(config.defaults.codex_mechanical_model, "gpt-5.6-luna")
+            self.assertEqual(config.defaults.codex_mechanical_reasoning_effort, "low")
+            self.assertEqual(config.defaults.codex_balanced_model, "gpt-5.6-terra")
+            self.assertEqual(config.defaults.codex_balanced_reasoning_effort, "medium")
+            self.assertEqual(config.defaults.codex_deep_model, "gpt-5.6-terra")
+            self.assertEqual(config.defaults.codex_deep_reasoning_effort, "medium")
+            self.assertEqual(
+                config.defaults.codex_global_quota_database,
+                (root / "global" / "quota.sqlite3").resolve(strict=False),
+            )
+            self.assertEqual(config.defaults.codex_global_max_concurrent_jobs, 2)
+            self.assertEqual(config.defaults.codex_five_hour_soft_limit_percent, 75.0)
+            self.assertEqual(config.defaults.codex_quota_poll_sec, 30.0)
+            self.assertEqual(
+                config.defaults.codex_sessions_root,
+                (root / "sessions").resolve(strict=False),
+            )
             self.assertEqual(config.defaults.runs_layout, "date")
             self.assertEqual(config.defaults.auto_archive_days, 7)
             self.assertEqual(config.defaults.auto_archive_limit, 200)

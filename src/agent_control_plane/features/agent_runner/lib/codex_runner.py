@@ -92,44 +92,45 @@ class CodexExecRunner:
             metrics = output.metrics(
                 model=spec.codex_model,
                 duration_sec=time.monotonic() - started_mono,
+                sessions_root=spec.codex_sessions_root,
             )
             return replace(result, metrics=metrics)
 
     @staticmethod
     def _build_command(spec: AgentRunSpec) -> list[str]:
         last_message_path = spec.log_path.with_suffix(".last-message.md")
-        command = [
-            spec.codex_command,
-            "exec",
-            "--model",
-            spec.codex_model,
-            "--json",
-            "-c",
-            f'model_reasoning_effort="{spec.codex_reasoning_effort}"',
-            "-c",
-            'approval_policy="never"',
-        ]
+        command = [spec.codex_command, "exec"]
+        if spec.codex_resume_thread_id is not None:
+            command.append("resume")
+        command.extend(
+            [
+                "--model",
+                spec.codex_model,
+                "--json",
+                "-c",
+                f'model_reasoning_effort="{spec.codex_reasoning_effort}"',
+                "-c",
+                'approval_policy="never"',
+            ]
+        )
         for feature_name in CODEX_SPARK_DISABLED_FEATURES:
             command.extend(["--disable", feature_name])
         for server_name in spec.codex_disabled_mcp_servers:
             command.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
-        command.extend(
-            [
-                "--cd",
-                str(spec.workspace_path),
-                "--output-last-message",
-                str(last_message_path),
-            ]
-        )
+        if spec.codex_resume_thread_id is None:
+            command.extend(["--cd", str(spec.workspace_path)])
+        command.extend(["--output-last-message", str(last_message_path)])
         if spec.yolo:
             command.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
+        elif spec.codex_resume_thread_id is None:
             command.extend(
                 [
                     "--sandbox",
                     "read-only" if spec.read_only else spec.codex_sandbox_mode,
                 ]
             )
+        if spec.codex_resume_thread_id is not None:
+            command.append(spec.codex_resume_thread_id)
         command.append("-")
         return command
 

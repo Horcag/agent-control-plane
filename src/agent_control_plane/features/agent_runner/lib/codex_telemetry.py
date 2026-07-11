@@ -46,6 +46,7 @@ def parse_codex_jsonl(
     *,
     model: str,
     duration_sec: float,
+    sessions_root: Path | None = None,
 ) -> AttemptMetrics:
     event_count = 0
     thread_id: str | None = None
@@ -96,6 +97,15 @@ def parse_codex_jsonl(
         tool_counts[tool_key] += 1
         if item.get("error") or str(item.get("status") or "") in {"error", "failed"}:
             failed_tool_calls += 1
+
+    if not usage_available and thread_id and sessions_root is not None:
+        recovered = _recover_session_usage(sessions_root, thread_id)
+        if recovered is not None:
+            usage_available = True
+            input_tokens = recovered["input_tokens"]
+            cached_input_tokens = recovered["cached_input_tokens"]
+            output_tokens = recovered["output_tokens"]
+            reasoning_output_tokens = recovered["reasoning_output_tokens"]
 
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
     estimated_credits = _estimate(
@@ -172,6 +182,68 @@ def render_codex_json_line(line: str) -> str:
         message = event.get("message") or event.get("error") or "unknown error"
         return f"ERROR {message}\n"
     return f"{event_type}\n"
+
+
+def _recover_session_usage(
+    sessions_root: Path,
+    thread_id: str,
+) -> dict[str, int] | None:
+    if not sessions_root.exists():
+        return None
+    candidates = sorted(
+        sessions_root.rglob(f"*{thread_id}*.jsonl"),
+        key=_safe_mtime,
+        reverse=True,
+    )
+    for path in candidates[:4]:
+        usage = _latest_session_usage(path)
+        if usage is not None:
+            return usage
+    return None
+
+
+def _latest_session_usage(path: Path) -> dict[str, int] | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    latest_total: dict[str, int] | None = None
+    for line in lines:
+        event = _parse_event(line)
+        if event is None or event.get("type") != "event_msg":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "token_count":
+            continue
+        info = payload.get("info")
+        if not isinstance(info, dict):
+            continue
+        last_usage = _usage_mapping(info.get("last_token_usage"))
+        if last_usage is not None:
+            latest_total = last_usage
+            continue
+        total_usage = _usage_mapping(info.get("total_token_usage"))
+        if total_usage is not None:
+            latest_total = total_usage
+    return latest_total
+
+
+def _usage_mapping(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict):
+        return None
+    return {
+        "input_tokens": _integer(value.get("input_tokens")),
+        "cached_input_tokens": _integer(value.get("cached_input_tokens")),
+        "output_tokens": _integer(value.get("output_tokens")),
+        "reasoning_output_tokens": _integer(value.get("reasoning_output_tokens")),
+    }
+
+
+def _safe_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _parse_event(line: str) -> dict[str, Any] | None:

@@ -19,7 +19,10 @@ CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "agentbridge_global_tree": "mcp: agentbridge-ide/list_directory_tree",
     "agentbridge_external_attach": "mcp: agentbridge-ide/attach_external_dir",
 }
-CODEX_PRODUCTIVE_LOG_MARKERS = ("mcp: agentbridge-ide/",)
+CODEX_PRODUCTIVE_LOG_MARKERS = (
+    "mcp: ide-mcp-server/",
+    "mcp: agentbridge-ide/",
+)
 
 
 def refresh_log_activity(

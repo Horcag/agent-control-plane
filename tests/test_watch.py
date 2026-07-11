@@ -40,6 +40,32 @@ class WatchJobTest(unittest.TestCase):
             self.assertFalse(summary["terminal"])
             self.assertTrue(summary["timed_out"])
             self.assertEqual(summary["status"], "running")
+            self.assertNotIn("dirty_status", summary)
+            self.assertNotIn("log_tail", summary)
+            self.assertNotIn("latest_attempt_metrics", summary)
+
+    def test_watch_returns_bounded_log_delta_from_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-delta")
+            log_path = job.run_dir / "attempt-001.log"
+            log_path.parent.mkdir(parents=True)
+            log_path.write_text("0123456789", encoding="utf-8")
+            control.store.update_job(job.job_id, status="running", log_path=log_path)
+
+            summary = control.watch_job(
+                job.job_id,
+                poll_interval_sec=0,
+                timeout_sec=0,
+                log_cursor=2,
+                log_byte_limit=4,
+            )
+
+            self.assertEqual(summary["log_delta"], "2345")
+            self.assertEqual(summary["next_log_cursor"], 6)
+            self.assertTrue(summary["log_delta_truncated"])
+            self.assertNotIn("dirty_status", summary)
 
     def test_summary_marks_dead_worker_as_worker_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

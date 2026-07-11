@@ -72,6 +72,18 @@ class ControlDefaults:
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_no_progress_timeout_sec: int = 240
+    codex_quality_tier: str = "deep"
+    codex_mechanical_model: str = "gpt-5.6-luna"
+    codex_mechanical_reasoning_effort: str = "low"
+    codex_balanced_model: str = "gpt-5.6-terra"
+    codex_balanced_reasoning_effort: str = "medium"
+    codex_deep_model: str = "gpt-5.6-terra"
+    codex_deep_reasoning_effort: str = "medium"
+    codex_global_quota_database: Path | None = None
+    codex_global_max_concurrent_jobs: int = 2
+    codex_five_hour_soft_limit_percent: float = 75.0
+    codex_quota_poll_sec: float = 30.0
+    codex_sessions_root: Path | None = None
     auto_switch_agy_on_quota: bool = False
     auto_switch_agy_strategy: str = "best"
     auto_switch_agy_electron_command: tuple[str, ...] = (
@@ -167,6 +179,45 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         codex_no_progress_timeout_sec=_non_negative_int(
             defaults_raw.get("codex_no_progress_timeout_sec", 240),
             "codex_no_progress_timeout_sec",
+        ),
+        codex_quality_tier=_quality_tier_value(defaults_raw.get("codex_quality_tier", "deep")),
+        codex_mechanical_model=_string_value(
+            defaults_raw.get("codex_mechanical_model", "gpt-5.6-luna")
+        ),
+        codex_mechanical_reasoning_effort=_string_value(
+            defaults_raw.get("codex_mechanical_reasoning_effort", "low")
+        ),
+        codex_balanced_model=_string_value(
+            defaults_raw.get("codex_balanced_model", "gpt-5.6-terra")
+        ),
+        codex_balanced_reasoning_effort=_string_value(
+            defaults_raw.get("codex_balanced_reasoning_effort", "medium")
+        ),
+        codex_deep_model=_string_value(defaults_raw.get("codex_deep_model", "gpt-5.6-terra")),
+        codex_deep_reasoning_effort=_string_value(
+            defaults_raw.get("codex_deep_reasoning_effort", "medium")
+        ),
+        codex_global_quota_database=_optional_path(
+            defaults_raw,
+            "codex_global_quota_database",
+            project_root,
+        ),
+        codex_global_max_concurrent_jobs=_positive_int(
+            defaults_raw.get("codex_global_max_concurrent_jobs", 2),
+            "codex_global_max_concurrent_jobs",
+        ),
+        codex_five_hour_soft_limit_percent=_percent_value(
+            defaults_raw.get("codex_five_hour_soft_limit_percent", 75.0),
+            "codex_five_hour_soft_limit_percent",
+        ),
+        codex_quota_poll_sec=_positive_float(
+            defaults_raw.get("codex_quota_poll_sec", 30.0),
+            "codex_quota_poll_sec",
+        ),
+        codex_sessions_root=_optional_path(
+            defaults_raw,
+            "codex_sessions_root",
+            project_root,
         ),
         auto_switch_agy_on_quota=bool(defaults_raw.get("auto_switch_agy_on_quota", False)),
         auto_switch_agy_strategy=_string_value(
@@ -379,6 +430,29 @@ def _positive_int(value: Any, key: str) -> int:
     if parsed <= 0:
         raise ValueError(f"control.defaults.{key} must be positive")
     return parsed
+
+
+def _positive_float(value: Any, key: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError(f"control.defaults.{key} must be positive")
+    return parsed
+
+
+def _percent_value(value: Any, key: str) -> float:
+    parsed = float(value)
+    if not 0 < parsed <= 100:
+        raise ValueError(f"control.defaults.{key} must be in (0, 100]")
+    return parsed
+
+
+def _quality_tier_value(value: Any) -> str:
+    tier = _string_value(value).strip().lower()
+    if tier not in {"mechanical", "balanced", "deep"}:
+        raise ValueError(
+            "control.defaults.codex_quality_tier must be mechanical, balanced, or deep"
+        )
+    return tier
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

@@ -126,18 +126,21 @@ Mandatory execution rules:
 - If IDEA MCP is unavailable for required edits or diagnostics, write a blocked result.
 - If verification requires missing dependencies, report the blocker instead of installing packages.
 - If something fails, name the exact tool or command and the exact failure.
+- Before the first edit, run `get_problems(path=...)` for every intended target
+  file that IDEA can inspect and record the diagnostic baseline in the progress
+  file. Do not spend task scope fixing pre-existing diagnostics.
 - After the final edit, collect the changed file list and run IDEA MCP diagnostics
   for every changed repository file that the IDE can inspect.
 - For each changed file, prefer `get_problems(path=...)` for the pass/fail
   diagnostic check. `get_highlights` is useful for quick-fixes, but it is not
-  enough by itself.
+  enough by itself. Compare final diagnostics with the recorded pre-edit baseline.
 - Never treat `No highlights found in 0 files analyzed`, `0 files analyzed`, or
   any equivalent zero-file diagnostic result as clean. Treat it as inconclusive,
   retry with `include_unindexed=true` or `get_problems(path=...)`, and report the
   exact inconclusive output if the IDE still cannot analyze the file.
-- Do not write Status: completed while any task-caused IDE error, warning, type
-  warning, lint warning, unresolved import, syntax problem, or formatting problem
-  remains.
+- Do not write Status: completed while any new or worsened task-caused IDE error,
+  warning, type warning, lint warning, unresolved import, syntax problem, or
+  formatting problem remains.
 - Before repository-wide exploration or any edit, create or update the live
   progress file with: Current phase, Confirmed facts, Target files, Next action,
   Changed files, and Open risks.
@@ -185,13 +188,14 @@ Mandatory execution rules:
   a compacted/resumed worker can recover without repeating work.
 - The progress file is an internal handoff artifact; the final result file is
   still mandatory.
-- Treat unresolved imports as real diagnostics unless a focused runtime/linter
-  check proves they are only IDE source-root/indexing noise. Report such proven
-  IDE-index issues explicitly under Diagnostics with the exact verification
-  command.
-- If a remaining diagnostic is unrelated, stale, IDE-index-only, or outside
-  scope, verify it with a focused check and report it under Diagnostics; use
-  Status: partial unless the task explicitly allows that diagnostic class.
+- Treat new or worsened unresolved imports as real diagnostics unless a focused
+  runtime/linter check proves they are only IDE source-root/indexing noise. Report
+  such proven IDE-index issues explicitly under Diagnostics with the exact
+  verification command.
+- A diagnostic already present in the pre-edit baseline, or proven unrelated,
+  stale, IDE-index-only, or outside scope, is non-blocking for this task. Verify it
+  with one focused check, report it under Diagnostics, and allow Status: completed
+  when no task-caused regression remains.
 - Run the narrowest relevant formatter/linter/type/test commands already
   available in the repo. If they cannot run because dependencies are missing,
   report that exact blocker instead of claiming completion.

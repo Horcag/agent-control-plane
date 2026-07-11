@@ -37,6 +37,23 @@ class CodexRunnerCommandTest(unittest.TestCase):
         self.assertEqual(command[-1], "-")
         self.assertNotIn(spec.prompt, command)
 
+    def test_build_command_resumes_same_thread_for_escalation(self) -> None:
+        spec = _spec(
+            read_only=False,
+            yolo=False,
+            codex_resume_thread_id="019ef56b-74b4-70e2-9b0d-0e2c0ddfbc9c",
+        )
+
+        command = CodexExecRunner._build_command(spec)
+
+        self.assertEqual(command[0:3], ["codex", "exec", "resume"])
+        self.assertIn("--model", command)
+        self.assertIn("gpt-5", command)
+        self.assertIn(spec.codex_resume_thread_id, command)
+        self.assertEqual(command[-1], "-")
+        self.assertNotIn("--cd", command)
+        self.assertNotIn("--sandbox", command)
+
     def test_build_command_allows_danger_full_access_sandbox_without_yolo(self) -> None:
         command = CodexExecRunner._build_command(
             _spec(read_only=False, yolo=False, codex_sandbox_mode="danger-full-access")
@@ -308,6 +325,20 @@ class CodexRunnerCommandTest(unittest.TestCase):
             self.assertTrue(productive)
             self.assertGreater(scan_size, 0)
 
+    def test_native_idea_tool_activity_counts_as_productive_log_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "attempt-001.log"
+            log_path.write_text(
+                "codex\nmcp: ide-mcp-server/read_file started\n",
+                encoding="utf-8",
+            )
+            spec = _spec(read_only=False, yolo=False, log_path=log_path)
+
+            productive, scan_size = productive_log_activity_if_needed(spec, scan_size=0)
+
+            self.assertTrue(productive)
+            self.assertGreater(scan_size, 0)
+
     def test_model_manager_noise_is_not_productive_log_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             log_path = Path(temp) / "attempt-001.log"
@@ -368,14 +399,15 @@ class _FakeProc:
 
 
 def _spec(
-        *,
-        read_only: bool,
-        yolo: bool,
-        codex_sandbox_mode: str = "workspace-write",
-        codex_disabled_mcp_servers: tuple[str, ...] = (),
-        codex_no_progress_timeout_sec: int = 0,
-        codex_forbidden_tool_markers: tuple[str, ...] = (),
-        log_path: Path | None = None,
+    *,
+    read_only: bool,
+    yolo: bool,
+    codex_sandbox_mode: str = "workspace-write",
+    codex_disabled_mcp_servers: tuple[str, ...] = (),
+    codex_no_progress_timeout_sec: int = 0,
+    codex_forbidden_tool_markers: tuple[str, ...] = (),
+    codex_resume_thread_id: str | None = None,
+    log_path: Path | None = None,
 ) -> AgentRunSpec:
     return AgentRunSpec(
         backend="codex",
@@ -387,6 +419,7 @@ def _spec(
         codex_disabled_mcp_servers=codex_disabled_mcp_servers,
         codex_no_progress_timeout_sec=codex_no_progress_timeout_sec,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
+        codex_resume_thread_id=codex_resume_thread_id,
         prompt="secret task prompt",
         workspace_path=Path("D:/repo/workspace"),
         result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),

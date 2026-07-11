@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import sqlite3
 import subprocess  # nosec B404
 import sys
 import time
@@ -27,7 +28,12 @@ from agent_control_plane.features.agent_runner import (
     AgentRunner,
     AgentRunSpec,
     CodexExecRunner,
+    CodexRateLimitReader,
+    GlobalQuotaBroker,
+    ModelProfile,
+    ModelRoutingPolicy,
     PtyAgyRunner,
+    QuotaDecision,
     build_task_prompt,
     inspect_result,
     normalize_backend,
@@ -97,6 +103,7 @@ class StartOptions:
     backend: str | None = None
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
+    codex_quality_tier: str | None = None
     slot: str | None = None
     workspace_path: Path | None = None
     expected_branch: str | None = None
@@ -155,6 +162,34 @@ class AgentControlPlane:
         self.slot_store = SlotStore(config.database_path)
         self.slots = SlotManager(config, self.slot_store)
         self.policy = WorkspacePolicy(config)
+        defaults = config.defaults
+        self.model_routing = ModelRoutingPolicy(
+            mechanical=ModelProfile(
+                defaults.codex_mechanical_model,
+                defaults.codex_mechanical_reasoning_effort,
+            ),
+            balanced=ModelProfile(
+                defaults.codex_balanced_model,
+                defaults.codex_balanced_reasoning_effort,
+            ),
+            deep=ModelProfile(
+                defaults.codex_deep_model,
+                defaults.codex_deep_reasoning_effort,
+            ),
+        )
+        self.quota_broker: GlobalQuotaBroker | None = None
+        if defaults.codex_global_quota_database is not None:
+            rate_limit_reader = (
+                CodexRateLimitReader(defaults.codex_sessions_root).latest
+                if defaults.codex_sessions_root is not None
+                else None
+            )
+            self.quota_broker = GlobalQuotaBroker(
+                defaults.codex_global_quota_database,
+                max_concurrent_jobs=defaults.codex_global_max_concurrent_jobs,
+                soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
+                rate_limit_reader=rate_limit_reader,
+            )
 
     @staticmethod
     def _runner_for_backend(backend: str) -> AgentRunner:
@@ -183,6 +218,27 @@ class AgentControlPlane:
             "default_backend": self.config.defaults.backend,
             "codex_model": self.config.defaults.codex_model,
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
+            "codex_quality_tier": self.config.defaults.codex_quality_tier,
+            "codex_quality_profiles": {
+                tier: [
+                    {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
+                    for profile in self.model_routing.ladder_for_tier(tier)
+                ]
+                for tier in ("mechanical", "balanced", "deep")
+            },
+            "codex_global_quota": {
+                "enabled": self.quota_broker is not None,
+                "database": (
+                    str(self.config.defaults.codex_global_quota_database)
+                    if self.config.defaults.codex_global_quota_database
+                    else None
+                ),
+                "max_concurrent_jobs": self.config.defaults.codex_global_max_concurrent_jobs,
+                "five_hour_soft_limit_percent": (
+                    self.config.defaults.codex_five_hour_soft_limit_percent
+                ),
+                "poll_sec": self.config.defaults.codex_quota_poll_sec,
+            },
             "runs_layout": self.config.defaults.runs_layout,
             "auto_archive_days": self.config.defaults.auto_archive_days,
             "auto_archive_limit": self.config.defaults.auto_archive_limit,
@@ -319,14 +375,35 @@ class AgentControlPlane:
             route_config.backend,
             self.config.defaults.backend,
         )
-        codex_model = _option(
-            options.codex_model or route_config.codex_model,
-            self.config.defaults.codex_model,
+        explicit_codex_profile = any(
+            value is not None
+            for value in (
+                options.codex_model,
+                options.codex_reasoning_effort,
+                route_config.codex_model,
+                route_config.codex_reasoning_effort,
+            )
         )
-        codex_reasoning_effort = _option(
-            options.codex_reasoning_effort or route_config.codex_reasoning_effort,
-            self.config.defaults.codex_reasoning_effort,
-        )
+        codex_quality_tier: str | None = None
+        if normalize_backend(backend) == CODEX_BACKEND and not explicit_codex_profile:
+            codex_quality_tier = (
+                options.codex_quality_tier or self.config.defaults.codex_quality_tier
+            )
+            try:
+                initial_profile = self.model_routing.ladder_for_tier(codex_quality_tier)[0]
+            except ValueError as exc:
+                raise PolicyError(str(exc)) from exc
+            codex_model = initial_profile.model
+            codex_reasoning_effort = initial_profile.reasoning_effort
+        else:
+            codex_model = _option(
+                options.codex_model or route_config.codex_model,
+                self.config.defaults.codex_model,
+            )
+            codex_reasoning_effort = _option(
+                options.codex_reasoning_effort or route_config.codex_reasoning_effort,
+                self.config.defaults.codex_reasoning_effort,
+            )
 
         job_id = new_job_id(options.task_id)
         run_dir = self._run_dir_for_job(job_id)
@@ -367,6 +444,7 @@ class AgentControlPlane:
                 backend=backend,
                 codex_model=codex_model,
                 codex_reasoning_effort=codex_reasoning_effort,
+                codex_quality_tier=codex_quality_tier,
                 slot_name=options.slot,
             )
         except ValueError as exc:
@@ -430,6 +508,13 @@ class AgentControlPlane:
         )
         self.store.add_event(job_id, "info", f"Worker started with PID {os.getpid()}")
 
+        if normalize_backend(job.backend) == CODEX_BACKEND and self.quota_broker is not None:
+            if not self._wait_for_codex_quota(job):
+                message = "Cancel requested while waiting for global Codex quota"
+                self._write_blocked_result_if_missing(job, message)
+                return self._finish_job(job_id, "cancelled", message)
+            job = self.store.get_job(job_id)
+
         check = self.policy.check_start(
             StartRequest(
                 task_id=job.task_id,
@@ -446,8 +531,14 @@ class AgentControlPlane:
             return self._finish_job(job_id, "blocked", message)
 
         prompt = job.prompt_path.read_text(encoding="utf-8")
+        attempt_prompt = prompt
         runner = self._runner_for_backend(job.backend)
-        attempts = job.max_restarts + 1
+        model_ladder = self._model_ladder_for_job(job)
+        model_index = 0
+        resume_thread_id: str | None = None
+        attempts = job.max_restarts + (
+            len(model_ladder) if normalize_backend(job.backend) == CODEX_BACKEND else 1
+        )
         guardrail_baseline = self._guardrail_baseline(job)
         route_config = self.config.routes.get(job.route)
         route_root_baseline = self._route_root_dirty_baseline(job, route_config)
@@ -466,6 +557,7 @@ class AgentControlPlane:
                 self._write_blocked_result_if_missing(job, message)
                 return self._finish_job(job_id, "cancelled", message)
 
+            active_profile = model_ladder[model_index]
             log_path = job.run_dir / f"attempt-{attempt_no:03d}.log"
             self.store.start_attempt(job_id, attempt_no, log_path)
             self.store.update_job(
@@ -475,7 +567,12 @@ class AgentControlPlane:
                 runner_pid=None,
                 agy_pid=None,
             )
-            self.store.add_event(job_id, "info", f"Attempt {attempt_no} started")
+            self.store.add_event(
+                job_id,
+                "info",
+                f"Attempt {attempt_no} started with {active_profile.model}/"
+                f"{active_profile.reasoning_effort}",
+            )
             guardrail_message: str | None = None
             last_guardrail_check = 0.0
 
@@ -522,13 +619,11 @@ class AgentControlPlane:
                     backend=job.backend,
                     agy_command=self.config.agy_command,
                     codex_command=self.config.codex_command,
-                    codex_model=job.codex_model or self.config.defaults.codex_model,
-                    codex_reasoning_effort=(
-                        job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
-                    ),
+                    codex_model=active_profile.model,
+                    codex_reasoning_effort=active_profile.reasoning_effort,
                     codex_sandbox_mode=self.config.defaults.codex_sandbox_mode,
                     codex_disabled_mcp_servers=self.config.defaults.codex_disabled_mcp_servers,
-                    prompt=prompt,
+                    prompt=attempt_prompt,
                     workspace_path=job.workspace_path,
                     result_path=job.result_path,
                     log_path=log_path,
@@ -541,6 +636,8 @@ class AgentControlPlane:
                         self.config.defaults.codex_no_progress_timeout_sec
                     ),
                     codex_forbidden_tool_markers=codex_forbidden_tool_markers,
+                    codex_resume_thread_id=resume_thread_id,
+                    codex_sessions_root=self.config.defaults.codex_sessions_root,
                 ),
                 cancel_requested=should_stop,
                 pid_observed=record_runner_pid,
@@ -559,8 +656,8 @@ class AgentControlPlane:
                     job_id,
                     attempt_no,
                     backend=job.backend,
-                    model=job.codex_model,
-                    reasoning_effort=job.codex_reasoning_effort,
+                    model=active_profile.model,
+                    reasoning_effort=active_profile.reasoning_effort,
                     metrics=result.metrics,
                 )
             self.store.update_job(job_id, runner_pid=None, agy_pid=None)
@@ -570,6 +667,40 @@ class AgentControlPlane:
             if guardrail_message:
                 self._write_blocked_result_if_missing(job, guardrail_message)
                 return self._finish_job(job_id, "guardrail_violation", guardrail_message)
+
+            has_next_model = model_index + 1 < len(model_ladder)
+            if normalize_backend(
+                job.backend
+            ) == CODEX_BACKEND and self.model_routing.should_escalate(
+                runner_status=result.status,
+                result_status=result.result_status,
+                has_next=has_next_model,
+            ):
+                model_index += 1
+                if result.metrics is not None and result.metrics.thread_id:
+                    resume_thread_id = result.metrics.thread_id
+                next_profile = model_ladder[model_index]
+                self.store.update_job(
+                    job_id,
+                    codex_model=next_profile.model,
+                    codex_reasoning_effort=next_profile.reasoning_effort,
+                )
+                continuation = (
+                    "Continue the same assigned task from the existing workspace state. "
+                    f"The prior attempt ended as {result.status}/"
+                    f"{result.result_status or 'no-result'}: {result.message}. "
+                    "Review the current changes, finish the implementation, run the required "
+                    "checks, and write the required result.md with a final Status marker."
+                )
+                attempt_prompt = continuation if resume_thread_id else f"{prompt}\n\n{continuation}"
+                self.store.add_event(
+                    job_id,
+                    "warning",
+                    f"Escalating to {next_profile.model}/{next_profile.reasoning_effort}; "
+                    f"resume_thread={resume_thread_id or 'unavailable'}",
+                )
+                attempt_no += 1
+                continue
 
             if result.completed:
                 final_status = result.result_status or "completed"
@@ -623,9 +754,48 @@ class AgentControlPlane:
         self._write_blocked_result_if_missing(job, last_result_message)
         return self._finish_job(job_id, "failed", last_result_message)
 
+    def _model_ladder_for_job(self, job: JobRecord) -> tuple[ModelProfile, ...]:
+        model = job.codex_model or self.config.defaults.codex_model
+        effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
+        if normalize_backend(job.backend) != CODEX_BACKEND or job.codex_quality_tier is None:
+            return self.model_routing.ladder_for_explicit_model(model, effort)
+        return self.model_routing.ladder_for_tier(job.codex_quality_tier)
+
+    def _wait_for_codex_quota(self, job: JobRecord) -> bool:
+        broker = self.quota_broker
+        if broker is None:
+            return True
+        last_reason: str | None = None
+        while not self.store.cancel_requested(job.job_id):
+            decision = broker.try_acquire(job.job_id, worker_pid=os.getpid())
+            if decision.acquired:
+                self.store.update_job(job.job_id, status="running")
+                self.store.add_event(
+                    job.job_id,
+                    "info",
+                    f"Global Codex quota acquired; active_jobs={decision.active_jobs}",
+                )
+                return True
+            self.store.update_job(job.job_id, status="waiting_quota")
+            if decision.reason != last_reason:
+                self.store.add_event(job.job_id, "warning", self._quota_wait_message(decision))
+                last_reason = decision.reason
+            sleep_for = self.config.defaults.codex_quota_poll_sec
+            if decision.retry_after_sec is not None and decision.retry_after_sec > 0:
+                sleep_for = min(sleep_for, decision.retry_after_sec)
+            time.sleep(sleep_for)
+        return False
+
+    @staticmethod
+    def _quota_wait_message(decision: QuotaDecision) -> str:
+        detail = f"active_jobs={decision.active_jobs}"
+        if decision.retry_after_sec is not None:
+            detail += f", retry_after_sec={round(decision.retry_after_sec, 1)}"
+        return f"Waiting for global Codex quota: {decision.reason or 'unavailable'} ({detail})"
+
     def _refresh_stale_worker_if_needed(self, job_id: str) -> JobRecord:
         job = self.store.get_job(job_id)
-        if self._is_terminal(job) or job.status != "running":
+        if self._is_terminal(job) or job.status not in {"running", "waiting_quota"}:
             return job
         if job.worker_pid is None:
             return job
@@ -661,6 +831,7 @@ class AgentControlPlane:
             "backend": job.backend,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
+            "codex_quality_tier": job.codex_quality_tier,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
@@ -706,6 +877,7 @@ class AgentControlPlane:
             "backend": job.backend,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
+            "codex_quality_tier": job.codex_quality_tier,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
@@ -770,18 +942,33 @@ class AgentControlPlane:
         poll_interval_sec: float = 30.0,
         timeout_sec: float | None = None,
         log_lines: int = 80,
+        include_details: bool = False,
+        log_cursor: int | None = None,
+        log_byte_limit: int = 2048,
     ) -> dict[str, Any]:
-        """Poll a job until it reaches a terminal state or the optional timeout expires."""
+        """Poll a job with a compact payload and optional bounded log delta."""
         if poll_interval_sec < 0:
             raise ValueError("poll_interval_sec must be non-negative")
         if timeout_sec is not None and timeout_sec < 0:
             raise ValueError("timeout_sec must be non-negative")
         if poll_interval_sec == 0 and timeout_sec is None:
             raise ValueError("poll_interval_sec=0 requires a timeout_sec")
+        if log_cursor is not None and log_cursor < 0:
+            raise ValueError("log_cursor must be non-negative")
+        if not 0 < log_byte_limit <= 16_384:
+            raise ValueError("log_byte_limit must be in [1, 16384]")
 
         started = time.monotonic()
         while True:
-            summary = self.summary_job(job_id, log_lines)
+            summary = (
+                self.summary_job(job_id, log_lines)
+                if include_details
+                else self._compact_watch_snapshot(
+                    job_id,
+                    log_cursor=log_cursor,
+                    log_byte_limit=log_byte_limit,
+                )
+            )
             if summary["terminal"]:
                 summary["timed_out"] = False
                 summary["watch_elapsed_sec"] = round(time.monotonic() - started, 3)
@@ -804,6 +991,48 @@ class AgentControlPlane:
                     return summary
                 continue
             time.sleep(sleep_for)
+
+    def _compact_watch_snapshot(
+        self,
+        job_id: str,
+        *,
+        log_cursor: int | None,
+        log_byte_limit: int,
+    ) -> dict[str, Any]:
+        job = self._refresh_stale_worker_if_needed(job_id)
+        result_state = inspect_result(job.result_path, _job_start_timestamp(job))
+        payload: dict[str, Any] = {
+            "job_id": job.job_id,
+            "task_id": job.task_id,
+            "status": job.status,
+            "terminal": self._is_terminal(job),
+            "last_error": job.last_error,
+            "backend": job.backend,
+            "codex_model": job.codex_model,
+            "codex_reasoning_effort": job.codex_reasoning_effort,
+            "codex_quality_tier": job.codex_quality_tier,
+            "worker_pid": job.worker_pid,
+            "runner_pid": job.runner_pid,
+            "updated_at": job.updated_at,
+            "finished_at": job.finished_at,
+            "result_done": result_state.done,
+            "result_status": result_state.status,
+            "result_path": str(job.result_path),
+        }
+        if log_cursor is not None:
+            delta, next_cursor, truncated = _read_log_delta(
+                job.log_path,
+                cursor=log_cursor,
+                byte_limit=log_byte_limit,
+            )
+            payload.update(
+                {
+                    "log_delta": delta,
+                    "next_log_cursor": next_cursor,
+                    "log_delta_truncated": truncated,
+                }
+            )
+        return payload
 
     def cancel_job(self, job_id: str) -> JobRecord:
         self.store.add_event(job_id, "warning", "Cancel requested")
@@ -1089,6 +1318,11 @@ class AgentControlPlane:
 
     def _finish_job(self, job_id: str, status: str, last_error: str | None = None) -> JobRecord:
         job = self.store.mark_finished(job_id, status, last_error)
+        if self.quota_broker is not None:
+            try:
+                self.quota_broker.release(job_id)
+            except (OSError, sqlite3.Error) as exc:
+                self.store.add_event(job_id, "warning", f"Could not release quota lease: {exc}")
         if job.slot_name:
             slot_status, slot_note = self._slot_release_status(job, status)
             self.slots.release_for_job(
@@ -1520,6 +1754,23 @@ def _path_relative_to(path: Path, parent: Path) -> Path | None:
         return path.relative_to(parent)
     except ValueError:
         return None
+
+
+def _read_log_delta(
+    path: Path | None,
+    *,
+    cursor: int,
+    byte_limit: int,
+) -> tuple[str, int, bool]:
+    if path is None or not path.exists():
+        return "", cursor, False
+    size = path.stat().st_size
+    safe_cursor = min(cursor, size)
+    with path.open("rb") as handle:
+        handle.seek(safe_cursor)
+        data = handle.read(byte_limit)
+    next_cursor = safe_cursor + len(data)
+    return data.decode("utf-8", errors="replace"), next_cursor, next_cursor < size
 
 
 def _tail(path: Path, lines: int) -> str:

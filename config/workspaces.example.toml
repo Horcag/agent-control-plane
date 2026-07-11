@@ -28,6 +28,20 @@ codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
 codex_disabled_mcp_servers = []
 codex_no_progress_timeout_sec = 600
+# Keep deep as the default until review/rework telemetry proves a cheaper tier is net-positive.
+# Use mechanical only for bounded edits with strong automated acceptance checks.
+codex_quality_tier = "deep"
+codex_mechanical_model = "gpt-5.6-luna"
+codex_mechanical_reasoning_effort = "low"
+codex_balanced_model = "gpt-5.6-terra"
+codex_balanced_reasoning_effort = "medium"
+codex_deep_model = "gpt-5.6-terra"
+codex_deep_reasoning_effort = "medium"
+codex_global_quota_database = "${USERPROFILE}/.codex/agent-control-plane/global-quota.sqlite3"
+codex_global_max_concurrent_jobs = 2
+codex_five_hour_soft_limit_percent = 75
+codex_quota_poll_sec = 30
+codex_sessions_root = "${USERPROFILE}/.codex/sessions"
 guardrail_poll_sec = 2
 prepare_slots = true
 auto_switch_agy_on_quota = false

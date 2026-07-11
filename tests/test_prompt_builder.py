@@ -134,7 +134,10 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("get_problems(path=...)", prompt)
             self.assertIn("0 files analyzed", prompt)
             self.assertIn("inconclusive", prompt)
-            self.assertIn("Treat unresolved imports as real diagnostics", prompt)
+            self.assertIn("record the diagnostic baseline", prompt)
+            self.assertIn("Compare final diagnostics", prompt)
+            self.assertIn("Treat new or worsened unresolved imports", prompt)
+            self.assertIn("is non-blocking for this task", prompt)
             self.assertIn("Do not write Status: completed", prompt)
             self.assertIn("formatting problem", prompt)
 

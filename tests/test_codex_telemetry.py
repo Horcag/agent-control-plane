@@ -102,6 +102,55 @@ class CodexTelemetryTest(unittest.TestCase):
             self.assertAlmostEqual(metrics.estimated_credits or 0.0, 0.10375)
             self.assertAlmostEqual(metrics.estimated_api_usd or 0.0, 0.00415)
 
+    def test_recovers_cumulative_usage_from_codex_session_after_failed_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            event_log = root / "attempt.events.jsonl"
+            event_log.write_text(
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"})
+                + "\n"
+                + json.dumps({"type": "turn.failed", "message": "capacity"})
+                + "\n",
+                encoding="utf-8",
+            )
+            session_dir = root / "sessions" / "2026" / "07" / "11"
+            session_dir.mkdir(parents=True)
+            (session_dir / "rollout-2026-thread-1.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": 4000,
+                                    "cached_input_tokens": 2500,
+                                    "output_tokens": 300,
+                                    "reasoning_output_tokens": 80,
+                                }
+                            },
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            metrics = parse_codex_jsonl(
+                event_log,
+                model="gpt-5.6-terra",
+                duration_sec=10.0,
+                sessions_root=root / "sessions",
+            )
+
+            self.assertTrue(metrics.usage_available)
+            self.assertFalse(metrics.turn_completed)
+            self.assertEqual(metrics.input_tokens, 4000)
+            self.assertEqual(metrics.cached_input_tokens, 2500)
+            self.assertEqual(metrics.output_tokens, 300)
+            self.assertEqual(metrics.reasoning_output_tokens, 80)
+            self.assertIsNotNone(metrics.estimated_credits)
+
     def test_unknown_model_keeps_raw_usage_without_estimated_cost(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "attempt.events.jsonl"

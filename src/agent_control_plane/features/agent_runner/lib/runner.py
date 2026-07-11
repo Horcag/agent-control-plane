@@ -46,6 +46,8 @@ class AgentRunSpec:
     read_only: bool
     codex_no_progress_timeout_sec: int = 0
     codex_forbidden_tool_markers: tuple[str, ...] = ()
+    codex_resume_thread_id: str | None = None
+    codex_sessions_root: Path | None = None
 
 
 @dataclass(frozen=True)

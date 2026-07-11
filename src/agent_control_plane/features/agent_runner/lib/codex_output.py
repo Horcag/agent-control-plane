@@ -57,12 +57,19 @@ class CodexOutputCapture:
         if self.log is not None:
             self.log.flush()
 
-    def metrics(self, *, model: str, duration_sec: float) -> AttemptMetrics:
+    def metrics(
+        self,
+        *,
+        model: str,
+        duration_sec: float,
+        sessions_root: Path | None = None,
+    ) -> AttemptMetrics:
         self.join()
         return parse_codex_jsonl(
             self.event_log_path,
             model=model,
             duration_sec=duration_sec,
+            sessions_root=sessions_root,
         )
 
     def _pump(self, stream: IO[str]) -> None:

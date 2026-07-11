@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
+from agent_control_plane.features.agent_runner.lib.result_detector import (
+    contains_capacity_marker,
+    inspect_result,
+    recover_result_from_last_message,
+)
 
 
 class ResultDetectorTest(unittest.TestCase):
@@ -40,6 +44,43 @@ class ResultDetectorTest(unittest.TestCase):
 
             self.assertTrue(state.done)
             self.assertEqual(state.status, "completed")
+
+    def test_recovers_result_when_codex_only_wrote_last_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = root / "result.md"
+            last_message = root / "attempt-001.last-message.md"
+            last_message.write_text(
+                "Status: completed\n\nChanged files: backend/app.py\n",
+                encoding="utf-8",
+            )
+
+            state = recover_result_from_last_message(result, last_message, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.status, "completed")
+            self.assertEqual(
+                result.read_text(encoding="utf-8"), last_message.read_text(encoding="utf-8")
+            )
+
+    def test_does_not_recover_last_message_without_status_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = root / "result.md"
+            last_message = root / "attempt-001.last-message.md"
+            last_message.write_text("I ran out of capacity", encoding="utf-8")
+
+            state = recover_result_from_last_message(result, last_message, started_at=0.0)
+
+            self.assertFalse(state.done)
+            self.assertFalse(result.exists())
+
+    def test_detects_codex_usage_limit_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "attempt.log"
+            log.write_text("You've hit your usage limit. Try again later.", encoding="utf-8")
+
+            self.assertTrue(contains_capacity_marker(log))
 
     def test_placeholder_is_not_done(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

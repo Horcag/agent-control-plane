@@ -14,7 +14,12 @@ from agent_control_plane.app.runtime.orchestrator import (
     PolicyError,
     StartOptions,
 )
-from agent_control_plane.features.agent_runner import AGY_BACKEND, CODEX_BACKEND
+from agent_control_plane.entities.job import AttemptMetrics
+from agent_control_plane.features.agent_runner import (
+    AGY_BACKEND,
+    CODEX_BACKEND,
+    QuotaDecision,
+)
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.shared.config import (
@@ -52,6 +57,88 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn(str(workspace), progress_text)
             self.assertIn("Awaiting agent execution", result_text)
             self.assertFalse(result_state.done)
+
+    def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-mechanical")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-mechanical",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        codex_quality_tier="mechanical",
+                    )
+                )
+
+            self.assertEqual(job.codex_quality_tier, "mechanical")
+            self.assertEqual(job.codex_model, "gpt-5.6-luna")
+            self.assertEqual(job.codex_reasoning_effort, "low")
+            self.assertEqual(control.config.defaults.codex_quality_tier, "deep")
+
+    def test_capacity_escalates_mechanical_job_to_terra_on_same_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-capacity",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-luna",
+                codex_reasoning_effort="low",
+                codex_quality_tier="mechanical",
+            )
+            runner = _CapacityThenCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(finished.codex_model, "gpt-5.6-terra")
+            self.assertEqual(finished.codex_reasoning_effort, "medium")
+            self.assertEqual(
+                [spec.codex_model for spec in runner.specs],
+                [
+                    "gpt-5.6-luna",
+                    "gpt-5.6-terra",
+                ],
+            )
+            self.assertIsNone(runner.specs[0].codex_resume_thread_id)
+            self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-capacity")
+
+    def test_quota_wait_retries_without_starting_model_until_acquired(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-quota",
+                backend=CODEX_BACKEND,
+            )
+            broker = _SequenceQuotaBroker()
+            control.quota_broker = broker  # type: ignore[assignment]
+
+            with patch("agent_control_plane.app.runtime.orchestrator.time.sleep"):
+                acquired = control._wait_for_codex_quota(job)
+
+            self.assertTrue(acquired)
+            self.assertEqual(broker.calls, 2)
+            self.assertEqual(control.store.get_job(job.job_id).status, "running")
 
     def test_read_only_slot_job_skips_ide_and_dependency_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -329,6 +416,70 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn("dirty.txt", note or "")
 
 
+class _CapacityThenCompletedRunner:
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        self.specs.append(spec)
+        if len(self.specs) == 1:
+            return AgyRunResult(
+                status="capacity",
+                completed=False,
+                exit_code=1,
+                result_status=None,
+                message="usage limit reached",
+                metrics=_attempt_metrics(thread_id="thread-capacity"),
+            )
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.result_path.write_text("Status: completed\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="completed",
+            message="completed after escalation",
+            metrics=_attempt_metrics(thread_id="thread-capacity"),
+        )
+
+
+class _SequenceQuotaBroker:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def try_acquire(self, _job_id: str, *, worker_pid: int) -> QuotaDecision:
+        self.calls += 1
+        if self.calls == 1:
+            return QuotaDecision(
+                acquired=False,
+                reason="concurrency_limit",
+                active_jobs=2,
+            )
+        return QuotaDecision(acquired=True, reason=None, active_jobs=1)
+
+
+def _attempt_metrics(*, thread_id: str) -> AttemptMetrics:
+    return AttemptMetrics(
+        duration_sec=1.0,
+        thread_id=thread_id,
+        event_count=1,
+        turn_completed=False,
+        usage_available=False,
+        input_tokens=0,
+        cached_input_tokens=0,
+        output_tokens=0,
+        reasoning_output_tokens=0,
+        tool_calls=0,
+        failed_tool_calls=0,
+        error_events=0,
+        tool_counts=(),
+        estimated_credits=None,
+        estimated_api_usd=None,
+        rate_card_version="test",
+        event_log_path=None,
+    )
+
+
 class _BlockedRunner:
     def run(self, *args: Any, **kwargs: Any) -> AgyRunResult:
         return AgyRunResult(
@@ -425,6 +576,9 @@ def _create_job(
     allow_dirty: bool = False,
     backend: str = AGY_BACKEND,
     slot_name: str | None = None,
+    codex_model: str | None = None,
+    codex_reasoning_effort: str | None = None,
+    codex_quality_tier: str | None = None,
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -448,6 +602,9 @@ def _create_job(
         allow_dirty=allow_dirty,
         read_only=False,
         backend=backend,
+        codex_model=codex_model,
+        codex_reasoning_effort=codex_reasoning_effort,
+        codex_quality_tier=codex_quality_tier,
         slot_name=slot_name,
     )
 

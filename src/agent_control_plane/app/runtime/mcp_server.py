@@ -36,6 +36,7 @@ def build_server(config_path: str | None = None) -> Any:
         backend: str | None = None,
         codex_model: str | None = None,
         codex_reasoning_effort: str | None = None,
+        codex_quality_tier: str | None = None,
         slot: str | None = None,
         workspace_path: str | None = None,
         expected_branch: str | None = None,
@@ -50,6 +51,8 @@ def build_server(config_path: str | None = None) -> Any:
         wait_timeout_sec: float = 25.0,
         poll_interval_sec: float = 5.0,
         lines: int = 80,
+        log_cursor: int | None = None,
+        log_byte_limit: int = 2048,
     ) -> dict[str, Any]:
         """Start an agent job and optionally wait briefly for a terminal result."""
         normalized_backend = normalize_backend(backend) if backend is not None else None
@@ -67,6 +70,7 @@ def build_server(config_path: str | None = None) -> Any:
                     backend=normalized_backend,
                     codex_model=codex_model,
                     codex_reasoning_effort=codex_reasoning_effort,
+                    codex_quality_tier=codex_quality_tier,
                     slot=slot,
                     workspace_path=Path(workspace_path) if workspace_path else None,
                     expected_branch=expected_branch,
@@ -90,6 +94,7 @@ def build_server(config_path: str | None = None) -> Any:
             "backend": job.backend,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
+            "codex_quality_tier": job.codex_quality_tier,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "read_only": job.read_only,
@@ -101,6 +106,8 @@ def build_server(config_path: str | None = None) -> Any:
                 poll_interval_sec=poll_interval_sec,
                 timeout_sec=wait_timeout_sec,
                 log_lines=lines,
+                log_cursor=log_cursor,
+                log_byte_limit=log_byte_limit,
             )
         return response
 
@@ -110,13 +117,17 @@ def build_server(config_path: str | None = None) -> Any:
         poll_interval_sec: float = 5.0,
         timeout_sec: float = 25.0,
         lines: int = 80,
+        log_cursor: int | None = None,
+        log_byte_limit: int = 2048,
     ) -> dict[str, Any]:
-        """Poll a job until it reaches terminal status or timeout. Keep timeout below MCP limits."""
+        """Poll compact status; pass next_log_cursor back to receive only new log bytes."""
         return control.watch_job(
             job_id,
             poll_interval_sec=poll_interval_sec,
             timeout_sec=timeout_sec,
             log_lines=lines,
+            log_cursor=log_cursor,
+            log_byte_limit=log_byte_limit,
         )
 
     @mcp.tool()

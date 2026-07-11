@@ -14,7 +14,11 @@ from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     scan_forbidden_tool,
     scan_tool_timeouts,
 )
-from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
+from agent_control_plane.features.agent_runner.lib.result_detector import (
+    contains_capacity_marker,
+    inspect_result,
+    recover_result_from_last_message,
+)
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
 
 CODEX_COMPLETION_GRACE_SEC = 60.0
@@ -261,9 +265,22 @@ class CodexProcessMonitor:
         exit_code = proc.poll()
         if exit_code is None:
             return None
-        result_state = inspect_result(spec.result_path, started_wall)
+        last_message_path = spec.log_path.with_suffix(".last-message.md")
+        result_state = recover_result_from_last_message(
+            spec.result_path,
+            last_message_path,
+            started_wall,
+        )
         if result_state.done:
             return CodexProcessMonitor._completed_result(proc, result_state.status)
+        if contains_capacity_marker(spec.log_path, last_message_path):
+            return AgentRunResult(
+                status="capacity",
+                completed=False,
+                exit_code=exit_code,
+                result_status=None,
+                message="Codex capacity or usage limit was reached",
+            )
         return AgentRunResult(
             status="exited_without_result",
             completed=False,
