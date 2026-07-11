@@ -195,9 +195,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             path=route_path,
             required_branch=str(_required(value, "required_branch")),
             worktree_root=route_worktree_root or global_worktree_root,
-            worktree_base=(
-                _optional_path(value, "worktree_base", project_root) or worktree_base or route_path
-            ),
+            worktree_base=_optional_path(value, "worktree_base", project_root) or route_path,
             source_roots=_relative_path_tuple(
                 value.get("source_roots", ["backend", "frontend/src"])
             ),

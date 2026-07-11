@@ -119,7 +119,34 @@ class WatchJobTest(unittest.TestCase):
             self.assertIsNotNone(archived.archived_at)
             self.assertTrue(archived.prompt_path.exists())
 
-    def test_start_job_uses_date_run_dir_and_auto_archives_old_runs(self) -> None:
+    def test_archive_jobs_refuses_run_dir_outside_configured_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-foreign")
+            foreign_run_dir = root / "legacy-runs" / job.job_id
+            foreign_run_dir.mkdir(parents=True)
+            foreign_prompt_path = foreign_run_dir / "prompt.md"
+            foreign_prompt_path.write_text("prompt", encoding="utf-8")
+            control.store.update_job(
+                job.job_id,
+                run_dir=foreign_run_dir,
+                prompt_path=foreign_prompt_path,
+            )
+            control.finish_job(job.job_id, "completed", "done")
+            old_finished_at = datetime.fromtimestamp(1, UTC).isoformat(timespec="seconds")
+            control.store.update_job(job.job_id, finished_at=old_finished_at)
+
+            decisions = control.archive_jobs(older_than_days=1, limit=10, apply=True)
+            current = control.store.get_job(job.job_id)
+
+            self.assertEqual(decisions[0]["action"], "blocked")
+            self.assertIn("outside configured runs root", decisions[0]["reason"])
+            self.assertTrue(foreign_run_dir.exists())
+            self.assertEqual(current.run_dir, foreign_run_dir)
+            self.assertIsNone(current.archived_at)
+
+    def test_start_job_uses_date_run_dir_without_implicit_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -146,18 +173,16 @@ class WatchJobTest(unittest.TestCase):
                     )
                 )
 
-            archived = control.store.get_job(old_job.job_id)
+            old_job_after_start = control.store.get_job(old_job.job_id)
             expected_run_dir = root / "runs" / "2026" / "06" / "29" / job.job_id
-            expected_archive_dir = (
-                root / "runs" / "_archive" / "1970" / "01" / "01" / old_job.job_id
-            )
             events = control.store.recent_events(job.job_id)
 
             self.assertEqual(job.run_dir, expected_run_dir)
             self.assertTrue(expected_run_dir.exists())
-            self.assertEqual(archived.run_dir, expected_archive_dir)
-            self.assertTrue(expected_archive_dir.exists())
-            self.assertTrue(any("Auto-archived 1 old run" in event[2] for event in events))
+            self.assertEqual(old_job_after_start.run_dir, old_job.run_dir)
+            self.assertTrue(old_job.run_dir.exists())
+            self.assertIsNone(old_job_after_start.archived_at)
+            self.assertFalse(any("Auto-archived" in event[2] for event in events))
 
 
 def _git_repo(path: Path, branch: str) -> Path:
@@ -177,6 +202,8 @@ def _run(command: list[str], cwd: Path) -> None:
 def _brief(coordination_root: Path, task_id: str) -> None:
     task_dir = coordination_root / "tasks" / task_id
     task_dir.mkdir(parents=True)
+    (coordination_root / "agent-protocol.md").write_text("# Protocol\n", encoding="utf-8")
+    (coordination_root / "workspace-routing.md").write_text("# Routing\n", encoding="utf-8")
     (task_dir / "brief.md").write_text("# Brief\n", encoding="utf-8")
 
 

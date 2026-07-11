@@ -51,10 +51,11 @@ class CodexRunnerCommandTest(unittest.TestCase):
             _spec(
                 read_only=False,
                 yolo=False,
-                codex_disabled_mcp_servers=("dataspell_ide",),
+                codex_disabled_mcp_servers=("agentbridge-ide", "dataspell_ide"),
             )
         )
 
+        self.assertIn("mcp_servers.agentbridge-ide.enabled=false", command)
         self.assertIn("mcp_servers.dataspell_ide.enabled=false", command)
 
     def test_build_command_uses_read_only_sandbox_when_requested(self) -> None:
@@ -367,14 +368,14 @@ class _FakeProc:
 
 
 def _spec(
-    *,
-    read_only: bool,
-    yolo: bool,
-    codex_sandbox_mode: str = "workspace-write",
-    codex_disabled_mcp_servers: tuple[str, ...] = (),
-    codex_no_progress_timeout_sec: int = 0,
-    codex_forbidden_tool_markers: tuple[str, ...] = (),
-    log_path: Path | None = None,
+        *,
+        read_only: bool,
+        yolo: bool,
+        codex_sandbox_mode: str = "workspace-write",
+        codex_disabled_mcp_servers: tuple[str, ...] = (),
+        codex_no_progress_timeout_sec: int = 0,
+        codex_forbidden_tool_markers: tuple[str, ...] = (),
+        log_path: Path | None = None,
 ) -> AgentRunSpec:
     return AgentRunSpec(
         backend="codex",

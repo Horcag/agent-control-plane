@@ -51,6 +51,10 @@ required_branch = "main"
 codex_forbidden_tool_markers = ["raw_exec", "web_search"]
 monitor_route_root = false
 
+[routes.audit]
+path = "other-repo"
+required_branch = "main"
+
 [routes.reports]
 path = "reports"
 required_branch = "main"
@@ -111,6 +115,10 @@ path = "slots/reports-1"
             self.assertEqual(
                 config.routes["main"].worktree_base,
                 (root / "repo").resolve(strict=False),
+            )
+            self.assertEqual(
+                config.routes["audit"].worktree_base,
+                (root / "other-repo").resolve(strict=False),
             )
             self.assertEqual(
                 config.routes["main"].codex_forbidden_tool_markers,

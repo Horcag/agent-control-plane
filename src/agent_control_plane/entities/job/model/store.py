@@ -172,6 +172,13 @@ class JobStore:
         job_id = job_id or new_job_id(task_id)
         now = utc_now()
         with self._connect() as db:
+            db.execute("begin immediate")
+            existing = db.execute(
+                "select job_id from jobs where task_id = ? limit 1",
+                (task_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"Task ID already exists: {task_id} (job {existing['job_id']})")
             db.execute(
                 """
                 insert into jobs (

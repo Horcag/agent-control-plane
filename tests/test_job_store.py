@@ -33,6 +33,15 @@ class JobStoreTest(unittest.TestCase):
             store.add_event("job-1", "info", "started")
             self.assertEqual(store.recent_events("job-1")[-1][2], "started")
 
+    def test_create_job_rejects_duplicate_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            _create_job(store, root, "job-1")
+
+            with self.assertRaisesRegex(ValueError, "Task ID already exists"):
+                _create_job(store, root, "job-2")
+
     def test_cancel_flag_is_durable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

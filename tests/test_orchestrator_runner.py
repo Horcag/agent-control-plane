@@ -3,16 +3,26 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
-from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
+from agent_control_plane.app.runtime.orchestrator import (
+    AgentControlPlane,
+    PolicyError,
+    StartOptions,
+)
 from agent_control_plane.features.agent_runner import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
-from agent_control_plane.shared.config import ControlConfig, ControlDefaults, RouteConfig
+from agent_control_plane.shared.config import (
+    ControlConfig,
+    ControlDefaults,
+    RouteConfig,
+    SlotConfig,
+)
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
@@ -42,6 +52,74 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn(str(workspace), progress_text)
             self.assertIn("Awaiting agent execution", result_text)
             self.assertFalse(result_state.done)
+
+    def test_read_only_slot_job_skips_ide_and_dependency_preparation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_path = _git_repo(root / "repo", "main")
+            slot_path = _git_repo(root / "slots" / "main-1", "main")
+            control = AgentControlPlane(_config_with_slot(root, route_path, slot_path))
+            _brief(control.config.coordination_root, "task-read-only")
+
+            with (
+                patch.object(control.slots, "ensure_ide_root_module") as ensure_ide_root,
+                patch.object(control.slots, "prepare_slot") as prepare_slot,
+                patch.object(control, "_launch_worker", return_value=123),
+            ):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-read-only",
+                        route="main",
+                        slot="main-1",
+                        read_only=True,
+                    )
+                )
+
+            self.assertEqual(job.status, "queued")
+            ensure_ide_root.assert_not_called()
+            prepare_slot.assert_not_called()
+
+    def test_blocked_start_does_not_prepare_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_path = _git_repo(root / "repo", "main")
+            slot_path = _git_repo(root / "slots" / "main-1", "main")
+            control = AgentControlPlane(_config_with_slot(root, route_path, slot_path))
+
+            with (
+                patch.object(control.slots, "ensure_ide_root_module") as ensure_ide_root,
+                patch.object(control.slots, "prepare_slot") as prepare_slot,
+                self.assertRaisesRegex(PolicyError, "Task brief not found"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="missing-brief",
+                        route="main",
+                        slot="main-1",
+                    )
+                )
+
+            ensure_ide_root.assert_not_called()
+            prepare_slot.assert_not_called()
+
+    def test_reusing_task_id_does_not_overwrite_coordination_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-duplicate")
+            result_path = (
+                control.config.coordination_root / "tasks" / "task-duplicate" / "result.md"
+            )
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                control.start_job(StartOptions(task_id="task-duplicate", route="main"))
+                result_path.write_text("sentinel\n", encoding="utf-8")
+
+                with self.assertRaisesRegex(PolicyError, "Task ID already exists"):
+                    control.start_job(StartOptions(task_id="task-duplicate", route="main"))
+
+            self.assertEqual(result_path.read_text(encoding="utf-8"), "sentinel\n")
 
     def test_blocked_runner_result_finishes_job_as_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -287,6 +365,8 @@ def _run(command: list[str], cwd: Path) -> None:
 def _brief(coordination_root: Path, task_id: str) -> None:
     task_dir = coordination_root / "tasks" / task_id
     task_dir.mkdir(parents=True)
+    (coordination_root / "agent-protocol.md").write_text("# Protocol\n", encoding="utf-8")
+    (coordination_root / "workspace-routing.md").write_text("# Routing\n", encoding="utf-8")
     (task_dir / "brief.md").write_text("# Brief\n", encoding="utf-8")
 
 
@@ -365,6 +445,23 @@ def _config(root: Path, route_path: Path) -> ControlConfig:
         ),
         slots=MappingProxyType({}),
         slot_prepare=(),
+    )
+
+
+def _config_with_slot(root: Path, route_path: Path, slot_path: Path) -> ControlConfig:
+    config = _config(root, route_path)
+    return replace(
+        config,
+        defaults=replace(config.defaults, prepare_slots=True),
+        slots=MappingProxyType(
+            {
+                "main-1": SlotConfig(
+                    name="main-1",
+                    route="main",
+                    path=slot_path,
+                )
+            }
+        ),
     )
 
 
