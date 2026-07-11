@@ -702,6 +702,31 @@ class AgentControlPlane:
                 attempt_no += 1
                 continue
 
+            if (
+                normalize_backend(job.backend) == CODEX_BACKEND
+                and result.result_status == "partial"
+                and attempt_no < attempts
+            ):
+                if result.metrics is not None and result.metrics.thread_id:
+                    resume_thread_id = result.metrics.thread_id
+                continuation = (
+                    "Continue the same assigned task from the existing workspace and progress "
+                    "state. The prior attempt wrote Status: partial. Do not repeat completed "
+                    "discovery or revert useful changes. Finish the remaining acceptance "
+                    "criteria, run the required checks, commit when requested, and overwrite "
+                    "result.md with the final Status marker. A soft tool-call or changed-line "
+                    "checkpoint is not a blocker while scoped progress remains possible."
+                )
+                attempt_prompt = continuation if resume_thread_id else f"{prompt}\n\n{continuation}"
+                self.store.add_event(
+                    job_id,
+                    "warning",
+                    "Continuing partial Codex result with the same model; "
+                    f"resume_thread={resume_thread_id or 'unavailable'}",
+                )
+                attempt_no += 1
+                continue
+
             if result.completed:
                 final_status = result.result_status or "completed"
                 return self._finish_job(job_id, final_status, result.message)

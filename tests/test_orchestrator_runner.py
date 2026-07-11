@@ -117,6 +117,39 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIsNone(runner.specs[0].codex_resume_thread_id)
             self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-capacity")
 
+    def test_partial_deep_job_continues_same_model_on_same_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-partial",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-terra",
+                codex_reasoning_effort="medium",
+                codex_quality_tier="deep",
+            )
+            runner = _PartialThenCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(
+                [spec.codex_model for spec in runner.specs],
+                ["gpt-5.6-terra", "gpt-5.6-terra"],
+            )
+            self.assertIsNone(runner.specs[0].codex_resume_thread_id)
+            self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-partial")
+            self.assertIn("Continue the same assigned task", runner.specs[1].prompt)
+
     def test_quota_wait_retries_without_starting_model_until_acquired(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -440,6 +473,34 @@ class _CapacityThenCompletedRunner:
             result_status="completed",
             message="completed after escalation",
             metrics=_attempt_metrics(thread_id="thread-capacity"),
+        )
+
+
+class _PartialThenCompletedRunner:
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        self.specs.append(spec)
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        if len(self.specs) == 1:
+            spec.result_path.write_text("Status: partial\n", encoding="utf-8")
+            return AgyRunResult(
+                status="completed",
+                completed=True,
+                exit_code=1,
+                result_status="partial",
+                message="partial checkpoint",
+                metrics=_attempt_metrics(thread_id="thread-partial"),
+            )
+        spec.result_path.write_text("Status: completed\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="completed",
+            message="completed after continuation",
+            metrics=_attempt_metrics(thread_id="thread-partial"),
         )
 
 

@@ -164,10 +164,11 @@ Mandatory execution rules:
   trying alternate command spellings; write Status: partial/blocked with the exact
   blocker.
 - Keep bounded discovery under roughly 25 IDEA MCP calls after the first progress
-  update. For implementation tasks with explicit target files, continue through
-  edits and verification with a total budget of roughly 60 calls; do not stop at
-  the discovery cap before attempting the requested change. Audit-only tasks keep
-  the lower cap.
+  update. For implementation tasks with explicit target files, roughly 60 total
+  calls is a progress checkpoint, not a completion boundary: update the progress
+  file, stop repeating discovery, and continue through the requested edits and
+  verification while successful progress is still being made. Audit-only tasks
+  keep the lower cap.
 - If the progress file already says the verification/conclusion is complete, the
   next action must be writing result.md, not another search/read/test command.
 - Do not edit files until the progress file names the intended target files and
@@ -180,12 +181,14 @@ Mandatory execution rules:
   Status: partial or Status: blocked with the exact failed operation and stop.
   Do not keep printing the same diff or repeating analysis without a new successful
   file read/edit/result write.
-- If the diff grows beyond the task scope, contains unrelated formatting churn,
-  or exceeds roughly 120 changed lines without an explicit need in the brief,
+- If the diff grows beyond the task scope or contains unrelated formatting churn,
   stop, preserve the changed file list in the progress file, and write a
-  Status: partial result instead of continuing.
-- After every edit, update the live progress file before doing more analysis so
-  a compacted/resumed worker can recover without repeating work.
+  Status: partial result instead of continuing. Treat roughly 120 changed lines as
+  a review checkpoint, not an automatic stop, when the brief explicitly requires
+  the larger change and the diff remains scoped.
+- Update the live progress file after each coherent edit phase and before a long
+  verification phase. Do not spend a tool call after every tiny edit; preserve
+  enough state that a compacted/resumed worker can continue without rediscovery.
 - The progress file is an internal handoff artifact; the final result file is
   still mandatory.
 - Treat new or worsened unresolved imports as real diagnostics unless a focused
