@@ -61,6 +61,10 @@ forbidden_status_globs = [
 [routes.app]
 path = "../my-project"
 required_branch = "main"
+# Use a stable AgentBridge IDE/port ID from ~/.codex/config.toml.
+ide_mcp_server = "agentbridge_idea_8644"
+# This is the root returned by the selected server's get_project_info call.
+ide_mcp_project_root = "../my-project"
 worktree_root = "../agent-control-plane-worktrees"
 worktree_base = "../my-project"
 source_roots = ["."]

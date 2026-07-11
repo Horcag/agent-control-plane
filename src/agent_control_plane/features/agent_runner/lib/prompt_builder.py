@@ -24,14 +24,21 @@ def build_task_prompt(
     idea_edit_path = workspace_path.resolve(strict=False)
     idea_edit_root = str(idea_edit_path)
     idea_project_root = config.coordination_root.parent.resolve(strict=False)
+    route_config = config.routes.get(route)
+    expected_idea_project_root = (
+        route_config.ide_mcp_project_root
+        if route_config is not None and route_config.ide_mcp_project_root is not None
+        else idea_project_root
+    ).resolve(strict=False)
     idea_create_root = _idea_create_root(idea_edit_path, idea_project_root)
-    idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config)
+    idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config, route)
 
     return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 IDEA MCP edit root: {idea_edit_root}
 IDEA MCP create root: {idea_create_root}
+Expected IDEA MCP project root: {expected_idea_project_root}
 Expected branch: {expected_branch}
 
 Read before acting:
@@ -53,10 +60,17 @@ Mandatory execution rules:
   `{tool_namespace}*` tools for repository reads, edits, Git inspection,
   terminals, tests, and diagnostics.
 - {forbidden_idea_servers} are forbidden for this job. Do not
-  discover, call, configure, or fall back to either server.
-- In Codex / `codex exec`, first call `{tool_namespace}read_file` directly
-  on the first path under "Read before acting". Registered IDEA MCP tools are
-  normally available without a discovery call.
+  discover, call, configure, or fall back to those servers.
+- In Codex / `codex exec`, the first IDEA MCP call must be
+  `{tool_namespace}get_project_info`. Require its reported project Path,
+  after normalizing separators and resolving it, to equal exactly
+  `{expected_idea_project_root}`.
+- If the IDEA MCP project root differs, do not read, search, edit, run Git, or
+  execute repository commands through that server. Write Status: blocked with
+  the expected and actual roots, then stop.
+- After the project-root canary succeeds, call `{tool_namespace}read_file`
+  directly on the first path under "Read before acting". Registered IDEA MCP
+  tools are normally available without a discovery call.
 - Only use `tool_search` as an optional fallback when that function is actually
   available and the direct IDEA MCP call reports an unknown or unavailable tool.
   Never block merely because `tool_search` is absent.
@@ -224,19 +238,33 @@ def _idea_create_root(workspace_path: Path, project_root: Path) -> str:
     return Path(relative_path).as_posix()
 
 
-def _idea_mcp_settings(config: ControlConfig) -> tuple[str, str, str]:
+def _idea_mcp_settings(config: ControlConfig, route: str) -> tuple[str, str, str]:
     disabled = set(config.defaults.codex_disabled_mcp_servers)
-    if "ide-mcp-server" in disabled and "agentbridge-ide" not in disabled:
-        return (
-            "agentbridge-ide",
-            "mcp__agentbridge_ide__",
-            "`ide-mcp-server` and `dataspell_ide`",
-        )
-    return (
-        "ide-mcp-server",
-        "mcp__ide_mcp_server__",
-        "`agentbridge-ide` and `dataspell_ide`",
-    )
+    route_config = config.routes.get(route)
+    configured_server = route_config.ide_mcp_server if route_config is not None else None
+
+    if configured_server is not None:
+        if configured_server in disabled:
+            raise ValueError(
+                f"Route {route!r} selects disabled IDEA MCP server {configured_server!r}"
+            )
+        server = configured_server
+    elif "agentbridge_idea_64343" in disabled and "agentbridge_idea_8644" not in disabled:
+        server = "agentbridge_idea_8644"
+    else:
+        server = "agentbridge_idea_64343"
+
+    tool_namespace = f"mcp__{server.replace('-', '_')}__"
+    forbidden_servers = tuple(sorted(disabled - {server}))
+    if not forbidden_servers:
+        agentbridge_servers = {
+            "agentbridge_dataspell_8643",
+            "agentbridge_idea_64343",
+            "agentbridge_idea_8644",
+        }
+        forbidden_servers = tuple(sorted(agentbridge_servers - {server}))
+    forbidden_text = ", ".join(f"`{name}`" for name in forbidden_servers)
+    return server, tool_namespace, forbidden_text
 
 
 def _protocol_path(coordination_root: Path) -> Path:

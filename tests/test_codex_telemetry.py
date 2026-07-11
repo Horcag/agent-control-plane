@@ -23,7 +23,7 @@ class CodexTelemetryTest(unittest.TestCase):
                     "item": {
                         "id": "item-1",
                         "type": "mcp_tool_call",
-                        "server": "agentbridge-ide",
+                        "server": "agentbridge_idea_8644",
                         "tool": "read_file",
                         "status": "in_progress",
                     },
@@ -33,7 +33,7 @@ class CodexTelemetryTest(unittest.TestCase):
                     "item": {
                         "id": "item-1",
                         "type": "mcp_tool_call",
-                        "server": "agentbridge-ide",
+                        "server": "agentbridge_idea_8644",
                         "tool": "read_file",
                         "status": "completed",
                         "error": None,
@@ -94,7 +94,7 @@ class CodexTelemetryTest(unittest.TestCase):
                 metrics.tool_counts,
                 (
                     ("command_execution", 1),
-                    ("mcp:agentbridge-ide/read_file", 1),
+                    ("mcp:agentbridge_idea_8644/read_file", 1),
                 ),
             )
             self.assertAlmostEqual(metrics.cache_hit_ratio, 0.6)
@@ -181,7 +181,7 @@ class CodexTelemetryTest(unittest.TestCase):
                 "type": "item.started",
                 "item": {
                     "type": "mcp_tool_call",
-                    "server": "agentbridge-ide",
+                    "server": "agentbridge_idea_8644",
                     "tool": "read_file",
                 },
             }
@@ -209,7 +209,7 @@ class CodexTelemetryTest(unittest.TestCase):
 
         self.assertEqual(
             render_codex_json_line(mcp_line),
-            "mcp: agentbridge-ide/read_file started\n",
+            "mcp: agentbridge_idea_8644/read_file started\n",
         )
         self.assertIn("\nexec\n", "\n" + render_codex_json_line(exec_line))
         self.assertIn("web search:", render_codex_json_line(web_line))

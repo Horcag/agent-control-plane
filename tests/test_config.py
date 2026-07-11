@@ -75,6 +75,8 @@ backend = "codex-spark"
 codex_reasoning_effort = "medium"
 source_roots = [".", "backend/src", "frontend", "frontend/src", "scripts"]
 ide_sdk_name = "Python 3.12 (.venv)"
+ide_mcp_server = "reports_agentbridge_idea"
+ide_mcp_project_root = "ide-project"
 test_roots = ["backend/tests", "frontend/tests"]
 exclude_dirs = ["dist", "frontend/build"]
 
@@ -168,6 +170,14 @@ path = "slots/reports-1"
             self.assertEqual(config.routes["reports"].backend, "codex")
             self.assertEqual(config.routes["reports"].codex_reasoning_effort, "medium")
             self.assertEqual(config.routes["reports"].ide_sdk_name, "Python 3.12 (.venv)")
+            self.assertEqual(
+                config.routes["reports"].ide_mcp_server,
+                "reports_agentbridge_idea",
+            )
+            self.assertEqual(
+                config.routes["reports"].ide_mcp_project_root,
+                (root / "ide-project").resolve(strict=False),
+            )
             self.assertEqual(
                 tuple(path.as_posix() for path in config.routes["reports"].test_roots),
                 ("backend/tests", "frontend/tests"),

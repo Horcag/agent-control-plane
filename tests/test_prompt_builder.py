@@ -81,11 +81,22 @@ class PromptBuilderTest(unittest.TestCase):
 
             self.assertIn("Workspace route: main", prompt)
             self.assertIn("Expected branch: review/pr", prompt)
-            self.assertIn("Use only the IDEA MCP server `ide-mcp-server`", prompt)
-            self.assertIn("call `mcp__ide_mcp_server__read_file` directly", prompt)
+            self.assertIn("Use only the IDEA MCP server `agentbridge_idea_64343`", prompt)
+            self.assertIn(
+                f"Expected IDEA MCP project root: {root.resolve(strict=False)}",
+                prompt,
+            )
+            self.assertIn(
+                "first IDEA MCP call must be\n  `mcp__agentbridge_idea_64343__get_project_info`",
+                prompt,
+            )
+            self.assertIn("If the IDEA MCP project root differs", prompt)
+            self.assertIn("call `mcp__agentbridge_idea_64343__read_file`", prompt)
             self.assertIn("Only use `tool_search` as an optional fallback", prompt)
-            self.assertIn("mcp__ide_mcp_server__*", prompt)
-            self.assertIn("`agentbridge-ide` and `dataspell_ide` are forbidden", prompt)
+            self.assertIn("mcp__agentbridge_idea_64343__*", prompt)
+            self.assertIn(
+                "`agentbridge_dataspell_8643`, `agentbridge_idea_8644` are forbidden", prompt
+            )
             self.assertIn(
                 f"IDEA MCP edit root: {workspace.resolve(strict=False)}",
                 prompt,
@@ -108,8 +119,8 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("exact physical workspace path for repository edits", prompt)
             self.assertIn("canonical checkout", prompt)
             self.assertIn("forbidden tool usage", prompt)
-            self.assertIn("mcp__ide_mcp_server__run_in_terminal", prompt)
-            self.assertNotIn("mcp__agentbridge_ide", prompt)
+            self.assertIn("mcp__agentbridge_idea_64343__run_in_terminal", prompt)
+            self.assertNotIn("mcp__agentbridge_idea_8644", prompt)
             self.assertIn("Do not install dependencies", prompt)
             self.assertIn("Always write the result file", prompt)
             self.assertIn("Maintain live progress/state", prompt)
@@ -150,7 +161,10 @@ class PromptBuilderTest(unittest.TestCase):
                 config,
                 defaults=replace(
                     config.defaults,
-                    codex_disabled_mcp_servers=("dataspell_ide", "ide-mcp-server"),
+                    codex_disabled_mcp_servers=(
+                        "agentbridge_dataspell_8643",
+                        "agentbridge_idea_64343",
+                    ),
                 ),
             )
             agentbridge_prompt = build_task_prompt(
@@ -161,10 +175,65 @@ class PromptBuilderTest(unittest.TestCase):
                 expected_branch="review/pr",
                 result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
             )
-            self.assertIn("IDEA MCP server `agentbridge-ide`", agentbridge_prompt)
-            self.assertIn("mcp__agentbridge_ide__read_file", agentbridge_prompt)
-            self.assertIn("`ide-mcp-server` and `dataspell_ide` are forbidden", agentbridge_prompt)
-            self.assertNotIn("mcp__ide_mcp_server__read_file", agentbridge_prompt)
+            self.assertIn("IDEA MCP server `agentbridge_idea_8644`", agentbridge_prompt)
+            self.assertIn("mcp__agentbridge_idea_8644__get_project_info", agentbridge_prompt)
+            self.assertIn("mcp__agentbridge_idea_8644__read_file", agentbridge_prompt)
+            self.assertIn(
+                "`agentbridge_dataspell_8643`, `agentbridge_idea_64343` are forbidden",
+                agentbridge_prompt,
+            )
+            self.assertNotIn("mcp__agentbridge_idea_64343__read_file", agentbridge_prompt)
+
+            named_server = "agentbridge_idea_8644"
+            named_config = replace(
+                agentbridge_config,
+                routes=MappingProxyType(
+                    {
+                        "main": replace(
+                            config.routes["main"],
+                            ide_mcp_server=named_server,
+                            ide_mcp_project_root=root / "hhru-idea-project",
+                        )
+                    }
+                ),
+            )
+            named_prompt = build_task_prompt(
+                config=named_config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+            )
+            self.assertIn(
+                f"IDEA MCP server `{named_server}`",
+                named_prompt,
+            )
+            self.assertIn(
+                "mcp__agentbridge_idea_8644__get_project_info",
+                named_prompt,
+            )
+            self.assertIn(
+                f"Expected IDEA MCP project root: {(root / 'hhru-idea-project').resolve(strict=False)}",
+                named_prompt,
+            )
+
+            disabled_named_config = replace(
+                named_config,
+                defaults=replace(
+                    named_config.defaults,
+                    codex_disabled_mcp_servers=(named_server,),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "selects disabled IDEA MCP server"):
+                build_task_prompt(
+                    config=disabled_named_config,
+                    task_id="task-1",
+                    route="main",
+                    workspace_path=workspace,
+                    expected_branch="review/pr",
+                    result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                )
 
     def test_prompt_uses_absolute_edit_root_and_relative_create_root_for_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

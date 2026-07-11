@@ -30,6 +30,34 @@ medium to Terra medium when the task needs materially deeper reasoning. Do not u
 runner already owns external slot fan-out. Combining both makes attribution, cost,
 concurrency, and workspace ownership harder to control.
 
+## IDE MCP Routing
+
+Name AgentBridge MCP servers by IDE type and stable port, not by the repository
+currently opened in that IDE instance:
+
+- `agentbridge_idea_8644`
+- `agentbridge_idea_64343`
+- `agentbridge_dataspell_8643`
+
+The names stay unchanged when an IDE instance opens another project. A route selects
+the endpoint and independently declares the project root expected at execution time:
+
+```toml
+ide_mcp_server = "agentbridge_idea_8644"
+ide_mcp_project_root = "D:/Documents/work"
+```
+
+The runner derives the native namespace from the server ID, so this example maps to
+`mcp__agentbridge_idea_8644__*`. Before any repository operation, the worker must
+call `get_project_info` and compare its reported project root with
+`ide_mcp_project_root`. A mismatch is a routing failure and must end as
+`Status: blocked` before repository reads, edits, Git calls, or commands.
+
+Keep the other AgentBridge endpoints in `codex_disabled_mcp_servers` for that
+control-plane config. Switching the project served on an existing port does not
+require a Codex restart; the root canary verifies that the endpoint now exposes the
+route's expected IDE project.
+
 ## Effort Names
 
 The Codex UI and CLI use different labels for two settings:

@@ -13,16 +13,15 @@ CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "raw_exec": "\nexec\n",
     "codex_list_mcp_resources": "mcp: codex/list_mcp_resources",
     "codex_list_mcp_resource_templates": "mcp: codex/list_mcp_resource_templates",
-    "agentbridge_global_search": "mcp: agentbridge-ide/search_text",
-    "agentbridge_global_symbols": "mcp: agentbridge-ide/search_symbols",
-    "agentbridge_global_files": "mcp: agentbridge-ide/list_project_files",
-    "agentbridge_global_tree": "mcp: agentbridge-ide/list_directory_tree",
-    "agentbridge_external_attach": "mcp: agentbridge-ide/attach_external_dir",
 }
-CODEX_PRODUCTIVE_LOG_MARKERS = (
-    "mcp: ide-mcp-server/",
-    "mcp: agentbridge-ide/",
-)
+CODEX_FORBIDDEN_AGENTBRIDGE_TOOLS_BY_NAME: dict[str, str] = {
+    "agentbridge_global_search": "search_text",
+    "agentbridge_global_symbols": "search_symbols",
+    "agentbridge_global_files": "list_project_files",
+    "agentbridge_global_tree": "list_directory_tree",
+    "agentbridge_external_attach": "attach_external_dir",
+}
+CODEX_PRODUCTIVE_LOG_MARKERS = ("mcp: agentbridge_",)
 
 
 def refresh_log_activity(
@@ -68,6 +67,16 @@ def scan_forbidden_tool(
     text, next_scan_size = _read_new_log_text(log_path, scan_size)
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     for name in marker_names:
+        agentbridge_tool = CODEX_FORBIDDEN_AGENTBRIDGE_TOOLS_BY_NAME.get(name)
+        if agentbridge_tool is not None:
+            marker = f"mcp: agentbridge_*/{agentbridge_tool}"
+            if any(
+                "mcp: agentbridge_" in line and f"/{agentbridge_tool}" in line
+                for line in normalized.splitlines()
+            ):
+                return (name, marker), next_scan_size
+            continue
+
         marker = CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME.get(name, name)
         if marker in normalized:
             return (name, marker), next_scan_size

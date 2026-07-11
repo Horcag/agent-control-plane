@@ -49,7 +49,7 @@ class JobMetricsStoreTest(unittest.TestCase):
             self.assertEqual(attempt["reasoning_effort"], "medium")
             self.assertEqual(
                 attempt["tool_counts"],
-                {"mcp:agentbridge-ide/read_file": 2},
+                {"mcp:agentbridge_idea_8644/read_file": 2},
             )
             self.assertEqual(len(attempts), 2)
             self.assertEqual(report["totals"]["attempt_count"], 2)
@@ -77,7 +77,7 @@ def _metrics(log_path: Path) -> AttemptMetrics:
         tool_calls=2,
         failed_tool_calls=1,
         error_events=0,
-        tool_counts=(("mcp:agentbridge-ide/read_file", 2),),
+        tool_counts=(("mcp:agentbridge_idea_8644/read_file", 2),),
         estimated_credits=0.10375,
         estimated_api_usd=0.00415,
         rate_card_version="2026-07-09",

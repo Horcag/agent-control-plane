@@ -68,12 +68,15 @@ class CodexRunnerCommandTest(unittest.TestCase):
             _spec(
                 read_only=False,
                 yolo=False,
-                codex_disabled_mcp_servers=("agentbridge-ide", "dataspell_ide"),
+                codex_disabled_mcp_servers=(
+                    "agentbridge_idea_8644",
+                    "agentbridge_dataspell_8643",
+                ),
             )
         )
 
-        self.assertIn("mcp_servers.agentbridge-ide.enabled=false", command)
-        self.assertIn("mcp_servers.dataspell_ide.enabled=false", command)
+        self.assertIn("mcp_servers.agentbridge_idea_8644.enabled=false", command)
+        self.assertIn("mcp_servers.agentbridge_dataspell_8643.enabled=false", command)
 
     def test_build_command_uses_read_only_sandbox_when_requested(self) -> None:
         command = CodexExecRunner._build_command(_spec(read_only=True, yolo=False))
@@ -262,33 +265,42 @@ class CodexRunnerCommandTest(unittest.TestCase):
             "agentbridge_global_tree": "list_directory_tree",
             "agentbridge_external_attach": "attach_external_dir",
         }
+        servers = (
+            "agentbridge_idea_8644",
+            "agentbridge_idea_64343",
+            "agentbridge_dataspell_8643",
+        )
         for marker_name, tool_name in cases.items():
-            with self.subTest(marker_name=marker_name), tempfile.TemporaryDirectory() as temp:
-                log_path = Path(temp) / "attempt-001.log"
-                log_path.write_text(
-                    f"mcp: agentbridge-ide/{tool_name} started\n",
-                    encoding="utf-8",
-                )
-                proc = _FakeProc()
-                spec = _spec(
-                    read_only=True,
-                    yolo=False,
-                    log_path=log_path,
-                    codex_forbidden_tool_markers=(marker_name,),
-                )
+            for server in servers:
+                with (
+                    self.subTest(marker_name=marker_name, server=server),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
+                    log_path = Path(temp) / "attempt-001.log"
+                    log_path.write_text(
+                        f"mcp: {server}/{tool_name} started\n",
+                        encoding="utf-8",
+                    )
+                    proc = _FakeProc()
+                    spec = _spec(
+                        read_only=True,
+                        yolo=False,
+                        log_path=log_path,
+                        codex_forbidden_tool_markers=(marker_name,),
+                    )
 
-                result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
-                    proc,
-                    spec,
-                    scan_size=0,
-                )
+                    result, scan_size = CodexProcessMonitor()._forbidden_tool_result_if_needed(
+                        proc,
+                        spec,
+                        scan_size=0,
+                    )
 
-                self.assertIsNotNone(result)
-                assert result is not None
-                self.assertEqual(result.status, "forbidden_tool_usage")
-                self.assertIn(marker_name, result.message)
-                self.assertGreater(scan_size, 0)
-                self.assertTrue(proc.terminated)
+                    self.assertIsNotNone(result)
+                    assert result is not None
+                    self.assertEqual(result.status, "forbidden_tool_usage")
+                    self.assertIn(marker_name, result.message)
+                    self.assertGreater(scan_size, 0)
+                    self.assertTrue(proc.terminated)
 
     def test_forbidden_markers_are_disabled_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -311,8 +323,8 @@ class CodexRunnerCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             log_path = Path(temp) / "attempt-001.log"
             log_path.write_text(
-                "codex\nmcp: agentbridge-ide/read_file started\n"
-                "mcp: agentbridge-ide/read_file (completed)\n",
+                "codex\nmcp: agentbridge_idea_8644/read_file started\n"
+                "mcp: agentbridge_idea_8644/read_file (completed)\n",
                 encoding="utf-8",
             )
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
@@ -325,11 +337,11 @@ class CodexRunnerCommandTest(unittest.TestCase):
             self.assertTrue(productive)
             self.assertGreater(scan_size, 0)
 
-    def test_native_idea_tool_activity_counts_as_productive_log_activity(self) -> None:
+    def test_second_idea_agentbridge_activity_counts_as_productive_log_activity(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             log_path = Path(temp) / "attempt-001.log"
             log_path.write_text(
-                "codex\nmcp: ide-mcp-server/read_file started\n",
+                "codex\nmcp: agentbridge_idea_64343/read_file started\n",
                 encoding="utf-8",
             )
             spec = _spec(read_only=False, yolo=False, log_path=log_path)
