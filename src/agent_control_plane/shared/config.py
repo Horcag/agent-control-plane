@@ -95,6 +95,8 @@ class ControlDefaults:
         "--no-install",
         "electron",
     )
+    shared_ide_sdk_name: str | None = None
+    shared_ide_sdk_type: str = "Python SDK"
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         yolo=bool(defaults_raw.get("yolo", False)),
         allow_dirty=bool(defaults_raw.get("allow_dirty", False)),
         prepare_slots=bool(defaults_raw.get("prepare_slots", True)),
+        shared_ide_sdk_name=_optional_string_value(defaults_raw.get("shared_ide_sdk_name")),
+        shared_ide_sdk_type=_string_value(defaults_raw.get("shared_ide_sdk_type", "Python SDK")),
         guardrail_poll_sec=float(defaults_raw.get("guardrail_poll_sec", 2.0)),
         forbidden_status_globs=_string_tuple(
             defaults_raw.get(

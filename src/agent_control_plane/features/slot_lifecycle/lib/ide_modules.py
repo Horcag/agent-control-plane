@@ -298,6 +298,11 @@ def _slot_root_module_content(config: ControlConfig) -> str:
         )
 
     content = "\n".join(content_blocks)
+    sdk_entries = _sdk_order_entries(
+        config.defaults.shared_ide_sdk_name,
+        config.defaults.shared_ide_sdk_type,
+        include_interpreter_library=True,
+    )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<module type="PYTHON_MODULE" version="4">\n'
@@ -308,7 +313,7 @@ def _slot_root_module_content(config: ControlConfig) -> str:
         '  <component name="NewModuleRootManager" inherit-compiler-output="true">\n'
         "    <exclude-output />\n"
         f"{content}\n"
-        f"{_sdk_order_entries()}"
+        f"{sdk_entries}"
         "  </component>\n"
         "</module>\n"
     ).replace(MODULE_DIR_EXPR, module_dir_expr)
@@ -358,9 +363,12 @@ def _join_module_url(base_url: str, relative_path: Path) -> str:
 def _sdk_order_entries(
     sdk_name: str | None = None,
     sdk_type: str = DEFAULT_IDE_SDK_TYPE,
+    *,
+    include_interpreter_library: bool | None = None,
 ) -> str:
     effective_sdk_name = sdk_name or DEFAULT_IDE_SDK_NAME
-    include_interpreter_library = effective_sdk_name == DEFAULT_IDE_SDK_NAME
+    if include_interpreter_library is None:
+        include_interpreter_library = effective_sdk_name == DEFAULT_IDE_SDK_NAME
     lines = [
         f'    <orderEntry type="jdk" jdkName="{effective_sdk_name}" jdkType="{sdk_type}" />',
         '    <orderEntry type="sourceFolder" forTests="false" />',
