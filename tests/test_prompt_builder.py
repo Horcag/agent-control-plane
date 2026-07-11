@@ -86,7 +86,10 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Only use `tool_search` as an optional fallback", prompt)
             self.assertIn("mcp__ide_mcp_server__*", prompt)
             self.assertIn("`agentbridge-ide` and `dataspell_ide` are forbidden", prompt)
-            self.assertIn(f"IDEA MCP edit root: {workspace}", prompt)
+            self.assertIn(
+                f"IDEA MCP edit root: {workspace.resolve(strict=False)}",
+                prompt,
+            )
             self.assertIn(
                 "IDEA MCP create root: ../main-tiger-agent-slots/dev-3",
                 prompt,
@@ -202,7 +205,10 @@ class PromptBuilderTest(unittest.TestCase):
             )
 
             workspace = root / "slots" / "work-slot-11"
-            self.assertIn(f"IDEA MCP edit root: {workspace}", prompt)
+            self.assertIn(
+                f"IDEA MCP edit root: {workspace.resolve(strict=False)}",
+                prompt,
+            )
             self.assertIn("IDEA MCP create root: slots/work-slot-11", prompt)
             self.assertIn(str(root / ".agent-work" / "agy-protocol.md"), prompt)
             self.assertNotIn("slot-links", prompt)

@@ -54,7 +54,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             self.assertEqual(job.status, "queued")
             self.assertIn(job.job_id, progress_text)
-            self.assertIn(str(workspace), progress_text)
+            self.assertIn(str(job.workspace_path), progress_text)
             self.assertIn("Awaiting agent execution", result_text)
             self.assertFalse(result_state.done)
 
