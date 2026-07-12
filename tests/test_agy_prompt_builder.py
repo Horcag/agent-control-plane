@@ -73,7 +73,8 @@ class AgyPromptBuilderTest(unittest.TestCase):
 
             self.assertIn("native JetBrains IDEA MCP server `idea`", prompt)
             self.assertIn("mcp__idea__get_repositories", prompt)
-            self.assertIn(f'projectPath="{root}"', prompt)
+            expected_project_root = coordination_root.parent.resolve(strict=False)
+            self.assertIn(f'projectPath="{expected_project_root}"', prompt)
             self.assertIn("mcp__idea__read_file", prompt)
             self.assertIn("mcp__idea__apply_patch", prompt)
             self.assertIn("mcp__idea__create_new_file", prompt)
