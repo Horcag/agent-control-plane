@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from agent_control_plane.features.agent_runner.lib.agy_idea_prompt import build_agy_task_prompt
+from agent_control_plane.shared.agent_backends import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.shared.config import ControlConfig
 
 
@@ -14,6 +16,8 @@ def build_task_prompt(
     workspace_path: Path,
     expected_branch: str,
     result_path: Path,
+    backend: str = CODEX_BACKEND,
+    read_only: bool = False,
 ) -> str:
     task_dir = config.coordination_root / "tasks" / task_id
     brief_path = task_dir / "brief.md"
@@ -30,6 +34,31 @@ def build_task_prompt(
         if route_config is not None and route_config.ide_mcp_project_root is not None
         else idea_project_root
     ).resolve(strict=False)
+    if backend == AGY_BACKEND:
+        if not read_only:
+            try:
+                idea_edit_path.relative_to(expected_idea_project_root)
+            except ValueError as exc:
+                raise ValueError(
+                    "AGY native IDEA MCP write tools require the assigned workspace "
+                    f"to be inside the open IDEA project root; workspace={idea_edit_path}, "
+                    f"project_root={expected_idea_project_root}. Use Codex, relocate the "
+                    "slot under the project root, or run an explicitly read-only AGY task."
+                ) from exc
+        return build_agy_task_prompt(
+            task_id=task_id,
+            route=route,
+            workspace_path=workspace_path,
+            expected_branch=expected_branch,
+            result_path=result_path,
+            progress_path=progress_path,
+            protocol_path=protocol_path,
+            routing_path=routing_path,
+            brief_path=brief_path,
+            expected_idea_project_root=expected_idea_project_root,
+            read_only=read_only,
+        )
+
     idea_create_root = _idea_create_root(idea_edit_path, idea_project_root)
     idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config, route)
 

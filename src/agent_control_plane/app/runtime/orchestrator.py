@@ -416,8 +416,10 @@ class AgentControlPlane:
                 workspace_path=check.workspace_path,
                 expected_branch=check.expected_branch,
                 result_path=check.result_path,
+                backend=backend,
+                read_only=options.read_only,
             )
-        except FileNotFoundError as exc:
+        except (FileNotFoundError, ValueError) as exc:
             raise PolicyError(str(exc)) from exc
 
         try:
