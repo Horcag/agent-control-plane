@@ -22,6 +22,7 @@ JOB_COLUMNS = {
     "status",
     "codex_model",
     "codex_reasoning_effort",
+    "codex_tool_call_budget",
     "run_dir",
     "prompt_path",
     "log_path",
@@ -58,6 +59,7 @@ class JobRecord:
     codex_model: str | None
     codex_reasoning_effort: str | None
     codex_quality_tier: str | None
+    codex_tool_call_budget: int | None
     archived_at: str | None
     created_at: str
     updated_at: str
@@ -103,6 +105,7 @@ class JobStore:
                     codex_model text,
                     codex_reasoning_effort text,
                     codex_quality_tier text,
+                    codex_tool_call_budget integer,
                     archived_at text,
                     created_at text not null,
                     updated_at text not null,
@@ -170,6 +173,7 @@ class JobStore:
         codex_model: str | None = None,
         codex_reasoning_effort: str | None = None,
         codex_quality_tier: str | None = None,
+        codex_tool_call_budget: int | None = None,
         slot_name: str | None = None,
     ) -> JobRecord:
         self.initialize()
@@ -190,10 +194,11 @@ class JobStore:
                     job_id, task_id, route, workspace_path, expected_branch, status,
                     config_path, run_dir, prompt_path, result_path,
                     backend, codex_model, codex_reasoning_effort, codex_quality_tier,
+                    codex_tool_call_budget,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
                     print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -210,6 +215,7 @@ class JobStore:
                     codex_model,
                     codex_reasoning_effort,
                     codex_quality_tier,
+                    codex_tool_call_budget,
                     now,
                     now,
                     timeout_sec,
@@ -419,6 +425,8 @@ class JobStore:
             db.execute("alter table jobs add column codex_reasoning_effort text")
         if "codex_quality_tier" not in columns:
             db.execute("alter table jobs add column codex_quality_tier text")
+        if "codex_tool_call_budget" not in columns:
+            db.execute("alter table jobs add column codex_tool_call_budget integer")
         if "archived_at" not in columns:
             db.execute("alter table jobs add column archived_at text")
 
@@ -473,6 +481,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         codex_model=row["codex_model"],
         codex_reasoning_effort=row["codex_reasoning_effort"],
         codex_quality_tier=row["codex_quality_tier"],
+        codex_tool_call_budget=row["codex_tool_call_budget"],
         archived_at=row["archived_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],

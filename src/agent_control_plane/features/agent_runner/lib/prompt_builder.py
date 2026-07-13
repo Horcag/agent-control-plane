@@ -18,6 +18,7 @@ def build_task_prompt(
     result_path: Path,
     backend: str = CODEX_BACKEND,
     read_only: bool = False,
+    codex_tool_call_budget: int = 0,
 ) -> str:
     task_dir = config.coordination_root / "tasks" / task_id
     brief_path = task_dir / "brief.md"
@@ -69,6 +70,7 @@ IDEA MCP edit root: {idea_edit_root}
 IDEA MCP create root: {idea_create_root}
 Expected IDEA MCP project root: {expected_idea_project_root}
 Expected branch: {expected_branch}
+Hard tool-call budget: {codex_tool_call_budget or "runner default"}
 
 Read before acting:
 - {protocol_path}
@@ -111,6 +113,13 @@ Mandatory execution rules:
 - Use `{tool_namespace}run_in_terminal` for necessary local commands such
   as path-scoped `rg`, tests, linters, and formatters. Use dedicated IDEA MCP
   `git_*` tools exclusively for Git; terminal Git is forbidden.
+- Reserve one terminal tab named exactly `{task_id}`. Every `run_in_terminal`,
+  `read_terminal_output`, `write_terminal_input`, and `close_terminal` call must
+  pass `tab_name="{task_id}"`; never omit it and never append display suffixes
+  such as ` (new)`. Close that exact tab before finishing.
+- Stay within the hard tool-call budget shown above. Batch independent reads
+  when safe, avoid repeated full-log/status calls, and stop with a precise
+  partial result before spending calls on speculative cleanup.
 - Only block for missing IDEA MCP tools after one direct IDEA MCP call fails.
   If `tool_search` exists, use it once as a fallback. Include the exact
   direct-call and optional discovery output in the result.

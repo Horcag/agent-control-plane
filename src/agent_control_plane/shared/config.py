@@ -81,6 +81,9 @@ class ControlDefaults:
     codex_balanced_reasoning_effort: str = "medium"
     codex_deep_model: str = "gpt-5.6-terra"
     codex_deep_reasoning_effort: str = "medium"
+    codex_mechanical_tool_call_budget: int = 45
+    codex_balanced_tool_call_budget: int = 80
+    codex_deep_tool_call_budget: int = 120
     codex_global_quota_database: Path | None = None
     codex_global_max_concurrent_jobs: int = 2
     codex_five_hour_soft_limit_percent: float = 75.0
@@ -202,6 +205,18 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         codex_deep_model=_string_value(defaults_raw.get("codex_deep_model", "gpt-5.6-terra")),
         codex_deep_reasoning_effort=_string_value(
             defaults_raw.get("codex_deep_reasoning_effort", "medium")
+        ),
+        codex_mechanical_tool_call_budget=_positive_int(
+            defaults_raw.get("codex_mechanical_tool_call_budget", 45),
+            "codex_mechanical_tool_call_budget",
+        ),
+        codex_balanced_tool_call_budget=_positive_int(
+            defaults_raw.get("codex_balanced_tool_call_budget", 80),
+            "codex_balanced_tool_call_budget",
+        ),
+        codex_deep_tool_call_budget=_positive_int(
+            defaults_raw.get("codex_deep_tool_call_budget", 120),
+            "codex_deep_tool_call_budget",
         ),
         codex_global_quota_database=_optional_path(
             defaults_raw,

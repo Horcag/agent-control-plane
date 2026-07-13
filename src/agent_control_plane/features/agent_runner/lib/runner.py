@@ -45,6 +45,8 @@ class AgentRunSpec:
     yolo: bool
     read_only: bool
     codex_no_progress_timeout_sec: int = 0
+    codex_tool_call_budget: int = 0
+    codex_terminal_tab_name: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_resume_thread_id: str | None = None
     codex_sessions_root: Path | None = None

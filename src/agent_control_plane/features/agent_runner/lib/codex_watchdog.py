@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
+from typing import Any
 
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
 from agent_control_plane.shared.git_tools import GitError, workspace_state
@@ -22,6 +24,14 @@ CODEX_FORBIDDEN_AGENTBRIDGE_TOOLS_BY_NAME: dict[str, str] = {
     "agentbridge_external_attach": "attach_external_dir",
 }
 CODEX_PRODUCTIVE_LOG_MARKERS = ("mcp: agentbridge_",)
+CODEX_TERMINAL_TOOLS = frozenset(
+    {
+        "run_in_terminal",
+        "read_terminal_output",
+        "write_terminal_input",
+        "close_terminal",
+    }
+)
 
 
 def refresh_log_activity(
@@ -83,6 +93,45 @@ def scan_forbidden_tool(
     return None, next_scan_size
 
 
+def scan_codex_tool_constraints(
+    event_log_path: Path,
+    scan_size: int,
+    tool_call_count: int,
+    *,
+    tool_call_budget: int,
+    terminal_tab_name: str | None,
+) -> tuple[str | None, int, int]:
+    """Count started tools and reject terminal calls that can leak across jobs."""
+    text, next_scan_size = _read_new_log_text(event_log_path, scan_size)
+    for line in text.splitlines():
+        event = _json_object(line)
+        if event is None or event.get("type") != "item.started":
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "mcp_tool_call":
+            continue
+        tool_call_count += 1
+        tool = str(item.get("tool") or "")
+        arguments = item.get("arguments")
+        if tool in CODEX_TERMINAL_TOOLS and terminal_tab_name is not None:
+            tab_name = arguments.get("tab_name") if isinstance(arguments, dict) else None
+            if tab_name != terminal_tab_name:
+                return (
+                    f"Terminal tool {tool} must use tab_name={terminal_tab_name!r}; "
+                    f"received {tab_name!r}",
+                    next_scan_size,
+                    tool_call_count,
+                )
+        if tool_call_budget > 0 and tool_call_count > tool_call_budget:
+            return (
+                f"Codex exceeded the hard tool-call budget of {tool_call_budget} "
+                f"(observed {tool_call_count})",
+                next_scan_size,
+                tool_call_count,
+            )
+    return None, next_scan_size, tool_call_count
+
+
 def progress_signature(spec: AgentRunSpec) -> tuple[tuple[str, ...] | None, bool]:
     """Return durable progress markers and whether target workspace is dirty."""
     progress_path = spec.result_path.parent / "agent-progress.md"
@@ -141,3 +190,11 @@ def _read_new_log_text(log_path: Path, scan_size: int) -> tuple[str, int]:
     except OSError:
         return "", scan_size
     return chunk.decode("utf-8", errors="replace"), next_scan_size
+
+
+def _json_object(line: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None

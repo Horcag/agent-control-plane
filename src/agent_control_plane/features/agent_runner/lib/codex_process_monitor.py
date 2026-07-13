@@ -11,6 +11,7 @@ from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     productive_log_activity_if_needed,
     progress_signature,
     refresh_log_activity,
+    scan_codex_tool_constraints,
     scan_forbidden_tool,
     scan_tool_timeouts,
 )
@@ -52,6 +53,8 @@ class CodexProcessMonitor:
         tool_timeout_count = 0
         last_forbidden_tool_scan_size = 0
         last_productive_log_scan_size = 0
+        last_constraint_scan_size = 0
+        tool_call_count = 0
         current_progress_signature, workspace_dirty = progress_signature(spec)
 
         while True:
@@ -75,6 +78,24 @@ class CodexProcessMonitor:
                 if next_signature != current_progress_signature:
                     current_progress_signature = next_signature
                     last_productive_mono = now
+
+            constraint_violation, last_constraint_scan_size, tool_call_count = (
+                scan_codex_tool_constraints(
+                    spec.log_path.with_suffix(".events.jsonl"),
+                    last_constraint_scan_size,
+                    tool_call_count,
+                    tool_call_budget=spec.codex_tool_call_budget,
+                    terminal_tab_name=spec.codex_terminal_tab_name,
+                )
+            )
+            if constraint_violation is not None:
+                terminate_spawned_process(proc)
+                status = (
+                    "terminal_scope_violation"
+                    if constraint_violation.startswith("Terminal tool")
+                    else "tool_call_budget"
+                )
+                return self._stopped_result(proc, status, constraint_violation)
 
             (
                 terminal_result,

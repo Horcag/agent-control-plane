@@ -12,6 +12,10 @@ from agent_control_plane.app.runtime.orchestrator import (
     PolicyError,
     StartOptions,
 )
+from agent_control_plane.app.runtime.review_cli import (
+    add_review_parser,
+    handle_review_command,
+)
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
@@ -39,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
                     codex_model=args.codex_model,
                     codex_reasoning_effort=args.codex_reasoning_effort,
                     codex_quality_tier=args.codex_quality_tier,
+                    codex_tool_call_budget=args.codex_tool_call_budget,
                     slot=args.slot,
                     workspace_path=Path(args.workspace_path) if args.workspace_path else None,
                     expected_branch=args.expected_branch,
@@ -100,6 +105,14 @@ def main(argv: list[str] | None = None) -> int:
                     model=args.model,
                     reasoning_effort=args.reasoning_effort,
                     valid_only=args.valid_only,
+                )
+            )
+            return 0
+        if args.command == "review":
+            _print_json(
+                handle_review_command(
+                    args,
+                    database_path=control.config.database_path,
                 )
             )
             return 0
@@ -296,6 +309,11 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("mechanical", "balanced", "deep"),
         help="Opt into a quality tier; deep remains the safe default",
     )
+    start.add_argument(
+        "--codex-tool-call-budget",
+        type=int,
+        help="Hard per-attempt Codex tool-call budget; overrides the quality-tier default",
+    )
     start.add_argument("--slot", help="Use a managed IDE-indexed slot by name")
     start.add_argument("--workspace-path")
     start.add_argument("--expected-branch")
@@ -356,6 +374,8 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include only completed attempts with a final usage event",
     )
+
+    add_review_parser(subparsers, common)
 
     watch = subparsers.add_parser(
         "watch",

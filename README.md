@@ -249,6 +249,24 @@ cache-hit, tool-call, result-status, failure, and estimated credit/API-cost metr
 SQLite. `status` and `summary` include the latest attempt; `analytics` aggregates
 comparable model/effort runs.
 
+Root review is accounted separately so agent savings are not overstated. Start from the
+current Codex rollout or import an existing marker, checkpoint phase boundaries, attach
+the acceptance outcome for each job, and finish the span:
+
+```powershell
+agent-control review start --config .\config\workspaces.toml --name transfer --session <rollout.jsonl>
+agent-control review checkpoint <span-id> review --config .\config\workspaces.toml
+agent-control review attach <span-id> <job-id> accepted --root-verified --accepted-sha <sha> --config .\config\workspaces.toml
+agent-control review finish <span-id> --config .\config\workspaces.toml
+agent-control review show <span-id> --config .\config\workspaces.toml
+```
+
+The report uses `uncached input + output` as comparable tokens and publishes
+`review_tax = root comparable / accepted agent comparable`. Codex attempts also have
+hard tool-call budgets per quality tier (45 mechanical, 80 balanced, 120 deep by
+default); `start --codex-tool-call-budget` is the explicit override. Terminal MCP calls
+must use the exact task ID as their tab name, preventing cross-slot terminal reuse.
+
 Archive old terminal runs:
 
 ```powershell

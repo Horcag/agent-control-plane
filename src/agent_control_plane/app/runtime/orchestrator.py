@@ -104,6 +104,7 @@ class StartOptions:
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_quality_tier: str | None = None
+    codex_tool_call_budget: int | None = None
     slot: str | None = None
     workspace_path: Path | None = None
     expected_branch: str | None = None
@@ -219,6 +220,11 @@ class AgentControlPlane:
             "codex_model": self.config.defaults.codex_model,
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
+            "codex_tool_call_budgets": {
+                "mechanical": self.config.defaults.codex_mechanical_tool_call_budget,
+                "balanced": self.config.defaults.codex_balanced_tool_call_budget,
+                "deep": self.config.defaults.codex_deep_tool_call_budget,
+            },
             "codex_quality_profiles": {
                 tier: [
                     {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
@@ -405,6 +411,21 @@ class AgentControlPlane:
                 self.config.defaults.codex_reasoning_effort,
             )
 
+        codex_tool_call_budget: int | None = None
+        if normalize_backend(backend) == CODEX_BACKEND:
+            budget_tier = (
+                options.codex_quality_tier
+                or codex_quality_tier
+                or self.config.defaults.codex_quality_tier
+            )
+            codex_tool_call_budget = (
+                options.codex_tool_call_budget
+                if options.codex_tool_call_budget is not None
+                else _tool_call_budget_for_tier(self.config, budget_tier)
+            )
+            if codex_tool_call_budget <= 0:
+                raise PolicyError("Codex tool-call budget must be positive")
+
         job_id = new_job_id(options.task_id)
         run_dir = self._run_dir_for_job(job_id)
         prompt_path = run_dir / "prompt.md"
@@ -418,6 +439,7 @@ class AgentControlPlane:
                 result_path=check.result_path,
                 backend=backend,
                 read_only=options.read_only,
+                codex_tool_call_budget=codex_tool_call_budget or 0,
             )
         except (FileNotFoundError, ValueError) as exc:
             raise PolicyError(str(exc)) from exc
@@ -447,6 +469,7 @@ class AgentControlPlane:
                 codex_model=codex_model,
                 codex_reasoning_effort=codex_reasoning_effort,
                 codex_quality_tier=codex_quality_tier,
+                codex_tool_call_budget=codex_tool_call_budget,
                 slot_name=options.slot,
             )
         except ValueError as exc:
@@ -637,6 +660,8 @@ class AgentControlPlane:
                     codex_no_progress_timeout_sec=(
                         self.config.defaults.codex_no_progress_timeout_sec
                     ),
+                    codex_tool_call_budget=job.codex_tool_call_budget or 0,
+                    codex_terminal_tab_name=job.task_id,
                     codex_forbidden_tool_markers=codex_forbidden_tool_markers,
                     codex_resume_thread_id=resume_thread_id,
                     codex_sessions_root=self.config.defaults.codex_sessions_root,
@@ -859,6 +884,7 @@ class AgentControlPlane:
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
+            "codex_tool_call_budget": job.codex_tool_call_budget,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
@@ -905,6 +931,7 @@ class AgentControlPlane:
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
+            "codex_tool_call_budget": job.codex_tool_call_budget,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
@@ -1038,6 +1065,7 @@ class AgentControlPlane:
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
+            "codex_tool_call_budget": job.codex_tool_call_budget,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "updated_at": job.updated_at,
@@ -1753,6 +1781,18 @@ def _backend_option(*values: str | None) -> str:
             raise PolicyError(f"Unsupported backend {value!r}. Expected one of: {allowed}")
         return backend
     raise PolicyError("No backend configured")
+
+
+def _tool_call_budget_for_tier(config: ControlConfig, tier: str) -> int:
+    budgets = {
+        "mechanical": config.defaults.codex_mechanical_tool_call_budget,
+        "balanced": config.defaults.codex_balanced_tool_call_budget,
+        "deep": config.defaults.codex_deep_tool_call_budget,
+    }
+    try:
+        return budgets[tier]
+    except KeyError as exc:
+        raise PolicyError(f"Unsupported Codex quality tier for tool budget: {tier}") from exc
 
 
 def _date_bucket_from_timestamp(timestamp: float) -> Path:
