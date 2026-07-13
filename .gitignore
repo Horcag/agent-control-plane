@@ -23,3 +23,6 @@ config/workspaces.toml
 config/*.local.toml
 *.sqlite3
 *.sqlite3-*
+
+# Generated reports and exports.
+/output/
