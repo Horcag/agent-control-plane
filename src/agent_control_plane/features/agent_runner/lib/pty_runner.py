@@ -7,11 +7,13 @@ import time
 from collections.abc import Callable
 from typing import Protocol, TextIO
 
+from agent_control_plane.features.agent_runner.lib.codex_watchdog import progress_signature
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b].*?(?:\x07|\x1b\\)")
 TRUST_PROMPT_TAIL_LIMIT = 12_000
+DURABLE_PROGRESS_POLL_INTERVAL_SEC = 2.0
 
 
 class PtyProcessLike(Protocol):
@@ -98,15 +100,17 @@ class PtyAgyRunner:
         log: TextIO,
         spec: AgyRunSpec,
         started_wall: float,
-        last_output_mono: float,
+        last_activity_mono: float,
         deadline_mono: float,
         cancel_requested: Callable[[], bool],
     ) -> AgyRunResult:
         output_tail = ""
+        durable_signature, _ = progress_signature(spec)
+        next_progress_poll_mono = last_activity_mono + DURABLE_PROGRESS_POLL_INTERVAL_SEC
         while True:
             drained_output = self._drain_output(output_queue, log)
             if drained_output:
-                last_output_mono = time.monotonic()
+                last_activity_mono = time.monotonic()
                 output_tail = (output_tail + drained_output)[-TRUST_PROMPT_TAIL_LIMIT:]
 
             completed = self._completed_result_if_ready(proc, spec, started_wall, terminate=True)
@@ -127,13 +131,36 @@ class PtyAgyRunner:
                 return exited
 
             now = time.monotonic()
+            if now >= next_progress_poll_mono:
+                last_activity_mono, durable_signature = self._refresh_durable_activity(
+                    spec,
+                    previous_signature=durable_signature,
+                    last_activity_mono=last_activity_mono,
+                    now=now,
+                )
+                next_progress_poll_mono = now + DURABLE_PROGRESS_POLL_INTERVAL_SEC
             stopped = self._timeout_result_if_needed(
-                proc, spec, now, deadline_mono, last_output_mono
+                proc, spec, now, deadline_mono, last_activity_mono
             )
             if stopped is not None:
                 return stopped
 
             time.sleep(0.2)
+
+    @staticmethod
+    def _refresh_durable_activity(
+        spec: AgyRunSpec,
+        *,
+        previous_signature: tuple[str, ...] | None,
+        last_activity_mono: float,
+        now: float,
+    ) -> tuple[float, tuple[str, ...] | None]:
+        current_signature, _ = progress_signature(spec)
+        if current_signature is None:
+            return last_activity_mono, previous_signature
+        if current_signature != previous_signature:
+            return now, current_signature
+        return last_activity_mono, current_signature
 
     @staticmethod
     def _build_command(spec: AgyRunSpec) -> list[str]:
@@ -198,7 +225,7 @@ class PtyAgyRunner:
         spec: AgyRunSpec,
         now: float,
         deadline_mono: float,
-        last_output_mono: float,
+        last_activity_mono: float,
     ) -> AgyRunResult | None:
         if now >= deadline_mono:
             self._terminate_spawned(proc)
@@ -207,12 +234,12 @@ class PtyAgyRunner:
                 "timeout",
                 f"Timed out after {spec.timeout_sec} seconds",
             )
-        if 0 < spec.idle_timeout_sec <= now - last_output_mono:
+        if 0 < spec.idle_timeout_sec <= now - last_activity_mono:
             self._terminate_spawned(proc)
             return self._stopped_result(
                 proc,
                 "idle_timeout",
-                f"No terminal output for {spec.idle_timeout_sec} seconds",
+                (f"No AGY terminal output or durable progress for {spec.idle_timeout_sec} seconds"),
             )
         return None
 

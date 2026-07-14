@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
 
@@ -66,6 +67,88 @@ class PtyRunnerCommandTest(unittest.TestCase):
         message = PtyAgyRunner._trust_prompt_message_if_needed("Status: completed\n")
 
         self.assertIsNone(message)
+
+    def test_changed_durable_signature_refreshes_activity(self) -> None:
+        spec = _spec(prompt="task", yolo=False)
+
+        with patch(
+            "agent_control_plane.features.agent_runner.lib.pty_runner.progress_signature",
+            return_value=(("agent-progress.md:2:20",), True),
+        ):
+            activity, signature = PtyAgyRunner._refresh_durable_activity(
+                spec,
+                previous_signature=("agent-progress.md:1:10",),
+                last_activity_mono=5.0,
+                now=12.0,
+            )
+
+        self.assertEqual(12.0, activity)
+        self.assertEqual(("agent-progress.md:2:20",), signature)
+
+    def test_static_dirty_signature_does_not_refresh_activity(self) -> None:
+        spec = _spec(prompt="task", yolo=False)
+        signature = ("git-status:?? src/new.py", "dirty-file:src/new.py:1:10")
+
+        with patch(
+            "agent_control_plane.features.agent_runner.lib.pty_runner.progress_signature",
+            return_value=(signature, True),
+        ):
+            activity, current = PtyAgyRunner._refresh_durable_activity(
+                spec,
+                previous_signature=signature,
+                last_activity_mono=5.0,
+                now=12.0,
+            )
+
+        self.assertEqual(5.0, activity)
+        self.assertEqual(signature, current)
+
+    def test_hard_timeout_wins_despite_recent_activity(self) -> None:
+        proc = _FakeProcess()
+        result = PtyAgyRunner()._timeout_result_if_needed(
+            proc,
+            _spec(prompt="task", yolo=False),
+            now=30.0,
+            deadline_mono=30.0,
+            last_activity_mono=29.9,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("timeout", result.status if result else None)
+        self.assertTrue(proc.terminated)
+
+    def test_idle_timeout_mentions_terminal_and_durable_progress(self) -> None:
+        proc = _FakeProcess()
+        result = PtyAgyRunner()._timeout_result_if_needed(
+            proc,
+            _spec(prompt="task", yolo=False),
+            now=11.0,
+            deadline_mono=30.0,
+            last_activity_mono=1.0,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("idle_timeout", result.status if result else None)
+        self.assertIn("terminal output or durable progress", result.message if result else "")
+        self.assertTrue(proc.terminated)
+
+
+class _FakeProcess:
+    pid: int | None = 123
+    exitstatus: int | None = None
+
+    def __init__(self) -> None:
+        self.terminated = False
+
+    def read(self, size: int) -> str:
+        del size
+        return ""
+
+    def isalive(self) -> bool:
+        return not self.terminated
+
+    def terminate(self, force: bool = False) -> None:
+        self.terminated = force
 
 
 def _spec(*, prompt: str, yolo: bool, agy_model: str | None = None) -> AgyRunSpec:
