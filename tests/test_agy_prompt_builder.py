@@ -82,6 +82,9 @@ class AgyPromptBuilderTest(unittest.TestCase):
             self.assertIn("mcp__idea__execute_terminal_command", prompt)
             self.assertIn("mcp__idea__get_file_problems", prompt)
             self.assertIn("Git may run only inside that IDEA terminal", prompt)
+            self.assertIn("UV_PROJECT_ENVIRONMENT", prompt)
+            self.assertIn(f"{workspace.resolve(strict=False)}/.venv", prompt)
+            self.assertIn("verify `sys.prefix`", prompt)
             self.assertIn(
                 "Never inspect the canonical checkout or another slot as a\n  proxy",
                 prompt,

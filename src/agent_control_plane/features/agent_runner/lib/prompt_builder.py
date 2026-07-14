@@ -119,6 +119,15 @@ Mandatory execution rules:
   `read_terminal_output`, `write_terminal_input`, and `close_terminal` call must
   pass `tab_name="{task_id}"`; never omit it and never append display suffixes
   such as ` (new)`. Close that exact tab before finishing.
+- AgentBridge terminal tabs may inherit the host IDE's Python environment rather
+  than the assigned workspace environment. Before any Python or `uv` command, if
+  `{workspace_path}/.venv` exists, make the command self-contained: set both
+  `VIRTUAL_ENV` and `UV_PROJECT_ENVIRONMENT` to that exact workspace `.venv`,
+  prepend its `Scripts` directory on Windows (or `bin` on POSIX) to `PATH`, and
+  set the working directory to `{workspace_path}`. Prefer invoking the exact
+  workspace `.venv` Python executable for Python-based tools. Verify `sys.prefix`
+  resolves inside `{workspace_path}/.venv` before accepting quality-gate output;
+  never rely on or target the canonical checkout's inherited environment.
 - Stay within the hard tool-call budget shown above. Batch independent reads
   when safe, avoid repeated full-log/status calls, and stop with a precise
   partial result before spending calls on speculative cleanup.

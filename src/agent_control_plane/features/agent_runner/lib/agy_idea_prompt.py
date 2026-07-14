@@ -127,6 +127,14 @@ Mandatory execution rules:
 - Run the narrowest existing tests, linters, type checks, and format checks through
   `mcp__idea__execute_terminal_command`. Do not install dependencies or modify
   lockfiles; slot preparation belongs to the control-plane.
+- IDEA terminal commands may inherit the host IDE's Python environment rather
+  than the assigned workspace environment. Before any Python or `uv` command, if
+  `{workspace_path}/.venv` exists, make the command self-contained: set both
+  `VIRTUAL_ENV` and `UV_PROJECT_ENVIRONMENT` to that exact workspace `.venv`,
+  prepend its `Scripts` directory on Windows (or `bin` on POSIX) to `PATH`, and
+  change directory to `{workspace_path}`. Prefer the exact workspace `.venv`
+  Python executable and verify `sys.prefix` resolves inside it; never target the
+  canonical checkout's inherited environment.
 - The first coordination write must update `{progress_path}` through the native
   IDEA MCP. Include Current phase, Confirmed facts, Target files, Next action,
   Changed files, and Open risks.
@@ -228,6 +236,14 @@ Mandatory execution rules:
   explicitly requests that exact mutation.
 - Reserve one terminal tab named exactly `{task_id}` for necessary commands. Reuse
   and close that exact tab before finishing.
+- AgentBridge/IDE terminal tabs may inherit the host IDE's Python environment
+  rather than the assigned workspace environment. Before any Python or `uv`
+  command, if `{workspace_path}/.venv` exists, make the command self-contained:
+  set both `VIRTUAL_ENV` and `UV_PROJECT_ENVIRONMENT` to that exact workspace
+  `.venv`, prepend its `Scripts` directory on Windows (or `bin` on POSIX) to
+  `PATH`, and set the working directory to `{workspace_path}`. Prefer the exact
+  workspace `.venv` Python executable and verify `sys.prefix` resolves inside it;
+  never target the canonical checkout's inherited environment.
 - Before edits, record `get_problems` baselines for target files that exist. After
   edits, run `get_problems` on every changed file using its exact physical workspace
   path. A zero-file or unavailable analysis is inconclusive, not clean; never inspect
