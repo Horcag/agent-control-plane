@@ -92,6 +92,14 @@ Mandatory execution rules:
   Record a pre-edit diagnostic baseline for intended existing targets and
   compare it with the final result. A zero-file or unavailable analysis is
   inconclusive, not clean.
+- Every diagnostic claim must refer to the exact changed physical file under
+  `{workspace_path}`. Never inspect the canonical checkout or another slot as a
+  proxy. If native IDEA diagnostics reject an attached external workspace,
+  record the exact failure and treat that check as inconclusive; canonical-file
+  findings are not evidence for the assigned workspace.
+- When the brief makes exact IDEA diagnostics a completion condition, an
+  inconclusive external-workspace diagnostic requires Status: partial or
+  Status: blocked even if terminal linters and tests pass.
 - Use `mcp__idea__reformat_file` only for changed files. Do not mass-format,
   suppress diagnostics, or rewrite unrelated code.
 - Run the narrowest existing tests, linters, type checks, and format checks through
