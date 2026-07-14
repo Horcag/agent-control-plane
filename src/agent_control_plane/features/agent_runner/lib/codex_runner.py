@@ -5,6 +5,7 @@ import subprocess  # nosec B404
 import time
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import TextIO
 
 from agent_control_plane.features.agent_runner.lib.codex_output import CodexOutputCapture
@@ -48,6 +49,7 @@ class CodexExecRunner:
                 proc = subprocess.Popen(  # nosec B603
                     command,
                     cwd=str(spec.workspace_path),
+                    env=_workspace_environment(spec.workspace_path),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=log,
@@ -156,3 +158,40 @@ def _creation_flags() -> int:
         "CREATE_NO_WINDOW",
         0,
     )
+
+
+def _workspace_environment(workspace_path: Path) -> dict[str, str]:
+    """Isolate a worker from the controller's active Python environment."""
+
+    environment = os.environ.copy()
+    inherited_virtual_env = environment.pop("VIRTUAL_ENV", None)
+    environment.pop("UV_PYTHON", None)
+    environment.pop("UV_PROJECT_ENVIRONMENT", None)
+    environment.pop("PYTHONHOME", None)
+    environment.pop("CONDA_PREFIX", None)
+
+    path_entries = environment.get("PATH", "").split(os.pathsep)
+    if inherited_virtual_env:
+        inherited_scripts = _virtual_environment_scripts(Path(inherited_virtual_env))
+        inherited_key = os.path.normcase(os.path.normpath(str(inherited_scripts)))
+        path_entries = [
+            entry
+            for entry in path_entries
+            if os.path.normcase(os.path.normpath(entry)) != inherited_key
+        ]
+
+    local_virtual_env = workspace_path / ".venv"
+    if local_virtual_env.is_dir():
+        local_scripts = _virtual_environment_scripts(local_virtual_env)
+        environment["VIRTUAL_ENV"] = str(local_virtual_env)
+        environment["UV_PROJECT_ENVIRONMENT"] = str(local_virtual_env)
+        path_entries.insert(0, str(local_scripts))
+
+    environment["PATH"] = os.pathsep.join(path_entries)
+    return environment
+
+
+def _virtual_environment_scripts(virtual_env: Path) -> Path:
+    """Return the executable directory for a platform virtual environment."""
+
+    return virtual_env / ("Scripts" if os.name == "nt" else "bin")

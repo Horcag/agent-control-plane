@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agent_control_plane.features.agent_runner.lib.codex_process_monitor import (
     CodexProcessMonitor,
 )
-from agent_control_plane.features.agent_runner.lib.codex_runner import CodexExecRunner
+from agent_control_plane.features.agent_runner.lib.codex_runner import (
+    CodexExecRunner,
+    _workspace_environment,
+)
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     dirty_file_markers_from_porcelain,
     porcelain_changed_path,
@@ -17,6 +22,61 @@ from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
 
 
 class CodexRunnerCommandTest(unittest.TestCase):
+    def test_workspace_environment_uses_slot_virtual_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "slot"
+            local_virtual_env = workspace / ".venv"
+            local_scripts = local_virtual_env / ("Scripts" if os.name == "nt" else "bin")
+            local_scripts.mkdir(parents=True)
+            inherited_virtual_env = root / "controller-venv"
+            inherited_scripts = inherited_virtual_env / ("Scripts" if os.name == "nt" else "bin")
+            base_path = str(root / "bin")
+            inherited_path = os.pathsep.join((str(inherited_scripts), base_path))
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": inherited_path,
+                    "VIRTUAL_ENV": str(inherited_virtual_env),
+                    "UV_PYTHON": "3.12",
+                    "UV_PROJECT_ENVIRONMENT": str(inherited_virtual_env),
+                    "PYTHONHOME": str(root / "python-home"),
+                    "CONDA_PREFIX": str(root / "conda"),
+                },
+                clear=True,
+            ):
+                environment = _workspace_environment(workspace)
+
+            self.assertEqual(environment["VIRTUAL_ENV"], str(local_virtual_env))
+            self.assertEqual(environment["UV_PROJECT_ENVIRONMENT"], str(local_virtual_env))
+            self.assertNotIn("UV_PYTHON", environment)
+            self.assertNotIn("PYTHONHOME", environment)
+            self.assertNotIn("CONDA_PREFIX", environment)
+            self.assertEqual(environment["PATH"].split(os.pathsep)[0], str(local_scripts))
+            self.assertNotIn(str(inherited_scripts), environment["PATH"].split(os.pathsep))
+
+    def test_workspace_environment_clears_inherited_virtual_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace-without-venv"
+            workspace.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": "base-bin",
+                    "VIRTUAL_ENV": "controller-venv",
+                    "UV_PYTHON": "3.12",
+                    "UV_PROJECT_ENVIRONMENT": "controller-venv",
+                },
+                clear=True,
+            ):
+                environment = _workspace_environment(workspace)
+
+            self.assertNotIn("VIRTUAL_ENV", environment)
+            self.assertNotIn("UV_PYTHON", environment)
+            self.assertNotIn("UV_PROJECT_ENVIRONMENT", environment)
+            self.assertEqual(environment["PATH"], "base-bin")
+
     def test_build_command_uses_exec_with_configured_writable_sandbox(self) -> None:
         spec = _spec(read_only=False, yolo=False, codex_sandbox_mode="workspace-write")
 
