@@ -395,6 +395,7 @@ def is_agy_quota_failure(text: str) -> bool:
         "resource_exhausted" in normalized
         or "quota exceeded" in normalized
         or "quota has been exceeded" in normalized
+        or "quota reached" in normalized
         or ("429" in normalized and "quota" in normalized)
     )
 

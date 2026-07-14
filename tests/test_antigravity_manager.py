@@ -115,6 +115,11 @@ class AntigravityManagerAdapterTest(unittest.TestCase):
     def test_quota_failure_detection_is_specific(self) -> None:
         self.assertTrue(is_agy_quota_failure("RESOURCE_EXHAUSTED 429 quota exceeded"))
         self.assertTrue(is_agy_quota_failure("status=429; quota has been exceeded"))
+        self.assertTrue(
+            is_agy_quota_failure(
+                "Individual quota reached. Please upgrade your subscription. Resets in 17m13s."
+            )
+        )
         self.assertFalse(is_agy_quota_failure("agy exited without writing result.md"))
 
 

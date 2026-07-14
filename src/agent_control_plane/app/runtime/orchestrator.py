@@ -1687,6 +1687,13 @@ class AgentControlPlane:
         status = getattr(result, "status", "unknown")
         message = getattr(result, "message", "no runner message")
         exit_code = getattr(result, "exit_code", None)
+        if job.backend == AGY_BACKEND:
+            try:
+                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                log_text = ""
+            if is_agy_quota_failure(log_text):
+                message = f"agy quota exhausted before result creation; detector_reason={message}"
         return (
             f"{job.backend} exited without writing a valid result file. "
             f"job_id={job.job_id}; task_id={job.task_id}; runner_status={status}; "
