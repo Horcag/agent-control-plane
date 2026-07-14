@@ -145,6 +145,12 @@ and SQLite record.
 A backend is the runner implementation. Use `codex` for `codex exec` and `agy` for the
 Antigravity CLI.
 
+For AGY jobs that must edit managed slots outside the open IDEA base directory, set
+`agy_mcp_server` on the route to the AgentBridge server name from Antigravity's
+`User/mcp.json` (for example, `agentbridge-ide`). ACP then requires exact workspace
+paths through AgentBridge and forbids junction/symlink aliases. Without this setting,
+AGY keeps the legacy native `idea` MCP contract for compatibility.
+
 ## Slot Workflow
 
 Create or synchronize slots after editing the config:

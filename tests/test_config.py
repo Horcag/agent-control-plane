@@ -76,6 +76,7 @@ codex_reasoning_effort = "medium"
 source_roots = [".", "backend/src", "frontend", "frontend/src", "scripts"]
 ide_sdk_name = "Python 3.12 (.venv)"
 ide_mcp_server = "reports_agentbridge_idea"
+agy_mcp_server = "agentbridge-ide"
 ide_mcp_project_root = "ide-project"
 test_roots = ["backend/tests", "frontend/tests"]
 exclude_dirs = ["dist", "frontend/build"]
@@ -174,6 +175,7 @@ path = "slots/reports-1"
                 config.routes["reports"].ide_mcp_server,
                 "reports_agentbridge_idea",
             )
+            self.assertEqual(config.routes["reports"].agy_mcp_server, "agentbridge-ide")
             self.assertEqual(
                 config.routes["reports"].ide_mcp_project_root,
                 (root / "ide-project").resolve(strict=False),

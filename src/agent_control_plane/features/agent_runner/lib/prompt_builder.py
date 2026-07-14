@@ -36,6 +36,16 @@ def build_task_prompt(
         else idea_project_root
     ).resolve(strict=False)
     if backend == AGY_BACKEND:
+        agy_mcp_server = (
+            route_config.agy_mcp_server
+            if route_config is not None and route_config.agy_mcp_server is not None
+            else "idea"
+        )
+        workspace_create_root = (
+            _idea_create_root(idea_edit_path, expected_idea_project_root)
+            if agy_mcp_server != "idea"
+            else "."
+        )
         return build_agy_task_prompt(
             task_id=task_id,
             route=route,
@@ -47,6 +57,8 @@ def build_task_prompt(
             routing_path=routing_path,
             brief_path=brief_path,
             expected_idea_project_root=expected_idea_project_root,
+            mcp_server=agy_mcp_server,
+            workspace_create_root=workspace_create_root,
             read_only=read_only,
         )
 

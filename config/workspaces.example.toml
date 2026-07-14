@@ -66,6 +66,10 @@ path = "../my-project"
 required_branch = "main"
 # Use a stable AgentBridge IDE/port ID from ~/.codex/config.toml.
 ide_mcp_server = "agentbridge_idea_8644"
+# Optional: MCP server name from Antigravity User/mcp.json. Configure an
+# AgentBridge server for AGY jobs that edit external managed slots; otherwise
+# the legacy native `idea` contract remains the default.
+agy_mcp_server = "agentbridge-ide"
 # This is the root returned by the selected server's get_project_info call.
 ide_mcp_project_root = "../my-project"
 worktree_root = "../agent-control-plane-worktrees"

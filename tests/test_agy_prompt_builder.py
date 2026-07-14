@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -127,6 +128,32 @@ class AgyPromptBuilderTest(unittest.TestCase):
             )
             self.assertIn("This is a read-only job", read_only_prompt)
             self.assertIn(f"Workspace path: {resolved_external_workspace}", read_only_prompt)
+
+            agentbridge_route = replace(
+                config.routes["dev"],
+                agy_mcp_server="agentbridge-ide",
+            )
+            agentbridge_config = replace(
+                config,
+                routes=MappingProxyType({"dev": agentbridge_route}),
+            )
+            agentbridge_prompt = build_task_prompt(
+                config=agentbridge_config,
+                task_id="agy-task",
+                route="dev",
+                workspace_path=external_workspace,
+                expected_branch="slot/external",
+                result_path=task_dir / "result.md",
+                backend="agy",
+            )
+
+            self.assertIn("AgentBridge MCP server `agentbridge-ide`", agentbridge_prompt)
+            self.assertIn("`get_project_info`", agentbridge_prompt)
+            self.assertIn("`git_status`", agentbridge_prompt)
+            self.assertIn("`edit_text`", agentbridge_prompt)
+            self.assertIn("dedicated `git_*` tools exclusively", agentbridge_prompt)
+            self.assertIn("Junctions, symlinks, directory links", agentbridge_prompt)
+            self.assertNotIn("mcp__idea__get_repositories", agentbridge_prompt)
 
 
 if __name__ == "__main__":

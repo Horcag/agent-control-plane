@@ -15,9 +15,28 @@ def build_agy_task_prompt(
     routing_path: Path,
     brief_path: Path,
     expected_idea_project_root: Path,
+    mcp_server: str = "idea",
+    workspace_create_root: str = ".",
     read_only: bool,
 ) -> str:
-    """Build the AGY prompt for JetBrains' native `idea` MCP contract."""
+    """Build the AGY prompt for the configured JetBrains MCP contract."""
+
+    if mcp_server != "idea":
+        return _build_agentbridge_task_prompt(
+            task_id=task_id,
+            route=route,
+            workspace_path=workspace_path,
+            workspace_create_root=workspace_create_root,
+            expected_branch=expected_branch,
+            result_path=result_path,
+            progress_path=progress_path,
+            protocol_path=protocol_path,
+            routing_path=routing_path,
+            brief_path=brief_path,
+            expected_idea_project_root=expected_idea_project_root,
+            mcp_server=mcp_server,
+            read_only=read_only,
+        )
 
     access_rule = (
         "- This is a read-only job. Repository writes, Git mutations, commits, and pushes are forbidden."
@@ -61,6 +80,9 @@ Mandatory execution rules:
 - The assigned workspace may be physically outside the host project directory
   when IDEA has attached it as a VCS/module root. Physical containment neither
   grants nor proves access; the exact repository-root canary above is mandatory.
+- Junctions, symlinks, directory links, reparse points, aliases, and canonical-root
+  proxy paths are forbidden. If a native IDEA operation rejects the exact assigned
+  workspace, report the failure and stop instead of constructing a path workaround.
 - After the canary succeeds, call `mcp__idea__read_file` directly for
   `{protocol_path}`, with `projectPath="{expected_idea_project_root}"`.
   Registered tools are available directly; do not use `call_mcp_tool` wrappers.
@@ -120,6 +142,108 @@ Mandatory execution rules:
   post-commit status through the native IDEA MCP terminal. Never push.
 - Always write `{result_path}` before stopping, including on failure,
   interruption, or partial completion. Never finish with terminal output alone.
+
+Mandatory result file format:
+- Start with exactly one of: Status: completed, Status: partial, Status: blocked.
+- Include: Changed files, What changed, Verification performed,
+  Not verified / remaining risks.
+- State the exact physical workspace, branch, and HEAD/commit SHA.
+- If blocked or partial, include the exact blocker and next concrete action.
+"""
+
+
+def _build_agentbridge_task_prompt(
+    *,
+    task_id: str,
+    route: str,
+    workspace_path: Path,
+    workspace_create_root: str,
+    expected_branch: str,
+    result_path: Path,
+    progress_path: Path,
+    protocol_path: Path,
+    routing_path: Path,
+    brief_path: Path,
+    expected_idea_project_root: Path,
+    mcp_server: str,
+    read_only: bool,
+) -> str:
+    access_rule = (
+        "- This is a read-only job. Repository writes, Git mutations, commits, and pushes are forbidden."
+        if read_only
+        else "- Repository writes are allowed only under the assigned workspace and only when required by the brief."
+    )
+
+    return f"""Task ID: {task_id}
+Workspace route: {route}
+Workspace path: {workspace_path}
+AgentBridge create root: {workspace_create_root}
+Expected IDEA host project root: {expected_idea_project_root}
+Expected branch: {expected_branch}
+
+Read before acting:
+- {protocol_path}
+- {routing_path}
+- {brief_path}
+
+Execute the task only in:
+- {workspace_path}
+
+Write the final result to:
+- {result_path}
+
+Maintain live progress/state in:
+- {progress_path}
+
+Mandatory execution rules:
+{access_rule}
+- Use only the configured AgentBridge MCP server `{mcp_server}` and its direct tools
+  for repository reads, edits, Git inspection, terminals, tests, formatting, and
+  diagnostics. Do not use the native `idea` server, DataSpell, another AgentBridge
+  instance, web search, hosted tools, raw shell tools, or MCP discovery wrappers.
+- The first MCP call must invoke `{mcp_server}` tool `get_project_info`. Require its
+  reported project Path, after normalizing separators and resolving it, to equal
+  exactly `{expected_idea_project_root}`. If it differs, write Status: blocked with
+  expected and actual roots, then stop before repository reads or writes.
+- After the project-root canary, invoke `git_status` and `git_log` with
+  `repo="{workspace_path}"`, then `read_file` on `{protocol_path}` and the remaining
+  required files. Use exact absolute physical paths for every existing repository
+  file; relative paths and another checkout are forbidden.
+- The first coordination write must update `{progress_path}` with Current phase,
+  Confirmed facts, Target files, Next action, Changed files, and Open risks.
+- Use path-scoped `rg` through `run_in_terminal` or narrowly scoped AgentBridge
+  searches. Project-wide searches across all indexed checkouts are forbidden.
+- Edit an existing repository file only through `edit_text` using its exact absolute
+  physical path under `{workspace_path}`. Re-read it immediately and inspect
+  `git_diff(repo="{workspace_path}")` after each coherent edit phase.
+- Create a new repository file only through `write_file` at a project-relative path
+  under `{workspace_create_root}`, then re-read its exact absolute path under
+  `{workspace_path}` and require `git_status(repo="{workspace_path}")` to show it.
+- Junctions, symlinks, directory links, reparse points, aliases, and canonical-root
+  proxy paths are forbidden. Never create one to expose an external workspace to the
+  IDE. If an exact AgentBridge operation rejects the assigned workspace, report the
+  failure and stop instead of constructing a path workaround.
+- Use dedicated `git_*` tools exclusively for Git. Terminal Git is forbidden. Never
+  stage, commit, switch branches, merge, rebase, reset, or push unless the brief
+  explicitly requests that exact mutation.
+- Reserve one terminal tab named exactly `{task_id}` for necessary commands. Reuse
+  and close that exact tab before finishing.
+- Before edits, record `get_problems` baselines for target files that exist. After
+  edits, run `get_problems` on every changed file using its exact physical workspace
+  path. A zero-file or unavailable analysis is inconclusive, not clean; never inspect
+  the canonical checkout or another slot as a proxy.
+- Verify current branch and HEAD before editing. Preserve inherited and unrelated
+  changes. Keep edits surgical; do not mass-format or broaden task scope.
+- Do not install or resolve dependencies, generate lockfiles, suppress diagnostics,
+  or weaken quality gates. Run only the narrowest existing checks required by the
+  brief through AgentBridge terminals.
+- Keep discovery bounded. After at most three focused read/search rounds, record the
+  exact target files and plan or return a precise partial/blocked result.
+- If any tool rejects the exact workspace twice, or a route-root/forbidden artifact
+  appears, stop and write Status: partial or Status: blocked. Do not devise an alias,
+  junction, copy, or shell-write workaround.
+- Always write `{result_path}` before stopping, including on failure, interruption,
+  or partial completion. Never finish with terminal output alone.
 
 Mandatory result file format:
 - Start with exactly one of: Status: completed, Status: partial, Status: blocked.

@@ -28,6 +28,7 @@ class RouteConfig:
     ide_sdk_name: str | None = None
     ide_sdk_type: str = "Python SDK"
     ide_mcp_server: str | None = None
+    agy_mcp_server: str | None = None
     ide_mcp_project_root: Path | None = None
     backend: str | None = None
     codex_model: str | None = None
@@ -276,6 +277,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             ide_sdk_name=_optional_string_value(value.get("ide_sdk_name")),
             ide_sdk_type=_string_value(value.get("ide_sdk_type", "Python SDK")),
             ide_mcp_server=_optional_string_value(value.get("ide_mcp_server")),
+            agy_mcp_server=_optional_string_value(value.get("agy_mcp_server")),
             ide_mcp_project_root=_optional_path(
                 value,
                 "ide_mcp_project_root",

@@ -273,6 +273,7 @@ class AgentControlPlane:
                     "codex_reasoning_effort": (
                         route.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
                     ),
+                    "agy_mcp_server": route.agy_mcp_server or "idea",
                     "worktree_root": str(route.worktree_root) if route.worktree_root else None,
                     "worktree_base": str(route.worktree_base),
                     "source_roots": [str(path) for path in route.source_roots],
