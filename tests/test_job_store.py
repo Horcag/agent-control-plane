@@ -17,6 +17,7 @@ class JobStoreTest(unittest.TestCase):
             self.assertEqual(job.job_id, "job-1")
             self.assertEqual(job.status, "created")
             self.assertEqual(job.backend, "codex")
+            self.assertEqual(job.agy_model, "Gemini 3.5 Flash (High)")
             self.assertEqual(job.codex_model, "gpt-5")
             self.assertEqual(job.codex_reasoning_effort, "low")
 
@@ -72,6 +73,7 @@ def _create_job(store: JobStore, root: Path, job_id: str):
         allow_dirty=False,
         read_only=False,
         backend="codex-spark",
+        agy_model="Gemini 3.5 Flash (High)",
         codex_model="gpt-5",
         codex_reasoning_effort="low",
     )

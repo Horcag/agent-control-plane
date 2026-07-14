@@ -25,6 +25,7 @@ slot_root = "slots"
 agy_command = "agy"
 
 [control.defaults]
+agy_model = "Gemini 3.5 Flash (Medium)"
 timeout_sec = 10
 idle_timeout_sec = 5
 print_timeout = "10s"
@@ -77,6 +78,7 @@ source_roots = [".", "backend/src", "frontend", "frontend/src", "scripts"]
 ide_sdk_name = "Python 3.12 (.venv)"
 ide_mcp_server = "reports_agentbridge_idea"
 agy_mcp_server = "agentbridge-ide"
+agy_model = "Gemini 3.5 Flash (High)"
 ide_mcp_project_root = "ide-project"
 test_roots = ["backend/tests", "frontend/tests"]
 exclude_dirs = ["dist", "frontend/build"]
@@ -104,6 +106,7 @@ path = "slots/reports-1"
             self.assertTrue(config.defaults.prepare_slots)
             self.assertEqual(config.codex_command, "codex")
             self.assertEqual(config.defaults.backend, "codex")
+            self.assertEqual(config.defaults.agy_model, "Gemini 3.5 Flash (Medium)")
             self.assertEqual(config.defaults.codex_model, "gpt-5")
             self.assertEqual(config.defaults.codex_reasoning_effort, "low")
             self.assertEqual(config.defaults.codex_sandbox_mode, "workspace-write")
@@ -176,6 +179,7 @@ path = "slots/reports-1"
                 "reports_agentbridge_idea",
             )
             self.assertEqual(config.routes["reports"].agy_mcp_server, "agentbridge-ide")
+            self.assertEqual(config.routes["reports"].agy_model, "Gemini 3.5 Flash (High)")
             self.assertEqual(
                 config.routes["reports"].ide_mcp_project_root,
                 (root / "ide-project").resolve(strict=False),

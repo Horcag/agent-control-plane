@@ -29,6 +29,7 @@ class RouteConfig:
     ide_sdk_type: str = "Python SDK"
     ide_mcp_server: str | None = None
     agy_mcp_server: str | None = None
+    agy_model: str | None = None
     ide_mcp_project_root: Path | None = None
     backend: str | None = None
     codex_model: str | None = None
@@ -69,6 +70,7 @@ class ControlDefaults:
     auto_archive_days: int | None = None
     auto_archive_limit: int = 200
     backend: str = CODEX_BACKEND
+    agy_model: str | None = None
     codex_model: str = "gpt-5"
     codex_reasoning_effort: str = "low"
     codex_sandbox_mode: str = "workspace-write"
@@ -175,6 +177,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             defaults_raw.get("auto_archive_limit", 200), "auto_archive_limit"
         ),
         backend=_backend_value(defaults_raw.get("backend", CODEX_BACKEND)),
+        agy_model=_optional_string_value(defaults_raw.get("agy_model")),
         codex_model=_string_value(defaults_raw.get("codex_model", "gpt-5")),
         codex_reasoning_effort=_string_value(defaults_raw.get("codex_reasoning_effort", "low")),
         codex_sandbox_mode=_codex_sandbox_mode_value(
@@ -278,6 +281,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             ide_sdk_type=_string_value(value.get("ide_sdk_type", "Python SDK")),
             ide_mcp_server=_optional_string_value(value.get("ide_mcp_server")),
             agy_mcp_server=_optional_string_value(value.get("agy_mcp_server")),
+            agy_model=_optional_string_value(value.get("agy_model")),
             ide_mcp_project_root=_optional_path(
                 value,
                 "ide_mcp_project_root",

@@ -20,6 +20,7 @@ from agent_control_plane.shared.clock import utc_now
 
 JOB_COLUMNS = {
     "status",
+    "agy_model",
     "codex_model",
     "codex_reasoning_effort",
     "codex_tool_call_budget",
@@ -56,6 +57,7 @@ class JobRecord:
     runner_pid: int | None
     agy_pid: int | None
     backend: str
+    agy_model: str | None
     codex_model: str | None
     codex_reasoning_effort: str | None
     codex_quality_tier: str | None
@@ -102,6 +104,7 @@ class JobStore:
                     runner_pid integer,
                     agy_pid integer,
                     backend text not null default 'agy',
+                    agy_model text,
                     codex_model text,
                     codex_reasoning_effort text,
                     codex_quality_tier text,
@@ -170,6 +173,7 @@ class JobStore:
         allow_dirty: bool,
         read_only: bool,
         backend: str = AGY_BACKEND,
+        agy_model: str | None = None,
         codex_model: str | None = None,
         codex_reasoning_effort: str | None = None,
         codex_quality_tier: str | None = None,
@@ -193,12 +197,13 @@ class JobStore:
                 insert into jobs (
                     job_id, task_id, route, workspace_path, expected_branch, status,
                     config_path, run_dir, prompt_path, result_path,
-                    backend, codex_model, codex_reasoning_effort, codex_quality_tier,
+                    backend, agy_model, codex_model, codex_reasoning_effort,
+                    codex_quality_tier,
                     codex_tool_call_budget,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
                     print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -212,6 +217,7 @@ class JobStore:
                     str(prompt_path),
                     str(result_path),
                     backend,
+                    agy_model,
                     codex_model,
                     codex_reasoning_effort,
                     codex_quality_tier,
@@ -419,6 +425,8 @@ class JobStore:
             db.execute("alter table jobs add column runner_pid integer")
         if "backend" not in columns:
             db.execute("alter table jobs add column backend text not null default 'agy'")
+        if "agy_model" not in columns:
+            db.execute("alter table jobs add column agy_model text")
         if "codex_model" not in columns:
             db.execute("alter table jobs add column codex_model text")
         if "codex_reasoning_effort" not in columns:
@@ -478,6 +486,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         runner_pid=row["runner_pid"],
         agy_pid=row["agy_pid"],
         backend=normalize_backend(row["backend"]),
+        agy_model=row["agy_model"],
         codex_model=row["codex_model"],
         codex_reasoning_effort=row["codex_reasoning_effort"],
         codex_quality_tier=row["codex_quality_tier"],

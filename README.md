@@ -85,6 +85,7 @@ codex_command = "codex"
 
 [control.defaults]
 backend = "codex"
+agy_model = "Gemini 3.5 Flash (High)"
 codex_model = "gpt-5.6-terra"
 codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
@@ -144,6 +145,11 @@ and SQLite record.
 
 A backend is the runner implementation. Use `codex` for `codex exec` and `agy` for the
 Antigravity CLI.
+
+Set `agy_model` in `[control.defaults]` or on a route when Antigravity must use an
+explicit model. A job-level `--agy-model` override has highest priority. ACP persists
+the resolved model and passes it to `agy --model`, so quota failures and imported
+usage can be attributed to the model that actually ran.
 
 For AGY jobs that must edit managed slots outside the open IDEA base directory, set
 `agy_mcp_server` on the route to the AgentBridge server name from Antigravity's

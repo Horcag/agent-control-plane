@@ -8,7 +8,11 @@ from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec,
 
 class PtyRunnerCommandTest(unittest.TestCase):
     def test_build_command_uses_non_interactive_print_mode(self) -> None:
-        spec = _spec(prompt="do the task", yolo=True)
+        spec = _spec(
+            prompt="do the task",
+            yolo=True,
+            agy_model="Gemini 3.5 Flash (High)",
+        )
 
         command = PtyAgyRunner._build_command(spec)
 
@@ -17,6 +21,8 @@ class PtyRunnerCommandTest(unittest.TestCase):
             [
                 "agy",
                 "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.5 Flash (High)",
                 "--print",
                 "do the task",
                 "--print-timeout",
@@ -26,11 +32,18 @@ class PtyRunnerCommandTest(unittest.TestCase):
         self.assertNotIn("--prompt-interactive", command)
 
     def test_display_command_redacts_prompt(self) -> None:
-        spec = _spec(prompt="secret prompt", yolo=False)
+        spec = _spec(
+            prompt="secret prompt",
+            yolo=False,
+            agy_model="Gemini 3.5 Flash (High)",
+        )
 
         display = PtyAgyRunner._display_command(spec)
 
-        self.assertEqual(display, "agy --print <prompt> --print-timeout 10s")
+        self.assertEqual(
+            display,
+            "agy --model Gemini 3.5 Flash (High) --print <prompt> --print-timeout 10s",
+        )
         self.assertNotIn("secret prompt", display)
 
     def test_detects_workspace_trust_prompt(self) -> None:
@@ -55,7 +68,7 @@ class PtyRunnerCommandTest(unittest.TestCase):
         self.assertIsNone(message)
 
 
-def _spec(*, prompt: str, yolo: bool) -> AgyRunSpec:
+def _spec(*, prompt: str, yolo: bool, agy_model: str | None = None) -> AgyRunSpec:
     return AgyRunSpec(
         backend="agy",
         agy_command="agy",
@@ -73,6 +86,7 @@ def _spec(*, prompt: str, yolo: bool) -> AgyRunSpec:
         idle_timeout_sec=10,
         yolo=yolo,
         read_only=False,
+        agy_model=agy_model,
     )
 
 

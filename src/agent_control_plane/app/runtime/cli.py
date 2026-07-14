@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
                     task_id=args.task_id,
                     route=args.route,
                     backend=args.backend,
+                    agy_model=args.agy_model,
                     codex_model=args.codex_model,
                     codex_reasoning_effort=args.codex_reasoning_effort,
                     codex_quality_tier=args.codex_quality_tier,
@@ -299,6 +300,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--task-id", required=True)
     start.add_argument("--route", required=True)
     start.add_argument("--backend", choices=SUPPORTED_BACKENDS)
+    start.add_argument("--agy-model", help="Antigravity model to use when --backend=agy")
     start.add_argument("--codex-model", help="Model to use when --backend=codex")
     start.add_argument(
         "--codex-reasoning-effort",
@@ -671,6 +673,7 @@ def _job_payload(job: Any) -> dict[str, Any]:
         "prompt_path": str(job.prompt_path),
         "result_path": str(job.result_path),
         "backend": job.backend,
+        "agy_model": job.agy_model,
         "codex_model": job.codex_model,
         "codex_reasoning_effort": job.codex_reasoning_effort,
         "codex_quality_tier": job.codex_quality_tier,

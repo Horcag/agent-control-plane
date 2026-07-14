@@ -140,6 +140,8 @@ class PtyAgyRunner:
         command = [spec.agy_command]
         if spec.yolo:
             command.append("--dangerously-skip-permissions")
+        if spec.agy_model:
+            command.extend(["--model", spec.agy_model])
         command.extend(["--print", spec.prompt, "--print-timeout", spec.print_timeout])
         return command
 
@@ -148,6 +150,8 @@ class PtyAgyRunner:
         command = [spec.agy_command]
         if spec.yolo:
             command.append("--dangerously-skip-permissions")
+        if spec.agy_model:
+            command.extend(["--model", spec.agy_model])
         command.extend(["--print", "<prompt>", "--print-timeout", spec.print_timeout])
         return " ".join(command)
 

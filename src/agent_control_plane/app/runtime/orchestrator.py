@@ -101,6 +101,7 @@ class StartOptions:
     task_id: str
     route: str
     backend: str | None = None
+    agy_model: str | None = None
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_quality_tier: str | None = None
@@ -217,6 +218,7 @@ class AgentControlPlane:
             "agy_on_path": shutil.which(self.config.agy_command),
             "codex_on_path": shutil.which(self.config.codex_command),
             "default_backend": self.config.defaults.backend,
+            "agy_model": self.config.defaults.agy_model,
             "codex_model": self.config.defaults.codex_model,
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
@@ -269,6 +271,7 @@ class AgentControlPlane:
                     "exists": route.path.exists(),
                     "required_branch": route.required_branch,
                     "backend": route.backend or self.config.defaults.backend,
+                    "agy_model": route.agy_model or self.config.defaults.agy_model,
                     "codex_model": route.codex_model or self.config.defaults.codex_model,
                     "codex_reasoning_effort": (
                         route.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
@@ -382,6 +385,14 @@ class AgentControlPlane:
             route_config.backend,
             self.config.defaults.backend,
         )
+        normalized_backend = normalize_backend(backend)
+        if options.agy_model is not None and normalized_backend != AGY_BACKEND:
+            raise PolicyError("--agy-model can only be used with the agy backend")
+        agy_model = (
+            options.agy_model or route_config.agy_model or self.config.defaults.agy_model
+            if normalized_backend == AGY_BACKEND
+            else None
+        )
         explicit_codex_profile = any(
             value is not None
             for value in (
@@ -392,28 +403,31 @@ class AgentControlPlane:
             )
         )
         codex_quality_tier: str | None = None
-        if normalize_backend(backend) == CODEX_BACKEND and not explicit_codex_profile:
-            codex_quality_tier = (
-                options.codex_quality_tier or self.config.defaults.codex_quality_tier
-            )
-            try:
-                initial_profile = self.model_routing.ladder_for_tier(codex_quality_tier)[0]
-            except ValueError as exc:
-                raise PolicyError(str(exc)) from exc
-            codex_model = initial_profile.model
-            codex_reasoning_effort = initial_profile.reasoning_effort
-        else:
-            codex_model = _option(
-                options.codex_model or route_config.codex_model,
-                self.config.defaults.codex_model,
-            )
-            codex_reasoning_effort = _option(
-                options.codex_reasoning_effort or route_config.codex_reasoning_effort,
-                self.config.defaults.codex_reasoning_effort,
-            )
+        codex_model: str | None = None
+        codex_reasoning_effort: str | None = None
+        if normalized_backend == CODEX_BACKEND:
+            if not explicit_codex_profile:
+                codex_quality_tier = (
+                    options.codex_quality_tier or self.config.defaults.codex_quality_tier
+                )
+                try:
+                    initial_profile = self.model_routing.ladder_for_tier(codex_quality_tier)[0]
+                except ValueError as exc:
+                    raise PolicyError(str(exc)) from exc
+                codex_model = initial_profile.model
+                codex_reasoning_effort = initial_profile.reasoning_effort
+            else:
+                codex_model = _option(
+                    options.codex_model or route_config.codex_model,
+                    self.config.defaults.codex_model,
+                )
+                codex_reasoning_effort = _option(
+                    options.codex_reasoning_effort or route_config.codex_reasoning_effort,
+                    self.config.defaults.codex_reasoning_effort,
+                )
 
         codex_tool_call_budget: int | None = None
-        if normalize_backend(backend) == CODEX_BACKEND:
+        if normalized_backend == CODEX_BACKEND:
             budget_tier = (
                 options.codex_quality_tier
                 or codex_quality_tier
@@ -467,6 +481,7 @@ class AgentControlPlane:
                 allow_dirty=allow_dirty,
                 read_only=options.read_only,
                 backend=backend,
+                agy_model=agy_model,
                 codex_model=codex_model,
                 codex_reasoning_effort=codex_reasoning_effort,
                 codex_quality_tier=codex_quality_tier,
@@ -593,11 +608,15 @@ class AgentControlPlane:
                 runner_pid=None,
                 agy_pid=None,
             )
+            attempt_profile = (
+                job.agy_model or "agy-default"
+                if normalize_backend(job.backend) == AGY_BACKEND
+                else f"{active_profile.model}/{active_profile.reasoning_effort}"
+            )
             self.store.add_event(
                 job_id,
                 "info",
-                f"Attempt {attempt_no} started with {active_profile.model}/"
-                f"{active_profile.reasoning_effort}",
+                f"Attempt {attempt_no} started with {attempt_profile}",
             )
             guardrail_message: str | None = None
             last_guardrail_check = 0.0
@@ -644,6 +663,7 @@ class AgentControlPlane:
                 AgentRunSpec(
                     backend=job.backend,
                     agy_command=self.config.agy_command,
+                    agy_model=job.agy_model,
                     codex_command=self.config.codex_command,
                     codex_model=active_profile.model,
                     codex_reasoning_effort=active_profile.reasoning_effort,
@@ -882,6 +902,7 @@ class AgentControlPlane:
             "workspace_path": str(job.workspace_path),
             "expected_branch": job.expected_branch,
             "backend": job.backend,
+            "agy_model": job.agy_model,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
@@ -929,6 +950,7 @@ class AgentControlPlane:
             "terminal": self._is_terminal(job),
             "last_error": job.last_error,
             "backend": job.backend,
+            "agy_model": job.agy_model,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
@@ -1063,6 +1085,7 @@ class AgentControlPlane:
             "terminal": self._is_terminal(job),
             "last_error": job.last_error,
             "backend": job.backend,
+            "agy_model": job.agy_model,
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,

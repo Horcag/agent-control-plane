@@ -23,6 +23,8 @@ runs_layout = "date"
 auto_archive_days = 14
 auto_archive_limit = 200
 backend = "codex"
+# Optional default Antigravity model. Override per route or with --agy-model.
+agy_model = "Gemini 3.5 Flash (High)"
 codex_model = "gpt-5.6-terra"
 codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
@@ -70,6 +72,8 @@ ide_mcp_server = "agentbridge_idea_8644"
 # AgentBridge server for AGY jobs that edit external managed slots; otherwise
 # the legacy native `idea` contract remains the default.
 agy_mcp_server = "agentbridge-ide"
+# Optional route-specific Antigravity model.
+agy_model = "Gemini 3.5 Flash (High)"
 # This is the root returned by the selected server's get_project_info call.
 ide_mcp_project_root = "../my-project"
 worktree_root = "../agent-control-plane-worktrees"

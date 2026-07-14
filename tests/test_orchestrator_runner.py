@@ -31,6 +31,44 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_agy_model_override_is_persisted_for_the_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-agy-model")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-agy-model",
+                        route="main",
+                        backend=AGY_BACKEND,
+                        agy_model="Gemini 3.5 Flash (High)",
+                    )
+                )
+
+            self.assertEqual(job.agy_model, "Gemini 3.5 Flash (High)")
+            self.assertIsNone(job.codex_model)
+            self.assertIsNone(job.codex_reasoning_effort)
+
+    def test_agy_model_override_is_rejected_for_codex_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-wrong-model-option")
+
+            with self.assertRaisesRegex(PolicyError, "agy-model"):
+                control.start_job(
+                    StartOptions(
+                        task_id="task-wrong-model-option",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        agy_model="Gemini 3.5 Flash (High)",
+                    )
+                )
+
     def test_start_job_initializes_codex_coordination_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
