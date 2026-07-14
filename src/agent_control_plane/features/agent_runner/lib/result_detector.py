@@ -5,15 +5,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 STATUS_PATTERNS = (
-    re.compile(r"(?im)^\s*Status\s*:\s*(completed|partial|blocked)\b"),
+    re.compile(r"(?im)^\s*Status\s*:\s*(completed|success|partial|blocked)\b"),
     re.compile(
         r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?(?:Status|Статус)(?:\*\*)?\s*:\s*"
-        r"(?:\*\*)?(completed|partial|blocked|завершено|частично|заблокировано)\b"
+        r"(?:\*\*)?(completed|success|partial|blocked|завершено|частично|заблокировано)\b"
     ),
-    re.compile(r"(?im)^\s*#+\s*Status\s*$[\s\r\n]+(completed|partial|blocked)\b"),
+    re.compile(r"(?im)^\s*#+\s*Status\s*$[\s\r\n]+(completed|success|partial|blocked)\b"),
 )
 
 STATUS_ALIASES = {
+    "success": "completed",
     "завершено": "completed",
     "частично": "partial",
     "заблокировано": "blocked",

@@ -23,6 +23,16 @@ class ResultDetectorTest(unittest.TestCase):
             self.assertTrue(state.done)
             self.assertEqual(state.status, "completed")
 
+    def test_normalizes_agy_success_status_to_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.md"
+            result.write_text("Status: success\n", encoding="utf-8")
+
+            state = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.status, "completed")
+
     def test_detects_markdown_heading_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.md"
