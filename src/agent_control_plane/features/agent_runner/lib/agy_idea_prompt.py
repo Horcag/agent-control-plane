@@ -58,6 +58,9 @@ Mandatory execution rules:
   Require the returned VCS roots to contain the exact normalized physical
   workspace `{workspace_path}`. If it does not, write Status: blocked with the
   actual roots and stop before reading or editing.
+- The assigned workspace may be physically outside the host project directory
+  when IDEA has attached it as a VCS/module root. Physical containment neither
+  grants nor proves access; the exact repository-root canary above is mandatory.
 - After the canary succeeds, call `mcp__idea__read_file` directly for
   `{protocol_path}`, with `projectPath="{expected_idea_project_root}"`.
   Registered tools are available directly; do not use `call_mcp_tool` wrappers.

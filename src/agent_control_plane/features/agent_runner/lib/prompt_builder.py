@@ -36,20 +36,10 @@ def build_task_prompt(
         else idea_project_root
     ).resolve(strict=False)
     if backend == AGY_BACKEND:
-        if not read_only:
-            try:
-                idea_edit_path.relative_to(expected_idea_project_root)
-            except ValueError as exc:
-                raise ValueError(
-                    "AGY native IDEA MCP write tools require the assigned workspace "
-                    f"to be inside the open IDEA project root; workspace={idea_edit_path}, "
-                    f"project_root={expected_idea_project_root}. Use Codex, relocate the "
-                    "slot under the project root, or run an explicitly read-only AGY task."
-                ) from exc
         return build_agy_task_prompt(
             task_id=task_id,
             route=route,
-            workspace_path=workspace_path,
+            workspace_path=idea_edit_path,
             expected_branch=expected_branch,
             result_path=result_path,
             progress_path=progress_path,

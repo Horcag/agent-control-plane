@@ -85,19 +85,26 @@ class AgyPromptBuilderTest(unittest.TestCase):
             self.assertNotIn("mcp__agentbridge_idea", prompt)
 
             external_workspace = root.parent / "external-slot"
-            with self.assertRaisesRegex(
-                ValueError,
-                "write tools require the assigned workspace",
-            ):
-                build_task_prompt(
-                    config=config,
-                    task_id="agy-task",
-                    route="dev",
-                    workspace_path=external_workspace,
-                    expected_branch="slot/external",
-                    result_path=task_dir / "result.md",
-                    backend="agy",
-                )
+            external_prompt = build_task_prompt(
+                config=config,
+                task_id="agy-task",
+                route="dev",
+                workspace_path=external_workspace,
+                expected_branch="slot/external",
+                result_path=task_dir / "result.md",
+                backend="agy",
+            )
+            resolved_external_workspace = external_workspace.resolve(strict=False)
+            self.assertIn(f"Workspace path: {resolved_external_workspace}", external_prompt)
+            self.assertIn(
+                "may be physically outside the host project directory",
+                external_prompt,
+            )
+            self.assertIn(
+                f"VCS roots to contain the exact normalized physical\n  workspace "
+                f"`{resolved_external_workspace}`",
+                external_prompt,
+            )
 
             read_only_prompt = build_task_prompt(
                 config=config,
@@ -110,7 +117,7 @@ class AgyPromptBuilderTest(unittest.TestCase):
                 read_only=True,
             )
             self.assertIn("This is a read-only job", read_only_prompt)
-            self.assertIn(f"Workspace path: {external_workspace}", read_only_prompt)
+            self.assertIn(f"Workspace path: {resolved_external_workspace}", read_only_prompt)
 
 
 if __name__ == "__main__":
