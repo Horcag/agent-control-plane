@@ -45,13 +45,21 @@ from agent_control_plane.features.antigravity_accounts import (
     is_agy_quota_failure,
 )
 from agent_control_plane.features.slot_lifecycle import (
+    RouteRootGuard,
+    RouteRootSnapshot,
     SlotError,
     SlotManager,
     bootstrap_slot_config,
 )
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig, load_config
-from agent_control_plane.shared.git_tools import GitError, diff_patch, workspace_state
+from agent_control_plane.shared.git_tools import (
+    GitError,
+    diff_patch,
+    head_commit,
+    workspace_snapshot,
+    workspace_state,
+)
 
 
 class PolicyError(RuntimeError):
@@ -71,6 +79,7 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 500
+ROUTE_ROOT_INDEX_GRACE_SEC = 15.0
 
 
 def _compact_status_preview(porcelain: str, *, limit: int = 8) -> str:
@@ -82,8 +91,8 @@ def _compact_status_preview(porcelain: str, *, limit: int = 8) -> str:
     return "; ".join(lines[:limit]) + f"; ... ({len(lines) - limit} more)"
 
 
-def _status_paths(porcelain: str) -> tuple[str, ...]:
-    paths: list[str] = []
+def _status_entries(porcelain: str) -> tuple[tuple[str, str], ...]:
+    entries: list[tuple[str, str]] = []
     for line in porcelain.splitlines():
         if len(line) < 4:
             continue
@@ -93,8 +102,12 @@ def _status_paths(porcelain: str) -> tuple[str, ...]:
         if len(path) >= 2 and path[0] == path[-1] == '"':
             path = path[1:-1]
         if path:
-            paths.append(path)
-    return tuple(paths)
+            entries.append((line[:2], path))
+    return tuple(entries)
+
+
+def _status_paths(porcelain: str) -> tuple[str, ...]:
+    return tuple(path for _status, path in _status_entries(porcelain))
 
 
 @dataclass(frozen=True)
@@ -129,7 +142,7 @@ class GuardrailBaseline:
 @dataclass(frozen=True)
 class WorkspaceDirtyBaseline:
     path: Path
-    fingerprints: dict[str, str]
+    guard: RouteRootGuard
 
 
 def _process_is_alive(pid: int | None) -> bool:
@@ -1517,16 +1530,42 @@ class AgentControlPlane:
         route_root = route_config.path.resolve(strict=False)
         if route_root == job.workspace_path.resolve(strict=False):
             return None
+
         try:
-            state = workspace_state(route_root)
+            snapshot = self._route_root_snapshot(route_root)
+            if not snapshot.stable:
+                snapshot = self._route_root_snapshot(route_root)
         except GitError:
-            return WorkspaceDirtyBaseline(path=route_root, fingerprints={})
+            return WorkspaceDirtyBaseline(
+                path=route_root,
+                guard=RouteRootGuard(head=None, entries={}),
+            )
+
         return WorkspaceDirtyBaseline(
             path=route_root,
-            fingerprints={
-                path: self._status_path_fingerprint(route_root, path)
-                for path in _status_paths(state.porcelain)
-            },
+            guard=RouteRootGuard(
+                head=snapshot.head,
+                entries=dict(snapshot.entries),
+            ),
+        )
+
+    def _route_root_snapshot(self, route_root: Path) -> RouteRootSnapshot:
+        git_snapshot = workspace_snapshot(route_root)
+        entries = {
+            path: (
+                status,
+                self._status_path_fingerprint(route_root, path),
+            )
+            for status, path in _status_entries(git_snapshot.porcelain)
+        }
+        stable = git_snapshot.stable
+        if stable:
+            stable = head_commit(route_root) == git_snapshot.head
+        return RouteRootSnapshot(
+            head=git_snapshot.head,
+            entries=entries,
+            porcelain=git_snapshot.porcelain,
+            stable=stable,
         )
 
     def _route_root_guardrail_message(
@@ -1537,22 +1576,20 @@ class AgentControlPlane:
         if baseline is None:
             return None
         try:
-            state = workspace_state(baseline.path)
+            snapshot = self._route_root_snapshot(baseline.path)
         except GitError as exc:
             return f"Route root guardrail could not inspect git status: {exc}"
 
-        changed: list[str] = []
-        for path in _status_paths(state.porcelain):
-            fingerprint = self._status_path_fingerprint(baseline.path, path)
-            previous = baseline.fingerprints.get(path)
-            if previous is None or previous != fingerprint:
-                changed.append(path)
-
+        changed = baseline.guard.evaluate(
+            snapshot,
+            now=time.monotonic(),
+            staged_grace_sec=ROUTE_ROOT_INDEX_GRACE_SEC,
+        )
         if not changed:
             return None
 
         status_path = job.run_dir / "route-root-guardrail-status.txt"
-        status_path.write_text(state.porcelain, encoding="utf-8")
+        status_path.write_text(snapshot.porcelain, encoding="utf-8")
         try:
             patch = diff_patch(baseline.path)
         except GitError as exc:

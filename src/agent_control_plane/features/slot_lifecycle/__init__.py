@@ -16,6 +16,10 @@ from agent_control_plane.features.slot_lifecycle.lib.ide_modules import (
     unload_slot_ide_module,
     unload_slot_root_ide_module,
 )
+from agent_control_plane.features.slot_lifecycle.lib.route_root_guard import (
+    RouteRootGuard,
+    RouteRootSnapshot,
+)
 from agent_control_plane.features.slot_lifecycle.lib.slot_manager import (
     CleanupDecision,
     SlotError,
@@ -40,6 +44,8 @@ __all__ = [
     "IdeModuleError",
     "IdeModuleResult",
     "RepoLayout",
+    "RouteRootGuard",
+    "RouteRootSnapshot",
     "SlotError",
     "SlotManager",
     "SlotPrepareError",
