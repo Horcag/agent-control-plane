@@ -112,6 +112,21 @@ class AntigravityManagerAdapterTest(unittest.TestCase):
         for marker in banned_markers:
             self.assertNotIn(marker, helper_text)
 
+    def test_helper_accepts_manager_prerelease_install_directories(self) -> None:
+        helper_path = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "agent_control_plane"
+            / "features"
+            / "antigravity_accounts"
+            / "lib"
+            / "antigravity_manager_helper.js"
+        )
+
+        helper_text = helper_path.read_text(encoding="utf-8")
+
+        self.assertIn(r"^app-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$", helper_text)
+
     def test_quota_failure_detection_is_specific(self) -> None:
         self.assertTrue(is_agy_quota_failure("RESOURCE_EXHAUSTED 429 quota exceeded"))
         self.assertTrue(is_agy_quota_failure("status=429; quota has been exceeded"))

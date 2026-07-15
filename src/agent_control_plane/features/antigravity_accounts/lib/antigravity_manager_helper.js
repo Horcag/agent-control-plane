@@ -146,7 +146,10 @@ async function refreshTokenIfNeeded(token, proxyUrl, enabled) {
 function findLatestAppDir(managerInstallRoot) {
   const entries = fs.readdirSync(managerInstallRoot, { withFileTypes: true });
   const candidates = entries
-    .filter((entry) => entry.isDirectory() && /^app-\d+\.\d+\.\d+$/.test(entry.name))
+    .filter(
+      (entry) =>
+        entry.isDirectory() && /^app-\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(entry.name)
+    )
     .map((entry) => path.join(managerInstallRoot, entry.name))
     .filter((dir) => fs.existsSync(path.join(dir, "resources", "app.asar")));
   if (candidates.length === 0) {
