@@ -304,7 +304,10 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--codex-model", help="Model to use when --backend=codex")
     start.add_argument(
         "--codex-reasoning-effort",
-        help="Codex reasoning effort to use when --backend=codex",
+        help=(
+            "Codex reasoning effort to use when --backend=codex; managed "
+            "Luna/Terra/Sol profiles accept none, low, medium, high, or xhigh"
+        ),
     )
     start.add_argument(
         "--codex-quality-tier",

@@ -147,6 +147,11 @@ jobs when four physical slots are free, while no more than two Sol-high jobs fit
 assignment remains exclusive. If a running job escalates to a heavier profile, ACP
 atomically resizes its lease and waits when the larger lease would exceed the budget.
 
+Managed Luna, Terra, and Sol profiles accept reasoning efforts `none`, `low`,
+`medium`, `high`, and `xhigh`. ACP rejects any other effort for those profiles
+before it creates a job record or launches a worker. Explicit custom model names remain
+pass-through because their supported effort set is backend-defined.
+
 ## Core Concepts
 
 A route is a named repository target. It declares the canonical repository path and the

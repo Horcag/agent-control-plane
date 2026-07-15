@@ -69,6 +69,30 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                     )
                 )
 
+    def test_unsupported_managed_codex_effort_is_rejected_before_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-unsupported-effort")
+
+            with (
+                patch.object(control, "_launch_worker", return_value=123) as launch,
+                self.assertRaisesRegex(PolicyError, "does not support reasoning effort 'minimal'"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="task-unsupported-effort",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        codex_model="gpt-5.6-luna",
+                        codex_reasoning_effort="minimal",
+                    )
+                )
+
+            launch.assert_not_called()
+            self.assertEqual(control.store.list_jobs(), [])
+
     def test_start_job_initializes_codex_coordination_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

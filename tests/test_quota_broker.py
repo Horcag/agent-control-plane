@@ -83,6 +83,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
         self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "high"), 6)
         self.assertEqual(codex_job_capacity_units("gpt-5.6-terra", "medium"), 10)
         self.assertEqual(codex_job_capacity_units("gpt-5.6-sol", "high"), 30)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "minimal"), 6)
         self.assertEqual(codex_job_capacity_units("unknown-model", "low"), 30)
 
     def test_rejects_a_zero_burst_limit(self) -> None:

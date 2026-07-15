@@ -20,12 +20,10 @@ _MODEL_CAPACITY_WEIGHTS = {
 }
 _REASONING_CAPACITY_WEIGHTS = {
     "none": 1,
-    "minimal": 1,
     "low": 1,
     "medium": 2,
     "high": 3,
     "xhigh": 3,
-    "max": 3,
 }
 
 

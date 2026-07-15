@@ -3,12 +3,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 QUALITY_TIERS = ("mechanical", "balanced", "deep")
+_MANAGED_CODEX_MODEL_FAMILIES = frozenset({"luna", "terra", "sol"})
+_MANAGED_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh")
 
 
 @dataclass(frozen=True)
 class ModelProfile:
     model: str
     reasoning_effort: str
+
+
+def _validated_profile(profile: ModelProfile) -> ModelProfile:
+    model = profile.model.strip()
+    effort = profile.reasoning_effort.strip().lower()
+    if not model:
+        raise ValueError("Codex model must not be empty")
+
+    family = model.lower().rsplit("-", maxsplit=1)[-1]
+    if family in _MANAGED_CODEX_MODEL_FAMILIES and effort not in _MANAGED_CODEX_REASONING_EFFORTS:
+        allowed = ", ".join(_MANAGED_CODEX_REASONING_EFFORTS)
+        raise ValueError(
+            f"Codex model {model!r} does not support reasoning effort {effort!r}. "
+            f"Expected one of: {allowed}"
+        )
+    if not effort:
+        raise ValueError("Codex reasoning effort must not be empty")
+    return ModelProfile(model=model, reasoning_effort=effort)
 
 
 class ModelRoutingPolicy:
@@ -34,8 +54,8 @@ class ModelRoutingPolicy:
             raise ValueError(
                 f"Unsupported quality tier {quality_tier!r}. Expected one of: {allowed}"
             )
-        first = self._profiles[tier]
-        deep = self._profiles["deep"]
+        first = _validated_profile(self._profiles[tier])
+        deep = _validated_profile(self._profiles["deep"])
         if first == deep:
             return (first,)
         return first, deep
@@ -45,7 +65,7 @@ class ModelRoutingPolicy:
         model: str,
         reasoning_effort: str,
     ) -> tuple[ModelProfile, ...]:
-        return (ModelProfile(model, reasoning_effort),)
+        return (_validated_profile(ModelProfile(model, reasoning_effort)),)
 
     @staticmethod
     def should_escalate(

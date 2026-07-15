@@ -428,6 +428,15 @@ class AgentControlPlane:
                     options.codex_reasoning_effort or route_config.codex_reasoning_effort,
                     self.config.defaults.codex_reasoning_effort,
                 )
+                try:
+                    explicit_profile = self.model_routing.ladder_for_explicit_model(
+                        codex_model,
+                        codex_reasoning_effort,
+                    )[0]
+                except ValueError as exc:
+                    raise PolicyError(str(exc)) from exc
+                codex_model = explicit_profile.model
+                codex_reasoning_effort = explicit_profile.reasoning_effort
 
         codex_tool_call_budget: int | None = None
         if normalized_backend == CODEX_BACKEND:
