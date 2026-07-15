@@ -35,6 +35,7 @@ from agent_control_plane.features.agent_runner import (
     PtyAgyRunner,
     QuotaDecision,
     build_task_prompt,
+    codex_job_capacity_units,
     inspect_result,
     normalize_backend,
 )
@@ -189,6 +190,7 @@ class AgentControlPlane:
             self.quota_broker = GlobalQuotaBroker(
                 defaults.codex_global_quota_database,
                 max_concurrent_jobs=defaults.codex_global_max_concurrent_jobs,
+                max_burst_jobs=defaults.codex_global_max_burst_jobs,
                 soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
                 rate_limit_reader=rate_limit_reader,
             )
@@ -242,6 +244,7 @@ class AgentControlPlane:
                     else None
                 ),
                 "max_concurrent_jobs": self.config.defaults.codex_global_max_concurrent_jobs,
+                "max_burst_jobs": self.config.defaults.codex_global_max_burst_jobs,
                 "five_hour_soft_limit_percent": (
                     self.config.defaults.codex_five_hour_soft_limit_percent
                 ),
@@ -747,6 +750,13 @@ class AgentControlPlane:
                     f"Escalating to {next_profile.model}/{next_profile.reasoning_effort}; "
                     f"resume_thread={resume_thread_id or 'unavailable'}",
                 )
+                if self.quota_broker is not None and not self._wait_for_codex_quota(
+                    job,
+                    next_profile,
+                ):
+                    message = "Cancel requested while waiting to resize global Codex quota"
+                    self._write_blocked_result_if_missing(job, message)
+                    return self._finish_job(job_id, "cancelled", message)
                 attempt_no += 1
                 continue
 
@@ -834,19 +844,36 @@ class AgentControlPlane:
             return self.model_routing.ladder_for_explicit_model(model, effort)
         return self.model_routing.ladder_for_tier(job.codex_quality_tier)
 
-    def _wait_for_codex_quota(self, job: JobRecord) -> bool:
+    def _wait_for_codex_quota(
+        self,
+        job: JobRecord,
+        profile: ModelProfile | None = None,
+    ) -> bool:
         broker = self.quota_broker
         if broker is None:
             return True
+        active_profile = profile or self._model_ladder_for_job(job)[0]
+        capacity_units = codex_job_capacity_units(
+            active_profile.model,
+            active_profile.reasoning_effort,
+        )
         last_reason: str | None = None
         while not self.store.cancel_requested(job.job_id):
-            decision = broker.try_acquire(job.job_id, worker_pid=os.getpid())
+            decision = broker.try_acquire(
+                job.job_id,
+                worker_pid=os.getpid(),
+                capacity_units=capacity_units,
+            )
             if decision.acquired:
                 self.store.update_job(job.job_id, status="running")
                 self.store.add_event(
                     job.job_id,
                     "info",
-                    f"Global Codex quota acquired; active_jobs={decision.active_jobs}",
+                    "Global Codex quota acquired for "
+                    f"{active_profile.model}/{active_profile.reasoning_effort}; "
+                    f"active_jobs={decision.active_jobs}, "
+                    f"capacity={decision.active_capacity_units}/"
+                    f"{decision.max_capacity_units}",
                 )
                 return True
             self.store.update_job(job.job_id, status="waiting_quota")
@@ -861,7 +888,10 @@ class AgentControlPlane:
 
     @staticmethod
     def _quota_wait_message(decision: QuotaDecision) -> str:
-        detail = f"active_jobs={decision.active_jobs}"
+        detail = (
+            f"active_jobs={decision.active_jobs}, "
+            f"capacity={decision.active_capacity_units}/{decision.max_capacity_units}"
+        )
         if decision.retry_after_sec is not None:
             detail += f", retry_after_sec={round(decision.retry_after_sec, 1)}"
         return f"Waiting for global Codex quota: {decision.reason or 'unavailable'} ({detail})"

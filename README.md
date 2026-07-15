@@ -93,6 +93,8 @@ allow_dirty = false
 yolo = false
 prepare_slots = true
 runs_layout = "date"
+codex_global_max_concurrent_jobs = 2
+codex_global_max_burst_jobs = 4
 
 [routes.app]
 path = "../my-project"
@@ -130,6 +132,20 @@ agent-control smoke --config .\config\workspaces.toml
 `smoke` initializes the SQLite database and reports configured routes, slot state,
 available runner commands, and run-archive settings. It does not send a prompt to any
 model.
+
+### Weighted Codex Concurrency
+
+`codex_global_max_concurrent_jobs` is a weighted capacity budget measured in
+Sol-high-equivalent slots, not a literal process limit. Each nominal concurrency unit
+supplies 30 capacity units. Luna, Terra, and Sol jobs consume fewer or more units
+according to the effective model and reasoning effort; unknown model names consume all
+30 units.
+
+`codex_global_max_burst_jobs` is the separate hard process-count limit and defaults to
+twice the weighted slot count. With the example values above, ACP may run four cheap Luna
+jobs when four physical slots are free, while no more than two Sol-high jobs fit. Slot
+assignment remains exclusive. If a running job escalates to a heavier profile, ACP
+atomically resizes its lease and waits when the larger lease would exceed the budget.
 
 ## Core Concepts
 

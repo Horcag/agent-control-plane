@@ -75,6 +75,29 @@ Luna exposes Light through Extra High. Terra also exposes Ultra on eligible acco
 The absence of Luna Ultra is meaningful: Ultra is an orchestration mode, not merely one
 more reasoning step.
 
+## Weighted Global Quota
+
+ACP prices concurrent Codex jobs in deterministic capacity units so cheap workers do
+not consume the same global allowance as expensive workers:
+
+| Effective profile | Low, minimal, or none | Medium | High, xhigh, or max |
+| --- | ---: | ---: | ---: |
+| Luna | 2 | 4 | 6 |
+| Terra | 5 | 10 | 15 |
+| Sol | 10 | 20 | 30 |
+
+`codex_global_max_concurrent_jobs` supplies 30 units per configured concurrency slot.
+`codex_global_max_burst_jobs` separately caps the number of worker processes and
+defaults to twice that value. For example, a capacity of two slots plus a burst limit
+of four admits up to four Luna workers when physical route slots are available, but
+only two Sol-high workers.
+
+The quota broker stores the effective weight in its SQLite lease. Acquiring or resizing
+a lease is one transaction, so simultaneous workers cannot oversubscribe the budget.
+A Luna job that escalates to Terra keeps its original lease and waits until the larger
+weight fits. Unknown model names are charged the full 30 units to fail closed. Physical
+slot ownership remains exclusive and can impose a lower limit than the global quota.
+
 ## Why Medium
 
 Public coding benchmarks compare model tiers, not this repository's exact prompts and

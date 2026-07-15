@@ -12,6 +12,33 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+FULL_CODEX_JOB_CAPACITY_UNITS = 30
+_MODEL_CAPACITY_WEIGHTS = {
+    "luna": 2,
+    "terra": 5,
+    "sol": 10,
+}
+_REASONING_CAPACITY_WEIGHTS = {
+    "none": 1,
+    "minimal": 1,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 3,
+    "max": 3,
+}
+
+
+def codex_job_capacity_units(model: str, reasoning_effort: str) -> int:
+    """Return weighted concurrency units; unknown models consume one full slot."""
+
+    family = model.strip().lower().rsplit("-", 1)[-1]
+    model_weight = _MODEL_CAPACITY_WEIGHTS.get(family)
+    if model_weight is None:
+        return FULL_CODEX_JOB_CAPACITY_UNITS
+    effort_weight = _REASONING_CAPACITY_WEIGHTS.get(reasoning_effort.strip().lower(), 3)
+    return min(FULL_CODEX_JOB_CAPACITY_UNITS, model_weight * effort_weight)
+
 
 @dataclass(frozen=True)
 class RateLimitSnapshot:
@@ -26,6 +53,8 @@ class QuotaDecision:
     reason: str | None
     active_jobs: int
     retry_after_sec: float | None = None
+    active_capacity_units: int = 0
+    max_capacity_units: int = 0
 
 
 class CodexRateLimitReader:
@@ -91,31 +120,57 @@ class GlobalQuotaBroker:
         database_path: Path,
         *,
         max_concurrent_jobs: int,
+        max_burst_jobs: int | None = None,
         soft_limit_percent: float = 100.0,
         rate_limit_reader: Callable[[], RateLimitSnapshot | None] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if max_concurrent_jobs <= 0:
             raise ValueError("max_concurrent_jobs must be positive")
+        effective_burst_jobs = (
+            max_burst_jobs if max_burst_jobs is not None else max_concurrent_jobs * 2
+        )
+        if effective_burst_jobs <= 0:
+            raise ValueError("max_burst_jobs must be positive")
+        if effective_burst_jobs < max_concurrent_jobs:
+            raise ValueError("max_burst_jobs must be at least max_concurrent_jobs")
         if not 0 < soft_limit_percent <= 100:
             raise ValueError("soft_limit_percent must be in (0, 100]")
         self.database_path = database_path
         self.max_concurrent_jobs = max_concurrent_jobs
+        self.max_burst_jobs = effective_burst_jobs
+        self.max_capacity_units = max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
         self.soft_limit_percent = soft_limit_percent
         self.rate_limit_reader = rate_limit_reader
         self.clock = clock
         self._initialize()
 
-    def try_acquire(self, job_id: str, *, worker_pid: int) -> QuotaDecision:
+    def try_acquire(
+        self,
+        job_id: str,
+        *,
+        worker_pid: int,
+        capacity_units: int = FULL_CODEX_JOB_CAPACITY_UNITS,
+    ) -> QuotaDecision:
         if worker_pid <= 0:
             raise ValueError("worker_pid must be positive")
+        if not 0 < capacity_units <= FULL_CODEX_JOB_CAPACITY_UNITS:
+            raise ValueError(f"capacity_units must be in [1, {FULL_CODEX_JOB_CAPACITY_UNITS}]")
         now = self.clock()
         snapshot = self.rate_limit_reader() if self.rate_limit_reader is not None else None
 
         with self._connect() as db:
             db.execute("begin immediate")
             self._reclaim_dead_leases(db)
-            active_jobs = int(db.execute("select count(*) from leases").fetchone()[0])
+            totals = db.execute(
+                """
+                select count(*)                         as active_jobs,
+                       coalesce(sum(capacity_units), 0) as active_capacity_units
+                from leases
+                """
+            ).fetchone()
+            active_jobs = int(totals["active_jobs"])
+            active_capacity_units = int(totals["active_capacity_units"])
 
             if (
                 snapshot is not None
@@ -127,37 +182,78 @@ class GlobalQuotaBroker:
                     reason="rate_limit_soft_cap",
                     active_jobs=active_jobs,
                     retry_after_sec=max(0.0, snapshot.resets_at - now),
+                    active_capacity_units=active_capacity_units,
+                    max_capacity_units=self.max_capacity_units,
                 )
 
             existing = db.execute(
-                "select worker_pid from leases where job_id = ?",
+                "select worker_pid, capacity_units from leases where job_id = ?",
                 (job_id,),
             ).fetchone()
             if existing is not None:
-                db.execute(
-                    "update leases set worker_pid = ?, heartbeat_at = ? where job_id = ?",
-                    (worker_pid, now, job_id),
+                resized_capacity_units = (
+                    active_capacity_units - int(existing["capacity_units"]) + capacity_units
                 )
-                return QuotaDecision(acquired=True, reason=None, active_jobs=active_jobs)
+                if resized_capacity_units > self.max_capacity_units:
+                    return QuotaDecision(
+                        acquired=False,
+                        reason="weighted_capacity_limit",
+                        active_jobs=active_jobs,
+                        active_capacity_units=active_capacity_units,
+                        max_capacity_units=self.max_capacity_units,
+                    )
+                db.execute(
+                    """
+                    update leases
+                    set worker_pid     = ?,
+                        heartbeat_at   = ?,
+                        capacity_units = ?
+                    where job_id = ?
+                    """,
+                    (worker_pid, now, capacity_units, job_id),
+                )
+                return QuotaDecision(
+                    acquired=True,
+                    reason=None,
+                    active_jobs=active_jobs,
+                    active_capacity_units=resized_capacity_units,
+                    max_capacity_units=self.max_capacity_units,
+                )
 
-            if active_jobs >= self.max_concurrent_jobs:
+            if active_jobs >= self.max_burst_jobs:
                 return QuotaDecision(
                     acquired=False,
-                    reason="concurrency_limit",
+                    reason="burst_job_limit",
                     active_jobs=active_jobs,
+                    active_capacity_units=active_capacity_units,
+                    max_capacity_units=self.max_capacity_units,
+                )
+            if active_capacity_units + capacity_units > self.max_capacity_units:
+                return QuotaDecision(
+                    acquired=False,
+                    reason="weighted_capacity_limit",
+                    active_jobs=active_jobs,
+                    active_capacity_units=active_capacity_units,
+                    max_capacity_units=self.max_capacity_units,
                 )
 
             db.execute(
                 """
-                insert into leases (job_id, worker_pid, acquired_at, heartbeat_at)
-                values (?, ?, ?, ?)
+                insert into leases (job_id,
+                                    worker_pid,
+                                    acquired_at,
+                                    heartbeat_at,
+                                    capacity_units)
+                values (?, ?, ?, ?, ?)
                 """,
-                (job_id, worker_pid, now, now),
+                (job_id, worker_pid, now, now, capacity_units),
             )
             return QuotaDecision(
                 acquired=True,
                 reason=None,
                 active_jobs=active_jobs + 1,
+                active_capacity_units=active_capacity_units + capacity_units,
+                max_capacity_units=self.max_capacity_units,
             )
 
     def release(self, job_id: str) -> None:
@@ -167,16 +263,26 @@ class GlobalQuotaBroker:
     def _initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
+            db.execute("begin immediate")
             db.execute(
-                """
+                f"""
                 create table if not exists leases (
                     job_id text primary key,
                     worker_pid integer not null,
                     acquired_at real not null,
-                    heartbeat_at real not null
+                    heartbeat_at real not null,
+                    capacity_units integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}
                 )
                 """
             )
+            columns = {
+                str(row["name"]) for row in db.execute("pragma table_info(leases)").fetchall()
+            }
+            if "capacity_units" not in columns:
+                db.execute(
+                    "alter table leases add column capacity_units "
+                    f"integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}"
+                )
 
     @staticmethod
     def _reclaim_dead_leases(db: sqlite3.Connection) -> None:

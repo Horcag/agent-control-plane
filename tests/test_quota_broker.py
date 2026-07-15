@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
     CodexRateLimitReader,
     GlobalQuotaBroker,
     RateLimitSnapshot,
+    codex_job_capacity_units,
 )
 
 
@@ -26,7 +28,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
 
             self.assertTrue(acquired.acquired)
             self.assertFalse(blocked.acquired)
-            self.assertEqual(blocked.reason, "concurrency_limit")
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
             self.assertEqual(blocked.active_jobs, 1)
 
     def test_reclaims_a_lease_owned_by_a_dead_worker(self) -> None:
@@ -76,6 +78,145 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             broker.release("job-1")
 
             self.assertTrue(broker.try_acquire("job-2", worker_pid=202).acquired)
+
+    def test_model_and_effort_map_to_stable_capacity_units(self) -> None:
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "high"), 6)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-terra", "medium"), 10)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-sol", "high"), 30)
+        self.assertEqual(codex_job_capacity_units("unknown-model", "low"), 30)
+
+    def test_rejects_a_zero_burst_limit(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            self.assertRaisesRegex(ValueError, "max_burst_jobs must be positive"),
+        ):
+            GlobalQuotaBroker(
+                Path(temp) / "global-quota.sqlite3",
+                max_concurrent_jobs=1,
+                max_burst_jobs=0,
+            )
+
+    def test_cheap_jobs_can_burst_past_nominal_full_cost_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            broker = GlobalQuotaBroker(
+                Path(temp) / "global-quota.sqlite3",
+                max_concurrent_jobs=2,
+                max_burst_jobs=4,
+            )
+            decisions = [
+                broker.try_acquire(
+                    f"luna-{index}",
+                    worker_pid=os.getpid(),
+                    capacity_units=codex_job_capacity_units("gpt-5.6-luna", "high"),
+                )
+                for index in range(4)
+            ]
+
+            self.assertTrue(all(decision.acquired for decision in decisions))
+            self.assertEqual(decisions[-1].active_jobs, 4)
+            self.assertEqual(decisions[-1].active_capacity_units, 24)
+            self.assertEqual(decisions[-1].max_capacity_units, 60)
+
+            blocked = broker.try_acquire(
+                "luna-5",
+                worker_pid=os.getpid(),
+                capacity_units=6,
+            )
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "burst_job_limit")
+
+    def test_expensive_jobs_fill_weighted_capacity_before_burst_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            broker = GlobalQuotaBroker(
+                Path(temp) / "global-quota.sqlite3",
+                max_concurrent_jobs=2,
+                max_burst_jobs=4,
+            )
+            self.assertTrue(
+                broker.try_acquire("sol-1", worker_pid=os.getpid(), capacity_units=30).acquired
+            )
+            self.assertTrue(
+                broker.try_acquire("sol-2", worker_pid=os.getpid(), capacity_units=30).acquired
+            )
+
+            blocked = broker.try_acquire("sol-3", worker_pid=os.getpid(), capacity_units=30)
+
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
+            self.assertEqual(blocked.active_jobs, 2)
+            self.assertEqual(blocked.active_capacity_units, 60)
+
+    def test_existing_lease_resizes_atomically_for_model_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            broker = GlobalQuotaBroker(
+                Path(temp) / "global-quota.sqlite3",
+                max_concurrent_jobs=1,
+                max_burst_jobs=2,
+            )
+            self.assertTrue(
+                broker.try_acquire("escalating", worker_pid=os.getpid(), capacity_units=6).acquired
+            )
+            self.assertTrue(
+                broker.try_acquire("other", worker_pid=os.getpid(), capacity_units=6).acquired
+            )
+
+            blocked = broker.try_acquire(
+                "escalating",
+                worker_pid=os.getpid(),
+                capacity_units=30,
+            )
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
+            self.assertEqual(blocked.active_capacity_units, 12)
+
+            broker.release("other")
+            resized = broker.try_acquire(
+                "escalating",
+                worker_pid=os.getpid(),
+                capacity_units=30,
+            )
+            self.assertTrue(resized.acquired)
+            self.assertEqual(resized.active_jobs, 1)
+            self.assertEqual(resized.active_capacity_units, 30)
+
+    def test_legacy_leases_migrate_as_full_cost_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            db = sqlite3.connect(database)
+            try:
+                db.execute(
+                    """
+                    create table leases
+                    (
+                        job_id       text primary key,
+                        worker_pid   integer not null,
+                        acquired_at  real    not null,
+                        heartbeat_at real    not null
+                    )
+                    """
+                )
+                db.execute(
+                    "insert into leases values (?, ?, ?, ?)",
+                    ("legacy-sol", os.getpid(), 1.0, 1.0),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+                max_burst_jobs=2,
+            )
+            blocked = broker.try_acquire(
+                "new-luna",
+                worker_pid=os.getpid(),
+                capacity_units=6,
+            )
+
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
+            self.assertEqual(blocked.active_capacity_units, 30)
 
 
 class CodexRateLimitReaderTest(unittest.TestCase):

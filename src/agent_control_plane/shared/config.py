@@ -89,6 +89,7 @@ class ControlDefaults:
     codex_deep_tool_call_budget: int = 120
     codex_global_quota_database: Path | None = None
     codex_global_max_concurrent_jobs: int = 2
+    codex_global_max_burst_jobs: int = 4
     codex_five_hour_soft_limit_percent: float = 75.0
     codex_quota_poll_sec: float = 30.0
     codex_sessions_root: Path | None = None
@@ -144,6 +145,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
     defaults_raw = control.get("defaults", {})
     if not isinstance(defaults_raw, dict):
         raise ValueError("[control.defaults] must be a table")
+    codex_global_max_concurrent_jobs = _positive_int(
+        defaults_raw.get("codex_global_max_concurrent_jobs", 2),
+        "codex_global_max_concurrent_jobs",
+    )
+    codex_global_max_burst_jobs = _positive_int(
+        defaults_raw.get(
+            "codex_global_max_burst_jobs",
+            codex_global_max_concurrent_jobs * 2,
+        ),
+        "codex_global_max_burst_jobs",
+    )
+    if codex_global_max_burst_jobs < codex_global_max_concurrent_jobs:
+        raise ValueError(
+            "codex_global_max_burst_jobs must be at least codex_global_max_concurrent_jobs"
+        )
 
     defaults = ControlDefaults(
         timeout_sec=int(defaults_raw.get("timeout_sec", 3600)),
@@ -227,10 +243,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             "codex_global_quota_database",
             project_root,
         ),
-        codex_global_max_concurrent_jobs=_positive_int(
-            defaults_raw.get("codex_global_max_concurrent_jobs", 2),
-            "codex_global_max_concurrent_jobs",
-        ),
+        codex_global_max_concurrent_jobs=codex_global_max_concurrent_jobs,
+        codex_global_max_burst_jobs=codex_global_max_burst_jobs,
         codex_five_hour_soft_limit_percent=_percent_value(
             defaults_raw.get("codex_five_hour_soft_limit_percent", 75.0),
             "codex_five_hour_soft_limit_percent",

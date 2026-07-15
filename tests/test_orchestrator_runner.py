@@ -135,6 +135,8 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 codex_quality_tier="mechanical",
             )
             runner = _CapacityThenCompletedRunner()
+            broker = _RecordingQuotaBroker()
+            control.quota_broker = broker  # type: ignore[assignment]
 
             with patch(
                 "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
@@ -154,6 +156,8 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             )
             self.assertIsNone(runner.specs[0].codex_resume_thread_id)
             self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-capacity")
+            self.assertEqual(broker.capacity_units, [2, 10])
+            self.assertEqual(broker.released_jobs, [job.job_id])
 
     def test_partial_deep_job_continues_same_model_on_same_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -209,6 +213,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             self.assertTrue(acquired)
             self.assertEqual(broker.calls, 2)
+            self.assertEqual(broker.capacity_units, [30, 30])
             self.assertEqual(control.store.get_job(job.job_id).status, "running")
 
     def test_read_only_slot_job_skips_ide_and_dependency_preparation(self) -> None:
@@ -542,19 +547,60 @@ class _PartialThenCompletedRunner:
         )
 
 
+class _RecordingQuotaBroker:
+    def __init__(self) -> None:
+        self.capacity_units: list[int] = []
+        self.released_jobs: list[str] = []
+
+    def try_acquire(
+        self,
+        _job_id: str,
+        *,
+        worker_pid: int,
+        capacity_units: int,
+    ) -> QuotaDecision:
+        self.capacity_units.append(capacity_units)
+        return QuotaDecision(
+            acquired=True,
+            reason=None,
+            active_jobs=1,
+            active_capacity_units=capacity_units,
+            max_capacity_units=60,
+        )
+
+    def release(self, job_id: str) -> None:
+        self.released_jobs.append(job_id)
+
+
 class _SequenceQuotaBroker:
     def __init__(self) -> None:
         self.calls = 0
+        self.capacity_units: list[int] = []
 
-    def try_acquire(self, _job_id: str, *, worker_pid: int) -> QuotaDecision:
+    def try_acquire(
+        self,
+        _job_id: str,
+        *,
+        worker_pid: int,
+        capacity_units: int,
+    ) -> QuotaDecision:
         self.calls += 1
+        self.capacity_units.append(capacity_units)
         if self.calls == 1:
             return QuotaDecision(
                 acquired=False,
-                reason="concurrency_limit",
+                reason="weighted_capacity_limit",
                 active_jobs=2,
+                active_capacity_units=60,
+                max_capacity_units=60,
             )
-        return QuotaDecision(acquired=True, reason=None, active_jobs=1)
+        return QuotaDecision(
+            acquired=True,
+            reason=None,
+            active_jobs=1,
+            active_capacity_units=capacity_units,
+            max_capacity_units=60,
+        )
 
 
 def _attempt_metrics(*, thread_id: str) -> AttemptMetrics:
