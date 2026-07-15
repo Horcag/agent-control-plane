@@ -88,9 +88,9 @@ not consume the same global allowance as expensive workers:
 
 `codex_global_max_concurrent_jobs` supplies 30 units per configured concurrency slot.
 `codex_global_max_burst_jobs` separately caps the number of worker processes and
-defaults to twice that value. For example, a capacity of two slots plus a burst limit
-of four admits up to four Luna workers when physical route slots are available, but
-only two Sol-high workers.
+defaults to four times that value. For example, a capacity of two slots plus a burst
+limit of eight admits up to eight Luna workers when physical route slots are available,
+but the weighted budget still admits only two Sol-high workers.
 
 The quota broker stores the effective weight in its SQLite lease. Acquiring or resizing
 a lease is one transaction, so simultaneous workers cannot oversubscribe the budget.

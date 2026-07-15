@@ -94,7 +94,7 @@ yolo = false
 prepare_slots = true
 runs_layout = "date"
 codex_global_max_concurrent_jobs = 2
-codex_global_max_burst_jobs = 4
+codex_global_max_burst_jobs = 8
 
 [routes.app]
 path = "../my-project"
@@ -141,10 +141,11 @@ supplies 30 capacity units. Luna, Terra, and Sol jobs consume fewer or more unit
 according to the effective model and reasoning effort; unknown model names consume all
 30 units.
 
-`codex_global_max_burst_jobs` is the separate hard process-count limit and defaults to
-twice the weighted slot count. With the example values above, ACP may run four cheap Luna
-jobs when four physical slots are free, while no more than two Sol-high jobs fit. Slot
-assignment remains exclusive. If a running job escalates to a heavier profile, ACP
+`codex_global_max_burst_jobs` is the separate hard process-count safety limit and
+defaults to four times the weighted slot count. With the example values above, ACP may run
+up to eight cheap Luna jobs when physical slots are free, while no more than two Sol-high
+jobs fit the weighted budget. Slot assignment remains exclusive. If a running job
+escalates to a heavier profile, ACP
 atomically resizes its lease and waits when the larger lease would exceed the budget.
 
 Managed Luna, Terra, and Sol profiles accept reasoning efforts `none`, `low`,

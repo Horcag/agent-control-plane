@@ -126,7 +126,7 @@ class GlobalQuotaBroker:
         if max_concurrent_jobs <= 0:
             raise ValueError("max_concurrent_jobs must be positive")
         effective_burst_jobs = (
-            max_burst_jobs if max_burst_jobs is not None else max_concurrent_jobs * 2
+            max_burst_jobs if max_burst_jobs is not None else max_concurrent_jobs * 4
         )
         if effective_burst_jobs <= 0:
             raise ValueError("max_burst_jobs must be positive")

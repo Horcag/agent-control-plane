@@ -97,12 +97,11 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 max_burst_jobs=0,
             )
 
-    def test_cheap_jobs_can_burst_past_nominal_full_cost_slots(self) -> None:
+    def test_default_burst_allows_extra_cheap_jobs_past_four_workers(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             broker = GlobalQuotaBroker(
                 Path(temp) / "global-quota.sqlite3",
                 max_concurrent_jobs=2,
-                max_burst_jobs=4,
             )
             decisions = [
                 broker.try_acquire(
@@ -110,16 +109,17 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                     worker_pid=os.getpid(),
                     capacity_units=codex_job_capacity_units("gpt-5.6-luna", "high"),
                 )
-                for index in range(4)
+                for index in range(8)
             ]
 
             self.assertTrue(all(decision.acquired for decision in decisions))
-            self.assertEqual(decisions[-1].active_jobs, 4)
-            self.assertEqual(decisions[-1].active_capacity_units, 24)
+            self.assertEqual(decisions[4].active_jobs, 5)
+            self.assertEqual(decisions[-1].active_jobs, 8)
+            self.assertEqual(decisions[-1].active_capacity_units, 48)
             self.assertEqual(decisions[-1].max_capacity_units, 60)
 
             blocked = broker.try_acquire(
-                "luna-5",
+                "luna-9",
                 worker_pid=os.getpid(),
                 capacity_units=6,
             )

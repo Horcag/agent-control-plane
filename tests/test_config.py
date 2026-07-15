@@ -125,7 +125,7 @@ path = "slots/reports-1"
                 (root / "global" / "quota.sqlite3").resolve(strict=False),
             )
             self.assertEqual(config.defaults.codex_global_max_concurrent_jobs, 2)
-            self.assertEqual(config.defaults.codex_global_max_burst_jobs, 4)
+            self.assertEqual(config.defaults.codex_global_max_burst_jobs, 8)
             self.assertEqual(config.defaults.codex_five_hour_soft_limit_percent, 75.0)
             self.assertEqual(config.defaults.codex_quota_poll_sec, 30.0)
             self.assertEqual(
