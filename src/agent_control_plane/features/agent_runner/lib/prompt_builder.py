@@ -141,7 +141,8 @@ Mandatory execution rules:
   immediately at that exact path.
 - The IDEA project indexes multiple checkouts. For every repository `read_file`
   and every `git_*` call, use the exact absolute physical workspace prefix:
-  `{workspace_path}`. Relative repository paths and another checkout are forbidden.
+  `{workspace_path}`. Relative repository paths and another checkout are forbidden
+  except for the verified `write_file` path described below.
 - Before discovery, verify the physical workspace with `git_status` and `git_log`,
   both using `repo="{workspace_path}"`, then read one known file through an
   absolute path under `{workspace_path}`.
@@ -151,18 +152,25 @@ Mandatory execution rules:
   against `{workspace_path}`, then read each discovered file by its exact
   absolute physical path.
 - Read existing repository files by their absolute physical paths under
-  `{idea_edit_root}` and edit them through `edit_text` using the same absolute
-  path. Synthetic junction edit paths are forbidden.
-- Use the exact physical workspace path for repository edits to existing files.
-- Before each edit of an existing repository file, confirm the source and edit
-  paths both start with `{idea_edit_root}` and identify the same existing file.
-  If either check fails, write Status: blocked. Never retry against the route
-  root or canonical checkout.
+  `{idea_edit_root}`. Use `edit_text` with that same absolute path for normal
+  surgical edits.
+- Before each `edit_text` call, confirm the source and edit paths both start with
+  `{idea_edit_root}` and identify the same existing file. If either check fails,
+  write Status: blocked. Never retry against the route root or canonical checkout.
+- When the brief explicitly authorizes a whole-target rewrite, or the required
+  re-read plus surgical `edit_text` retry fails, first re-read the exact absolute
+  target and preview the proposed content with `show_diff`. Then `write_file`
+  may use the target's project-relative path under the IDEA MCP create root
+  `{idea_create_root}`, even though the target already exists. Verify that this
+  relative path resolves to the same existing physical file under
+  `{idea_edit_root}`, then immediately re-read the absolute target and require
+  `git_diff(repo="{workspace_path}")` to show only the intended rewrite.
+- Synthetic junction edit paths remain forbidden.
 - To create a new repository file through `write_file`, use its project-relative
   path under the IDEA MCP create root `{idea_create_root}`, for example
   `{idea_create_root}/path/to/new_file.py`.
-- Do not pass its absolute path to `write_file`: IDEA rebases non-existing
-  absolute Windows paths against the project root.
+- Never pass a non-existing file's absolute Windows path to `write_file`; IDEA
+  may rebase it against the project root.
 - Immediately after creating a repository file, re-read it through its absolute physical path under `{idea_edit_root}`.
 - Then inspect `git_status(repo="{workspace_path}")`. Accept either the exact
   new path as untracked (`??`) or an untracked parent directory that contains
