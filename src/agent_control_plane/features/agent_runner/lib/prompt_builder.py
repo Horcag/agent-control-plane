@@ -164,12 +164,17 @@ Mandatory execution rules:
 - Do not pass its absolute path to `write_file`: IDEA rebases non-existing
   absolute Windows paths against the project root.
 - Immediately after creating a repository file, re-read it through its absolute physical path under `{idea_edit_root}`.
-- Then inspect `git_status(repo="{workspace_path}")` and require that exact
-  new path to appear as untracked (`??`) in the assigned workspace.
+- Then inspect `git_status(repo="{workspace_path}")`. Accept either the exact
+  new path as untracked (`??`) or an untracked parent directory that contains
+  that path; Git may collapse a wholly untracked directory to one status entry.
+- When status is collapsed, normalize the reported parent and the absolute
+  reread path and verify that the new file is beneath that parent inside the
+  assigned workspace. An unrelated untracked directory is not evidence.
 - An empty `git_diff` is expected for a new untracked file. Do not stage it
   merely to make the diff visible, and do not treat that empty diff as a routing
-  failure. If the absolute reread fails or `git_status` does not list the exact
-  new path in the assigned workspace, write Status: blocked.
+  failure. If the absolute reread fails or `git_status` lists neither the exact
+  new path nor a covering untracked parent in the assigned workspace, write
+  Status: blocked.
 - After each edit, re-read the absolute physical path and inspect `git_diff` with
   `repo="{workspace_path}"`. A write without a diff in the assigned physical
   workspace is a routing failure, not a completed edit.
