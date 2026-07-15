@@ -9,6 +9,7 @@ from agent_control_plane.app.runtime.orchestrator import (
     PolicyError,
     StartOptions,
 )
+from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS, normalize_backend
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
 
@@ -54,6 +55,9 @@ def build_server(config_path: str | None = None) -> Any:
         lines: int = 80,
         log_cursor: int | None = None,
         log_byte_limit: int = 2048,
+        plan_id: str | None = None,
+        plan_task_id: str | None = None,
+        workspace_access: str | None = None,
     ) -> dict[str, Any]:
         """Start an agent job and optionally wait briefly for a terminal result."""
         normalized_backend = normalize_backend(backend) if backend is not None else None
@@ -83,6 +87,9 @@ def build_server(config_path: str | None = None) -> Any:
                     yolo=yolo,
                     allow_dirty=allow_dirty,
                     read_only=read_only,
+                    plan_id=plan_id,
+                    plan_task_id=plan_task_id,
+                    workspace_access=workspace_access,
                 )
             )
         except PolicyError as exc:
@@ -98,10 +105,13 @@ def build_server(config_path: str | None = None) -> Any:
             "codex_model": job.codex_model,
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
+            "workspace_access": job.workspace_access,
             "worker_pid": job.worker_pid,
             "runner_pid": job.runner_pid,
             "read_only": job.read_only,
             "slot_name": job.slot_name,
+            "plan_id": plan_id,
+            "plan_task_id": plan_task_id or (task_id if plan_id else None),
         }
         if wait:
             response["watch"] = control.watch_job(
@@ -139,6 +149,11 @@ def build_server(config_path: str | None = None) -> Any:
         return control.status_job(job_id)
 
     @mcp.tool()
+    def agent_reconcile(job_id: str | None = None) -> dict[str, Any]:
+        """Recover orphaned jobs and replay crash-safe terminal finalization."""
+        return control.reconcile_jobs(job_id)
+
+    @mcp.tool()
     def agent_summary_job(job_id: str, lines: int = 20) -> dict[str, Any]:
         """Return compact status, guardrail state, dirty status, and a short log tail."""
         return control.summary_job(job_id, lines)
@@ -157,6 +172,209 @@ def build_server(config_path: str | None = None) -> Any:
             reasoning_effort=reasoning_effort,
             valid_only=valid_only,
         )
+
+    @mcp.tool()
+    def agent_plan_create(
+        plan_id: str,
+        title: str,
+        objective: str = "",
+        tasks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Create one durable plan and its dependency graph in a single call."""
+        try:
+            definitions = _plan_task_definitions(tasks or [])
+            return control.create_plan(
+                plan_id=plan_id,
+                title=title,
+                objective=objective,
+                tasks=definitions,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_add_task(
+        plan_id: str,
+        task_id: str,
+        title: str,
+        depends_on: list[str] | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Add a logical task and its dependencies to an existing plan."""
+        try:
+            return control.add_plan_task(
+                plan_id,
+                task_id=task_id,
+                title=title,
+                depends_on=tuple(depends_on or ()),
+                execution=_plan_execution_spec(execution),
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_bind_job(plan_id: str, task_id: str, job_id: str) -> dict[str, Any]:
+        """Bind an already-created job to a logical plan task."""
+        try:
+            return control.bind_plan_job(plan_id, task_id, job_id)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_snapshot(
+        plan_id: str,
+        since: int | None = None,
+        event_limit: int = 100,
+        item_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Return compact plan state; pass cursor as since to receive only new events."""
+        try:
+            return control.plan_snapshot(
+                plan_id,
+                since=since,
+                event_limit=event_limit,
+                item_limit=item_limit,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_watch(
+        plan_id: str,
+        since: int,
+        poll_interval_sec: float = 5.0,
+        timeout_sec: float = 25.0,
+        event_limit: int = 100,
+        item_limit: int = 20,
+    ) -> dict[str, Any]:
+        """Long-poll until the plan cursor advances, without returning worker logs."""
+        try:
+            return control.watch_plan(
+                plan_id,
+                since=since,
+                poll_interval_sec=poll_interval_sec,
+                timeout_sec=timeout_sec,
+                event_limit=event_limit,
+                item_limit=item_limit,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_accept_task(
+        plan_id: str,
+        task_id: str,
+        accepted_sha: str | None = None,
+    ) -> dict[str, Any]:
+        """Record root acceptance and unlock tasks that depend on this one."""
+        try:
+            return control.accept_plan_task(
+                plan_id,
+                task_id,
+                accepted_sha=accepted_sha,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_reject_task(plan_id: str, task_id: str) -> dict[str, Any]:
+        """Record root rejection without unlocking dependent tasks."""
+        try:
+            return control.reject_plan_task(plan_id, task_id)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_dispatch(plan_id: str, max_jobs: int = 1) -> dict[str, Any]:
+        """Claim and start ready executable plan tasks in one durable dispatch pass."""
+        try:
+            return control.dispatch_plan(plan_id, max_jobs=max_jobs)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_retry_task(
+        plan_id: str,
+        task_id: str,
+        brief_override: str | None = None,
+    ) -> dict[str, Any]:
+        """Explicitly make a failed task eligible for a new dispatch attempt."""
+        try:
+            return control.retry_plan_task(
+                plan_id,
+                task_id,
+                brief_override=brief_override,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_list(limit: int = 20) -> list[dict[str, Any]]:
+        """List recent durable plans with compact progress counts."""
+        return control.list_plans(limit)
+
+    @mcp.tool()
+    def agent_review_inbox_list(
+        review_status: str | None = "pending",
+        limit: int = 50,
+        sync_subagents: bool = False,
+        since_hours: float = 72.0,
+        max_files: int = 500,
+        parent_thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """List durable handoffs; optionally import completed Codex subagents first."""
+        try:
+            return {
+                "ok": True,
+                "items": control.list_review_inbox(
+                    review_status=review_status,
+                    parent_thread_id=parent_thread_id,
+                    limit=limit,
+                    sync_subagents=sync_subagents,
+                    since_hours=since_hours,
+                    max_files=max_files,
+                ),
+            }
+        except (PolicyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_review_inbox_get(item_id: str) -> dict[str, Any]:
+        """Return one durable job or Codex subagent handoff."""
+        try:
+            return {"ok": True, "item": control.get_review_inbox_item(item_id)}
+        except KeyError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_review_inbox_resolve(item_id: str, decision: str) -> dict[str, Any]:
+        """Resolve an inbox item without implicitly accepting a plan task."""
+        try:
+            return {
+                "ok": True,
+                "item": control.resolve_review_inbox_item(item_id, decision),
+            }
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_sync_subagent_results(
+        since_hours: float = 72.0,
+        max_files: int = 500,
+        parent_thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Import completed in-scope Codex subagent rollouts into the review inbox."""
+        try:
+            return {
+                "ok": True,
+                **control.sync_subagent_results(
+                    since_hours=since_hours,
+                    max_files=max_files,
+                    parent_thread_id=parent_thread_id,
+                ),
+            }
+        except (PolicyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
     def agent_tail_job(job_id: str, lines: int = 80) -> str:
@@ -334,6 +552,14 @@ def build_server(config_path: str | None = None) -> Any:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
+    def agent_slots_checkpoint(name: str, job_id: str) -> dict[str, Any]:
+        """Checkpoint a terminal job's dirty slot, persist review metadata, and release it."""
+        try:
+            return {"ok": True, **control.checkpoint_slot(name, job_id=job_id)}
+        except (KeyError, PolicyError, SlotError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
     def agent_slots_cleanup(
         max_per_route: int,
         apply: bool = False,
@@ -361,6 +587,51 @@ def _infer_route_from_slot_name(slot_name: str) -> str:
     if separator and prefix and suffix.isdigit():
         return prefix
     return slot_name
+
+
+def _plan_task_definitions(payload: list[dict[str, Any]]) -> tuple[PlanTaskDefinition, ...]:
+    definitions = []
+    for item in payload:
+        depends_on = item.get("depends_on", [])
+        if not isinstance(depends_on, list) or not all(
+            isinstance(value, str) for value in depends_on
+        ):
+            raise ValueError("Plan task depends_on must be an array of task IDs")
+        definitions.append(
+            PlanTaskDefinition(
+                task_id=str(item.get("task_id", "")),
+                title=str(item.get("title", "")),
+                depends_on=tuple(depends_on),
+                execution=_plan_execution_spec(item.get("execution")),
+            )
+        )
+    return tuple(definitions)
+
+
+def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise ValueError("Plan task execution must be an object")
+    read_only = payload.get("read_only", False)
+    if not isinstance(read_only, bool):
+        raise ValueError("Plan task execution read_only must be a boolean")
+    return PlanExecutionSpec(
+        route=str(payload.get("route", "")),
+        brief=str(payload.get("brief", "")),
+        slot=_optional_text(payload.get("slot")),
+        backend=_optional_text(payload.get("backend")),
+        workspace_access=_optional_text(payload.get("workspace_access")),
+        read_only=read_only,
+        codex_quality_tier=_optional_text(payload.get("codex_quality_tier")),
+    )
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
 
 
 def main(argv: list[str] | None = None) -> None:

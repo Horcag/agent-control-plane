@@ -15,6 +15,7 @@ from agent_control_plane.app.runtime.orchestrator import (
     StartOptions,
 )
 from agent_control_plane.entities.job import AttemptMetrics
+from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
     CODEX_BACKEND,
@@ -31,6 +32,187 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_workspace_access_precedence_and_reporting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base_config = _config(root, workspace)
+            route = base_config.routes["main"]
+            config = replace(
+                base_config,
+                defaults=replace(base_config.defaults, workspace_access="native"),
+                routes=MappingProxyType({"main": replace(route, workspace_access="ide_mcp")}),
+            )
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "route-mode")
+            _brief(config.coordination_root, "job-mode")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                route_job = control.start_job(StartOptions(task_id="route-mode", route="main"))
+                job_override = control.start_job(
+                    StartOptions(
+                        task_id="job-mode",
+                        route="main",
+                        workspace_access="native",
+                    )
+                )
+
+            self.assertEqual(route_job.workspace_access, "ide_mcp")
+            self.assertEqual(job_override.workspace_access, "native")
+            control.store.update_job(job_override.job_id, status="completed")
+            self.assertEqual(
+                control.status_job(job_override.job_id)["workspace_access"],
+                "native",
+            )
+            self.assertEqual(
+                control.summary_job(job_override.job_id)["workspace_access"],
+                "native",
+            )
+            smoke = control.smoke()
+            self.assertEqual(smoke["workspace_access"], "native")
+            self.assertEqual(smoke["routes"]["main"]["workspace_access"], "ide_mcp")
+
+    def test_invalid_and_agy_native_modes_are_rejected_before_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "invalid-mode")
+            _brief(control.config.coordination_root, "agy-native")
+
+            with patch.object(control, "_launch_worker", return_value=123) as launch:
+                with self.assertRaisesRegex(PolicyError, "workspace_access"):
+                    control.start_job(
+                        StartOptions(
+                            task_id="invalid-mode",
+                            route="main",
+                            workspace_access="",
+                        )
+                    )
+                with self.assertRaisesRegex(PolicyError, "agy backend"):
+                    control.start_job(
+                        StartOptions(
+                            task_id="agy-native",
+                            route="main",
+                            backend=AGY_BACKEND,
+                            workspace_access="native",
+                        )
+                    )
+
+            launch.assert_not_called()
+            self.assertEqual(control.store.list_jobs(), [])
+
+    def test_native_slot_skips_only_ide_module_provisioning(self) -> None:
+        for workspace_access, expected_ide_calls in (("native", 0), ("ide_mcp", 1)):
+            with (
+                self.subTest(workspace_access=workspace_access),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                route_path = _git_repo(root / "repo", "main")
+                slot_path = _git_repo(root / "slots" / "main-1", "main")
+                control = AgentControlPlane(_config_with_slot(root, route_path, slot_path))
+                _brief(control.config.coordination_root, "slot-task")
+
+                with (
+                    patch.object(control.slots, "ensure_ide_root_module") as ensure_ide_root,
+                    patch.object(control.slots, "prepare_slot") as prepare_slot,
+                    patch.object(control, "_launch_worker", return_value=123),
+                ):
+                    control.start_job(
+                        StartOptions(
+                            task_id="slot-task",
+                            route="main",
+                            slot="main-1",
+                            backend=CODEX_BACKEND,
+                            workspace_access=workspace_access,
+                        )
+                    )
+
+                self.assertEqual(ensure_ide_root.call_count, expected_ide_calls)
+                prepare_slot.assert_called_once_with("main-1")
+
+    def test_native_read_only_progress_does_not_require_a_progress_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "native-review")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="native-review",
+                        route="main",
+                        workspace_access="native",
+                        read_only=True,
+                    )
+                )
+
+            progress = (job.result_path.parent / "agent-progress.md").read_text(encoding="utf-8")
+            self.assertIn("native read-only tools", progress)
+            self.assertIn("must not update this progress file", progress)
+
+    def test_native_runner_spec_disables_agentbridge_and_allows_raw_exec(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base_config = _config(root, workspace)
+            config = replace(
+                base_config,
+                defaults=replace(
+                    base_config.defaults,
+                    codex_disabled_mcp_servers=("custom", "agentbridge_idea_64343"),
+                    codex_forbidden_tool_markers=("raw_exec", "web_search"),
+                ),
+                routes=MappingProxyType(
+                    {
+                        "main": replace(
+                            base_config.routes["main"],
+                            ide_mcp_server="agentbridge_idea_64343",
+                        ),
+                        "secondary": replace(
+                            base_config.routes["main"],
+                            name="secondary",
+                            ide_mcp_server="agentbridge_idea_9999",
+                        ),
+                    }
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-native",
+                backend=CODEX_BACKEND,
+                workspace_access="native",
+            )
+            runner = _CapturingCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            spec = runner.specs[0]
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(spec.workspace_access, "native")
+            self.assertIsNone(spec.codex_terminal_tab_name)
+            self.assertEqual(spec.codex_forbidden_tool_markers, ("web_search",))
+            self.assertEqual(
+                spec.codex_disabled_mcp_servers,
+                (
+                    "custom",
+                    "agentbridge_idea_64343",
+                    "agentbridge_idea_9999",
+                    "agentbridge_dataspell_8643",
+                    "agentbridge_idea_8644",
+                ),
+            )
+
     def test_agy_model_override_is_persisted_for_the_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -119,6 +301,75 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn(str(job.workspace_path), progress_text)
             self.assertIn("Awaiting agent execution", result_text)
             self.assertFalse(result_state.done)
+
+    def test_start_job_binds_retry_task_id_to_logical_plan_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            control.create_plan(
+                plan_id="transfer",
+                title="Transfer",
+                tasks=(PlanTaskDefinition("schema", "Transfer schema"),),
+            )
+            _brief(control.config.coordination_root, "schema-repair-r2")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="schema-repair-r2",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        plan_id="transfer",
+                        plan_task_id="schema",
+                    )
+                )
+
+            snapshot = control.plan_snapshot("transfer")
+            self.assertEqual(snapshot["running"][0]["task_id"], "schema")
+            self.assertEqual(snapshot["running"][0]["job_id"], job.job_id)
+
+    def test_plan_dispatch_materializes_private_brief_and_starts_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            control.create_plan(
+                plan_id="dispatch",
+                title="Dispatch",
+                tasks=(
+                    PlanTaskDefinition(
+                        "schema",
+                        "Schema",
+                        execution=PlanExecutionSpec(
+                            route="main",
+                            brief="Implement only the schema change.",
+                            backend=CODEX_BACKEND,
+                            workspace_access="native",
+                            codex_quality_tier="mechanical",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                first = control.dispatch_plan("dispatch", max_jobs=1)
+                second = control.dispatch_plan("dispatch", max_jobs=1)
+
+            dispatched = first["dispatched"][0]
+            brief_path = (
+                control.config.coordination_root
+                / "tasks"
+                / dispatched["dispatch_task_id"]
+                / "brief.md"
+            )
+            self.assertEqual(first["claimed"], 1)
+            self.assertEqual(second["claimed"], 0)
+            self.assertEqual(
+                brief_path.read_text(encoding="utf-8"),
+                "Implement only the schema change.\n",
+            )
+            self.assertEqual(first["snapshot"]["running"][0]["job_id"], dispatched["job_id"])
 
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -660,6 +911,24 @@ class _BlockedRunner:
         )
 
 
+class _CapturingCompletedRunner:
+    def __init__(self) -> None:
+        self.specs: list[Any] = []
+
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        self.specs.append(spec)
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.result_path.write_text("Status: completed\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="completed",
+            message="completed",
+            metrics=_attempt_metrics(thread_id="thread-native"),
+        )
+
+
 class _MutatingForbiddenFileRunner:
     def run(self, spec: Any, **kwargs: Any) -> AgyRunResult:
         (spec.workspace_path / "uv.lock").write_text("after\n", encoding="utf-8")
@@ -748,6 +1017,7 @@ def _create_job(
     codex_model: str | None = None,
     codex_reasoning_effort: str | None = None,
     codex_quality_tier: str | None = None,
+    workspace_access: str = "ide_mcp",
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -774,6 +1044,7 @@ def _create_job(
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
         codex_quality_tier=codex_quality_tier,
+        workspace_access=workspace_access,
         slot_name=slot_name,
     )
 

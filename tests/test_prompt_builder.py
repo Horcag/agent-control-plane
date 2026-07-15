@@ -137,6 +137,7 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Always write the result file", prompt)
             self.assertIn("Maintain live progress/state", prompt)
             self.assertIn(str(Path("D:/repo/.agent-work/tasks/task-1/result.md")), prompt)
+            self.assertIn("verification.json", prompt)
             self.assertIn("exact progress file path", prompt)
             self.assertIn("absolute paths shown in this prompt", prompt)
             self.assertIn("equivalent project-relative `.agent-work/tasks/", prompt)
@@ -371,6 +372,111 @@ class PromptBuilderTest(unittest.TestCase):
                     expected_branch="main",
                     result_path=root / ".agent-work" / "tasks" / "task-1" / "result.md",
                 )
+
+    def test_native_mode_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _coordination_files(root, "task-1")
+            config = ControlConfig(
+                config_path=root / "workspaces.toml",
+                project_root=root,
+                coordination_root=root / ".agent-work",
+                runs_root=root / "runs",
+                database_path=root / "runs" / "jobs.sqlite3",
+                worktree_root=root / "worktrees",
+                worktree_base=root / "main",
+                slot_root=root / "slots",
+                agy_command="agy",
+                codex_command="codex",
+                defaults=ControlDefaults(
+                    timeout_sec=10,
+                    idle_timeout_sec=5,
+                    print_timeout="10s",
+                    max_restarts=0,
+                    yolo=False,
+                    allow_dirty=False,
+                    prepare_slots=True,
+                    guardrail_poll_sec=2.0,
+                    forbidden_status_globs=("uv.lock", ".venv/**"),
+                ),
+                routes=MappingProxyType(
+                    {
+                        "main": RouteConfig(
+                            name="main",
+                            path=root / "main",
+                            required_branch="main",
+                            worktree_root=root / "worktrees",
+                            worktree_base=root / "main",
+                            source_roots=(Path("backend"), Path("frontend/src")),
+                            test_roots=(Path("backend/tests"),),
+                            exclude_dirs=(),
+                        )
+                    }
+                ),
+                slots=MappingProxyType({}),
+                slot_prepare=(),
+            )
+
+            workspace = root.parent / "main-tiger-agent-slots" / "dev-3"
+
+            # Writable native prompt
+            native_writable = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="native",
+                read_only=False,
+            )
+
+            # Read-only native prompt
+            native_readonly = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="native",
+                read_only=True,
+            )
+
+            # Standard IDE prompt
+            ide_prompt = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="ide_mcp",
+                read_only=False,
+            )
+
+            # Assertions for native writable
+            self.assertIn("Task ID: task-1", native_writable)
+            self.assertIn("Workspace route: main", native_writable)
+            self.assertIn("Maintain live progress/state in:", native_writable)
+            self.assertNotIn("mcp__agentbridge_idea_", native_writable)
+            self.assertNotIn("Use only the IDEA MCP server", native_writable)
+
+            # Assertions for native read-only
+            self.assertIn("This is a READ-ONLY job.", native_readonly)
+            self.assertIn(
+                "You are FORBIDDEN from editing any files in the workspace or updating the progress file.",
+                native_readonly,
+            )
+            self.assertNotIn("Maintain live progress/state in:", native_readonly)
+            self.assertNotIn("mcp__agentbridge_idea_", native_readonly)
+
+            # IDE mode keeps the host-specific terminal and edit safety rules.
+            self.assertIn("Set-Location -LiteralPath", ide_prompt)
+            self.assertIn("auto_format_and_optimize_imports=false", ide_prompt)
+
+            # Materially smaller check (e.g. less than half the size of IDE prompt)
+            self.assertTrue(len(native_writable) < len(ide_prompt) * 0.6)
 
 
 def _coordination_files(

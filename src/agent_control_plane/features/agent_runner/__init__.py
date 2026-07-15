@@ -1,4 +1,5 @@
 from agent_control_plane.features.agent_runner.lib.codex_runner import CodexExecRunner
+from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     ModelProfile,
     ModelRoutingPolicy,
@@ -29,6 +30,14 @@ from agent_control_plane.features.agent_runner.lib.runner import (
     AgentRunSpec,
     normalize_backend,
 )
+from agent_control_plane.features.agent_runner.lib.worker_lease import (
+    FinalizationLease,
+    WorkerLease,
+    WorkerLeaseError,
+    WorkerLeaseProbe,
+    WorkerLeaseState,
+    probe_worker_lease,
+)
 
 __all__ = [
     "AGY_BACKEND",
@@ -42,14 +51,21 @@ __all__ = [
     "AgyRunSpec",
     "CodexExecRunner",
     "CodexRateLimitReader",
+    "FinalizationLease",
     "GlobalQuotaBroker",
+    "JobReconciler",
     "ModelProfile",
     "ModelRoutingPolicy",
     "PtyAgyRunner",
     "QuotaDecision",
     "ResultState",
+    "WorkerLease",
+    "WorkerLeaseError",
+    "WorkerLeaseProbe",
+    "WorkerLeaseState",
     "build_task_prompt",
     "codex_job_capacity_units",
     "inspect_result",
     "normalize_backend",
+    "probe_worker_lease",
 ]

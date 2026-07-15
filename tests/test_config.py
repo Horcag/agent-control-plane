@@ -50,6 +50,7 @@ codex_global_max_concurrent_jobs = 2
 codex_five_hour_soft_limit_percent = 75
 codex_quota_poll_sec = 30
 codex_sessions_root = "sessions"
+terminal_slot_policy = "checkpoint"
 
 [slot_prepare.frontend_node_modules]
 routes = ["main", "dev"]
@@ -132,6 +133,7 @@ path = "slots/reports-1"
                 config.defaults.codex_sessions_root,
                 (root / "sessions").resolve(strict=False),
             )
+            self.assertEqual(config.defaults.terminal_slot_policy, "checkpoint")
             self.assertEqual(config.defaults.runs_layout, "date")
             self.assertEqual(config.defaults.auto_archive_days, 7)
             self.assertEqual(config.defaults.auto_archive_limit, 200)
@@ -193,6 +195,115 @@ path = "slots/reports-1"
                 tuple(path.as_posix() for path in config.routes["reports"].exclude_dirs),
                 ("dist", "frontend/build"),
             )
+
+    def test_workspace_access_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+
+            base_toml = """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+agy_command = "agy"
+"""
+
+            # Case 1: default workspace_access is ide_mcp (compatibility default)
+            config_path.write_text(
+                base_toml
+                + """
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            self.assertEqual(config.defaults.workspace_access, "ide_mcp")
+            self.assertIsNone(config.routes["main"].workspace_access)
+
+            # Case 2: valid global "native" and route override
+            config_path.write_text(
+                base_toml
+                + """
+[control.defaults]
+workspace_access = "native"
+[routes.main]
+path = "repo"
+required_branch = "main"
+workspace_access = "ide_mcp"
+""",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            self.assertEqual(config.defaults.workspace_access, "native")
+            self.assertEqual(config.routes["main"].workspace_access, "ide_mcp")
+
+            # Case 3: invalid global value
+            config_path.write_text(
+                base_toml
+                + """
+[control.defaults]
+workspace_access = "invalid"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "workspace_access must be either 'ide_mcp' or 'native'"
+            ):
+                load_config(config_path)
+
+            # Case 4: invalid route value
+            config_path.write_text(
+                base_toml
+                + """
+[routes.main]
+path = "repo"
+required_branch = "main"
+workspace_access = "invalid"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "workspace_access must be either 'ide_mcp' or 'native'"
+            ):
+                load_config(config_path)
+
+    def test_terminal_slot_policy_rejects_unknown_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+terminal_slot_policy = "delete"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "terminal_slot_policy must be either 'preserve' or 'checkpoint'",
+            ):
+                load_config(config_path)
 
 
 if __name__ == "__main__":

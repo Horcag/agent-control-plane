@@ -30,6 +30,62 @@ medium to Terra medium when the task needs materially deeper reasoning. Do not u
 runner already owns external slot fan-out. Combining both makes attribution, cost,
 concurrency, and workspace ownership harder to control.
 
+## Workspace Access Modes
+
+Codex jobs support two independent workspace transports:
+
+- `ide_mcp` is the backward-compatible default. It uses the route-selected
+  AgentBridge/IDEA server, IDE Git operations, diagnostics, refactors, and one scoped
+  terminal tab. Every terminal command must explicitly change to the assigned physical
+  workspace because an IDE terminal may ignore its requested working directory.
+- `native` runs `codex exec` directly in the assigned slot with Codex-native shell,
+  `rg`, and file-edit tools. It uses a much smaller prompt, disables the route-selected
+  and known AgentBridge servers, skips IDEA module provisioning, and counts native
+  command/file events against the same hard tool budget.
+
+Resolve the effective mode in this order: job override, route override, then
+`[control.defaults].workspace_access`. `native` is Codex-only; ACP rejects it for AGY.
+Use native mode when lower prompt/tool overhead matters more than IDE diagnostics and
+refactors. In the safe `workspace-write` sandbox, `.git` remains protected, so the root
+reviewer normally creates the commit after accepting the diff. Read-only native jobs
+persist their structured final response through Codex last-message recovery.
+
+## Terminal Handoff and Slot Release
+
+Set `[control.defaults].terminal_slot_policy = "checkpoint"` when slots should become
+reusable after workers finish with uncommitted changes. ACP builds a commit with a
+temporary Git index, pins it under `refs/agent-control-plane/jobs/<job-hash>`, verifies
+the commit tree, and persists the same SHA plus a hashed full result payload in the review
+inbox. Inbox lists remain bounded; the full payload is loaded only by `inbox show`. Only
+then does it reset the worktree to its existing branch `HEAD` and mark the slot available.
+
+The checkpoint is delivery state, not acceptance: it does not move a branch, push,
+merge, or unlock plan dependencies. Root review may inspect or cherry-pick the ref and
+must still call the plan acceptance operation separately. Failed and cancelled jobs use
+the same mechanism as salvage checkpoints.
+
+Cleanup fails closed. A changed `HEAD`, a changed worktree after checkpoint creation, a
+dirty nested submodule, an unverifiable ref, or a failed inbox write prevents cleanup.
+The durable ref remains available when creation succeeded, and the slot remains dirty or
+locked for inspection.
+
+Workers write `result.md` for human review and a sibling schema-v1 `verification.json`
+for machine validation. The Markdown status remains the terminal signal, so a missing or
+malformed bundle cannot strand a slot. ACP records the bundle as `valid`, `missing`, or
+`invalid`, compares changed-file claims with the checkpoint tree, and refuses normal
+acceptance unless the handoff is valid and review-ready.
+
+For multi-task work, put execution specs on durable plan tasks and call the one-shot
+`plan dispatch`/`agent_plan_dispatch` operation. The dispatcher atomically claims ready
+tasks and never retries failures automatically. Use `plan retry` or
+`agent_plan_retry_task` only after reviewing the previous failure.
+
+Completed built-in Codex subagents do not have a live callback into ACP. Import their
+terminal `task_complete` records from the configured `codex_sessions_root` with
+`inbox sync-subagents` or `inbox list --sync-subagents`; ingestion is idempotent and only
+accepts rollouts whose working directory belongs to a configured route or slot. Pass
+`--parent-thread-id` when a resumed root needs only its own delegated results.
+
 ## IDE MCP Routing
 
 Name AgentBridge MCP servers by IDE type and stable port, not by the repository
@@ -44,7 +100,7 @@ the endpoint and independently declares the project root expected at execution t
 
 ```toml
 ide_mcp_server = "agentbridge_idea_8644"
-ide_mcp_project_root = "D:/Documents/work"
+ide_mcp_project_root = "C:/path/to/project"
 ```
 
 The runner derives the native namespace from the server ID, so this example maps to
@@ -97,6 +153,12 @@ a lease is one transaction, so simultaneous workers cannot oversubscribe the bud
 A Luna job that escalates to Terra keeps its original lease and waits until the larger
 weight fits. Unknown model names are charged the full 30 units to fail closed. Physical
 slot ownership remains exclusive and can impose a lower limit than the global quota.
+
+The rate-limit soft cap is independent of these concurrency weights. The legacy config
+name `codex_five_hour_soft_limit_percent` is applied to whichever primary window Codex
+reports; that window may be longer than five hours. At or above the threshold, ACP
+defers all Codex models, including Luna. A future model-aware reserve should be an
+explicit policy rather than an accidental bypass of the configured cap.
 
 ## Why Medium
 

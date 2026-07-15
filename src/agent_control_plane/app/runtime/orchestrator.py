@@ -6,14 +6,22 @@ import shutil
 import sqlite3
 import subprocess  # nosec B404
 import sys
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
 from agent_control_plane.entities.job import JobRecord, JobStore, format_events, new_job_id
-from agent_control_plane.entities.slot import SlotStore
+from agent_control_plane.entities.plan import PlanExecutionSpec, PlanStore, PlanTaskDefinition
+from agent_control_plane.entities.review_inbox import (
+    ReviewInboxDraft,
+    ReviewInboxItem,
+    ReviewInboxStore,
+)
+from agent_control_plane.entities.slot import SlotStore, SlotStoreError
 from agent_control_plane.entities.workspace import (
     ForbiddenStatusEntry,
     StartRequest,
@@ -29,11 +37,15 @@ from agent_control_plane.features.agent_runner import (
     AgentRunSpec,
     CodexExecRunner,
     CodexRateLimitReader,
+    FinalizationLease,
     GlobalQuotaBroker,
+    JobReconciler,
     ModelProfile,
     ModelRoutingPolicy,
     PtyAgyRunner,
     QuotaDecision,
+    WorkerLease,
+    WorkerLeaseError,
     build_task_prompt,
     codex_job_capacity_units,
     inspect_result,
@@ -43,6 +55,15 @@ from agent_control_plane.features.antigravity_accounts import (
     AntigravityManagerAdapter,
     AntigravityManagerError,
     is_agy_quota_failure,
+)
+from agent_control_plane.features.result_handoff import (
+    SlotCheckpoint,
+    SlotCheckpointError,
+    build_verification_bundle,
+    clean_checkpointed_workspace,
+    create_slot_checkpoint,
+    scan_codex_subagent_completions,
+    verify_slot_checkpoint,
 )
 from agent_control_plane.features.slot_lifecycle import (
     RouteRootGuard,
@@ -60,6 +81,7 @@ from agent_control_plane.shared.git_tools import (
     workspace_snapshot,
     workspace_state,
 )
+from agent_control_plane.shared.verification_report import inspect_verification_report
 
 
 class PolicyError(RuntimeError):
@@ -130,6 +152,10 @@ class StartOptions:
     yolo: bool | None = None
     allow_dirty: bool | None = None
     read_only: bool = False
+    plan_id: str | None = None
+    plan_task_id: str | None = None
+    plan_dispatch_token: str | None = None
+    workspace_access: str | None = None
 
 
 @dataclass(frozen=True)
@@ -175,9 +201,13 @@ class AgentControlPlane:
     def __init__(self, config: ControlConfig) -> None:
         self.config = config
         self.store = JobStore(config.database_path)
+        self.plan_store = PlanStore(config.database_path)
+        self.review_inbox = ReviewInboxStore(config.database_path)
         self.slot_store = SlotStore(config.database_path)
         self.slots = SlotManager(config, self.slot_store)
         self.policy = WorkspacePolicy(config)
+        self._active_worker_instance_id: str | None = None
+        self._worker_ownership_lost: threading.Event | None = None
         defaults = config.defaults
         self.model_routing = ModelRoutingPolicy(
             mechanical=ModelProfile(
@@ -226,6 +256,8 @@ class AgentControlPlane:
 
     def smoke(self) -> dict[str, Any]:
         self.store.initialize()
+        self.plan_store.initialize()
+        self.review_inbox.initialize()
         return {
             "config": str(self.config.config_path),
             "database": str(self.config.database_path),
@@ -237,6 +269,8 @@ class AgentControlPlane:
             "codex_model": self.config.defaults.codex_model,
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
+            "workspace_access": self.config.defaults.workspace_access,
+            "terminal_slot_policy": self.config.defaults.terminal_slot_policy,
             "codex_tool_call_budgets": {
                 "mechanical": self.config.defaults.codex_mechanical_tool_call_budget,
                 "balanced": self.config.defaults.codex_balanced_tool_call_budget,
@@ -258,6 +292,9 @@ class AgentControlPlane:
                 ),
                 "max_concurrent_jobs": self.config.defaults.codex_global_max_concurrent_jobs,
                 "max_burst_jobs": self.config.defaults.codex_global_max_burst_jobs,
+                "primary_window_soft_limit_percent": (
+                    self.config.defaults.codex_five_hour_soft_limit_percent
+                ),
                 "five_hour_soft_limit_percent": (
                     self.config.defaults.codex_five_hour_soft_limit_percent
                 ),
@@ -292,6 +329,9 @@ class AgentControlPlane:
                     "codex_reasoning_effort": (
                         route.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
                     ),
+                    "workspace_access": (
+                        route.workspace_access or self.config.defaults.workspace_access
+                    ),
                     "agy_mcp_server": route.agy_mcp_server or "idea",
                     "worktree_root": str(route.worktree_root) if route.worktree_root else None,
                     "worktree_base": str(route.worktree_base),
@@ -317,6 +357,253 @@ class AgentControlPlane:
             ],
         }
 
+    def reconcile_jobs(self, job_id: str | None = None) -> dict[str, Any]:
+        reconciler = JobReconciler(
+            store=self.store,
+            slot_store=self.slot_store,
+            is_terminal=self._is_terminal,
+            finalize=self._replay_finalization,
+            write_orphan_result=self._write_blocked_result_if_missing,
+            process_is_alive=_process_is_alive,
+        )
+        return reconciler.reconcile(job_id)
+
+    def create_plan(
+        self,
+        *,
+        plan_id: str,
+        title: str,
+        objective: str = "",
+        tasks: tuple[PlanTaskDefinition, ...] = (),
+    ) -> dict[str, Any]:
+        self.store.initialize()
+        self.plan_store.create_plan(
+            plan_id=plan_id,
+            title=title,
+            objective=objective,
+            tasks=tasks,
+        )
+        return self.plan_store.snapshot(plan_id)
+
+    def add_plan_task(
+        self,
+        plan_id: str,
+        *,
+        task_id: str,
+        title: str,
+        depends_on: tuple[str, ...] = (),
+        execution: PlanExecutionSpec | None = None,
+    ) -> dict[str, Any]:
+        self.store.initialize()
+        self.plan_store.add_task(
+            plan_id,
+            PlanTaskDefinition(
+                task_id=task_id,
+                title=title,
+                depends_on=depends_on,
+                execution=execution,
+            ),
+        )
+        return self.plan_store.snapshot(plan_id)
+
+    def bind_plan_job(self, plan_id: str, task_id: str, job_id: str) -> dict[str, Any]:
+        self.plan_store.bind_job(plan_id, task_id, job_id)
+        return self.plan_store.snapshot(plan_id)
+
+    def accept_plan_task(
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        accepted_sha: str | None = None,
+    ) -> dict[str, Any]:
+        target = self.plan_store.review_target(plan_id, task_id)
+        result_path = target.get("result_path")
+        verification = (
+            inspect_verification_report(
+                Path(result_path),
+                expected_status=target.get("job_status"),
+            )
+            if result_path
+            else None
+        )
+        if verification is None or verification.state != "valid":
+            detail = verification.error if verification is not None else "result path is missing"
+            raise PolicyError(
+                f"Plan task verification is not valid for acceptance: "
+                f"{plan_id}/{task_id}: {verification.state if verification else 'missing'}"
+                + (f" ({detail})" if detail else "")
+            )
+        try:
+            inbox_item = self.review_inbox.get(f"agent_job:{target['job_id']}")
+        except KeyError:
+            inbox_item = None
+        if (
+            inbox_item is not None
+            and (
+                inbox_item.verification_state != "valid"
+                or not isinstance(inbox_item.verification_bundle, dict)
+                or inbox_item.verification_bundle.get("review_ready") is not True
+            )
+        ):
+            raise PolicyError(
+                f"Plan task handoff is not review-ready for acceptance: {plan_id}/{task_id}"
+            )
+        cursor = self.plan_store.snapshot(plan_id)["cursor"]
+        self.plan_store.accept_task(plan_id, task_id, accepted_sha=accepted_sha)
+        return self.plan_store.snapshot(plan_id, since=cursor)
+
+    def reject_plan_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
+        cursor = self.plan_store.snapshot(plan_id)["cursor"]
+        self.plan_store.reject_task(plan_id, task_id)
+        return self.plan_store.snapshot(plan_id, since=cursor)
+
+    def dispatch_plan(self, plan_id: str, *, max_jobs: int = 1) -> dict[str, Any]:
+        """Run one durable dispatch pass for executable dependency-ready tasks."""
+        if max_jobs <= 0:
+            raise ValueError("max_jobs must be positive")
+        reconciled_dispatches = self.plan_store.reconcile_orphaned_dispatches(
+            plan_id,
+            process_is_alive=lambda pid: _process_is_alive(pid),
+        )
+        claims = self.plan_store.claim_ready_tasks(
+            plan_id,
+            owner_pid=os.getpid(),
+            limit=max_jobs,
+        )
+        dispatched: list[dict[str, Any]] = []
+        failures: list[dict[str, Any]] = []
+        for claim in claims:
+            try:
+                self._materialize_plan_brief(claim.dispatch_task_id, claim.execution.brief)
+                job = self.start_job(
+                    StartOptions(
+                        task_id=claim.dispatch_task_id,
+                        route=claim.execution.route,
+                        backend=claim.execution.backend,
+                        codex_quality_tier=claim.execution.codex_quality_tier,
+                        slot=claim.execution.slot,
+                        read_only=claim.execution.read_only,
+                        plan_id=plan_id,
+                        plan_task_id=claim.task_id,
+                        plan_dispatch_token=claim.dispatch_token,
+                        workspace_access=claim.execution.workspace_access,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - durable dispatch failure boundary
+                message = str(exc)
+                self.plan_store.mark_dispatch_failed(
+                    plan_id,
+                    claim.task_id,
+                    dispatch_token=claim.dispatch_token,
+                    error=message,
+                )
+                failures.append(
+                    {
+                        "task_id": claim.task_id,
+                        "dispatch_task_id": claim.dispatch_task_id,
+                        "attempt_no": claim.attempt_no,
+                        "error": message,
+                    }
+                )
+                continue
+            dispatched.append(
+                {
+                    "task_id": claim.task_id,
+                    "dispatch_task_id": claim.dispatch_task_id,
+                    "attempt_no": claim.attempt_no,
+                    "job_id": job.job_id,
+                    "status": job.status,
+                }
+            )
+        return {
+            "plan_id": plan_id,
+            "reconciled_dispatches": reconciled_dispatches,
+            "claimed": len(claims),
+            "dispatched": dispatched,
+            "failures": failures,
+            "snapshot": self.plan_store.snapshot(plan_id),
+        }
+
+    def retry_plan_task(
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        brief_override: str | None = None,
+    ) -> dict[str, Any]:
+        retried = self.plan_store.retry_task(
+            plan_id,
+            task_id,
+            brief_override=brief_override,
+        )
+        return {"task": retried, "snapshot": self.plan_store.snapshot(plan_id)}
+
+    def plan_snapshot(
+        self,
+        plan_id: str,
+        *,
+        since: int | None = None,
+        event_limit: int = 100,
+        item_limit: int = 20,
+    ) -> dict[str, Any]:
+        return self.plan_store.snapshot(
+            plan_id,
+            since=since,
+            event_limit=event_limit,
+            item_limit=item_limit,
+        )
+
+    def watch_plan(
+        self,
+        plan_id: str,
+        *,
+        since: int,
+        poll_interval_sec: float = 5.0,
+        timeout_sec: float | None = 25.0,
+        event_limit: int = 100,
+        item_limit: int = 20,
+    ) -> dict[str, Any]:
+        if poll_interval_sec < 0:
+            raise ValueError("poll_interval_sec must be non-negative")
+        if timeout_sec is not None and timeout_sec < 0:
+            raise ValueError("timeout_sec must be non-negative")
+        if poll_interval_sec == 0 and timeout_sec is None:
+            raise ValueError("poll_interval_sec=0 requires a timeout_sec")
+
+        started = time.monotonic()
+        while True:
+            snapshot = self.plan_snapshot(
+                plan_id,
+                since=since,
+                event_limit=event_limit,
+                item_limit=item_limit,
+            )
+            elapsed = time.monotonic() - started
+            if snapshot["changes"] or snapshot["status"] == "completed":
+                snapshot["timed_out"] = False
+                snapshot["watch_elapsed_sec"] = round(elapsed, 3)
+                return snapshot
+            if timeout_sec is not None and elapsed >= timeout_sec:
+                snapshot["timed_out"] = True
+                snapshot["watch_elapsed_sec"] = round(elapsed, 3)
+                return snapshot
+            sleep_for = poll_interval_sec
+            if timeout_sec is not None:
+                sleep_for = min(sleep_for, max(0.0, timeout_sec - elapsed))
+            if sleep_for <= 0:
+                continue
+            time.sleep(sleep_for)
+
+    def list_plans(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.plan_store.list_plans(limit)
+
+    def _materialize_plan_brief(self, task_id: str, brief: str) -> Path:
+        brief_path = self.config.coordination_root / "tasks" / task_id / "brief.md"
+        brief_path.parent.mkdir(parents=True, exist_ok=True)
+        brief_path.write_text(brief.rstrip() + "\n", encoding="utf-8")
+        return brief_path
+
     @staticmethod
     def _initialize_task_artifacts(
         *,
@@ -325,10 +612,28 @@ class AgentControlPlane:
         workspace_path: Path,
         expected_branch: str,
         result_path: Path,
+        workspace_access: str = "ide_mcp",
+        read_only: bool = False,
     ) -> None:
         task_dir = result_path.parent
         progress_path = task_dir / "agent-progress.md"
         task_dir.mkdir(parents=True, exist_ok=True)
+        if workspace_access == "native" and read_only:
+            next_action_rules = (
+                "- Agent runner must inspect the workspace with native read-only tools and "
+                "return the structured final response for control-plane recovery; it must "
+                "not update this progress file.\n"
+            )
+        elif workspace_access == "native":
+            next_action_rules = (
+                "- Agent runner must update this file through native shell/file editing "
+                "before repository exploration or edits.\n"
+            )
+        else:
+            next_action_rules = (
+                "- Agent runner must update this file through the IDEA MCP selected "
+                "in the generated prompt before repository exploration or edits.\n"
+            )
         progress_path.write_text(
             "Current phase: queued by control-plane\n"
             "Confirmed facts:\n"
@@ -340,8 +645,7 @@ class AgentControlPlane:
             "Target files:\n"
             "- none yet\n"
             "Next action:\n"
-            "- Agent runner must update this file through the IDEA MCP selected "
-            "in the generated prompt before repository exploration or edits.\n"
+            f"{next_action_rules}"
             "Changed files:\n"
             "- none\n"
             "Open risks:\n"
@@ -359,9 +663,28 @@ class AgentControlPlane:
         )
 
     def start_job(self, options: StartOptions) -> JobRecord:
+        if options.plan_task_id and not options.plan_id:
+            raise PolicyError("plan_task_id requires plan_id")
+        if options.plan_dispatch_token and not options.plan_id:
+            raise PolicyError("plan_dispatch_token requires plan_id")
+        plan_task_id = options.plan_task_id or options.task_id
+        if options.plan_id:
+            try:
+                if options.plan_dispatch_token:
+                    self.plan_store.assert_dispatch_claim(
+                        options.plan_id,
+                        plan_task_id,
+                        dispatch_token=options.plan_dispatch_token,
+                        dispatch_task_id=options.task_id,
+                    )
+                else:
+                    self.plan_store.assert_task_can_start(options.plan_id, plan_task_id)
+            except (KeyError, ValueError) as exc:
+                raise PolicyError(str(exc)) from exc
         allow_dirty = _option(options.allow_dirty, self.config.defaults.allow_dirty)
         workspace_path = options.workspace_path
         if options.slot:
+            self.reconcile_jobs()
             try:
                 slot_status = self.slots.inspect_slot(options.slot)
             except SlotError as exc:
@@ -396,12 +719,28 @@ class AgentControlPlane:
             raise PolicyError("Policy check did not resolve workspace path or expected branch")
 
         route_config = self.config.routes[options.route]
+        requested_workspace_access = (
+            options.workspace_access
+            if options.workspace_access is not None
+            else route_config.workspace_access
+        )
+        workspace_access = _option(
+            requested_workspace_access,
+            self.config.defaults.workspace_access,
+        )
+        if workspace_access not in {"ide_mcp", "native"}:
+            raise PolicyError(
+                f"workspace_access must be exactly 'ide_mcp' or 'native', got {workspace_access!r}"
+            )
+
         backend = _backend_option(
             options.backend,
             route_config.backend,
             self.config.defaults.backend,
         )
         normalized_backend = normalize_backend(backend)
+        if normalized_backend == AGY_BACKEND and workspace_access == "native":
+            raise PolicyError("workspace_access=native is not supported with the agy backend")
         if options.agy_model is not None and normalized_backend != AGY_BACKEND:
             raise PolicyError("--agy-model can only be used with the agy backend")
         agy_model = (
@@ -480,6 +819,7 @@ class AgentControlPlane:
                 backend=backend,
                 read_only=options.read_only,
                 codex_tool_call_budget=codex_tool_call_budget or 0,
+                workspace_access=workspace_access,
             )
         except (FileNotFoundError, ValueError) as exc:
             raise PolicyError(str(exc)) from exc
@@ -511,10 +851,28 @@ class AgentControlPlane:
                 codex_reasoning_effort=codex_reasoning_effort,
                 codex_quality_tier=codex_quality_tier,
                 codex_tool_call_budget=codex_tool_call_budget,
+                workspace_access=workspace_access,
                 slot_name=options.slot,
             )
         except ValueError as exc:
             raise PolicyError(str(exc)) from exc
+
+        if options.plan_id:
+            try:
+                if options.plan_dispatch_token:
+                    self.plan_store.bind_dispatched_job(
+                        options.plan_id,
+                        plan_task_id,
+                        dispatch_token=options.plan_dispatch_token,
+                        job_id=job.job_id,
+                    )
+                else:
+                    self.plan_store.bind_job(options.plan_id, plan_task_id, job.job_id)
+            except (KeyError, ValueError) as exc:
+                message = f"Could not bind job to plan task {options.plan_id}/{plan_task_id}: {exc}"
+                self.store.add_event(job.job_id, "error", message)
+                self._finish_job(job.job_id, "blocked", message)
+                raise PolicyError(message) from exc
 
         try:
             self._initialize_task_artifacts(
@@ -523,6 +881,8 @@ class AgentControlPlane:
                 workspace_path=check.workspace_path,
                 expected_branch=check.expected_branch,
                 result_path=check.result_path,
+                workspace_access=workspace_access,
+                read_only=options.read_only,
             )
             run_dir.mkdir(parents=True, exist_ok=False)
             prompt_path.write_text(prompt, encoding="utf-8")
@@ -547,7 +907,8 @@ class AgentControlPlane:
 
             if not options.read_only:
                 try:
-                    self.slots.ensure_ide_root_module()
+                    if workspace_access != "native":
+                        self.slots.ensure_ide_root_module()
                     if self.config.defaults.prepare_slots:
                         self.slots.prepare_slot(options.slot)
                 except SlotError as exc:
@@ -556,23 +917,82 @@ class AgentControlPlane:
                     self.store.add_event(job.job_id, "error", message)
                     return self._finish_job(job.job_id, "blocked", message)
 
+        worker_instance_id = uuid.uuid4().hex
         try:
-            worker_pid = self._launch_worker(job.job_id)
+            self.store.assign_worker(job.job_id, worker_instance_id)
+            worker_pid = self._launch_worker(job.job_id, worker_instance_id)
         except Exception as exc:
-            if options.slot:
-                self.slots.release_for_job(options.slot, job_id=job.job_id)
             self._finish_job(job.job_id, "worker_error", str(exc))
             raise
-        return self.store.update_job(job.job_id, status="queued", worker_pid=worker_pid)
-
-    def run_job(self, job_id: str) -> JobRecord:
-        job = self.store.update_job(
-            job_id,
-            status="running",
-            worker_pid=os.getpid(),
-            started_at=utc_now(),
+        self.store.update_for_worker(
+            job.job_id,
+            worker_instance_id,
+            worker_pid=worker_pid,
+            worker_heartbeat_at=utc_now(),
         )
-        self.store.add_event(job_id, "info", f"Worker started with PID {os.getpid()}")
+        return self.store.get_job(job.job_id)
+
+    def run_job(
+        self,
+        job_id: str,
+        worker_instance_id: str | None = None,
+    ) -> JobRecord:
+        job = self.store.get_job(job_id)
+        instance_id = worker_instance_id or job.worker_instance_id or uuid.uuid4().hex
+        if job.worker_instance_id is None:
+            job = self.store.assign_worker(
+                job_id,
+                instance_id,
+                worker_pid=os.getpid(),
+            )
+        elif job.worker_instance_id != instance_id:
+            raise WorkerLeaseError(
+                f"Worker identity mismatch for {job_id}: expected {job.worker_instance_id}"
+            )
+
+        lease = WorkerLease(job.run_dir, instance_id)
+        with lease:
+            if not self.store.update_for_worker(
+                job_id,
+                instance_id,
+                status="running",
+                worker_pid=os.getpid(),
+                worker_heartbeat_at=utc_now(),
+                started_at=job.started_at or utc_now(),
+            ):
+                raise WorkerLeaseError(f"Worker no longer owns job {job_id}")
+            self._active_worker_instance_id = instance_id
+            self._worker_ownership_lost = threading.Event()
+            heartbeat_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=self._worker_heartbeat_loop,
+                args=(job_id, instance_id, heartbeat_stop),
+                name=f"acp-heartbeat-{job_id[:32]}",
+                daemon=True,
+            )
+            heartbeat.start()
+            self.store.add_event(job_id, "info", f"Worker started with PID {os.getpid()}")
+            try:
+                return self._run_job_impl(job_id)
+            except Exception as exc:
+                current = self.store.get_job(job_id)
+                if current.finished_at is None and current.worker_instance_id == instance_id:
+                    self.store.finish_running_attempts(
+                        job_id,
+                        "worker_error",
+                        message=str(exc),
+                    )
+                    self.store.add_event(job_id, "error", f"Worker crashed: {exc}")
+                    self._finish_job(job_id, "worker_error", str(exc))
+                raise
+            finally:
+                heartbeat_stop.set()
+                heartbeat.join(timeout=2.0)
+                self._worker_ownership_lost = None
+                self._active_worker_instance_id = None
+
+    def _run_job_impl(self, job_id: str) -> JobRecord:
+        job = self.store.get_job(job_id)
 
         if normalize_backend(job.backend) == CODEX_BACKEND and self.quota_broker is not None:
             if not self._wait_for_codex_quota(job):
@@ -625,8 +1045,9 @@ class AgentControlPlane:
 
             active_profile = model_ladder[model_index]
             log_path = job.run_dir / f"attempt-{attempt_no:03d}.log"
+            self._assert_active_worker(job_id)
             self.store.start_attempt(job_id, attempt_no, log_path)
-            self.store.update_job(
+            self._update_active_worker_job(
                 job_id,
                 status="running",
                 log_path=log_path,
@@ -648,6 +1069,8 @@ class AgentControlPlane:
 
             def should_stop() -> bool:
                 nonlocal guardrail_message, last_guardrail_check
+                if self._worker_ownership_lost is not None and self._worker_ownership_lost.is_set():
+                    return True
                 if self.store.cancel_requested(job_id):
                     return True
                 if guardrail_message:
@@ -669,7 +1092,7 @@ class AgentControlPlane:
                 if guardrail_message:
                     self._preserve_dirty_state_if_needed(job, prefix="guardrail")
                     self.store.add_event(job_id, "error", guardrail_message)
-                    self.store.update_job(
+                    self._update_active_worker_job(
                         job_id,
                         status="guardrail_violation",
                         last_error=guardrail_message,
@@ -681,8 +1104,34 @@ class AgentControlPlane:
                 updates: dict[str, int | None] = {"runner_pid": pid}
                 if job.backend == AGY_BACKEND:
                     updates["agy_pid"] = pid
-                self.store.update_job(job_id, **updates)
+                self._update_active_worker_job(job_id, **updates)
                 return None
+
+            disabled_mcp = list(dict.fromkeys(self.config.defaults.codex_disabled_mcp_servers))
+            if job.workspace_access == "native":
+                configured_ide_servers = tuple(
+                    route.ide_mcp_server
+                    for route in self.config.routes.values()
+                    if route.ide_mcp_server
+                )
+                native_disabled_mcp = (
+                    *configured_ide_servers,
+                    "agentbridge_dataspell_8643",
+                    "agentbridge_idea_64343",
+                    "agentbridge_idea_8644",
+                )
+                disabled_mcp = list(
+                    dict.fromkeys(
+                        (*disabled_mcp, *(server for server in native_disabled_mcp if server))
+                    )
+                )
+
+            if job.workspace_access == "native":
+                effective_forbidden = tuple(
+                    m for m in codex_forbidden_tool_markers if m != "raw_exec"
+                )
+            else:
+                effective_forbidden = codex_forbidden_tool_markers
 
             result = runner.run(
                 AgentRunSpec(
@@ -693,7 +1142,7 @@ class AgentControlPlane:
                     codex_model=active_profile.model,
                     codex_reasoning_effort=active_profile.reasoning_effort,
                     codex_sandbox_mode=self.config.defaults.codex_sandbox_mode,
-                    codex_disabled_mcp_servers=self.config.defaults.codex_disabled_mcp_servers,
+                    codex_disabled_mcp_servers=tuple(disabled_mcp),
                     prompt=attempt_prompt,
                     workspace_path=job.workspace_path,
                     result_path=job.result_path,
@@ -707,15 +1156,19 @@ class AgentControlPlane:
                         self.config.defaults.codex_no_progress_timeout_sec
                     ),
                     codex_tool_call_budget=job.codex_tool_call_budget or 0,
-                    codex_terminal_tab_name=job.task_id,
-                    codex_forbidden_tool_markers=codex_forbidden_tool_markers,
+                    codex_terminal_tab_name=(
+                        None if job.workspace_access == "native" else job.task_id
+                    ),
+                    codex_forbidden_tool_markers=effective_forbidden,
                     codex_resume_thread_id=resume_thread_id,
                     codex_sessions_root=self.config.defaults.codex_sessions_root,
+                    workspace_access=job.workspace_access,
                 ),
                 cancel_requested=should_stop,
                 pid_observed=record_runner_pid,
             )
 
+            self._assert_active_worker(job_id)
             self.store.finish_attempt(
                 job_id,
                 attempt_no,
@@ -733,7 +1186,7 @@ class AgentControlPlane:
                     reasoning_effort=active_profile.reasoning_effort,
                     metrics=result.metrics,
                 )
-            self.store.update_job(job_id, runner_pid=None, agy_pid=None)
+            self._update_active_worker_job(job_id, runner_pid=None, agy_pid=None)
             self.store.add_event(job_id, "info", f"Attempt {attempt_no} ended: {result.status}")
             last_result_message = result.message
 
@@ -753,7 +1206,7 @@ class AgentControlPlane:
                 if result.metrics is not None and result.metrics.thread_id:
                     resume_thread_id = result.metrics.thread_id
                 next_profile = model_ladder[model_index]
-                self.store.update_job(
+                self._update_active_worker_job(
                     job_id,
                     codex_model=next_profile.model,
                     codex_reasoning_effort=next_profile.reasoning_effort,
@@ -859,6 +1312,53 @@ class AgentControlPlane:
         self._write_blocked_result_if_missing(job, last_result_message)
         return self._finish_job(job_id, "failed", last_result_message)
 
+    def _worker_heartbeat_loop(
+        self,
+        job_id: str,
+        worker_instance_id: str,
+        stop: threading.Event,
+    ) -> None:
+        while not stop.wait(5.0):
+            try:
+                owned = self.store.heartbeat_worker(
+                    job_id,
+                    worker_instance_id,
+                    worker_pid=os.getpid(),
+                )
+            except (OSError, sqlite3.Error):
+                owned = False
+            if owned:
+                continue
+            if self._worker_ownership_lost is not None:
+                self._worker_ownership_lost.set()
+            return
+
+    def _assert_active_worker(self, job_id: str) -> None:
+        instance_id = self._active_worker_instance_id
+        if instance_id is None:
+            return
+        if self._worker_ownership_lost is not None and self._worker_ownership_lost.is_set():
+            raise WorkerLeaseError(f"Worker ownership was lost for job {job_id}")
+        if self.store.heartbeat_worker(
+            job_id,
+            instance_id,
+            worker_pid=os.getpid(),
+        ):
+            return
+        if self._worker_ownership_lost is not None:
+            self._worker_ownership_lost.set()
+        raise WorkerLeaseError(f"Worker ownership was lost for job {job_id}")
+
+    def _update_active_worker_job(self, job_id: str, **values: Any) -> JobRecord:
+        instance_id = self._active_worker_instance_id
+        if instance_id is None:
+            return self.store.update_job(job_id, **values)
+        if self.store.update_for_worker(job_id, instance_id, **values):
+            return self.store.get_job(job_id)
+        if self._worker_ownership_lost is not None:
+            self._worker_ownership_lost.set()
+        raise WorkerLeaseError(f"Worker ownership was lost for job {job_id}")
+
     def _model_ladder_for_job(self, job: JobRecord) -> tuple[ModelProfile, ...]:
         model = job.codex_model or self.config.defaults.codex_model
         effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
@@ -881,13 +1381,14 @@ class AgentControlPlane:
         )
         last_reason: str | None = None
         while not self.store.cancel_requested(job.job_id):
+            self._assert_active_worker(job.job_id)
             decision = broker.try_acquire(
                 job.job_id,
                 worker_pid=os.getpid(),
                 capacity_units=capacity_units,
             )
             if decision.acquired:
-                self.store.update_job(job.job_id, status="running")
+                self._update_active_worker_job(job.job_id, status="running")
                 self.store.add_event(
                     job.job_id,
                     "info",
@@ -898,7 +1399,7 @@ class AgentControlPlane:
                     f"{decision.max_capacity_units}",
                 )
                 return True
-            self.store.update_job(job.job_id, status="waiting_quota")
+            self._update_active_worker_job(job.job_id, status="waiting_quota")
             if decision.reason != last_reason:
                 self.store.add_event(job.job_id, "warning", self._quota_wait_message(decision))
                 last_reason = decision.reason
@@ -919,29 +1420,8 @@ class AgentControlPlane:
         return f"Waiting for global Codex quota: {decision.reason or 'unavailable'} ({detail})"
 
     def _refresh_stale_worker_if_needed(self, job_id: str) -> JobRecord:
-        job = self.store.get_job(job_id)
-        if self._is_terminal(job) or job.status not in {"running", "waiting_quota"}:
-            return job
-        if job.worker_pid is None:
-            return job
-        if _process_is_alive(job.worker_pid):
-            return job
-
-        message = (
-            f"Worker process PID {job.worker_pid or '-'} is no longer alive "
-            f"while job status is {job.status}; marking job as worker_error."
-        )
-        if job.runner_pid:
-            message += f" Last observed runner PID was {job.runner_pid}."
-        if job.agy_pid and job.agy_pid != job.runner_pid:
-            message += f" Last observed agy PID was {job.agy_pid}."
-        worker_log_path = job.run_dir / "worker.log"
-        if worker_log_path.exists():
-            message += f" Worker log: {worker_log_path}"
-
-        self.store.add_event(job_id, "error", message)
-        self.store.finish_running_attempts(job_id, "worker_lost", message=message)
-        return self._finish_job(job_id, "worker_error", message)
+        self.reconcile_jobs(job_id)
+        return self.store.get_job(job_id)
 
     def status_job(self, job_id: str) -> dict[str, Any]:
         job = self._refresh_stale_worker_if_needed(job_id)
@@ -959,7 +1439,10 @@ class AgentControlPlane:
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
+            "workspace_access": job.workspace_access,
             "worker_pid": job.worker_pid,
+            "worker_instance_id": job.worker_instance_id,
+            "worker_heartbeat_at": job.worker_heartbeat_at,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
             "log_path": str(job.log_path) if job.log_path else None,
@@ -968,6 +1451,9 @@ class AgentControlPlane:
             "updated_at": job.updated_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "finalization_status": job.finalization_status,
+            "finalization_error": job.finalization_error,
+            "finalized_at": job.finalized_at,
             "last_error": job.last_error,
             "cancel_requested": job.cancel_requested,
             "read_only": job.read_only,
@@ -1007,7 +1493,10 @@ class AgentControlPlane:
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
+            "workspace_access": job.workspace_access,
             "worker_pid": job.worker_pid,
+            "worker_instance_id": job.worker_instance_id,
+            "worker_heartbeat_at": job.worker_heartbeat_at,
             "runner_pid": job.runner_pid,
             "agy_pid": job.agy_pid,
             "read_only": job.read_only,
@@ -1016,6 +1505,9 @@ class AgentControlPlane:
             "updated_at": job.updated_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
+            "finalization_status": job.finalization_status,
+            "finalization_error": job.finalization_error,
+            "finalized_at": job.finalized_at,
             "result_done": result_state.done,
             "result_status": result_state.status,
             "forbidden_changes": forbidden,
@@ -1149,6 +1641,7 @@ class AgentControlPlane:
             "result_done": result_state.done,
             "result_status": result_state.status,
             "result_path": str(job.result_path),
+            "workspace_access": job.workspace_access,
         }
         if log_cursor is not None:
             delta, next_cursor, truncated = _read_log_delta(
@@ -1199,6 +1692,142 @@ class AgentControlPlane:
 
     def sync_slots(self) -> list[dict[str, Any]]:
         return [status.as_dict() for status in self.slots.sync_configured_slots()]
+
+    def list_review_inbox(
+        self,
+        *,
+        review_status: str | None = "pending",
+        parent_thread_id: str | None = None,
+        limit: int = 50,
+        sync_subagents: bool = False,
+        since_hours: float | None = 72.0,
+        max_files: int = 500,
+    ) -> list[dict[str, Any]]:
+        if sync_subagents:
+            self.sync_subagent_results(
+                since_hours=since_hours,
+                max_files=max_files,
+                parent_thread_id=parent_thread_id,
+            )
+        return [
+            _compact_review_item(item, excerpt_limit=600)
+            for item in self.review_inbox.list_items(
+                review_status=review_status,
+                parent_thread_id=parent_thread_id,
+                limit=limit,
+            )
+        ]
+
+    def get_review_inbox_item(self, item_id: str) -> dict[str, Any]:
+        return self.review_inbox.get(item_id).as_dict()
+
+    def resolve_review_inbox_item(self, item_id: str, decision: str) -> dict[str, Any]:
+        return self.review_inbox.resolve(item_id, decision).as_dict()
+
+    def sync_subagent_results(
+        self,
+        *,
+        since_hours: float | None = 72.0,
+        max_files: int = 500,
+        parent_thread_id: str | None = None,
+    ) -> dict[str, Any]:
+        sessions_root = self.config.defaults.codex_sessions_root
+        if sessions_root is None:
+            raise PolicyError(
+                "codex_sessions_root is not configured; cannot import Codex subagent results"
+            )
+        scope_roots: dict[str, Path] = {}
+        for route_name, route_config in self.config.routes.items():
+            scope_roots[f"route:{route_name}"] = route_config.path
+            if route_config.worktree_base.resolve(strict=False) != route_config.path.resolve(
+                strict=False
+            ):
+                scope_roots[f"route-base:{route_name}"] = route_config.worktree_base
+        for configured_slot_name, slot in self.config.slots.items():
+            scope_roots[f"slot:{configured_slot_name}"] = slot.path
+
+        imported: list[ReviewInboxItem] = []
+        for completion in scan_codex_subagent_completions(
+            sessions_root,
+            workspace_roots=scope_roots,
+            parent_thread_id=parent_thread_id,
+            since_hours=since_hours,
+            max_files=max_files,
+        ):
+            matched_route, matched_slot_name = self._route_and_slot_for_scope(completion.route)
+            imported.append(
+                self.review_inbox.upsert(
+                    ReviewInboxDraft(
+                        source_kind="codex_subagent",
+                        source_id=completion.thread_id,
+                        source_status="completed",
+                        source_completed_at=_source_completion_time(completion.completed_at),
+                        delivery_status="ready",
+                        route=matched_route,
+                        workspace_path=completion.cwd,
+                        slot_name=matched_slot_name,
+                        parent_thread_id=completion.parent_thread_id,
+                        agent_path=completion.agent_path,
+                        rollout_path=completion.rollout_path,
+                        result_excerpt=completion.result,
+                        result_text=completion.result,
+                    )
+                )
+            )
+        return {
+            "imported": len(imported),
+            "items": [
+                _sync_review_item(item)
+                for item in sorted(
+                    imported,
+                    key=lambda candidate: (
+                        candidate.source_completed_at or candidate.updated_at,
+                        candidate.item_id,
+                    ),
+                    reverse=True,
+                )[:5]
+            ],
+            "items_truncated": len(imported) > 5,
+        }
+
+    def checkpoint_slot(self, name: str, *, job_id: str) -> dict[str, Any]:
+        job = self.store.get_job(job_id)
+        if not self._is_terminal(job):
+            raise PolicyError(f"Job {job_id} is not terminal")
+        if job.slot_name != name:
+            raise PolicyError(
+                f"Job {job_id} belongs to slot {job.slot_name!r}, not requested slot {name!r}"
+            )
+        status = self.slots.inspect_slot(name)
+        if status.path.resolve(strict=False) != job.workspace_path.resolve(strict=False):
+            raise PolicyError(f"Job {job_id} workspace does not match slot {name}")
+        if status.active_job_id not in {None, job_id}:
+            raise PolicyError(f"Slot {name} is active for another job: {status.active_job_id}")
+        item = self._finish_slot_lifecycle(
+            job,
+            job.status,
+            force_checkpoint=True,
+            allow_inactive=True,
+        )
+        if item is None:
+            raise PolicyError(f"Could not persist review inbox delivery for job {job_id}")
+        return {
+            "slot": self.slots.inspect_slot(name).as_dict(),
+            "inbox": item.as_dict(),
+        }
+
+    def _route_and_slot_for_scope(self, scope: str) -> tuple[str, str | None]:
+        if scope.startswith("slot:"):
+            slot_name = scope.removeprefix("slot:")
+            slot = self.config.slots.get(slot_name)
+            if slot is None:
+                raise PolicyError(f"Unknown configured slot scope: {scope}")
+            return slot.route, slot_name
+        if scope.startswith("route-base:"):
+            return scope.removeprefix("route-base:"), None
+        if scope.startswith("route:"):
+            return scope.removeprefix("route:"), None
+        return scope, None
 
     def manager_accounts(self) -> dict[str, Any]:
         return (
@@ -1406,7 +2035,7 @@ class AgentControlPlane:
         decision["archived_at"] = archived.archived_at
         return decision
 
-    def _launch_worker(self, job_id: str) -> int:
+    def _launch_worker(self, job_id: str, worker_instance_id: str) -> int:
         job = self.store.get_job(job_id)
         worker_log_path = job.run_dir / "worker.log"
         worker_log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1422,6 +2051,8 @@ class AgentControlPlane:
             str(self.config.config_path),
             "--job-id",
             job_id,
+            "--worker-instance-id",
+            worker_instance_id,
         ]
         creationflags = 0
         if os.name == "nt":
@@ -1448,21 +2079,409 @@ class AgentControlPlane:
         return proc.pid
 
     def _finish_job(self, job_id: str, status: str, last_error: str | None = None) -> JobRecord:
-        job = self.store.mark_finished(job_id, status, last_error)
+        instance_id = self._active_worker_instance_id
+        if instance_id is None:
+            self.store.mark_finished(job_id, status, last_error)
+        else:
+            finished = self.store.mark_finished_by_worker(
+                job_id,
+                instance_id,
+                status,
+                last_error,
+            )
+            if finished is None:
+                self.store.add_event(
+                    job_id,
+                    "warning",
+                    f"Stale worker {instance_id} was fenced from terminal transition",
+                )
+                return self.store.get_job(job_id)
+        return self._replay_finalization(job_id, False)
+
+    def _replay_finalization(self, job_id: str, allow_inactive: bool) -> JobRecord:
+        job = self.store.get_job(job_id)
+        if not self._is_terminal(job):
+            raise ValueError(f"Cannot finalize non-terminal job: {job_id}")
+        if job.finalization_status == "completed":
+            return job
+        lease = FinalizationLease(job.run_dir, uuid.uuid4().hex)
+        try:
+            lease.acquire()
+        except WorkerLeaseError:
+            self.store.add_event(
+                job_id,
+                "warning",
+                "Terminal finalization is already running in another process",
+            )
+            return self.store.get_job(job_id)
+        try:
+            return self._replay_finalization_claimed(job_id, allow_inactive)
+        finally:
+            lease.release()
+
+    def _replay_finalization_claimed(self, job_id: str, allow_inactive: bool) -> JobRecord:
+        job = self.store.get_job(job_id)
+        if not self._is_terminal(job):
+            raise ValueError(f"Cannot finalize non-terminal job: {job_id}")
+        if job.finalization_status == "completed":
+            return job
+        if job.finalization_status != "pending":
+            job = self.store.prepare_finalization_replay(job_id)
+        failure: str | None = None
         if self.quota_broker is not None:
             try:
                 self.quota_broker.release(job_id)
             except (OSError, sqlite3.Error) as exc:
-                self.store.add_event(job_id, "warning", f"Could not release quota lease: {exc}")
-        if job.slot_name:
-            slot_status, slot_note = self._slot_release_status(job, status)
-            self.slots.release_for_job(
-                job.slot_name,
+                failure = f"Could not release quota lease: {exc}"
+        item: ReviewInboxItem | None = None
+        try:
+            if failure is not None:
+                raise sqlite3.OperationalError(failure)
+            if job.slot_name:
+                item = self._finish_slot_lifecycle(
+                    job,
+                    job.status,
+                    allow_inactive=allow_inactive,
+                )
+            else:
+                item = self._upsert_job_review(
+                    job,
+                    delivery_status=("ready" if job.status == "completed" else "salvage_ready"),
+                    slot_released=False,
+                )
+            if item is None:
+                raise ValueError("Terminal handoff did not create a review inbox item")
+            if item.delivery_status in {"inspection_failed", "checkpoint_failed"}:
+                raise SlotCheckpointError(
+                    item.checkpoint_error or f"Terminal handoff is {item.delivery_status}"
+                )
+            if job.slot_name:
+                slot = self.slot_store.get_slot(job.slot_name)
+                if slot is not None and slot.active_job_id == job.job_id:
+                    raise ValueError(
+                        f"Slot {job.slot_name} is still owned by terminal job {job_id}"
+                    )
+        except (
+            GitError,
+            OSError,
+            sqlite3.Error,
+            SlotCheckpointError,
+            SlotStoreError,
+            ValueError,
+        ) as exc:
+            failed = self.store.mark_finalization_failed(job_id, str(exc))
+            self.store.add_event(
+                job_id,
+                "error",
+                f"Terminal finalization remains retryable: {exc}",
+            )
+            return failed
+        completed = self.store.mark_finalization_completed(job_id)
+        self.store.add_event(job_id, "info", "Terminal finalization completed")
+        return completed
+
+    def _finish_slot_lifecycle(
+        self,
+        job: JobRecord,
+        job_status: str,
+        *,
+        force_checkpoint: bool = False,
+        allow_inactive: bool = False,
+    ) -> ReviewInboxItem | None:
+        if job.slot_name is None:
+            raise ValueError(f"Job {job.job_id} has no slot to finalize")
+        slot = self.slot_store.require_slot(job.slot_name)
+        if slot.path.resolve(strict=False) != job.workspace_path.resolve(strict=False):
+            raise ValueError(f"Slot {job.slot_name} path changed before finalization: {slot.path}")
+        self.slot_store.claim_for_finalization(job.slot_name, job.job_id)
+        try:
+            state = workspace_state(job.workspace_path)
+        except GitError as exc:
+            note = f"job {job.job_id} finished {job_status}; could not inspect slot: {exc}"
+            item = self._upsert_job_review(
+                job,
+                delivery_status="inspection_failed",
+                checkpoint_error=str(exc),
+                slot_released=False,
+            )
+            self._release_slot_status(
+                job,
+                status="inspection_failed",
+                note=note,
+                allow_inactive=allow_inactive,
+            )
+            return item
+
+        should_checkpoint = force_checkpoint or (
+            self.config.defaults.terminal_slot_policy == "checkpoint"
+        )
+        existing_checkpoint = self._existing_job_checkpoint(job)
+        if should_checkpoint and not state.dirty and existing_checkpoint is not None:
+            return self._release_verified_checkpoint(
+                job,
+                job_status,
+                existing_checkpoint,
+                allow_inactive=allow_inactive,
+            )
+        if state.dirty and should_checkpoint:
+            return self._checkpoint_and_release_slot(
+                job,
+                job_status,
+                allow_inactive=allow_inactive,
+            )
+
+        slot_status, slot_note = self._slot_release_status(job, job_status)
+        if state.dirty:
+            delivery_status = (
+                "dirty_preserved" if job_status == "completed" else "salvage_dirty_preserved"
+            )
+        else:
+            delivery_status = "ready" if job_status == "completed" else "salvage_ready"
+        item = self._upsert_job_review(
+            job,
+            delivery_status=delivery_status,
+            slot_released=False,
+        )
+        released = self._release_slot_status(
+            job,
+            status=slot_status,
+            note=slot_note,
+            allow_inactive=allow_inactive,
+        )
+        if slot_status == "available" and released:
+            item = self._upsert_job_review(
+                job,
+                delivery_status=delivery_status,
+                slot_released=True,
+            )
+        return item
+
+    def _existing_job_checkpoint(self, job: JobRecord) -> SlotCheckpoint | None:
+        try:
+            item = self.review_inbox.get(f"agent_job:{job.job_id}")
+        except KeyError:
+            return None
+        if not all(
+            (
+                item.checkpoint_ref,
+                item.checkpoint_sha,
+                item.checkpoint_tree_sha,
+                item.base_sha,
+            )
+        ):
+            return None
+        return SlotCheckpoint(
+            job_id=job.job_id,
+            task_id=job.task_id,
+            terminal_status=job.status,
+            workspace_path=job.workspace_path.resolve(strict=False),
+            ref_name=str(item.checkpoint_ref),
+            commit_sha=str(item.checkpoint_sha),
+            tree_sha=str(item.checkpoint_tree_sha),
+            base_sha=str(item.base_sha),
+        )
+
+    def _release_verified_checkpoint(
+        self,
+        job: JobRecord,
+        job_status: str,
+        checkpoint: SlotCheckpoint,
+        *,
+        allow_inactive: bool,
+    ) -> ReviewInboxItem:
+        delivery_status = "checkpointed" if job_status == "completed" else "salvage_checkpointed"
+        existing_item = self.review_inbox.get(f"agent_job:{job.job_id}")
+        try:
+            verify_slot_checkpoint(job.workspace_path, checkpoint)
+            if workspace_state(job.workspace_path).dirty:
+                raise SlotCheckpointError(
+                    "Workspace changed while the existing checkpoint was being verified"
+                )
+        except (GitError, OSError, SlotCheckpointError) as exc:
+            self._release_slot_status(
+                job,
+                status="checkpoint_failed",
+                note=f"job {job.job_id} checkpoint verification failed: {exc}",
+                allow_inactive=True,
+            )
+            item = self._upsert_job_review(
+                job,
+                delivery_status="checkpoint_failed",
+                checkpoint=checkpoint,
+                checkpoint_error=str(exc),
+                slot_released=False,
+            )
+            self.store.add_event(
+                job.job_id,
+                "error",
+                f"Existing terminal checkpoint failed verification: {exc}",
+            )
+            return item
+
+        released = self._release_slot_status(
+            job,
+            status="available",
+            note=f"job {job.job_id} checkpoint verified at {checkpoint.ref_name}",
+            allow_inactive=allow_inactive,
+        )
+        return self._upsert_job_review(
+            job,
+            delivery_status=delivery_status,
+            checkpoint=checkpoint,
+            slot_released=existing_item.slot_released or released,
+        )
+
+    def _checkpoint_and_release_slot(
+        self,
+        job: JobRecord,
+        job_status: str,
+        *,
+        allow_inactive: bool,
+    ) -> ReviewInboxItem | None:
+        checkpoint: SlotCheckpoint | None = None
+        try:
+            checkpoint = create_slot_checkpoint(
+                job.workspace_path,
                 job_id=job.job_id,
+                task_id=job.task_id,
+                terminal_status=job_status,
+                scratch_root=job.run_dir / "checkpoint",
+            )
+            delivery_status = (
+                "checkpointed" if job_status == "completed" else "salvage_checkpointed"
+            )
+            self._upsert_job_review(
+                job,
+                delivery_status=delivery_status,
+                checkpoint=checkpoint,
+                slot_released=False,
+            )
+            clean_checkpointed_workspace(
+                job.workspace_path,
+                checkpoint,
+                scratch_root=job.run_dir / "checkpoint",
+            )
+        except (GitError, OSError, sqlite3.Error, SlotCheckpointError) as exc:
+            slot_status, slot_note = self._slot_release_status(job, job_status)
+            self._release_slot_status(
+                job,
                 status=slot_status,
                 note=slot_note,
+                allow_inactive=allow_inactive,
             )
-        return job
+            try:
+                item = self._upsert_job_review(
+                    job,
+                    delivery_status="checkpoint_failed",
+                    checkpoint=checkpoint,
+                    checkpoint_error=str(exc),
+                    slot_released=False,
+                )
+            except (OSError, sqlite3.Error):
+                item = None
+            self.store.add_event(
+                job.job_id,
+                "error",
+                f"Terminal checkpoint cleanup failed safely; slot remains dirty: {exc}",
+            )
+            return item
+
+        released = self._release_slot_status(
+            job,
+            status="available",
+            note=f"job {job.job_id} checkpointed at {checkpoint.ref_name}",
+            allow_inactive=allow_inactive,
+        )
+        item = self._upsert_job_review(
+            job,
+            delivery_status=delivery_status,
+            checkpoint=checkpoint,
+            slot_released=released,
+        )
+        if released:
+            self.store.add_event(
+                job.job_id,
+                "info",
+                (
+                    f"Terminal changes checkpointed at {checkpoint.ref_name} "
+                    f"({checkpoint.commit_sha}); slot is available"
+                ),
+            )
+        else:
+            self.store.add_event(
+                job.job_id,
+                "warning",
+                "Checkpoint is durable and workspace is clean, but the slot registry lock was not released",
+            )
+        return item
+
+    def _upsert_job_review(
+        self,
+        job: JobRecord,
+        *,
+        delivery_status: str,
+        checkpoint: SlotCheckpoint | None = None,
+        checkpoint_error: str | None = None,
+        slot_released: bool,
+    ) -> ReviewInboxItem:
+        result_text = _read_result_text(job.result_path, fallback=job.last_error)
+        verification_bundle = build_verification_bundle(
+            job.result_path,
+            workspace_path=job.workspace_path,
+            checkpoint=checkpoint,
+            checkpoint_error=checkpoint_error,
+        )
+        return self.review_inbox.upsert(
+            ReviewInboxDraft(
+                source_kind="agent_job",
+                source_id=job.job_id,
+                source_status=job.status,
+                source_completed_at=job.finished_at,
+                delivery_status=delivery_status,
+                task_id=job.task_id,
+                route=job.route,
+                workspace_path=job.workspace_path,
+                slot_name=job.slot_name,
+                result_path=job.result_path,
+                checkpoint_ref=checkpoint.ref_name if checkpoint else None,
+                checkpoint_sha=checkpoint.commit_sha if checkpoint else None,
+                checkpoint_tree_sha=checkpoint.tree_sha if checkpoint else None,
+                base_sha=checkpoint.base_sha if checkpoint else None,
+                result_excerpt=result_text,
+                result_text=result_text,
+                verification_bundle=verification_bundle,
+                checkpoint_error=checkpoint_error,
+                slot_released=slot_released,
+            )
+        )
+
+    def _release_slot_status(
+        self,
+        job: JobRecord,
+        *,
+        status: str,
+        note: str | None,
+        allow_inactive: bool,
+    ) -> bool:
+        if job.slot_name is None:
+            return False
+        record = self.slot_store.get_slot(job.slot_name)
+        if record is None:
+            return False
+        if record.active_job_id == job.job_id:
+            return (
+                self.slots.release_for_job(
+                    job.slot_name,
+                    job_id=job.job_id,
+                    status=status,
+                    note=note,
+                )
+                is not None
+            )
+        if record.active_job_id is None and allow_inactive:
+            self.slot_store.mark_status(job.slot_name, status, note=note)
+            return status == "available"
+        return False
 
     @staticmethod
     def _slot_release_status(job: JobRecord, job_status: str) -> tuple[str, str | None]:
@@ -1928,6 +2947,75 @@ def _path_relative_to(path: Path, parent: Path) -> Path | None:
         return path.relative_to(parent)
     except ValueError:
         return None
+
+
+def _read_result_text(path: Path, *, fallback: str | None) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return fallback
+    return text or fallback
+
+
+def _compact_review_item(
+    item: ReviewInboxItem,
+    *,
+    excerpt_limit: int,
+) -> dict[str, Any]:
+    payload = item.as_dict()
+    payload.pop("result_text", None)
+    payload.pop("verification_json", None)
+    excerpt = item.result_excerpt
+    truncated = excerpt is not None and len(excerpt) > excerpt_limit
+    if truncated and excerpt is not None:
+        payload["result_excerpt"] = excerpt[: excerpt_limit - 3] + "..."
+    payload["result_excerpt_truncated"] = truncated
+    bundle = payload.pop("verification_bundle", None)
+    if isinstance(bundle, dict):
+        raw_result = bundle.get("result")
+        raw_artifact = bundle.get("artifact")
+        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
+        artifact: dict[str, Any] = raw_artifact if isinstance(raw_artifact, dict) else {}
+        payload["verification_summary"] = {
+            "review_ready": bundle.get("review_ready"),
+            "format_valid": result.get("format_valid"),
+            "status": result.get("status"),
+            "verification_claim_count": len(result.get("verification_claims", [])),
+            "actual_changed_file_count": len(bundle.get("changed_files_actual", [])),
+            "artifact_kind": artifact.get("kind"),
+            "checkpoint_verified": artifact.get("checkpoint_verified"),
+            "artifact_error": artifact.get("error"),
+        }
+    return payload
+
+
+def _sync_review_item(item: ReviewInboxItem) -> dict[str, Any]:
+    return {
+        "item_id": item.item_id,
+        "source_completed_at": item.source_completed_at,
+        "parent_thread_id": item.parent_thread_id,
+        "agent_path": item.agent_path,
+    }
+
+
+def _source_completion_time(value: str | int | float | None) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, UTC).isoformat(timespec="seconds")
+        except (OSError, OverflowError, ValueError):
+            return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return text
+    return parsed.astimezone(UTC).isoformat(timespec="seconds")
 
 
 def _read_log_delta(

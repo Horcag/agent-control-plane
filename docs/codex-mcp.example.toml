@@ -1,8 +1,10 @@
-# Copy this block into your Codex config.toml after installing the package.
-# Replace C:\\path\\to\\agent-control-plane with your local clone path.
+# First install the MCP extra into this clone's virtual environment:
+# .\.venv\Scripts\python.exe -m pip install -e ".[mcp]"
+# Then copy this block into Codex config.toml, replace the placeholder paths,
+# and restart Codex so the MCP process is recreated with the new configuration.
 
 [mcp_servers.agent_control_plane]
-command = "python"
+command = "C:\\path\\to\\agent-control-plane\\.venv\\Scripts\\python.exe"
 args = [
   "-m",
   "agent_control_plane.app.runtime.mcp_server",
@@ -13,8 +15,5 @@ cwd = "C:\\path\\to\\agent-control-plane"
 enabled = true
 required = false
 startup_timeout_sec = 60
-tool_timeout_sec = 30
-
-# Keep this env block when you use an editable installation or run from source.
-[mcp_servers.agent_control_plane.env]
-PYTHONPATH = "C:\\path\\to\\agent-control-plane\\src"
+# Keep this above the default 25-second watch/plan-watch window.
+tool_timeout_sec = 90

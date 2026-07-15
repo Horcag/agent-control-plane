@@ -37,6 +37,7 @@ class CodexExecRunner:
                 raise RuntimeError("Codex output log was not opened")
             last_message_path = spec.log_path.with_suffix(".last-message.md")
             log.write("# codex exec run\n")
+            log.write(f"workspace_access: {spec.workspace_access}\n")
             log.write(f"workspace: {spec.workspace_path}\n")
             log.write(f"model: {spec.codex_model}\n")
             log.write(f"reasoning_effort: {spec.codex_reasoning_effort}\n")
@@ -121,6 +122,8 @@ class CodexExecRunner:
             command.extend(["-c", f"mcp_servers.{server_name}.enabled=false"])
         if spec.codex_resume_thread_id is None:
             command.extend(["--cd", str(spec.workspace_path)])
+            if spec.workspace_access == "native":
+                command.extend(["--add-dir", str(spec.result_path.parent)])
         command.extend(["--output-last-message", str(last_message_path)])
         if spec.yolo:
             command.append("--dangerously-bypass-approvals-and-sandbox")

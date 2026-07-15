@@ -143,7 +143,7 @@ class SlotManagerTest(unittest.TestCase):
             self.assertEqual(record.status, "active")
             self.assertEqual(record.active_job_id, "job-2")
 
-    def test_inspect_slot_reconciles_clean_dirty_after_job_status(self) -> None:
+    def test_inspect_slot_is_read_only_and_explicit_reconcile_marks_clean_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             slot_root = root / "slots"
@@ -157,8 +157,13 @@ class SlotManagerTest(unittest.TestCase):
 
             status = manager.inspect_slot("main-1")
 
-            self.assertEqual(status.status, "available")
-            self.assertEqual(status.note, "reconciled clean workspace")
+            self.assertEqual(status.status, "dirty_after_job")
+            self.assertEqual(store.require_slot("main-1").status, "dirty_after_job")
+
+            reconciled = manager.reconcile_clean_slot("main-1")
+
+            self.assertEqual(reconciled.status, "available")
+            self.assertEqual(reconciled.note, "reconciled clean workspace")
             self.assertEqual(store.require_slot("main-1").status, "available")
 
     def test_inspect_slot_preserves_clean_dirty_after_failure_status(self) -> None:

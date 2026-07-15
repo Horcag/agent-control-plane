@@ -33,9 +33,13 @@ class IdeModulesTest(unittest.TestCase):
             config = _config(root, slot_path)
 
             result = ensure_slot_ide_module(config, config.slots["dev-1"])
+            payload = result.as_dict()
 
             self.assertTrue(result.changed)
             self.assertTrue(result.loaded)
+            self.assertTrue(payload["workspace_configured_loaded"])
+            self.assertIsNone(payload["runtime_loaded"])
+            self.assertTrue(payload["ide_reload_required"])
             self.assertTrue(result.module_file.exists())
             self.assertIn("frontend/node_modules", result.module_file.read_text(encoding="utf-8"))
             modules_text = result.modules_xml.read_text(encoding="utf-8")
@@ -58,6 +62,8 @@ class IdeModulesTest(unittest.TestCase):
             second = ensure_slot_ide_module(config, config.slots["dev-1"])
 
             self.assertFalse(second.changed)
+            self.assertFalse(second.as_dict()["ide_reload_required"])
+            self.assertIsNone(second.as_dict()["runtime_loaded"])
             modules_text = second.modules_xml.read_text(encoding="utf-8")
             self.assertEqual(modules_text.count("agentbridge-slot-dev-1.iml"), 2)
 

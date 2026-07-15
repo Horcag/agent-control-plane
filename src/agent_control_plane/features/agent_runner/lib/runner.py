@@ -51,6 +51,7 @@ class AgentRunSpec:
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_resume_thread_id: str | None = None
     codex_sessions_root: Path | None = None
+    workspace_access: str = "ide_mcp"
 
 
 @dataclass(frozen=True)

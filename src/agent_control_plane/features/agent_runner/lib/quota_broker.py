@@ -12,6 +12,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
+
 FULL_CODEX_JOB_CAPACITY_UNITS = 30
 _MODEL_CAPACITY_WEIGHTS = {
     "luna": 2,
@@ -56,7 +58,7 @@ class QuotaDecision:
 
 
 class CodexRateLimitReader:
-    """Read the newest five-hour Codex rate-limit snapshot from local rollouts."""
+    """Read the newest primary Codex rate-limit snapshot from local rollouts."""
 
     def __init__(self, sessions_root: Path, *, max_files: int = 24) -> None:
         self.sessions_root = sessions_root
@@ -111,7 +113,7 @@ class CodexRateLimitReader:
 
 
 class GlobalQuotaBroker:
-    """Cross-process concurrency and five-hour quota broker backed by SQLite."""
+    """Cross-process concurrency and primary-window quota broker backed by SQLite."""
 
     def __init__(
         self,
@@ -259,28 +261,33 @@ class GlobalQuotaBroker:
             db.execute("delete from leases where job_id = ?", (job_id,))
 
     def _initialize(self) -> None:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute("begin immediate")
-            db.execute(
-                f"""
-                create table if not exists leases (
-                    job_id text primary key,
-                    worker_pid integer not null,
-                    acquired_at real not null,
-                    heartbeat_at real not null,
-                    capacity_units integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}
-                )
-                """
+        apply_schema_migration(
+            self.database_path,
+            component="global_quota_broker",
+            version=1,
+            checksum="global-quota-broker-v1-20260715",
+            migrate=self._migrate_schema,
+        )
+
+    @staticmethod
+    def _migrate_schema(db: sqlite3.Connection) -> None:
+        db.execute(
+            f"""
+            create table if not exists leases (
+                job_id text primary key,
+                worker_pid integer not null,
+                acquired_at real not null,
+                heartbeat_at real not null,
+                capacity_units integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}
             )
-            columns = {
-                str(row["name"]) for row in db.execute("pragma table_info(leases)").fetchall()
-            }
-            if "capacity_units" not in columns:
-                db.execute(
-                    "alter table leases add column capacity_units "
-                    f"integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}"
-                )
+            """
+        )
+        columns = {str(row["name"]) for row in db.execute("pragma table_info(leases)")}
+        if "capacity_units" not in columns:
+            db.execute(
+                "alter table leases add column capacity_units "
+                f"integer not null default {FULL_CODEX_JOB_CAPACITY_UNITS}"
+            )
 
     @staticmethod
     def _reclaim_dead_leases(db: sqlite3.Connection) -> None:
@@ -291,14 +298,8 @@ class GlobalQuotaBroker:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.database_path, timeout=30)
-        db.row_factory = sqlite3.Row
-        db.execute("pragma busy_timeout = 30000")
-        try:
+        with control_database(self.database_path) as db:
             yield db
-            db.commit()
-        finally:
-            db.close()
 
 
 def _pid_alive(pid: int) -> bool:

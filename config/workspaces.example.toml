@@ -28,6 +28,11 @@ agy_model = "Gemini 3.5 Flash (High)"
 codex_model = "gpt-5.6-terra"
 codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
+# Backward-compatible default. Use "native" to run Codex without AgentBridge/IDEA.
+workspace_access = "ide_mcp"
+# "preserve" leaves terminal changes in a dirty slot. "checkpoint" first stores
+# them in a controller-owned Git ref and review inbox, then cleans and releases the slot.
+terminal_slot_policy = "checkpoint"
 codex_disabled_mcp_servers = []
 codex_no_progress_timeout_sec = 600
 # Keep deep as the default until review/rework telemetry proves a cheaper tier is net-positive.
@@ -45,6 +50,8 @@ codex_deep_tool_call_budget = 120
 codex_global_quota_database = "${USERPROFILE}/.codex/agent-control-plane/global-quota.sqlite3"
 codex_global_max_concurrent_jobs = 2
 codex_global_max_burst_jobs = 8
+# Legacy option name: ACP applies this threshold to the primary rate-limit window
+# reported by Codex, regardless of whether that window is five hours or longer.
 codex_five_hour_soft_limit_percent = 75
 codex_quota_poll_sec = 30
 codex_sessions_root = "${USERPROFILE}/.codex/sessions"
@@ -67,6 +74,8 @@ forbidden_status_globs = [
 [routes.app]
 path = "../my-project"
 required_branch = "main"
+# Optional route override: "ide_mcp" or "native". A per-job override has priority.
+# workspace_access = "native"
 # Use a stable AgentBridge IDE/port ID from ~/.codex/config.toml.
 ide_mcp_server = "agentbridge_idea_8644"
 # Optional: MCP server name from Antigravity User/mcp.json. Configure an

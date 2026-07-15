@@ -144,6 +144,35 @@ class CodexRunnerCommandTest(unittest.TestCase):
         self.assertIn("read-only", command)
         self.assertNotIn("workspace-write", command)
 
+    def test_native_initial_command_adds_coordination_root_for_both_sandboxes(self) -> None:
+        for read_only, expected_sandbox in ((False, "workspace-write"), (True, "read-only")):
+            with self.subTest(read_only=read_only):
+                spec = _spec(
+                    read_only=read_only,
+                    yolo=False,
+                    workspace_access="native",
+                )
+
+                command = CodexExecRunner._build_command(spec)
+
+                add_dir_index = command.index("--add-dir")
+                self.assertEqual(command[add_dir_index + 1], str(spec.result_path.parent))
+                self.assertIn(expected_sandbox, command)
+
+    def test_native_resume_keeps_original_workspace_roots(self) -> None:
+        spec = _spec(
+            read_only=False,
+            yolo=False,
+            workspace_access="native",
+            codex_resume_thread_id="019ef56b-74b4-70e2-9b0d-0e2c0ddfbc9c",
+        )
+
+        command = CodexExecRunner._build_command(spec)
+
+        self.assertNotIn("--cd", command)
+        self.assertNotIn("--add-dir", command)
+        self.assertNotIn("--sandbox", command)
+
     def test_yolo_bypasses_sandbox_flags(self) -> None:
         command = CodexExecRunner._build_command(_spec(read_only=False, yolo=True))
 
@@ -480,6 +509,7 @@ def _spec(
     codex_forbidden_tool_markers: tuple[str, ...] = (),
     codex_resume_thread_id: str | None = None,
     log_path: Path | None = None,
+    workspace_access: str = "ide_mcp",
 ) -> AgentRunSpec:
     return AgentRunSpec(
         backend="codex",
@@ -501,6 +531,7 @@ def _spec(
         idle_timeout_sec=10,
         yolo=yolo,
         read_only=read_only,
+        workspace_access=workspace_access,
     )
 
 

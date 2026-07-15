@@ -30,7 +30,11 @@ class IdeModuleResult:
             "workspace_xml": str(self.workspace_xml),
             "changed": self.changed,
             "present": self.present,
+            # Backward-compatible alias for the persisted workspace.xml intent.
             "loaded": self.loaded,
+            "workspace_configured_loaded": self.loaded,
+            "runtime_loaded": None,
+            "ide_reload_required": self.changed,
         }
 
 

@@ -43,8 +43,9 @@ def build_agy_task_prompt(
         if read_only
         else "- Repository writes are allowed only under the assigned workspace and only when required by the brief."
     )
+    verification_rules = _verification_rules(result_path.with_name("verification.json"))
 
-    return f"""Task ID: {task_id}
+    return """Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 Expected IDEA host project root: {expected_idea_project_root}
@@ -60,6 +61,8 @@ Execute the task only in:
 
 Write the final result to:
 - {result_path}
+
+{verification_rules}
 
 Maintain live progress/state in:
 - {progress_path}
@@ -164,7 +167,7 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-"""
+""".format_map(locals())
 
 
 def _build_agentbridge_task_prompt(
@@ -188,8 +191,9 @@ def _build_agentbridge_task_prompt(
         if read_only
         else "- Repository writes are allowed only under the assigned workspace and only when required by the brief."
     )
+    verification_rules = _verification_rules(result_path.with_name("verification.json"))
 
-    return f"""Task ID: {task_id}
+    return """Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 AgentBridge create root: {workspace_create_root}
@@ -206,6 +210,8 @@ Execute the task only in:
 
 Write the final result to:
 - {result_path}
+
+{verification_rules}
 
 Maintain live progress/state in:
 - {progress_path}
@@ -281,4 +287,14 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-"""
+""".format_map(locals())
+
+
+def _verification_rules(path: Path) -> str:
+    return f"""Write machine-readable verification JSON to `{path}` with exactly these keys:
+- schema_version: 1
+- status: completed, partial, or blocked; it must match result.md
+- changed_files: objects with path and change
+- checks: objects with command, cwd, outcome, exit_code, and summary
+- unverified: concrete omitted checks or remaining risks
+Missing or malformed verification.json blocks normal acceptance."""

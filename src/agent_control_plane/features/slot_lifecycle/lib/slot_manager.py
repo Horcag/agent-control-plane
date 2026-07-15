@@ -179,17 +179,6 @@ class SlotManager:
                     problems.append(f"git status failed: {exc}")
 
         display_status = status
-        if (
-            status == "dirty_after_job"
-            and active_job_id is None
-            and is_git
-            and not dirty
-            and not problems
-        ):
-            record = self._store.mark_available(name, note="reconciled clean workspace")
-            status = record.status
-            note = record.note
-            display_status = status
         if dirty and status == "available" and active_job_id is None:
             display_status = "dirty"
 
@@ -209,6 +198,18 @@ class SlotManager:
             note=note,
             problems=tuple(problems),
         )
+
+    def reconcile_clean_slot(self, name: str) -> SlotStatus:
+        """Explicitly release a clean, inactive terminal-preservation status."""
+        status = self.inspect_slot(name)
+        if status.active_job_id is not None:
+            raise SlotError(f"Slot {name} is active for job {status.active_job_id}")
+        if status.status != "dirty_after_job":
+            return status
+        if status.dirty or status.problems:
+            raise SlotError(f"Slot {name} is not clean enough to reconcile")
+        self._store.mark_available(name, note="reconciled clean workspace")
+        return self.inspect_slot(name, sync=False)
 
     def create_slot(
         self,
@@ -292,7 +293,7 @@ class SlotManager:
                 raise SlotError(f"Refusing to delete non-git non-empty slot path: {status.path}")
             status.path.rmdir()
 
-        self._store.mark_deleted(name, note="deleted")
+        self._store.mark_deleted(name, note="deleted", force=force)
         return self.inspect_slot(name)
 
     def checkout_slot(
@@ -418,14 +419,18 @@ class SlotManager:
             raise SlotError(f"Slot {name} is marked deleted")
         resumable_statuses = {"dirty", "dirty_after_job", "dirty_after_failure"}
         clean_resumable = status.status == "dirty_after_job" and not status.dirty
-        if status.status != "available" and not clean_resumable and not (
-            allow_dirty and status.status in resumable_statuses
+        if (
+            status.status != "available"
+            and not clean_resumable
+            and not (allow_dirty and status.status in resumable_statuses)
         ):
             raise SlotError(f"Slot {name} is {status.status!r}, not available")
         if status.dirty and not allow_dirty:
             raise SlotError(f"Slot {name} is dirty:\n{status.dirty}")
         if not status.exists or not status.is_git_workspace:
             raise SlotError(f"Slot {name} is not an existing git workspace")
+        if clean_resumable or (allow_dirty and status.status in resumable_statuses):
+            self._store.mark_available(name, note=f"explicitly resumed for job {job_id}")
         return self._store.acquire_slot(name, job_id)
 
     def release_for_job(

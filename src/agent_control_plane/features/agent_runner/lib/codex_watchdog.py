@@ -53,7 +53,11 @@ def productive_log_activity_if_needed(
     scan_size: int,
 ) -> tuple[bool, int]:
     text, next_scan_size = _read_new_log_text(spec.log_path, scan_size)
-    return any(marker in text for marker in CODEX_PRODUCTIVE_LOG_MARKERS), next_scan_size
+    if any(marker in text for marker in CODEX_PRODUCTIVE_LOG_MARKERS):
+        return True, next_scan_size
+    if spec.workspace_access == "native" and "\nexec\n" in text:
+        return True, next_scan_size
+    return False, next_scan_size
 
 
 def scan_tool_timeouts(
@@ -108,12 +112,19 @@ def scan_codex_tool_constraints(
         if event is None or event.get("type") != "item.started":
             continue
         item = event.get("item")
-        if not isinstance(item, dict) or item.get("type") != "mcp_tool_call":
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type not in {"mcp_tool_call", "command_execution", "file_change"}:
             continue
         tool_call_count += 1
         tool = str(item.get("tool") or "")
         arguments = item.get("arguments")
-        if tool in CODEX_TERMINAL_TOOLS and terminal_tab_name is not None:
+        if (
+            item_type == "mcp_tool_call"
+            and tool in CODEX_TERMINAL_TOOLS
+            and terminal_tab_name is not None
+        ):
             tab_name = arguments.get("tab_name") if isinstance(arguments, dict) else None
             if tab_name != terminal_tab_name:
                 return (

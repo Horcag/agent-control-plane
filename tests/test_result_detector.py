@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +23,81 @@ class ResultDetectorTest(unittest.TestCase):
 
             self.assertTrue(state.done)
             self.assertEqual(state.status, "completed")
+            self.assertEqual(state.verification_state, "missing")
+
+    def test_verification_bundle_is_validated_without_controlling_termination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = root / "result.md"
+            result.write_text("Status: completed\n", encoding="utf-8")
+            (root / "verification.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "completed",
+                        "changed_files": [{"path": "src/app.py", "change": "modified"}],
+                        "checks": [
+                            {
+                                "command": "pytest -q",
+                                "cwd": ".",
+                                "outcome": "passed",
+                                "exit_code": 0,
+                                "summary": "3 passed",
+                            }
+                        ],
+                        "unverified": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.verification_state, "valid")
+            self.assertIsNone(state.verification_error)
+
+    def test_invalid_or_status_mismatched_bundle_still_terminates_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = root / "result.md"
+            result.write_text("Status: completed\n", encoding="utf-8")
+            verification = root / "verification.json"
+            verification.write_text("{broken", encoding="utf-8")
+
+            malformed = inspect_result(result, started_at=0.0)
+            verification.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "status": "blocked",
+                        "changed_files": [],
+                        "checks": [],
+                        "unverified": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            mismatched = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(malformed.done)
+            self.assertEqual(malformed.verification_state, "invalid")
+            self.assertTrue(mismatched.done)
+            self.assertEqual(mismatched.verification_state, "invalid")
+            self.assertIn("status", mismatched.verification_error or "")
+
+    def test_detects_inline_code_status_without_matching_prose(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.md"
+            result.write_text(
+                "## Status\n`Status: partial`\n\nThe prose mentions Status: completed later.\n",
+                encoding="utf-8",
+            )
+
+            state = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.status, "partial")
 
     def test_normalizes_agy_success_status_to_completed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

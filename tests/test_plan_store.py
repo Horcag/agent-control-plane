@@ -1,0 +1,536 @@
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from agent_control_plane.entities.job import JobStore, ReviewMetricsStore
+from agent_control_plane.entities.plan import (
+    PlanExecutionSpec,
+    PlanStore,
+    PlanTaskDefinition,
+)
+from agent_control_plane.shared.codex_session_usage import TokenUsage
+
+
+def test_plan_snapshot_exposes_only_dependency_ready_tasks() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        store = _plan_store(root)
+
+        store.create_plan(
+            plan_id="transfer",
+            title="Main to dev transfer",
+            objective="Restore product parity",
+            tasks=(
+                PlanTaskDefinition("schema", "Transfer schema"),
+                PlanTaskDefinition("api", "Transfer API", depends_on=("schema",)),
+            ),
+        )
+
+        snapshot = store.snapshot("transfer")
+
+        assert snapshot["progress"] == "0/2"
+        assert [task["task_id"] for task in snapshot["ready_next"]] == ["schema"]
+        assert snapshot["counts"] == {"pending": 1, "ready": 1}
+        assert snapshot["changes"] == []
+        assert snapshot["cursor"] > 0
+
+
+def test_completed_job_waits_for_root_acceptance_before_unlocking_dependents() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(
+                PlanTaskDefinition("schema", "Transfer schema"),
+                PlanTaskDefinition("api", "Transfer API", depends_on=("schema",)),
+            ),
+        )
+        initial_cursor = plans.snapshot("transfer")["cursor"]
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.mark_finished("schema-job", "completed")
+
+        finalizing = plans.snapshot("transfer", since=initial_cursor)
+
+        assert finalizing["awaiting_review"] == []
+        assert finalizing["running"][0]["state"] == "finalizing"
+
+        jobs.mark_finalization_completed("schema-job")
+
+        awaiting_review = plans.snapshot("transfer", since=initial_cursor)
+
+        assert awaiting_review["ready_next"] == []
+        assert awaiting_review["awaiting_review"][0]["job_id"] == "schema-job"
+        assert awaiting_review["requires_root_decision"][0]["task_id"] == "schema"
+        review_cursor = awaiting_review["cursor"]
+
+        plans.accept_task("transfer", "schema", accepted_sha="abc123")
+        accepted = plans.snapshot("transfer", since=review_cursor)
+
+        assert accepted["completed"] == [
+            {
+                "task_id": "schema",
+                "job_id": "schema-job",
+                "accepted_sha": "abc123",
+            }
+        ]
+        assert [task["task_id"] for task in accepted["ready_next"]] == ["api"]
+        assert accepted["progress"] == "1/2"
+        assert plans.snapshot("transfer", since=accepted["cursor"])["changes"] == []
+
+
+def test_plan_manifest_rejects_unknown_dependencies_and_cycles() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        store = _plan_store(Path(temp))
+
+        with pytest.raises(ValueError, match="unknown task"):
+            store.create_plan(
+                plan_id="unknown",
+                title="Unknown dependency",
+                tasks=(PlanTaskDefinition("api", "API", depends_on=("schema",)),),
+            )
+
+        with pytest.raises(ValueError, match="cycle"):
+            store.create_plan(
+                plan_id="cycle",
+                title="Cycle",
+                tasks=(
+                    PlanTaskDefinition("schema", "Schema", depends_on=("api",)),
+                    PlanTaskDefinition("api", "API", depends_on=("schema",)),
+                ),
+            )
+
+
+def test_manual_job_binding_cannot_bypass_plan_dependencies() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(
+                PlanTaskDefinition("schema", "Schema"),
+                PlanTaskDefinition("api", "API", depends_on=("schema",)),
+            ),
+        )
+        _create_job(jobs, root, job_id="api-job", task_id="api-run")
+
+        with pytest.raises(ValueError, match="dependencies are incomplete"):
+            plans.bind_job("transfer", "api", "api-job")
+
+
+def test_root_verified_review_outcome_automatically_accepts_plan_task() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        reviews = ReviewMetricsStore(root / "jobs.sqlite3")
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(PlanTaskDefinition("schema", "Schema"),),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.mark_finished("schema-job", "completed")
+        jobs.mark_finalization_completed("schema-job")
+        span_id = reviews.start_span(
+            span_id="review-transfer",
+            name="Transfer review",
+            session_path=root / "rollout.jsonl",
+            usage=TokenUsage(0, 0, 0, 0),
+        )
+        reviews.attach_job(
+            span_id,
+            job_id="schema-job",
+            outcome="accepted",
+            root_verified=True,
+            accepted_sha="abc123",
+        )
+
+        snapshot = plans.snapshot("transfer")
+
+        assert snapshot["progress"] == "1/1"
+        assert snapshot["status"] == "completed"
+
+
+def test_plan_invariants_cover_active_jobs_decisions_and_current_projection() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(
+                PlanTaskDefinition("schema", "Schema"),
+                PlanTaskDefinition("api", "API", depends_on=("schema",)),
+            ),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        _create_job(jobs, root, job_id="schema-retry", task_id="schema-retry-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.update_job("schema-job", status="waiting_quota")
+
+        with pytest.raises(ValueError, match="active job"):
+            plans.bind_job("transfer", "schema", "schema-retry")
+
+        snapshot = plans.snapshot("transfer")
+        assert snapshot["running"][0]["job_status"] == "waiting_quota"
+
+
+def test_root_decisions_require_completed_job_and_are_immutable() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(PlanTaskDefinition("schema", "Schema"),),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.mark_finished("schema-job", "failed")
+        jobs.mark_finalization_completed("schema-job")
+
+        with pytest.raises(ValueError, match="eligible completed worker"):
+            plans.accept_task("transfer", "schema")
+
+        _create_job(jobs, root, job_id="schema-retry", task_id="schema-retry-run")
+        plans.bind_job("transfer", "schema", "schema-retry")
+        jobs.mark_finished("schema-retry", "completed")
+        jobs.mark_finalization_completed("schema-retry")
+        plans.accept_task("transfer", "schema", accepted_sha="abc123")
+
+        with pytest.raises(ValueError, match="already accepted"):
+            plans.reject_task("transfer", "schema")
+
+
+def test_active_root_verified_outcome_does_not_unlock_dependants() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        reviews = ReviewMetricsStore(root / "jobs.sqlite3")
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(
+                PlanTaskDefinition("schema", "Schema"),
+                PlanTaskDefinition("api", "API", depends_on=("schema",)),
+            ),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        span_id = reviews.start_span(
+            span_id="review-transfer",
+            name="Transfer review",
+            session_path=root / "rollout.jsonl",
+            usage=TokenUsage(0, 0, 0, 0),
+        )
+        reviews.attach_job(
+            span_id,
+            job_id="schema-job",
+            outcome="accepted",
+            root_verified=True,
+            accepted_sha="abc123",
+        )
+
+        snapshot = plans.snapshot("transfer")
+
+        assert snapshot["progress"] == "0/2"
+        assert snapshot["ready_next"] == []
+        assert snapshot["running"][0]["task_id"] == "schema"
+
+
+def test_snapshot_exposes_completed_task_identity_and_truncation() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(PlanTaskDefinition("schema", "Schema"),),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.mark_finished("schema-job", "completed")
+        jobs.mark_finalization_completed("schema-job")
+        plans.accept_task("transfer", "schema", accepted_sha="abc123")
+
+        snapshot = plans.snapshot("transfer", item_limit=1)
+
+        assert snapshot["progress"] == "1/1"
+        assert snapshot["completed_tasks"] == [
+            {"task_id": "schema", "job_id": "schema-job", "accepted_sha": "abc123"}
+        ]
+        assert snapshot["item_counts"]["completed_tasks"] == 1
+        assert snapshot["truncated"]["completed_tasks"] is False
+
+
+def test_plan_manifest_rejects_duplicate_dependencies_and_duplicate_plan_ids() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        store = _plan_store(Path(temp))
+        definitions = (PlanTaskDefinition("schema", "Schema"),)
+        store.create_plan(plan_id="transfer", title="Transfer", tasks=definitions)
+
+        with pytest.raises(ValueError, match="duplicate dependency"):
+            store.create_plan(
+                plan_id="duplicate-dependency",
+                title="Duplicate dependency",
+                tasks=(
+                    PlanTaskDefinition("schema", "Schema"),
+                    PlanTaskDefinition("api", "API", depends_on=("schema", "schema")),
+                ),
+            )
+        with pytest.raises(ValueError, match="already exists"):
+            store.create_plan(plan_id="transfer", title="Transfer", tasks=definitions)
+
+
+def test_executable_task_spec_round_trips_without_returning_full_brief() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        plans.create_plan(
+            plan_id="dispatch",
+            title="Dispatch",
+            tasks=(
+                PlanTaskDefinition(
+                    "schema",
+                    "Schema",
+                    execution=PlanExecutionSpec(
+                        route="dev",
+                        brief="secret implementation brief",
+                        backend="codex",
+                        workspace_access="native",
+                        codex_quality_tier="mechanical",
+                    ),
+                ),
+            ),
+        )
+
+        task = plans.snapshot("dispatch")["ready_next"][0]
+
+        assert task["execution"] == {
+            "route": "dev",
+            "slot": None,
+            "backend": "codex",
+            "workspace_access": "native",
+            "read_only": False,
+            "codex_quality_tier": "mechanical",
+            "brief_sha256": "2d3f668e501d9979fac44adb78c7cf3b970a83cba93a0d62d0a769caf31b884d",
+            "brief_chars": 27,
+        }
+        assert "secret implementation brief" not in str(task)
+
+
+def test_ready_task_claim_is_atomic_across_two_plan_store_instances(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    first = PlanStore(database)
+    second = PlanStore(database)
+    first.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+
+    first_claims = first.claim_ready_tasks("dispatch", limit=1)
+    second_claims = second.claim_ready_tasks("dispatch", limit=1)
+
+    assert len(first_claims) == 1
+    assert second_claims == []
+    assert first.snapshot("dispatch")["running"][0]["state"] == "dispatching"
+
+
+def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="First attempt"),
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="failed-job", task_id="failed-run")
+    plans.bind_job("dispatch", "task", "failed-job")
+    jobs.mark_finished("failed-job", "failed")
+    jobs.mark_finalization_completed("failed-job")
+
+    assert plans.claim_ready_tasks("dispatch", limit=1) == []
+    retried = plans.retry_task("dispatch", "task", brief_override="Second attempt")
+    claims = plans.claim_ready_tasks("dispatch", limit=1)
+
+    assert retried["state"] == "ready"
+    assert claims[0].attempt_no == 1
+    assert claims[0].execution.brief == "Second attempt"
+
+
+def test_dispatch_claim_token_is_required_to_bind_created_job(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+    claim = plans.claim_ready_tasks("dispatch")[0]
+    _create_job(jobs, tmp_path, job_id="created-job", task_id=claim.dispatch_task_id)
+
+    with pytest.raises(ValueError, match="stale"):
+        plans.bind_dispatched_job(
+            "dispatch",
+            "task",
+            dispatch_token="wrong-token",
+            job_id="created-job",
+        )
+
+    plans.assert_dispatch_claim(
+        "dispatch",
+        "task",
+        dispatch_token=claim.dispatch_token,
+        dispatch_task_id=claim.dispatch_task_id,
+    )
+    plans.bind_dispatched_job(
+        "dispatch",
+        "task",
+        dispatch_token=claim.dispatch_token,
+        job_id="created-job",
+    )
+
+    running = plans.snapshot("dispatch")["running"][0]
+    assert running["job_id"] == "created-job"
+    assert running["attempt_no"] == 1
+
+
+def test_dispatch_failure_is_durable_and_not_automatically_reclaimed(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+    claim = plans.claim_ready_tasks("dispatch")[0]
+
+    assert plans.mark_dispatch_failed(
+        "dispatch",
+        "task",
+        dispatch_token=claim.dispatch_token,
+        error="slot unavailable",
+    )
+    assert plans.claim_ready_tasks("dispatch") == []
+    blocked = plans.snapshot("dispatch")["blocked"][0]
+    assert blocked["state"] == "dispatch_failed"
+    assert blocked["dispatch_error"] == "slot unavailable"
+
+
+def test_dead_dispatch_owner_is_reconciled_to_explicit_retry_state(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+    plans.claim_ready_tasks("dispatch", owner_pid=424242, limit=1)
+
+    recovered = plans.reconcile_orphaned_dispatches(
+        "dispatch",
+        process_is_alive=lambda _pid: False,
+    )
+
+    assert recovered == ["task"]
+    assert plans.snapshot("dispatch")["blocked"][0]["state"] == "dispatch_failed"
+    assert plans.claim_ready_tasks("dispatch") == []
+
+
+def _plan_store(root: Path) -> PlanStore:
+    jobs = JobStore(root / "jobs.sqlite3")
+    jobs.initialize()
+    return PlanStore(root / "jobs.sqlite3")
+
+
+def _create_job(
+    store: JobStore,
+    root: Path,
+    *,
+    job_id: str,
+    task_id: str,
+) -> None:
+    result_path = root / "tasks" / task_id / "result.md"
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        "Status: completed\n\nChanged files: src/schema.py\n\nVerification performed: tests passed\n",
+        encoding="utf-8",
+    )
+    store.create_job(
+        job_id=job_id,
+        task_id=task_id,
+        route="dev",
+        workspace_path=root / "workspace",
+        expected_branch="codex/schema",
+        config_path=root / "workspaces.toml",
+        run_dir=root / "runs" / job_id,
+        prompt_path=root / "runs" / job_id / "prompt.md",
+        result_path=result_path,
+        timeout_sec=10,
+        idle_timeout_sec=5,
+        print_timeout="10s",
+        max_restarts=0,
+        yolo=False,
+        allow_dirty=False,
+        read_only=False,
+        backend="codex",
+    )

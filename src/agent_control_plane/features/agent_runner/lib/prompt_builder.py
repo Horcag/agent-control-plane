@@ -19,10 +19,55 @@ def build_task_prompt(
     backend: str = CODEX_BACKEND,
     read_only: bool = False,
     codex_tool_call_budget: int = 0,
+    workspace_access: str = "ide_mcp",
 ) -> str:
     task_dir = config.coordination_root / "tasks" / task_id
     brief_path = task_dir / "brief.md"
     progress_path = task_dir / "agent-progress.md"
+    verification_path = result_path.with_name("verification.json")
+    verification_rules = _verification_rules(verification_path)
+
+    if workspace_access == "native":
+        _required_file(brief_path)
+        if read_only:
+            coordination_rules = f"""- This is a READ-ONLY job.
+- You are FORBIDDEN from editing any files in the workspace or updating the progress file.
+- You MUST write your final response beginning with exactly one of: Status: completed, Status: partial, Status: blocked.
+- The response itself will be recovered and written to: {result_path}"""
+        else:
+            coordination_rules = f"""- Maintain live progress/state in: {progress_path}
+- Your first coordination action MUST be to update the progress file: {progress_path} with: Current phase, Confirmed facts, Target files, Next action, Changed files, and Open risks.
+- Write the final result file to: {result_path} only after all work and verification are actually complete."""
+
+        return f"""Task ID: {task_id}
+Workspace route: {route}
+Workspace path: {workspace_path}
+Expected branch: {expected_branch}
+Hard tool-call budget: {codex_tool_call_budget or "runner default"}
+
+Read before acting:
+- {brief_path}
+
+Execute the task only in:
+- {workspace_path}
+
+Write the final result to:
+- {result_path}
+
+{verification_rules}
+
+{coordination_rules}
+
+Mandatory execution rules:
+- Use native shell commands, native search (for example `rg`), and native file-edit tools (for example `apply_patch`).
+- You are FORBIDDEN from using or discovering AgentBridge, IntelliJ IDEA, or DataSpell MCP servers or tools.
+- Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
+- Preserve user changes. Keep changes narrow, task-scoped, and minimal.
+- Run tests and inspect diffs before claiming completion.
+- You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
+- You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID.
+- Write the final result in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
+"""
     protocol_path = _protocol_path(config.coordination_root)
     routing_path = _required_file(config.coordination_root / "workspace-routing.md")
     _required_file(brief_path)
@@ -85,6 +130,8 @@ Execute the task only in:
 Write the final result to:
 - {result_path}
 
+{verification_rules}
+
 Maintain live progress/state in:
 - {progress_path}
 
@@ -113,8 +160,11 @@ Mandatory execution rules:
   `list_mcp_resource_templates` for delegated repository work. The runner treats
   those markers as forbidden tool usage and will stop the attempt.
 - Use `{tool_namespace}run_in_terminal` for necessary local commands such
-  as path-scoped `rg`, tests, linters, and formatters. Use dedicated IDEA MCP
-  `git_*` tools exclusively for Git; terminal Git is forbidden.
+  as path-scoped `rg`, tests, linters, and formatters. Every terminal command must
+  first perform an explicit `Set-Location -LiteralPath '{workspace_path}'` (on Windows)
+  or `cd '{workspace_path}'` (on POSIX) because the IDE terminal's working-directory argument
+  is not reliable on this host. Use dedicated IDEA MCP `git_*` tools exclusively for Git;
+  terminal Git is forbidden.
 - Reserve one terminal tab named exactly `{task_id}`. Every `run_in_terminal`,
   `read_terminal_output`, `write_terminal_input`, and `close_terminal` call must
   pass `tab_name="{task_id}"`; never omit it and never append display suffixes
@@ -153,7 +203,8 @@ Mandatory execution rules:
   absolute physical path.
 - Read existing repository files by their absolute physical paths under
   `{idea_edit_root}`. Use `edit_text` with that same absolute path for normal
-  surgical edits.
+  surgical edits. For all AgentBridge `edit_text` calls, you must pass
+  `auto_format_and_optimize_imports=false` unless formatting/refactoring is the task itself.
 - Before each `edit_text` call, confirm the source and edit paths both start with
   `{idea_edit_root}` and identify the same existing file. If either check fails,
   write Status: blocked. Never retry against the route root or canonical checkout.
@@ -350,6 +401,19 @@ def _protocol_path(coordination_root: Path) -> Path:
             return candidate
     expected = ", ".join(str(candidate) for candidate in candidates)
     raise FileNotFoundError(f"Required agent protocol not found; expected one of: {expected}")
+
+
+def _verification_rules(path: Path) -> str:
+    return f"""Write the machine-readable verification bundle to:
+- {path}
+
+The file must be JSON only, use schema_version 1, and contain exactly:
+- status: completed, partial, or blocked; it must match result.md.
+- changed_files: objects with path and change (added, modified, deleted, renamed, or untracked).
+- checks: objects with command, cwd, outcome (passed, failed, or not_run), exit_code, and summary.
+- unverified: an array of concrete remaining risks or omitted checks.
+Example: {{"schema_version":1,"status":"completed","changed_files":[],"checks":[{{"command":"pytest -q","cwd":".","outcome":"passed","exit_code":0,"summary":"3 passed"}}],"unverified":[]}}
+Missing or malformed verification.json does not keep the worker alive, but it blocks normal acceptance."""
 
 
 def _required_file(path: Path) -> Path:

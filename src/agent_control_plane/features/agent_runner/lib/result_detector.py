@@ -4,7 +4,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_control_plane.shared.verification_report import inspect_verification_report
+
 STATUS_PATTERNS = (
+    re.compile(r"(?im)^\s*`Status\s*:\s*(completed|success|partial|blocked)\b`\s*$"),
     re.compile(r"(?im)^\s*Status\s*:\s*(completed|success|partial|blocked)\b"),
     re.compile(
         r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?(?:Status|Статус)(?:\*\*)?\s*:\s*"
@@ -33,6 +36,9 @@ class ResultState:
     done: bool
     status: str | None
     reason: str | None = None
+    verification_state: str | None = None
+    verification_error: str | None = None
+    verification_sha256: str | None = None
 
 
 def inspect_result(path: Path, started_at: float) -> ResultState:
@@ -54,7 +60,19 @@ def inspect_result(path: Path, started_at: float) -> ResultState:
     for pattern in STATUS_PATTERNS:
         match = pattern.search(text)
         if match:
-            return ResultState(done=True, status=_normalize_status(match.group(1)))
+            status = _normalize_status(match.group(1))
+            verification = inspect_verification_report(
+                path,
+                expected_status=status,
+                started_at=started_at,
+            )
+            return ResultState(
+                done=True,
+                status=status,
+                verification_state=verification.state,
+                verification_error=verification.error,
+                verification_sha256=verification.sha256,
+            )
     return ResultState(done=False, status=None, reason="result status marker is missing")
 
 

@@ -9,6 +9,7 @@ from typing import Any
 
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.codex_session_usage import TokenUsage
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 REVIEW_PHASES = (
     "investigation",
@@ -27,11 +28,19 @@ class ReviewMetricsStore:
         self.database_path = database_path
 
     def initialize(self) -> None:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                create table if not exists review_spans (
+        apply_schema_migration(
+            self.database_path,
+            component="review_metrics_store",
+            version=1,
+            checksum="review-metrics-store-v1-20260715",
+            migrate=self._migrate_schema,
+        )
+
+    @staticmethod
+    def _migrate_schema(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            create table if not exists review_spans (
                     span_id text primary key,
                     name text not null,
                     session_path text not null,
@@ -49,9 +58,12 @@ class ReviewMetricsStore:
                     notes text,
                     created_at text not null,
                     updated_at text not null
-                );
-
-                create table if not exists review_checkpoints (
+                )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists review_checkpoints (
                     span_id text not null references review_spans(span_id),
                     phase text not null,
                     recorded_at text not null,
@@ -60,9 +72,12 @@ class ReviewMetricsStore:
                     output_tokens integer not null,
                     reasoning_output_tokens integer not null,
                     primary key(span_id, phase)
-                );
-
-                create table if not exists review_job_outcomes (
+                )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists review_job_outcomes (
                     span_id text not null references review_spans(span_id),
                     job_id text not null references jobs(job_id),
                     attempt_no integer,
@@ -74,9 +89,9 @@ class ReviewMetricsStore:
                     notes text,
                     recorded_at text not null,
                     primary key(span_id, job_id)
-                );
-                """
-            )
+                )
+            """
+        )
 
     def start_span(
         self,
@@ -360,14 +375,8 @@ class ReviewMetricsStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.database_path, timeout=30)
-        db.row_factory = sqlite3.Row
-        db.execute("pragma foreign_keys = on")
-        try:
+        with control_database(self.database_path) as db:
             yield db
-            db.commit()
-        finally:
-            db.close()
 
 
 def _usage_from_row(row: dict[str, Any], prefix: str) -> TokenUsage:

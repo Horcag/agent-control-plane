@@ -35,6 +35,7 @@ class RouteConfig:
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] | None = None
+    workspace_access: str | None = None
     monitor_route_root: bool = True
 
 
@@ -74,6 +75,8 @@ class ControlDefaults:
     codex_model: str = "gpt-5"
     codex_reasoning_effort: str = "low"
     codex_sandbox_mode: str = "workspace-write"
+    workspace_access: str = "ide_mcp"
+    terminal_slot_policy: str = "preserve"
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_no_progress_timeout_sec: int = 240
@@ -199,6 +202,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         codex_sandbox_mode=_codex_sandbox_mode_value(
             defaults_raw.get("codex_sandbox_mode", "workspace-write")
         ),
+        workspace_access=_workspace_access_value(defaults_raw.get("workspace_access", "ide_mcp")),
+        terminal_slot_policy=_terminal_slot_policy_value(
+            defaults_raw.get("terminal_slot_policy", "preserve")
+        ),
         codex_disabled_mcp_servers=_string_tuple(
             defaults_raw.get("codex_disabled_mcp_servers", [])
         ),
@@ -307,6 +314,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             codex_forbidden_tool_markers=_optional_string_tuple(
                 value.get("codex_forbidden_tool_markers")
             ),
+            workspace_access=_optional_workspace_access_value(value.get("workspace_access")),
             monitor_route_root=bool(value.get("monitor_route_root", True)),
         )
 
@@ -454,6 +462,26 @@ def _codex_sandbox_mode_value(value: Any) -> str:
         expected = ", ".join(sorted(allowed))
         raise ValueError(f"control.defaults.codex_sandbox_mode must be one of: {expected}")
     return mode
+
+
+def _workspace_access_value(value: Any) -> str:
+    access = _string_value(value).strip()
+    if access not in {"ide_mcp", "native"}:
+        raise ValueError("workspace_access must be either 'ide_mcp' or 'native'")
+    return access
+
+
+def _optional_workspace_access_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _workspace_access_value(value)
+
+
+def _terminal_slot_policy_value(value: Any) -> str:
+    policy = _string_value(value).strip()
+    if policy not in {"preserve", "checkpoint"}:
+        raise ValueError("terminal_slot_policy must be either 'preserve' or 'checkpoint'")
+    return policy
 
 
 def _optional_non_negative_int(value: Any) -> int | None:

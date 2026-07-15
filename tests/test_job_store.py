@@ -53,6 +53,110 @@ class JobStoreTest(unittest.TestCase):
 
             self.assertTrue(store.cancel_requested("job-2"))
 
+    def test_workspace_access_default_is_ide_mcp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            job = _create_job(store, root, "job-1")
+            self.assertEqual(job.workspace_access, "ide_mcp")
+
+    def test_workspace_access_explicit_native(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            job = store.create_job(
+                job_id="job-native",
+                task_id="task-native",
+                route="main",
+                workspace_path=root / "workspace",
+                expected_branch="review/pr",
+                config_path=root / "config.toml",
+                run_dir=root / "runs" / "job-native",
+                prompt_path=root / "runs" / "job-native" / "prompt.md",
+                result_path=root / "tasks" / "task-native" / "result.md",
+                timeout_sec=10,
+                idle_timeout_sec=5,
+                print_timeout="10s",
+                max_restarts=0,
+                yolo=False,
+                allow_dirty=False,
+                read_only=False,
+                workspace_access="native",
+            )
+            self.assertEqual(job.workspace_access, "native")
+
+            # Fetch from DB and check again
+            fetched = store.get_job("job-native")
+            self.assertEqual(fetched.workspace_access, "native")
+
+    def test_old_jobs_table_migration(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "jobs.sqlite3"
+
+            # Manually create table without workspace_access column
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                create table jobs (
+                    job_id                 text primary key,
+                    task_id                text    not null,
+                    route                  text    not null,
+                    workspace_path         text    not null,
+                    expected_branch        text    not null,
+                    status                 text    not null,
+                    config_path            text    not null,
+                    run_dir                text    not null,
+                    prompt_path            text    not null,
+                    result_path            text    not null,
+                    log_path               text,
+                    worker_pid             integer,
+                    runner_pid             integer,
+                    agy_pid                integer,
+                    backend                text    not null default 'agy',
+                    agy_model              text,
+                    codex_model            text,
+                    codex_reasoning_effort text,
+                    codex_quality_tier     text,
+                    codex_tool_call_budget integer,
+                    archived_at            text,
+                    created_at             text    not null,
+                    updated_at             text    not null,
+                    started_at             text,
+                    finished_at            text,
+                    timeout_sec            integer not null,
+                    idle_timeout_sec       integer not null,
+                    print_timeout          text    not null,
+                    max_restarts           integer not null,
+                    yolo                   integer not null,
+                    allow_dirty            integer not null,
+                    read_only              integer not null default 0,
+                    slot_name              text,
+                    last_error             text,
+                    cancel_requested       integer not null default 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                insert into jobs (job_id, task_id, route, workspace_path, expected_branch, status,
+                                  config_path, run_dir, prompt_path, result_path,
+                                  created_at, updated_at, timeout_sec, idle_timeout_sec,
+                                  print_timeout, max_restarts, yolo, allow_dirty)
+                values ('old-job', 'old-task', 'main', 'wp', 'branch', 'created',
+                        'cp', 'rd', 'pp', 'rp', 'now', 'now', 10, 5, '10s', 0, 0, 0)
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            # Initialize JobStore (should trigger migration/add workspace_access column)
+            store = JobStore(db_path)
+            job = store.get_job("old-job")
+            self.assertEqual(job.workspace_access, "ide_mcp")
+
 
 def _create_job(store: JobStore, root: Path, job_id: str):
     return store.create_job(

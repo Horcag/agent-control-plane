@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_control_plane.shared.clock import utc_now
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 
 @dataclass(frozen=True)
@@ -28,24 +29,32 @@ class SlotStore:
         self.database_path = database_path
 
     def initialize(self) -> None:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                create table if not exists slots (
-                    name text primary key,
-                    route text not null,
-                    path text not null,
-                    status text not null,
-                    active_job_id text,
-                    created_at text not null,
-                    updated_at text not null,
-                    last_used_at text,
-                    use_count integer not null default 0,
-                    note text
-                );
-                """
+        apply_schema_migration(
+            self.database_path,
+            component="slot_store",
+            version=1,
+            checksum="slot-store-v1-20260715",
+            migrate=self._migrate_schema,
+        )
+
+    @staticmethod
+    def _migrate_schema(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            create table if not exists slots (
+                name text primary key,
+                route text not null,
+                path text not null,
+                status text not null,
+                active_job_id text,
+                created_at text not null,
+                updated_at text not null,
+                last_used_at text,
+                use_count integer not null default 0,
+                note text
             )
+            """
+        )
 
     def register_slot(
         self,
@@ -74,18 +83,45 @@ class SlotStore:
                 db.execute(
                     """
                     update slots
-                    set route = ?, path = ?, updated_at = ?, note = coalesce(?, note)
+                    set route = ?, path = ?, updated_at = ?
                     where name = ?
                     """,
-                    (route, str(path), now, note, name),
+                    (route, str(path), now, name),
                 )
         return self.require_slot(name)
 
     def mark_available(self, name: str, *, note: str | None = None) -> SlotRecord:
-        return self._update_status(name, "available", None, note)
+        return self._update_inactive_status(name, "available", note)
 
-    def mark_deleted(self, name: str, *, note: str | None = None) -> SlotRecord:
-        return self._update_status(name, "deleted", None, note)
+    def mark_status(self, name: str, status: str, *, note: str | None = None) -> SlotRecord:
+        normalized = status.strip()
+        if not normalized:
+            raise ValueError("Slot status must not be empty")
+        if normalized in {"active", "finalizing"}:
+            raise ValueError(f"Slot status {normalized!r} requires an explicit owner operation")
+        return self._update_inactive_status(name, normalized, note)
+
+    def mark_deleted(
+        self,
+        name: str,
+        *,
+        note: str | None = None,
+        force: bool = False,
+    ) -> SlotRecord:
+        if not force:
+            return self._update_inactive_status(name, "deleted", note)
+        self.initialize()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                update slots set status = 'deleted', active_job_id = null,
+                    updated_at = ?, note = ? where name = ?
+                """,
+                (utc_now(), note, name),
+            )
+            if cursor.rowcount != 1:
+                raise SlotStoreError(f"Slot is missing: {name}")
+        return self.require_slot(name)
 
     def acquire_slot(self, name: str, job_id: str) -> SlotRecord:
         self.initialize()
@@ -100,12 +136,33 @@ class SlotStore:
                     last_used_at = ?,
                     use_count = use_count + 1,
                     note = null
-                where name = ? and active_job_id is null
+                where name = ? and active_job_id is null and status = 'available'
                 """,
                 (job_id, now, now, name),
             )
             if cursor.rowcount != 1:
                 raise SlotStoreError(f"Slot is already active or missing: {name}")
+        return self.require_slot(name)
+
+    def claim_for_finalization(self, name: str, job_id: str) -> SlotRecord:
+        """Atomically exclude new owners before inspecting or cleaning a terminal slot."""
+        self.initialize()
+        now = utc_now()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                update slots
+                set status = 'finalizing', active_job_id = ?, updated_at = ?,
+                    note = 'terminal finalization in progress'
+                where name = ? and status != 'deleted'
+                    and (active_job_id is null or active_job_id = ?)
+                """,
+                (job_id, now, name, job_id),
+            )
+            if cursor.rowcount != 1:
+                raise SlotStoreError(
+                    f"Slot {name} is owned by another job; cannot finalize {job_id}"
+                )
         return self.require_slot(name)
 
     def release_slot(
@@ -154,31 +211,26 @@ class SlotStore:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.database_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        with control_database(self.database_path) as db:
+            yield db
 
-    def _update_status(
+    def _update_inactive_status(
         self,
         name: str,
         status: str,
-        active_job_id: str | None,
         note: str | None,
     ) -> SlotRecord:
         self.initialize()
         with self._connect() as db:
-            db.execute(
+            cursor = db.execute(
                 """
-                update slots
-                set status = ?, active_job_id = ?, updated_at = ?, note = ?
-                where name = ?
+                update slots set status = ?, active_job_id = null, updated_at = ?, note = ?
+                where name = ? and active_job_id is null
                 """,
-                (status, active_job_id, utc_now(), note, name),
+                (status, utc_now(), note, name),
             )
+            if cursor.rowcount != 1:
+                raise SlotStoreError(f"Slot is active or missing: {name}")
         return self.require_slot(name)
 
 

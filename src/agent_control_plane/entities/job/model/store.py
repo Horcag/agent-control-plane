@@ -17,6 +17,7 @@ from agent_control_plane.entities.job.model.attempt_metrics import (
 )
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, normalize_backend
 from agent_control_plane.shared.clock import utc_now
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 JOB_COLUMNS = {
     "status",
@@ -24,6 +25,7 @@ JOB_COLUMNS = {
     "codex_model",
     "codex_reasoning_effort",
     "codex_tool_call_budget",
+    "workspace_access",
     "run_dir",
     "prompt_path",
     "log_path",
@@ -37,6 +39,11 @@ JOB_COLUMNS = {
     "cancel_requested",
     "slot_name",
     "archived_at",
+    "worker_instance_id",
+    "worker_heartbeat_at",
+    "finalization_status",
+    "finalization_error",
+    "finalized_at",
 }
 
 
@@ -62,6 +69,7 @@ class JobRecord:
     codex_reasoning_effort: str | None
     codex_quality_tier: str | None
     codex_tool_call_budget: int | None
+    workspace_access: str
     archived_at: str | None
     created_at: str
     updated_at: str
@@ -77,6 +85,11 @@ class JobRecord:
     last_error: str | None
     cancel_requested: bool
     slot_name: str | None
+    worker_instance_id: str | None
+    worker_heartbeat_at: str | None
+    finalization_status: str
+    finalization_error: str | None
+    finalized_at: str | None
 
 
 class JobStore:
@@ -84,11 +97,19 @@ class JobStore:
         self.database_path = database_path
 
     def initialize(self) -> None:
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                create table if not exists jobs (
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=1,
+            checksum="job-store-v1-20260715",
+            migrate=self._migrate_schema,
+        )
+
+    @classmethod
+    def _migrate_schema(cls, db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            create table if not exists jobs (
                     job_id text primary key,
                     task_id text not null,
                     route text not null,
@@ -109,6 +130,7 @@ class JobStore:
                     codex_reasoning_effort text,
                     codex_quality_tier text,
                     codex_tool_call_budget integer,
+                    workspace_access text not null default 'ide_mcp',
                     archived_at text,
                     created_at text not null,
                     updated_at text not null,
@@ -123,10 +145,18 @@ class JobStore:
                     read_only integer not null default 0,
                     slot_name text,
                     last_error text,
-                    cancel_requested integer not null default 0
-                );
-
-                create table if not exists attempts (
+                    cancel_requested integer not null default 0,
+                    worker_instance_id text,
+                    worker_heartbeat_at text,
+                    finalization_status text not null default 'not_started',
+                    finalization_error text,
+                    finalized_at text
+                )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists attempts (
                     id integer primary key autoincrement,
                     job_id text not null references jobs(job_id),
                     attempt_no integer not null,
@@ -138,20 +168,37 @@ class JobStore:
                     exit_code integer,
                     message text,
                     unique(job_id, attempt_no)
-                );
-
-                create table if not exists events (
+                )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists events (
                     id integer primary key autoincrement,
                     job_id text not null references jobs(job_id),
                     created_at text not null,
                     level text not null,
                     message text not null
-                );
-                """
+                )
+            """
+        )
+        db.execute(
+            """
+            create table if not exists orphaned_events (
+                original_event_id integer primary key,
+                job_id text not null,
+                created_at text not null,
+                level text not null,
+                message text not null,
+                quarantined_at text not null,
+                reason text not null
             )
-            create_attempt_metrics_table(db)
-            self._ensure_columns(db)
-            self._ensure_attempt_columns(db)
+            """
+        )
+        create_attempt_metrics_table(db)
+        cls._ensure_columns(db)
+        cls._ensure_attempt_columns(db)
+        cls._quarantine_orphan_events(db)
 
     def create_job(
         self,
@@ -178,6 +225,7 @@ class JobStore:
         codex_reasoning_effort: str | None = None,
         codex_quality_tier: str | None = None,
         codex_tool_call_budget: int | None = None,
+        workspace_access: str = "ide_mcp",
         slot_name: str | None = None,
     ) -> JobRecord:
         self.initialize()
@@ -199,11 +247,11 @@ class JobStore:
                     config_path, run_dir, prompt_path, result_path,
                     backend, agy_model, codex_model, codex_reasoning_effort,
                     codex_quality_tier,
-                    codex_tool_call_budget,
+                    codex_tool_call_budget, workspace_access,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
                     print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -222,6 +270,7 @@ class JobStore:
                     codex_reasoning_effort,
                     codex_quality_tier,
                     codex_tool_call_budget,
+                    workspace_access,
                     now,
                     now,
                     timeout_sec,
@@ -257,13 +306,151 @@ class JobStore:
         return self.get_job(job_id)
 
     def mark_finished(self, job_id: str, status: str, last_error: str | None = None) -> JobRecord:
+        now = utc_now()
+        self.initialize()
+        with self._connect() as db:
+            db.execute(
+                """
+                update jobs
+                set status = ?, finished_at = ?, last_error = ?,
+                    worker_pid = null, runner_pid = null, agy_pid = null,
+                    worker_instance_id = null, worker_heartbeat_at = null,
+                    finalization_status = 'pending', finalization_error = null,
+                    finalized_at = null, updated_at = ?
+                where job_id = ? and finished_at is null
+                """,
+                (status, now, last_error, now, job_id),
+            )
+        return self.get_job(job_id)
+
+    def mark_finished_by_worker(
+        self,
+        job_id: str,
+        worker_instance_id: str,
+        status: str,
+        last_error: str | None = None,
+    ) -> JobRecord | None:
+        """Persist terminal state only while the caller still owns the worker identity."""
+        normalized = worker_instance_id.strip()
+        if not normalized:
+            raise ValueError("worker_instance_id must not be empty")
+        now = utc_now()
+        self.initialize()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                update jobs
+                set status = ?, finished_at = ?, last_error = ?,
+                    worker_pid = null, runner_pid = null, agy_pid = null,
+                    worker_instance_id = null, worker_heartbeat_at = null,
+                    finalization_status = 'pending', finalization_error = null,
+                    finalized_at = null, updated_at = ?
+                where job_id = ? and worker_instance_id = ? and finished_at is null
+                """,
+                (status, now, last_error, now, job_id, normalized),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self.get_job(job_id)
+
+    def assign_worker(
+        self,
+        job_id: str,
+        worker_instance_id: str,
+        *,
+        worker_pid: int | None = None,
+        heartbeat_at: str | None = None,
+    ) -> JobRecord:
+        normalized = worker_instance_id.strip()
+        if not normalized:
+            raise ValueError("worker_instance_id must not be empty")
+        now = heartbeat_at or utc_now()
+        self.initialize()
+        with self._connect() as db:
+            cursor = db.execute(
+                """
+                update jobs
+                set status = 'queued', worker_instance_id = ?, worker_heartbeat_at = ?,
+                    worker_pid = ?, updated_at = ?
+                where job_id = ? and finished_at is null
+                    and (worker_instance_id is null or worker_instance_id = ?)
+                """,
+                (normalized, now, worker_pid, utc_now(), job_id, normalized),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"Cannot assign worker to terminal, missing, or already-owned job: {job_id}"
+                )
+        return self.get_job(job_id)
+
+    def update_for_worker(
+        self,
+        job_id: str,
+        worker_instance_id: str,
+        **values: Any,
+    ) -> bool:
+        """Apply a worker mutation only if its durable identity is still current."""
+        invalid = sorted(set(values) - JOB_COLUMNS)
+        if invalid:
+            raise ValueError(f"Unsupported job columns: {', '.join(invalid)}")
+        if not values:
+            raise ValueError("At least one job column must be updated")
+        normalized = worker_instance_id.strip()
+        if not normalized:
+            raise ValueError("worker_instance_id must not be empty")
+        values["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        params = [_to_sql(value) for value in values.values()]
+        params.extend((job_id, normalized))
+        self.initialize()
+        with self._connect() as db:
+            cursor = db.execute(
+                f"""
+                update jobs set {assignments}
+                where job_id = ? and worker_instance_id = ? and finished_at is null
+                """,  # nosec B608
+                params,
+            )
+        return cursor.rowcount == 1
+
+    def heartbeat_worker(
+        self,
+        job_id: str,
+        worker_instance_id: str,
+        *,
+        worker_pid: int,
+        status: str | None = None,
+    ) -> bool:
+        values: dict[str, Any] = {
+            "worker_heartbeat_at": utc_now(),
+            "worker_pid": worker_pid,
+        }
+        if status is not None:
+            values["status"] = status
+        return self.update_for_worker(job_id, worker_instance_id, **values)
+
+    def mark_finalization_completed(self, job_id: str) -> JobRecord:
         return self.update_job(
             job_id,
-            status=status,
-            finished_at=utc_now(),
-            last_error=last_error,
-            runner_pid=None,
-            agy_pid=None,
+            finalization_status="completed",
+            finalization_error=None,
+            finalized_at=utc_now(),
+        )
+
+    def mark_finalization_failed(self, job_id: str, error: str) -> JobRecord:
+        return self.update_job(
+            job_id,
+            finalization_status="failed",
+            finalization_error=error,
+            finalized_at=None,
+        )
+
+    def prepare_finalization_replay(self, job_id: str) -> JobRecord:
+        return self.update_job(
+            job_id,
+            finalization_status="pending",
+            finalization_error=None,
+            finalized_at=None,
         )
 
     def request_cancel(self, job_id: str) -> JobRecord:
@@ -404,15 +591,22 @@ class JobStore:
             ).fetchall()
         return [_job_from_row(row) for row in rows]
 
+    def reconciliation_candidates(self) -> list[JobRecord]:
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                select * from jobs
+                where finished_at is null or finalization_status != 'completed'
+                order by created_at
+                """
+            ).fetchall()
+        return [_job_from_row(row) for row in rows]
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.database_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        with control_database(self.database_path) as db:
+            yield db
 
     @staticmethod
     def _ensure_columns(db: sqlite3.Connection) -> None:
@@ -437,12 +631,59 @@ class JobStore:
             db.execute("alter table jobs add column codex_tool_call_budget integer")
         if "archived_at" not in columns:
             db.execute("alter table jobs add column archived_at text")
+        if "workspace_access" not in columns:
+            db.execute(
+                "alter table jobs add column workspace_access text not null default 'ide_mcp'"
+            )
+        if "worker_instance_id" not in columns:
+            db.execute("alter table jobs add column worker_instance_id text")
+        if "worker_heartbeat_at" not in columns:
+            db.execute("alter table jobs add column worker_heartbeat_at text")
+        if "finalization_status" not in columns:
+            db.execute(
+                "alter table jobs add column finalization_status text not null default 'completed'"
+            )
+        if "finalization_error" not in columns:
+            db.execute("alter table jobs add column finalization_error text")
+        if "finalized_at" not in columns:
+            db.execute("alter table jobs add column finalized_at text")
 
     @staticmethod
     def _ensure_attempt_columns(db: sqlite3.Connection) -> None:
         columns = {row["name"] for row in db.execute("pragma table_info(attempts)").fetchall()}
         if "result_status" not in columns:
             db.execute("alter table attempts add column result_status text")
+
+    @staticmethod
+    def _quarantine_orphan_events(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            insert or ignore into orphaned_events (
+                original_event_id, job_id, created_at, level, message,
+                quarantined_at, reason
+            )
+            select events.id, events.job_id, events.created_at, events.level,
+                   events.message, ?, 'missing_parent_job'
+            from events
+            left join jobs on jobs.job_id = events.job_id
+            where jobs.job_id is null
+            """,
+            (utc_now(),),
+        )
+        db.execute(
+            """
+            delete from events
+            where not exists (
+                select 1 from jobs where jobs.job_id = events.job_id
+            )
+            """
+        )
+        violations = db.execute("pragma foreign_key_check").fetchall()
+        if violations:
+            details = ", ".join(
+                f"{row['table']}:{row['rowid']}->{row['parent']}" for row in violations[:5]
+            )
+            raise RuntimeError(f"Unresolved ACP foreign-key violations after job migration: {details}")
 
 
 def new_job_id(task_id: str) -> str:
@@ -491,6 +732,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         codex_reasoning_effort=row["codex_reasoning_effort"],
         codex_quality_tier=row["codex_quality_tier"],
         codex_tool_call_budget=row["codex_tool_call_budget"],
+        workspace_access=row["workspace_access"],
         archived_at=row["archived_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
@@ -506,6 +748,11 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         last_error=row["last_error"],
         cancel_requested=bool(row["cancel_requested"]),
         slot_name=row["slot_name"],
+        worker_instance_id=row["worker_instance_id"],
+        worker_heartbeat_at=row["worker_heartbeat_at"],
+        finalization_status=row["finalization_status"],
+        finalization_error=row["finalization_error"],
+        finalized_at=row["finalized_at"],
     )
 
 

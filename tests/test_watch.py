@@ -11,10 +11,53 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
+from agent_control_plane.entities.plan import PlanTaskDefinition
 from agent_control_plane.shared.config import ControlConfig, ControlDefaults, RouteConfig
 
 
 class WatchJobTest(unittest.TestCase):
+    def test_watch_plan_returns_only_new_job_state_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            control.create_plan(
+                plan_id="transfer",
+                title="Transfer",
+                tasks=(PlanTaskDefinition("schema", "Schema"),),
+            )
+            job = _create_job(control, root, "job-plan")
+            control.bind_plan_job("transfer", "schema", job.job_id)
+            cursor = control.plan_snapshot("transfer")["cursor"]
+            control.finish_job(job.job_id, "completed", "done")
+
+            snapshot = control.watch_plan(
+                "transfer",
+                since=cursor,
+                poll_interval_sec=0,
+                timeout_sec=1,
+            )
+
+            self.assertFalse(snapshot["timed_out"])
+            self.assertEqual(snapshot["awaiting_review"][0]["task_id"], "schema")
+            self.assertEqual(snapshot["changes"][-1]["state"], "awaiting_review")
+
+    def test_watch_plan_times_out_when_cursor_has_no_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            control.create_plan(plan_id="transfer", title="Transfer")
+            cursor = control.plan_snapshot("transfer")["cursor"]
+
+            snapshot = control.watch_plan(
+                "transfer",
+                since=cursor,
+                poll_interval_sec=0,
+                timeout_sec=0,
+            )
+
+            self.assertTrue(snapshot["timed_out"])
+            self.assertEqual(snapshot["changes"], [])
+
     def test_watch_returns_finished_job_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -43,6 +86,25 @@ class WatchJobTest(unittest.TestCase):
             self.assertNotIn("dirty_status", summary)
             self.assertNotIn("log_tail", summary)
             self.assertNotIn("latest_attempt_metrics", summary)
+
+    def test_compact_watch_reports_persisted_workspace_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-native")
+            control.store.update_job(
+                job.job_id,
+                status="running",
+                workspace_access="native",
+            )
+
+            summary = control.watch_job(
+                job.job_id,
+                poll_interval_sec=0,
+                timeout_sec=0,
+            )
+
+            self.assertEqual(summary["workspace_access"], "native")
 
     def test_watch_returns_bounded_log_delta_from_cursor(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
