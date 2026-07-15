@@ -240,14 +240,25 @@ Mandatory execution rules:
 - If the progress file already says the verification/conclusion is complete, the
   next action must be writing result.md, not another search/read/test command.
 - Do not edit files until the progress file names the intended target files and
-  behavior change. If the task is too broad for one bounded change, write a
-  partial result with the next concrete split instead of widening the scope.
-- Keep edits surgical. Do not rewrite whole files, mass-format unrelated code, or
-  change indentation/whitespace outside the necessary block.
+  behavior change. Once recorded, carry the full task-scoped implementation
+  through verification while successful progress continues.
+- The brief defines the bounded scope. When it explicitly requests a cohesive
+  decomposition, file split, migration, or target-file rewrite, complete that
+  transformation even if it spans multiple files, moves substantial code, or
+  exceeds 120 changed lines. Do not return partial solely because of diff size,
+  target-file count, or the need to create replacement modules.
+- Keep edits task-scoped. Prefer surgical edits when they preserve correctness.
+  A whole-target-file rewrite or IDEA `write_file` is permitted when the brief
+  explicitly requires the decomposition, migration, or rewrite and the progress
+  file lists every affected target. Never mass-format unrelated code or change
+  indentation/whitespace outside those targets.
 - If an edit, patch, or diff application fails, immediately re-read the target file
-  and retry once with the current content. If the retry also fails, write
-  Status: partial or Status: blocked with the exact failed operation and stop.
-  Do not keep printing the same diff or repeating analysis without a new successful
+  and retry once with the current content. When the brief explicitly authorizes
+  a target rewrite or file split, a failed surgical retry permits IDEA
+  `write_file` for only the recorded target using the re-read current content;
+  re-read the file and inspect its diff afterward. Write Status: partial or
+  Status: blocked only when that fallback cannot be applied safely, and include
+  the exact failed operation. Do not repeat analysis without a new successful
   file read/edit/result write.
 - If the diff grows beyond the task scope or contains unrelated formatting churn,
   stop, preserve the changed file list in the progress file, and write a
