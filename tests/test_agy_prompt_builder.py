@@ -94,6 +94,9 @@ class AgyPromptBuilderTest(unittest.TestCase):
                 "  Status: blocked",
                 prompt,
             )
+            self.assertIn("The brief defines the bounded scope", prompt)
+            self.assertIn("Do not return partial", prompt)
+            self.assertIn("explicitly authorized target rewrite or split", prompt)
             self.assertNotIn("mcp__ide_mcp_server__", prompt)
             self.assertNotIn("mcp__agentbridge_idea", prompt)
 
@@ -156,6 +159,8 @@ class AgyPromptBuilderTest(unittest.TestCase):
             self.assertIn("`edit_text`", agentbridge_prompt)
             self.assertIn("dedicated `git_*` tools exclusively", agentbridge_prompt)
             self.assertIn("Junctions, symlinks, directory links", agentbridge_prompt)
+            self.assertIn("The brief defines the bounded scope", agentbridge_prompt)
+            self.assertIn("AgentBridge `write_file` is permitted", agentbridge_prompt)
             self.assertNotIn("mcp__idea__get_repositories", agentbridge_prompt)
 
 

@@ -141,8 +141,15 @@ Mandatory execution rules:
 - Keep discovery bounded. After at most three focused search/read rounds, record
   exact target files and the implementation plan, or write a partial/blocked
   result naming the missing input.
-- Preserve user changes. Keep edits surgical and task-scoped. If a patch fails,
-  re-read and retry once; if it fails again, write a partial/blocked result.
+- The brief defines the bounded scope. When it explicitly requests a cohesive
+  decomposition, file split, migration, or target-file rewrite, complete it even
+  when it spans multiple files or moves substantial code. Do not return partial
+  solely because of diff size, target-file count, or replacement-module count.
+- Preserve user changes and keep edits task-scoped. Prefer surgical edits when
+  they preserve correctness. If a patch fails, re-read and retry once. For an
+  explicitly authorized target rewrite or split, continue through the available
+  native IDEA edit/create operation against only the recorded targets; return a
+  partial/blocked result only if that safe fallback also fails.
 - Do not claim completion while any new task-caused error, warning, type issue,
   lint issue, unresolved import, formatting problem, test failure, forbidden
   change, or dirty unrelated file remains.
@@ -249,7 +256,14 @@ Mandatory execution rules:
   path. A zero-file or unavailable analysis is inconclusive, not clean; never inspect
   the canonical checkout or another slot as a proxy.
 - Verify current branch and HEAD before editing. Preserve inherited and unrelated
-  changes. Keep edits surgical; do not mass-format or broaden task scope.
+  changes and keep edits task-scoped. Prefer surgical edits when they preserve
+  correctness; do not mass-format or broaden task scope.
+- The brief defines the bounded scope. When it explicitly requests a cohesive
+  decomposition, file split, migration, or target-file rewrite, complete it even
+  when it spans multiple files or moves substantial code. Do not return partial
+  solely because of diff size, target-file count, or replacement-module count.
+  AgentBridge `write_file` is permitted for only the recorded targets after
+  re-reading their current content.
 - Do not install or resolve dependencies, generate lockfiles, suppress diagnostics,
   or weaken quality gates. Run only the narrowest existing checks required by the
   brief through AgentBridge terminals.
