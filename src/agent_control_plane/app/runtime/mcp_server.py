@@ -149,9 +149,15 @@ def build_server(config_path: str | None = None) -> Any:
         return control.status_job(job_id)
 
     @mcp.tool()
-    def agent_reconcile(job_id: str | None = None) -> dict[str, Any]:
+    def agent_reconcile(
+        job_id: str | None = None,
+        terminate_verified_runners: bool = False,
+    ) -> dict[str, Any]:
         """Recover orphaned jobs and replay crash-safe terminal finalization."""
-        return control.reconcile_jobs(job_id)
+        return control.reconcile_jobs(
+            job_id,
+            terminate_verified_runners=terminate_verified_runners,
+        )
 
     @mcp.tool()
     def agent_summary_job(job_id: str, lines: int = 20) -> dict[str, Any]:
@@ -293,6 +299,24 @@ def build_server(config_path: str | None = None) -> Any:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
+    def agent_plan_run_until_review(
+        plan_id: str,
+        max_jobs: int = 1,
+        poll_interval_sec: float = 5.0,
+        timeout_sec: float | None = 25.0,
+    ) -> dict[str, Any]:
+        """Dispatch, watch, and reconcile until root review or another safe stop boundary."""
+        try:
+            return control.run_plan_until_review(
+                plan_id,
+                max_jobs=max_jobs,
+                poll_interval_sec=poll_interval_sec,
+                timeout_sec=timeout_sec,
+            )
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
     def agent_plan_retry_task(
         plan_id: str,
         task_id: str,
@@ -309,9 +333,44 @@ def build_server(config_path: str | None = None) -> Any:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
-    def agent_plan_list(limit: int = 20) -> list[dict[str, Any]]:
+    def agent_plan_cancel(plan_id: str) -> dict[str, Any]:
+        """Stop future plan dispatch and cooperatively cancel unfinished jobs."""
+        try:
+            return {"ok": True, "cancellation": control.cancel_plan(plan_id)}
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_archive(plan_id: str) -> dict[str, Any]:
+        """Mark one terminal, fully reviewed plan as retention-eligible."""
+        try:
+            return {"ok": True, "plan": control.archive_plan(plan_id)}
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_plan_list(
+        limit: int = 20,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
         """List recent durable plans with compact progress counts."""
-        return control.list_plans(limit)
+        return control.list_plans(limit, include_archived=include_archived)
+
+    @mcp.tool()
+    def agent_retention_gc(
+        older_than_days: int = 30,
+        limit: int = 500,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        """Dry-run or prune only archived and reviewed state beyond retention."""
+        try:
+            return control.collect_garbage(
+                older_than_days=older_than_days,
+                limit=limit,
+                apply=apply,
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
     def agent_review_inbox_list(
@@ -355,6 +414,35 @@ def build_server(config_path: str | None = None) -> Any:
                 "item": control.resolve_review_inbox_item(item_id, decision),
             }
         except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
+    def agent_accept_handoff(
+        plan_id: str,
+        task_id: str,
+        review_span_id: str,
+        accepted_sha: str | None = None,
+        attempt_no: int | None = None,
+        defects_found: int = 0,
+        false_positives: int = 0,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically accept one inbox item, plan task, and root review outcome."""
+        try:
+            return {
+                "ok": True,
+                "acceptance": control.accept_handoff(
+                    plan_id,
+                    task_id,
+                    review_span_id=review_span_id,
+                    accepted_sha=accepted_sha,
+                    attempt_no=attempt_no,
+                    defects_found=defects_found,
+                    false_positives=false_positives,
+                    notes=notes,
+                ),
+            }
+        except (KeyError, PolicyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()

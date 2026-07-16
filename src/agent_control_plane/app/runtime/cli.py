@@ -36,10 +36,24 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(control.smoke())
             return 0
         if args.command == "reconcile":
-            _print_json(control.reconcile_jobs(args.job_id))
+            _print_json(
+                control.reconcile_jobs(
+                    args.job_id,
+                    terminate_verified_runners=args.terminate_verified_runners,
+                )
+            )
             return 0
         if args.command == "plan":
             _print_json(_handle_plan_command(control, args))
+            return 0
+        if args.command == "gc":
+            _print_json(
+                control.collect_garbage(
+                    older_than_days=args.older_than_days,
+                    limit=args.limit,
+                    apply=args.apply,
+                )
+            )
             return 0
         if args.command == "start":
             job = control.start_job(
@@ -151,6 +165,20 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
+        if args.command == "accept-handoff":
+            _print_json(
+                control.accept_handoff(
+                    args.plan_id,
+                    args.task_id,
+                    review_span_id=args.review_span_id,
+                    accepted_sha=args.accepted_sha,
+                    attempt_no=args.attempt,
+                    defects_found=args.defects_found,
+                    false_positives=args.false_positives,
+                    notes=args.notes,
+                )
+            )
+            return 0
         if args.command == "watch":
             if args.live:
                 _print_json(
@@ -340,6 +368,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Replay terminal finalization and recover orphaned jobs",
     )
     reconcile.add_argument("--job-id", help="Reconcile one job instead of all candidates")
+    reconcile.add_argument(
+        "--terminate-verified-runners",
+        action="store_true",
+        help="Terminate only runner PIDs whose durable process identity still matches",
+    )
 
     start = subparsers.add_parser("start", parents=[common], help="Start a background agent job")
     start.add_argument("--task-id", required=True)
@@ -533,6 +566,20 @@ def _build_parser() -> argparse.ArgumentParser:
     archive.add_argument("--limit", type=int, default=50)
     archive.add_argument("--apply", action="store_true", help="Move run dirs into runs/_archive")
 
+    accept_handoff = subparsers.add_parser(
+        "accept-handoff",
+        parents=[common],
+        help="Atomically accept the inbox item, plan task, and root review outcome",
+    )
+    accept_handoff.add_argument("plan_id")
+    accept_handoff.add_argument("task_id")
+    accept_handoff.add_argument("--review-span-id", required=True)
+    accept_handoff.add_argument("--accepted-sha")
+    accept_handoff.add_argument("--attempt", type=int)
+    accept_handoff.add_argument("--defects-found", type=int, default=0)
+    accept_handoff.add_argument("--false-positives", type=int, default=0)
+    accept_handoff.add_argument("--notes")
+
     plan = subparsers.add_parser("plan", help="Manage durable multi-job supervisor plans")
     plan_subparsers = plan.add_subparsers(dest="plan_command", required=True)
 
@@ -619,6 +666,26 @@ def _build_parser() -> argparse.ArgumentParser:
     plan_dispatch.add_argument("plan_id")
     plan_dispatch.add_argument("--max-jobs", type=int, default=1)
 
+    plan_run = plan_subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="Continuously dispatch, watch, and reconcile until root review is required",
+    )
+    plan_run.add_argument("plan_id")
+    plan_run.add_argument(
+        "--until-review",
+        action="store_true",
+        required=True,
+        help="Stop before root acceptance, rejection, or explicit retry decisions",
+    )
+    plan_run.add_argument("--max-jobs", type=int, default=1)
+    plan_run.add_argument("--poll-interval-sec", type=float, default=5.0)
+    plan_run.add_argument(
+        "--timeout-sec",
+        type=float,
+        help="Maximum supervisor runtime; omitted means run until a safe stop boundary",
+    )
+
     plan_retry = plan_subparsers.add_parser(
         "retry",
         parents=[common],
@@ -628,8 +695,36 @@ def _build_parser() -> argparse.ArgumentParser:
     plan_retry.add_argument("task_id")
     plan_retry.add_argument("--brief-file")
 
+    plan_cancel = plan_subparsers.add_parser(
+        "cancel",
+        parents=[common],
+        help="Stop future dispatch and request cancellation of unfinished plan jobs",
+    )
+    plan_cancel.add_argument("plan_id")
+
+    plan_archive = plan_subparsers.add_parser(
+        "archive",
+        parents=[common],
+        help="Mark a completed or cancelled, fully reviewed plan as retention-eligible",
+    )
+    plan_archive.add_argument("plan_id")
+
     plan_list = plan_subparsers.add_parser("list", parents=[common], help="List recent plans")
     plan_list.add_argument("--limit", type=int, default=20)
+    plan_list.add_argument("--include-archived", action="store_true")
+
+    retention_gc = subparsers.add_parser(
+        "gc",
+        parents=[common],
+        help="Prune archived plans, old events, resolved payloads, and verified checkpoint refs",
+    )
+    retention_gc.add_argument("--older-than-days", type=int, default=30)
+    retention_gc.add_argument("--limit", type=int, default=500)
+    retention_gc.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the reported cleanup; default is a dry-run",
+    )
 
     slots = subparsers.add_parser("slots", help="Manage reusable IDE-indexed worktree slots")
     slot_subparsers = slots.add_subparsers(dest="slot_command", required=True)
@@ -929,6 +1024,13 @@ def _handle_plan_command(control: AgentControlPlane, args: argparse.Namespace) -
         )
     if args.plan_command == "dispatch":
         return control.dispatch_plan(args.plan_id, max_jobs=args.max_jobs)
+    if args.plan_command == "run":
+        return control.run_plan_until_review(
+            args.plan_id,
+            max_jobs=args.max_jobs,
+            poll_interval_sec=args.poll_interval_sec,
+            timeout_sec=args.timeout_sec,
+        )
     if args.plan_command == "retry":
         brief_override = None
         if args.brief_file:
@@ -941,8 +1043,12 @@ def _handle_plan_command(control: AgentControlPlane, args: argparse.Namespace) -
             args.task_id,
             brief_override=brief_override,
         )
+    if args.plan_command == "cancel":
+        return control.cancel_plan(args.plan_id)
+    if args.plan_command == "archive":
+        return control.archive_plan(args.plan_id)
     if args.plan_command == "list":
-        return control.list_plans(args.limit)
+        return control.list_plans(args.limit, include_archived=args.include_archived)
     raise ValueError(f"Unknown plan command: {args.plan_command}")
 
 

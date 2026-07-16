@@ -27,6 +27,15 @@ class GitWorkspaceSnapshot:
     stable: bool
 
 
+def compact_status_preview(porcelain: str, *, limit: int = 8) -> str:
+    lines = [line.strip() for line in porcelain.splitlines() if line.strip()]
+    if not lines:
+        return "none"
+    if len(lines) <= limit:
+        return "; ".join(lines)
+    return "; ".join(lines[:limit]) + f"; ... ({len(lines) - limit} more)"
+
+
 def run_git(path: Path, *args: str) -> str:
     proc = subprocess.run(  # nosec B603 B607
         ["git", "-C", str(path), *args],

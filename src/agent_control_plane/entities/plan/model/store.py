@@ -98,6 +98,9 @@ class PlanRecord:
     status: str
     created_at: str
     updated_at: str
+    cancel_requested_at: str | None
+    cancelled_at: str | None
+    archived_at: str | None
 
 
 class PlanStore:
@@ -121,6 +124,13 @@ class PlanStore:
             checksum="plan-dispatch-owner-v2-20260715",
             migrate=self._migrate_dispatch_owner,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="plan_store",
+            version=3,
+            checksum="plan-lifecycle-v3-20260715",
+            migrate=self._migrate_plan_lifecycle,
+        )
 
     @classmethod
     def _migrate_schema(cls, db: sqlite3.Connection) -> None:
@@ -132,7 +142,10 @@ class PlanStore:
                     objective text not null,
                     status text not null,
                     created_at text not null,
-                    updated_at text not null
+                    updated_at text not null,
+                    cancel_requested_at text,
+                    cancelled_at text,
+                    archived_at text
                 )
             """
         )
@@ -223,6 +236,19 @@ class PlanStore:
         if "dispatch_owner_pid" not in columns:
             db.execute("alter table plan_tasks add column dispatch_owner_pid integer")
 
+    @staticmethod
+    def _migrate_plan_lifecycle(db: sqlite3.Connection) -> None:
+        columns = {str(row["name"]) for row in db.execute("pragma table_info(plans)")}
+        for name in ("cancel_requested_at", "cancelled_at", "archived_at"):
+            if name not in columns:
+                db.execute(f"alter table plans add column {name} text")  # nosec B608
+        db.execute(
+            """
+            create index if not exists plans_archived_at_idx
+            on plans(archived_at, updated_at)
+            """
+        )
+
     def create_plan(
         self,
         *,
@@ -257,11 +283,100 @@ class PlanStore:
             self._refresh_ready_states(db, plan_id)
         return self.get_plan(plan_id)
 
+    def request_cancel(self, plan_id: str) -> dict[str, Any]:
+        """Stop future dispatch and return unfinished jobs needing cooperative cancellation."""
+        self.initialize()
+        with self._connect() as db:
+            db.execute("begin immediate")
+            plan = self._sync_plan(db, plan_id)
+            if plan.archived_at is not None:
+                raise ValueError(f"Plan is archived: {plan_id}")
+            if plan.status == "completed":
+                raise ValueError(f"Completed plan cannot be cancelled: {plan_id}")
+            if plan.status not in {"active", "cancelling", "cancelled"}:
+                raise ValueError(f"Plan cannot be cancelled from status {plan.status}: {plan_id}")
+            if plan.status == "active":
+                now = utc_now()
+                db.execute(
+                    """
+                    update plans set status = 'cancelling', cancel_requested_at = ?,
+                        updated_at = ? where plan_id = ?
+                    """,
+                    (now, now, plan_id),
+                )
+                db.execute(
+                    """
+                    update plan_tasks set state = 'cancelled', updated_at = ?
+                    where plan_id = ? and job_id is null
+                        and state not in ('completed', 'dispatching')
+                    """,
+                    (now, plan_id),
+                )
+                self._add_event(db, plan_id, "plan_cancel_requested", {})
+            active_job_ids = [
+                str(row["job_id"])
+                for row in db.execute(
+                    """
+                    select distinct j.job_id
+                    from plan_tasks t join jobs j on j.job_id = t.job_id
+                    where t.plan_id = ? and j.finished_at is null
+                    order by j.job_id
+                    """,
+                    (plan_id,),
+                ).fetchall()
+            ]
+            updated = self._sync_lifecycle_status(db, plan_id)
+            return {
+                "plan_id": plan_id,
+                "status": updated.status,
+                "active_job_ids": active_job_ids,
+                "cancel_requested_at": updated.cancel_requested_at,
+                "cancelled_at": updated.cancelled_at,
+            }
+
+    def archive_plan(self, plan_id: str) -> PlanRecord:
+        """Mark a terminal, fully reviewed plan as retention-eligible."""
+        self.initialize()
+        with self._connect() as db:
+            db.execute("begin immediate")
+            plan = self._sync_plan(db, plan_id)
+            if plan.archived_at is not None:
+                return plan
+            if plan.status not in {"completed", "cancelled"}:
+                raise ValueError(
+                    f"Plan must be completed or cancelled before archive: {plan_id} ({plan.status})"
+                )
+            active = db.execute(
+                """
+                select task_id from plan_tasks
+                where plan_id = ? and state in (
+                    'dispatching', 'created', 'queued', 'running', 'waiting_quota',
+                    'cancel_requested', 'finalizing'
+                ) order by task_id
+                """,
+                (plan_id,),
+            ).fetchall()
+            if active:
+                task_ids = ", ".join(str(row["task_id"]) for row in active)
+                raise ValueError(f"Plan still has active tasks: {plan_id}: {task_ids}")
+            pending_items = self._pending_review_items(db, plan_id)
+            if pending_items:
+                raise ValueError(
+                    f"Plan still has pending inbox items: {plan_id}: " + ", ".join(pending_items)
+                )
+            now = utc_now()
+            db.execute(
+                "update plans set archived_at = ?, updated_at = ? where plan_id = ?",
+                (now, now, plan_id),
+            )
+            self._add_event(db, plan_id, "plan_archived", {})
+            return _plan_from_row(self._require_plan(db, plan_id))
+
     def add_task(self, plan_id: str, task: PlanTaskDefinition) -> None:
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
-            self._require_plan(db, plan_id)
+            self._require_active_plan(db, plan_id)
             existing = self._task_definitions(db, plan_id)
             _validate_task_graph((*existing, task))
             self._insert_task(db, plan_id, task, utc_now())
@@ -272,6 +387,7 @@ class PlanStore:
         with self._connect() as db:
             db.execute("begin immediate")
             self._sync_plan(db, plan_id)
+            self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
             if task["state"] == "completed":
                 raise ValueError(f"Plan task already completed: {plan_id}/{task_id}")
@@ -295,6 +411,7 @@ class PlanStore:
         with self._connect() as db:
             db.execute("begin immediate")
             self._sync_plan(db, plan_id)
+            self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
             incomplete = self._incomplete_dependencies(db, plan_id, task_id)
             if incomplete:
@@ -361,6 +478,7 @@ class PlanStore:
         with self._connect() as db:
             db.execute("begin immediate")
             self._sync_plan(db, plan_id)
+            self._require_active_plan(db, plan_id)
             rows = db.execute(
                 """
                 select * from plan_tasks
@@ -483,6 +601,7 @@ class PlanStore:
     ) -> None:
         self.initialize()
         with self._connect() as db:
+            self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
             if (
                 task["state"] != "dispatching"
@@ -504,13 +623,35 @@ class PlanStore:
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
+            plan = _plan_from_row(self._require_plan(db, plan_id))
             job = db.execute(
-                "select job_id, status, finalization_status from jobs where job_id = ?",
+                """
+                select job_id, status, finalization_status, finished_at
+                from jobs where job_id = ?
+                """,
                 (job_id,),
             ).fetchone()
             if job is None:
                 raise KeyError(f"Job not found: {job_id}")
-            state = _state_for_job(job["status"], "pending", job["finalization_status"])
+            job_status = str(job["status"])
+            if plan.status != "active" and job["finished_at"] is None:
+                now = utc_now()
+                db.execute(
+                    """
+                    update jobs set status = 'cancel_requested', cancel_requested = 1,
+                        updated_at = ? where job_id = ? and finished_at is null
+                    """,
+                    (now, job_id),
+                )
+                db.execute(
+                    """
+                    insert into events (job_id, created_at, level, message)
+                    values (?, ?, 'warning', 'Plan cancellation raced with dispatch; cancel requested')
+                    """,
+                    (job_id, now),
+                )
+                job_status = "cancel_requested"
+            state = _state_for_job(job_status, "pending", job["finalization_status"])
             try:
                 cursor = db.execute(
                     """
@@ -521,7 +662,7 @@ class PlanStore:
                     where plan_id = ? and task_id = ? and state = 'dispatching'
                         and dispatch_token = ? and job_id is null
                     """,
-                    (job_id, job["status"], state, utc_now(), plan_id, task_id, dispatch_token),
+                    (job_id, job_status, state, utc_now(), plan_id, task_id, dispatch_token),
                 )
             except sqlite3.IntegrityError as exc:
                 raise ValueError(f"Job is already bound to another plan task: {job_id}") from exc
@@ -563,6 +704,7 @@ class PlanStore:
                     {"error": error},
                     task_id=task_id,
                 )
+                self._sync_plan(db, plan_id)
                 return True
             return False
 
@@ -578,12 +720,12 @@ class PlanStore:
         with self._connect() as db:
             db.execute("begin immediate")
             self._sync_plan(db, plan_id)
+            self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
             retryable_states = BLOCKED_STATES - {"awaiting_review"}
             if task["state"] not in retryable_states:
                 raise ValueError(
-                    f"Plan task is not eligible for retry: {plan_id}/{task_id} "
-                    f"({task['state']})"
+                    f"Plan task is not eligible for retry: {plan_id}/{task_id} ({task['state']})"
                 )
             execution = _execution_from_json(task["execution_json"])
             if execution is None:
@@ -631,6 +773,22 @@ class PlanStore:
     def accept_task(self, plan_id: str, task_id: str, *, accepted_sha: str | None = None) -> None:
         self._record_decision(plan_id, task_id, "accepted", accepted_sha=accepted_sha)
 
+    def accept_task_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        plan_id: str,
+        task_id: str,
+        *,
+        accepted_sha: str | None = None,
+    ) -> None:
+        self._record_decision_in_transaction(
+            db,
+            plan_id,
+            task_id,
+            "accepted",
+            accepted_sha=accepted_sha,
+        )
+
     def reject_task(self, plan_id: str, task_id: str) -> None:
         self._record_decision(plan_id, task_id, "rejected")
 
@@ -676,7 +834,10 @@ class PlanStore:
             "plan_id": plan.plan_id,
             "title": plan.title,
             "objective": plan.objective,
-            "status": "completed" if tasks and completed_count == len(tasks) else plan.status,
+            "status": plan.status,
+            "cancel_requested_at": plan.cancel_requested_at,
+            "cancelled_at": plan.cancelled_at,
+            "archived_at": plan.archived_at,
             "progress": f"{completed_count}/{len(tasks)}",
             "counts": counts,
             "cursor": cursor,
@@ -707,21 +868,34 @@ class PlanStore:
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
-            self._sync_plan(db, plan_id)
-            row = db.execute(
-                """
-                select t.state, t.job_id, t.job_status, j.result_path
-                from plan_tasks t
-                left join jobs j on j.job_id = t.job_id
-                where t.plan_id = ? and t.task_id = ?
-                """,
-                (plan_id, task_id),
-            ).fetchone()
+            return self.review_target_in_transaction(db, plan_id, task_id)
+
+    def review_target_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        plan_id: str,
+        task_id: str,
+    ) -> dict[str, Any]:
+        self._sync_plan(db, plan_id)
+        row = db.execute(
+            """
+            select t.state, t.job_id, t.job_status, j.result_path
+            from plan_tasks t
+            left join jobs j on j.job_id = t.job_id
+            where t.plan_id = ? and t.task_id = ?
+            """,
+            (plan_id, task_id),
+        ).fetchone()
         if row is None:
             raise KeyError(f"Plan task not found: {plan_id}/{task_id}")
         return dict(row)
 
-    def list_plans(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_plans(
+        self,
+        limit: int = 20,
+        *,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
         if limit <= 0:
             raise ValueError("limit must be positive")
         self.initialize()
@@ -730,8 +904,12 @@ class PlanStore:
             plan_ids = [
                 row["plan_id"]
                 for row in db.execute(
-                    "select plan_id from plans order by updated_at desc limit ?",
-                    (limit,),
+                    """
+                    select plan_id from plans
+                    where ? or archived_at is null
+                    order by updated_at desc limit ?
+                    """,
+                    (int(include_archived), limit),
                 ).fetchall()
             ]
             for plan_id in plan_ids:
@@ -741,9 +919,10 @@ class PlanStore:
                 select p.*, count(t.task_id) as task_count,
                        sum(case when t.state = 'completed' then 1 else 0 end) as completed_count
                 from plans p left join plan_tasks t on t.plan_id = p.plan_id
+                where ? or p.archived_at is null
                 group by p.plan_id order by p.updated_at desc limit ?
                 """,
-                (limit,),
+                (int(include_archived), limit),
             ).fetchall()
         return [
             {
@@ -752,6 +931,9 @@ class PlanStore:
                 "status": _listed_plan_status(row),
                 "progress": f"{int(row['completed_count'] or 0)}/{int(row['task_count'])}",
                 "updated_at": row["updated_at"],
+                "cancel_requested_at": row["cancel_requested_at"],
+                "cancelled_at": row["cancelled_at"],
+                "archived_at": row["archived_at"],
             }
             for row in rows
         ]
@@ -767,36 +949,54 @@ class PlanStore:
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
-            self._sync_plan(db, plan_id)
-            task = self._require_task(db, plan_id, task_id)
-            if task["review_status"] == "accepted":
-                if decision == "accepted" and accepted_sha == task["accepted_sha"]:
-                    return
-                raise ValueError(f"Plan task already accepted: {plan_id}/{task_id}")
-            if task["review_status"] == "rejected" and decision == "rejected":
-                return
-            if task["job_id"] is None or task["state"] != "awaiting_review":
-                raise ValueError(f"Plan task has no eligible completed worker: {plan_id}/{task_id}")
-            state = "completed" if decision == "accepted" else "rejected"
-            now = utc_now()
-            db.execute(
-                """
-                update plan_tasks set state = ?, review_status = ?, accepted_sha = ?, updated_at = ?
-                where plan_id = ? and task_id = ?
-                """,
-                (state, decision, accepted_sha, now, plan_id, task_id),
-            )
-            self._add_event(
+            self._record_decision_in_transaction(
                 db,
                 plan_id,
-                "task_accepted" if decision == "accepted" else "task_rejected",
-                {"job_id": task["job_id"], "accepted_sha": accepted_sha},
-                task_id=task_id,
+                task_id,
+                decision,
+                accepted_sha=accepted_sha,
             )
-            self._refresh_ready_states(db, plan_id)
+
+    def _record_decision_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        plan_id: str,
+        task_id: str,
+        decision: str,
+        *,
+        accepted_sha: str | None = None,
+    ) -> None:
+        self._sync_plan(db, plan_id)
+        task = self._require_task(db, plan_id, task_id)
+        if task["review_status"] == "accepted":
+            if decision == "accepted" and accepted_sha == task["accepted_sha"]:
+                return
+            raise ValueError(f"Plan task already accepted: {plan_id}/{task_id}")
+        if task["review_status"] == "rejected" and decision == "rejected":
+            return
+        if task["job_id"] is None or task["state"] != "awaiting_review":
+            raise ValueError(f"Plan task has no eligible completed worker: {plan_id}/{task_id}")
+        state = "completed" if decision == "accepted" else "rejected"
+        now = utc_now()
+        db.execute(
+            """
+            update plan_tasks set state = ?, review_status = ?, accepted_sha = ?, updated_at = ?
+            where plan_id = ? and task_id = ?
+            """,
+            (state, decision, accepted_sha, now, plan_id, task_id),
+        )
+        self._add_event(
+            db,
+            plan_id,
+            "task_accepted" if decision == "accepted" else "task_rejected",
+            {"job_id": task["job_id"], "accepted_sha": accepted_sha},
+            task_id=task_id,
+        )
+        self._refresh_ready_states(db, plan_id)
+        self._sync_lifecycle_status(db, plan_id)
 
     def _sync_plan(self, db: sqlite3.Connection, plan_id: str) -> PlanRecord:
-        plan = _plan_from_row(self._require_plan(db, plan_id))
+        self._require_plan(db, plan_id)
         rows = db.execute(
             """
             select t.*, j.status as observed_job_status,
@@ -846,7 +1046,7 @@ class PlanStore:
                 task_id=task["task_id"],
             )
         self._refresh_ready_states(db, plan_id)
-        return plan
+        return self._sync_lifecycle_status(db, plan_id)
 
     @staticmethod
     def _observed_review(
@@ -881,6 +1081,9 @@ class PlanStore:
         return task["review_status"], task["accepted_sha"]
 
     def _refresh_ready_states(self, db: sqlite3.Connection, plan_id: str) -> None:
+        plan = self._require_plan(db, plan_id)
+        if plan["status"] != "active" or plan["archived_at"] is not None:
+            return
         rows = db.execute(
             """
             select * from plan_tasks
@@ -907,6 +1110,84 @@ class PlanStore:
                 {"old_state": task["state"], "state": state},
                 task_id=task["task_id"],
             )
+
+    def _sync_lifecycle_status(self, db: sqlite3.Connection, plan_id: str) -> PlanRecord:
+        plan = _plan_from_row(self._require_plan(db, plan_id))
+        if plan.status == "cancelling":
+            now = utc_now()
+            db.execute(
+                """
+                update plan_tasks set state = 'cancelled', updated_at = ?
+                where plan_id = ? and job_id is null
+                    and state not in ('completed', 'cancelled', 'dispatching')
+                """,
+                (now, plan_id),
+            )
+            active_count = int(
+                db.execute(
+                    """
+                    select count(*) as count from plan_tasks
+                    where plan_id = ? and state in (
+                        'dispatching', 'created', 'queued', 'running', 'waiting_quota',
+                        'cancel_requested', 'finalizing'
+                    )
+                    """,
+                    (plan_id,),
+                ).fetchone()["count"]
+            )
+            if active_count == 0:
+                db.execute(
+                    """
+                    update plans set status = 'cancelled', cancelled_at = ?, updated_at = ?
+                    where plan_id = ? and status = 'cancelling'
+                    """,
+                    (now, now, plan_id),
+                )
+                self._add_event(db, plan_id, "plan_cancelled", {})
+        elif plan.status == "active":
+            counts = db.execute(
+                """
+                select count(*) as task_count,
+                    sum(case when state = 'completed' then 1 else 0 end) as completed_count
+                from plan_tasks where plan_id = ?
+                """,
+                (plan_id,),
+            ).fetchone()
+            task_count = int(counts["task_count"])
+            completed_count = int(counts["completed_count"] or 0)
+            if task_count and completed_count == task_count:
+                now = utc_now()
+                db.execute(
+                    """
+                    update plans set status = 'completed', updated_at = ?
+                    where plan_id = ? and status = 'active'
+                    """,
+                    (now, plan_id),
+                )
+                self._add_event(db, plan_id, "plan_completed", {})
+        return _plan_from_row(self._require_plan(db, plan_id))
+
+    @staticmethod
+    def _pending_review_items(db: sqlite3.Connection, plan_id: str) -> list[str]:
+        inbox_exists = db.execute(
+            """
+            select 1 from sqlite_master
+            where type = 'table' and name = 'review_inbox_items'
+            """
+        ).fetchone()
+        if inbox_exists is None:
+            return []
+        rows = db.execute(
+            """
+            select i.item_id
+            from plan_tasks t join review_inbox_items i
+              on i.source_kind = 'agent_job' and i.source_id = t.job_id
+            where t.plan_id = ? and i.review_status = 'pending'
+            order by i.item_id
+            """,
+            (plan_id,),
+        ).fetchall()
+        return [str(row["item_id"]) for row in rows]
 
     @staticmethod
     def _incomplete_dependencies(
@@ -1103,6 +1384,13 @@ class PlanStore:
             raise KeyError(f"Plan not found: {plan_id}")
         return row
 
+    @classmethod
+    def _require_active_plan(cls, db: sqlite3.Connection, plan_id: str) -> sqlite3.Row:
+        row = cls._require_plan(db, plan_id)
+        if row["status"] != "active" or row["archived_at"] is not None:
+            raise ValueError(f"Plan is not active: {plan_id} ({row['status']})")
+        return row
+
     @staticmethod
     def _require_task(db: sqlite3.Connection, plan_id: str, task_id: str) -> sqlite3.Row:
         row = db.execute(
@@ -1295,12 +1583,11 @@ def _plan_from_row(row: sqlite3.Row) -> PlanRecord:
         status=row["status"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        cancel_requested_at=row["cancel_requested_at"],
+        cancelled_at=row["cancelled_at"],
+        archived_at=row["archived_at"],
     )
 
 
 def _listed_plan_status(row: sqlite3.Row) -> str:
-    task_count = int(row["task_count"])
-    completed_count = int(row["completed_count"] or 0)
-    if task_count and completed_count == task_count:
-        return "completed"
     return str(row["status"])

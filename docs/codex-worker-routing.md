@@ -61,8 +61,9 @@ then does it reset the worktree to its existing branch `HEAD` and mark the slot 
 
 The checkpoint is delivery state, not acceptance: it does not move a branch, push,
 merge, or unlock plan dependencies. Root review may inspect or cherry-pick the ref and
-must still call the plan acceptance operation separately. Failed and cancelled jobs use
-the same mechanism as salvage checkpoints.
+then use `accept-handoff`/`agent_accept_handoff` to commit inbox resolution, plan
+acceptance, and review attribution atomically. Failed and cancelled jobs use the same
+mechanism as salvage checkpoints.
 
 Cleanup fails closed. A changed `HEAD`, a changed worktree after checkpoint creation, a
 dirty nested submodule, an unverifiable ref, or a failed inbox write prevents cleanup.
@@ -75,9 +76,11 @@ malformed bundle cannot strand a slot. ACP records the bundle as `valid`, `missi
 `invalid`, compares changed-file claims with the checkpoint tree, and refuses normal
 acceptance unless the handoff is valid and review-ready.
 
-For multi-task work, put execution specs on durable plan tasks and call the one-shot
-`plan dispatch`/`agent_plan_dispatch` operation. The dispatcher atomically claims ready
-tasks and never retries failures automatically. Use `plan retry` or
+For multi-task work, put execution specs on durable plan tasks. Use the one-shot
+`plan dispatch`/`agent_plan_dispatch` operation for externally scheduled passes, or
+`plan run --until-review`/`agent_plan_run_until_review` for a foreground
+`dispatch -> watch -> reconcile -> dispatch` cycle. Both paths atomically claim ready
+tasks and never retry failures automatically. Use `plan retry` or
 `agent_plan_retry_task` only after reviewing the previous failure.
 
 Completed built-in Codex subagents do not have a live callback into ACP. Import their

@@ -139,7 +139,8 @@ class WatchJobTest(unittest.TestCase):
             control.store.update_job(job.job_id, status="running", worker_pid=123456)
 
             with patch(
-                "agent_control_plane.app.runtime.orchestrator._process_is_alive", return_value=False
+                "agent_control_plane.app.runtime.orchestrator.process_is_alive",
+                return_value=False,
             ):
                 summary = control.summary_job(job.job_id)
 

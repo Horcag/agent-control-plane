@@ -405,41 +405,50 @@ class ReviewInboxStore:
         return [_item_from_row(row) for row in rows]
 
     def resolve(self, item_id: str, decision: str) -> ReviewInboxItem:
+        self.initialize()
+        with self._connect() as db:
+            db.execute("begin immediate")
+            self.resolve_in_transaction(db, item_id, decision)
+        return self.get(item_id)
+
+    def resolve_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        item_id: str,
+        decision: str,
+    ) -> None:
         if decision not in REVIEW_DECISIONS:
             expected = ", ".join(sorted(REVIEW_DECISIONS))
             raise ValueError(f"decision must be one of: {expected}")
-        self.initialize()
         now = utc_now()
-        with self._connect() as db:
-            existing = db.execute(
-                """
-                select i.verification_bundle_json, p.verification_state
-                from review_inbox_items i
-                left join review_inbox_payloads p on p.item_id = i.item_id
-                where i.item_id = ?
-                """,
-                (item_id,),
-            ).fetchone()
-            if existing is None:
-                raise KeyError(f"Review inbox item not found: {item_id}")
-            if decision == "accepted":
-                bundle = _json_object(existing["verification_bundle_json"])
-                review_ready = bundle.get("review_ready") if bundle is not None else None
-                if existing["verification_state"] != "valid" or review_ready is not True:
-                    raise ValueError(
-                        "Review item cannot be accepted until verification is valid and review-ready"
-                    )
-            cursor = db.execute(
-                """
-                update review_inbox_items
-                set review_status = ?, reviewed_at = ?, updated_at = ?
-                where item_id = ?
-                """,
-                (decision, now, now, item_id),
-            )
-            if cursor.rowcount != 1:
-                raise KeyError(f"Review inbox item not found: {item_id}")
-        return self.get(item_id)
+        existing = db.execute(
+            """
+            select i.verification_bundle_json, p.verification_state
+            from review_inbox_items i
+            left join review_inbox_payloads p on p.item_id = i.item_id
+            where i.item_id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+        if existing is None:
+            raise KeyError(f"Review inbox item not found: {item_id}")
+        if decision == "accepted":
+            bundle = _json_object(existing["verification_bundle_json"])
+            review_ready = bundle.get("review_ready") if bundle is not None else None
+            if existing["verification_state"] != "valid" or review_ready is not True:
+                raise ValueError(
+                    "Review item cannot be accepted until verification is valid and review-ready"
+                )
+        cursor = db.execute(
+            """
+            update review_inbox_items
+            set review_status = ?, reviewed_at = ?, updated_at = ?
+            where item_id = ?
+            """,
+            (decision, now, now, item_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Review inbox item not found: {item_id}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:

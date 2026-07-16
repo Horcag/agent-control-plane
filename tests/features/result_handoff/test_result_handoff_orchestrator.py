@@ -10,9 +10,11 @@ from unittest.mock import patch
 import pytest
 
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, PolicyError
+from agent_control_plane.entities.job import ReviewMetricsStore
 from agent_control_plane.entities.plan import PlanTaskDefinition
 from agent_control_plane.entities.review_inbox import ReviewInboxDraft
 from agent_control_plane.features.result_handoff import SlotCheckpointError
+from agent_control_plane.shared.codex_session_usage import TokenUsage
 from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
@@ -134,6 +136,76 @@ def test_plan_acceptance_requires_valid_structured_verification(tmp_path: Path) 
     assert accepted["completed"][0]["task_id"] == "task"
 
 
+def test_accept_handoff_atomically_resolves_inbox_plan_and_review(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot, terminal_slot_policy="checkpoint")
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-atomic-accept", status_result="completed")
+    _finish_review_ready_plan(control, slot, job, plan_id="atomic-plan")
+    reviews = ReviewMetricsStore(config.database_path)
+    span_id = reviews.start_span(
+        span_id="review-atomic",
+        name="Atomic handoff review",
+        session_path=tmp_path / "rollout.jsonl",
+        usage=TokenUsage(0, 0, 0, 0),
+    )
+    checkpoint_sha = control.review_inbox.get(f"agent_job:{job.job_id}").checkpoint_sha
+
+    accepted = control.accept_handoff(
+        "atomic-plan",
+        "task",
+        review_span_id=span_id,
+        defects_found=1,
+        notes="root verified the checkpoint",
+    )
+
+    assert accepted["status"] == "accepted"
+    assert accepted["job_id"] == job.job_id
+    assert accepted["accepted_sha"] == checkpoint_sha
+    assert control.review_inbox.get(f"agent_job:{job.job_id}").review_status == "accepted"
+    assert control.plan_snapshot("atomic-plan")["status"] == "completed"
+    outcome = reviews.report(span_id)["job_outcomes"][0]
+    assert outcome["outcome"] == "accepted"
+    assert outcome["root_verified"] is True
+    assert outcome["accepted_sha"] == checkpoint_sha
+    assert outcome["defects_found"] == 1
+
+
+def test_accept_handoff_rolls_back_every_decision_when_review_attach_fails(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot, terminal_slot_policy="checkpoint")
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control, tmp_path, slot, "job-atomic-rollback", status_result="completed"
+    )
+    _finish_review_ready_plan(control, slot, job, plan_id="rollback-plan")
+    reviews = ReviewMetricsStore(config.database_path)
+    span_id = reviews.start_span(
+        span_id="review-rollback",
+        name="Rollback handoff review",
+        session_path=tmp_path / "rollout.jsonl",
+        usage=TokenUsage(0, 0, 0, 0),
+    )
+
+    with pytest.raises(KeyError, match="Attempt not found"):
+        control.accept_handoff(
+            "rollback-plan",
+            "task",
+            review_span_id=span_id,
+            attempt_no=99,
+        )
+
+    assert control.review_inbox.get(f"agent_job:{job.job_id}").review_status == "pending"
+    snapshot = control.plan_snapshot("rollback-plan")
+    assert snapshot["status"] == "active"
+    assert snapshot["awaiting_review"][0]["task_id"] == "task"
+    assert reviews.report(span_id)["job_outcomes"] == []
+
+
 def test_checkpoint_cleanup_failure_keeps_slot_dirty_and_review_ref_visible(tmp_path: Path) -> None:
     route = _committed_repo(tmp_path / "repo")
     slot = _committed_repo(tmp_path / "slots" / "app-1")
@@ -143,7 +215,7 @@ def test_checkpoint_cleanup_failure_keeps_slot_dirty_and_review_ref_visible(tmp_
     (slot / "worker.txt").write_text("salvage me\n", encoding="utf-8")
 
     with patch(
-        "agent_control_plane.app.runtime.orchestrator.clean_checkpointed_workspace",
+        "agent_control_plane.app.runtime.finalization_service.clean_checkpointed_workspace",
         side_effect=SlotCheckpointError("cleanup failed safely"),
     ):
         control.finish_job(job.job_id, "cancelled")
@@ -317,6 +389,60 @@ def _active_slot_job(
     control.slots.sync_configured_slots()
     control.slot_store.acquire_slot("app-1", job.job_id)
     return job
+
+
+def _finish_review_ready_plan(
+    control: AgentControlPlane,
+    slot: Path,
+    job,
+    *,
+    plan_id: str,
+) -> None:
+    control.create_plan(
+        plan_id=plan_id,
+        title="Atomic acceptance plan",
+        tasks=(PlanTaskDefinition("task", "Task"),),
+    )
+    control.bind_plan_job(plan_id, "task", job.job_id)
+    job.result_path.write_text(
+        """Status: completed
+
+Changed files:
+- worker.txt
+
+What changed:
+- Added the reviewed worker result.
+
+Verification performed:
+- focused test passed
+
+Not verified / remaining risks:
+- none
+""",
+        encoding="utf-8",
+    )
+    job.result_path.with_name("verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "changed_files": [{"path": "worker.txt", "change": "added"}],
+                "checks": [
+                    {
+                        "command": "pytest -q tests/test_worker.py",
+                        "cwd": ".",
+                        "outcome": "passed",
+                        "exit_code": 0,
+                        "summary": "focused test passed",
+                    }
+                ],
+                "unverified": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (slot / "worker.txt").write_text("reviewed result\n", encoding="utf-8")
+    control.finish_job(job.job_id, "completed")
 
 
 def _config(

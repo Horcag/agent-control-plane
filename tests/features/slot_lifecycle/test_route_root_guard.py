@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from agent_control_plane.app.runtime.orchestrator import (
-    AgentControlPlane,
+from agent_control_plane.app.runtime.job_guardrails import (
+    JobGuardrails,
     WorkspaceDirtyBaseline,
 )
 from agent_control_plane.features.slot_lifecycle.lib.route_root_guard import (
@@ -143,8 +143,8 @@ class RouteRootGuardTest(unittest.TestCase):
             _commit(route_root, "seed")
             (route_root / "identifier.sqlite").write_text("keep\n", encoding="utf-8")
 
-            control = AgentControlPlane.__new__(AgentControlPlane)
-            initial = control._route_root_snapshot(route_root)
+            guardrails = JobGuardrails(())
+            initial = guardrails.route_root_snapshot(route_root)
             baseline = WorkspaceDirtyBaseline(
                 path=route_root,
                 guard=RouteRootGuard(
@@ -160,17 +160,17 @@ class RouteRootGuardTest(unittest.TestCase):
             tracked.write_text("after\n", encoding="utf-8")
             _run(["git", "add", "tracked.py"], route_root)
             with patch(
-                "agent_control_plane.app.runtime.orchestrator.time.monotonic",
+                "agent_control_plane.app.runtime.job_guardrails.time.monotonic",
                 return_value=10.0,
             ):
-                staged_message = control._route_root_guardrail_message(job, baseline)
+                staged_message = guardrails.route_root_violation(job, baseline)
 
             _commit(route_root, "integrate")
             with patch(
-                "agent_control_plane.app.runtime.orchestrator.time.monotonic",
+                "agent_control_plane.app.runtime.job_guardrails.time.monotonic",
                 return_value=11.0,
             ):
-                committed_message = control._route_root_guardrail_message(job, baseline)
+                committed_message = guardrails.route_root_violation(job, baseline)
 
             self.assertIsNone(staged_message)
             self.assertIsNone(committed_message)

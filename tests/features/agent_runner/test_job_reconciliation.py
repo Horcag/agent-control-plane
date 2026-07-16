@@ -1,19 +1,33 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
+import pytest
+
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
 from agent_control_plane.entities.review_inbox import ReviewInboxDraft
 from agent_control_plane.features.agent_runner import (
     FinalizationLease,
+    ProcessIdentity,
+    ProcessTerminationResult,
+    ProcessTerminationState,
     WorkerLease,
     WorkerLeaseState,
+    capture_process_identity,
     probe_worker_lease,
+    supports_verified_process_termination,
+    terminate_verified_process,
+)
+from agent_control_plane.features.agent_runner.lib.codex_process_monitor import (
+    terminate_spawned_process,
 )
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.result_handoff import (
@@ -196,6 +210,135 @@ def test_reconcile_treats_reused_live_pid_without_worker_lease_as_orphan(
     assert recovered.status == "worker_error"
     assert recovered.finalization_status == "completed"
     assert control.slots.inspect_slot("app-1").active_job_id is None
+
+
+def test_orphan_runner_requires_explicit_verified_termination(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-live-orphan-runner")
+    identity = ProcessIdentity(pid=4242, started_key="test:123", executable="python")
+    control.store.assign_worker(
+        job.job_id,
+        "worker-gone",
+        worker_pid=1111,
+        heartbeat_at="2000-01-01T00:00:00+00:00",
+    )
+    control.store.update_job(
+        job.job_id,
+        runner_pid=identity.pid,
+        runner_process_identity=identity.to_json(),
+    )
+    live_pids = {identity.pid}
+
+    def terminate(expected: ProcessIdentity) -> ProcessTerminationResult:
+        assert expected == identity
+        live_pids.remove(expected.pid)
+        return ProcessTerminationResult(
+            state=ProcessTerminationState.TERMINATED,
+            pid=expected.pid,
+            message="terminated exact test process",
+        )
+
+    with (
+        patch(
+            "agent_control_plane.app.runtime.orchestrator.process_is_alive",
+            side_effect=lambda pid: pid in live_pids,
+        ),
+        patch(
+            "agent_control_plane.app.runtime.orchestrator.terminate_verified_process",
+            side_effect=terminate,
+        ) as terminate_mock,
+    ):
+        quarantined = AgentControlPlane(config).reconcile_jobs(job.job_id)
+        recovered = AgentControlPlane(config).reconcile_jobs(
+            job.job_id,
+            terminate_verified_runners=True,
+        )
+
+    assert quarantined["live_runner_conflicts"] == [job.job_id]
+    assert terminate_mock.call_count == 1
+    assert recovered["terminated_orphan_runners"] == [job.job_id]
+    assert recovered["reconciled_orphaned_jobs"] == [job.job_id]
+    assert control.store.get_job(job.job_id).status == "worker_error"
+    assert control.slots.inspect_slot("app-1").active_job_id is None
+
+
+@pytest.mark.skipif(
+    not supports_verified_process_termination(),
+    reason="OS has no safe exact-process termination primitive",
+)
+def test_reconcile_kills_verified_child_after_coordinator_death(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-coordinator-death")
+    ready_path = tmp_path / "coordinator-ready.json"
+    helper_path = Path(__file__).parent / "helpers" / "orphan_coordinator.py"
+    environment = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[3] / "src"
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get(
+        "PYTHONPATH", ""
+    )
+    coordinator = subprocess.Popen(  # nosec B603
+        [
+            sys.executable,
+            str(helper_path),
+            str(config.database_path),
+            str(job.run_dir),
+            job.job_id,
+            "coordinator-e2e",
+            str(ready_path),
+        ],
+        cwd=str(Path(__file__).resolve().parents[3]),
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    child_identity: ProcessIdentity | None = None
+    coordinator_identity: ProcessIdentity | None = None
+    try:
+        _wait_for_file(ready_path, coordinator)
+        payload = json.loads(ready_path.read_text(encoding="utf-8"))
+        coordinator_identity = ProcessIdentity.from_dict(payload["coordinator_identity"])
+        child_identity = ProcessIdentity.from_dict(payload["identity"])
+        assert capture_process_identity(coordinator_identity.pid) == coordinator_identity
+        assert capture_process_identity(child_identity.pid) == child_identity
+
+        coordinator_termination = terminate_verified_process(coordinator_identity)
+        coordinator.wait(timeout=5)
+
+        assert coordinator_termination.state is ProcessTerminationState.TERMINATED
+        assert coordinator.poll() is not None
+        assert capture_process_identity(child_identity.pid) == child_identity
+        report = AgentControlPlane(config).reconcile_jobs(
+            job.job_id,
+            terminate_verified_runners=True,
+        )
+
+        assert report["errors"] == []
+        assert report["terminated_orphan_runners"] == [job.job_id]
+        assert report["reconciled_orphaned_jobs"] == [job.job_id]
+        assert capture_process_identity(child_identity.pid) is None
+        assert control.store.get_job(job.job_id).status == "worker_error"
+        assert control.slots.inspect_slot("app-1").active_job_id is None
+    finally:
+        if (
+            coordinator_identity is not None
+            and capture_process_identity(coordinator_identity.pid) == coordinator_identity
+        ):
+            terminate_verified_process(coordinator_identity)
+        if coordinator.poll() is None:
+            terminate_spawned_process(coordinator)
+        if (
+            child_identity is not None
+            and capture_process_identity(child_identity.pid) == child_identity
+        ):
+            terminate_verified_process(child_identity)
 
 
 def test_reconcile_preserves_live_worker_and_quarantines_foreign_lease(tmp_path: Path) -> None:
@@ -397,6 +540,17 @@ def _active_slot_job(
     control.slots.sync_configured_slots()
     control.slot_store.acquire_slot("app-1", job.job_id)
     return job
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 15
+    while not path.exists():
+        if process.poll() is not None:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"Coordinator exited before ready: {stderr}")
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"Coordinator did not become ready: {path}")
+        time.sleep(0.05)
 
 
 def _config(root: Path, route: Path, slot: Path) -> ControlConfig:

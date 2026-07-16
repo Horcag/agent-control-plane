@@ -32,6 +32,19 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_run_job_delegates_to_the_execution_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            expected = object()
+
+            with patch.object(control.job_execution, "run_job", return_value=expected) as run_job:
+                actual = control.run_job("job-1", worker_instance_id="worker-1")
+
+            self.assertIs(actual, expected)
+            run_job.assert_called_once_with("job-1", worker_instance_id="worker-1")
+
     def test_workspace_access_precedence_and_reporting(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -371,6 +384,40 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             )
             self.assertEqual(first["snapshot"]["running"][0]["job_id"], dispatched["job_id"])
 
+    def test_plan_dispatch_uses_the_prepared_slot_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_path = _git_repo(root / "repo", "main")
+            slot_path = _git_repo(root / "slots" / "main-1", "codex/autonomous-supervisor")
+            control = AgentControlPlane(_config_with_slot(root, route_path, slot_path))
+            control.create_plan(
+                plan_id="slot-dispatch",
+                title="Slot dispatch",
+                tasks=(
+                    PlanTaskDefinition(
+                        "supervisor",
+                        "Supervisor",
+                        execution=PlanExecutionSpec(
+                            route="main",
+                            slot="main-1",
+                            brief="Implement the supervisor service.",
+                            backend=CODEX_BACKEND,
+                            workspace_access="native",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                dispatched = control.dispatch_plan("slot-dispatch", max_jobs=1)
+
+            self.assertEqual(dispatched["failures"], [])
+            job_id = dispatched["dispatched"][0]["job_id"]
+            self.assertEqual(
+                control.store.get_job(job_id).expected_branch,
+                "codex/autonomous-supervisor",
+            )
+
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -483,8 +530,8 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             broker = _SequenceQuotaBroker()
             control.quota_broker = broker  # type: ignore[assignment]
 
-            with patch("agent_control_plane.app.runtime.orchestrator.time.sleep"):
-                acquired = control._wait_for_codex_quota(job)
+            with patch("agent_control_plane.app.runtime.job_execution_service.time.sleep"):
+                acquired = control.job_execution.wait_for_codex_quota(job)
 
             self.assertTrue(acquired)
             self.assertEqual(broker.calls, 2)
@@ -760,7 +807,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             job = _create_job(control, root, workspace, "job-1")
             (workspace / "dirty.txt").write_text("dirty\n", encoding="utf-8")
 
-            status, note = control._slot_release_status(job, "cancelled")
+            status, note = control.finalization._slot_release_status(job, "cancelled")
 
             self.assertEqual(status, "dirty_after_job")
             self.assertIn("finished cancelled with dirty workspace", note or "")

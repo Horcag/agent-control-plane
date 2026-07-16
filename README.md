@@ -57,14 +57,25 @@ For development checks:
 
 ```powershell
 python -m pip install -e ".[dev,mcp]"
-python -m ruff check src tests
-python -m mypy src
-python -m bandit -q -c pyproject.toml -r src
+python -m ruff check src tests scripts
+python -m mypy src scripts/run_affected_tests.py
+python -m bandit -q -c pyproject.toml -r src scripts
 python -m pytest
 ```
 
-CI runs the full suite on both Windows and Linux with Python 3.11 and 3.12;
-Ruff, mypy, and Bandit run as separate quality gates.
+Tests mirror the production boundaries under `tests/app`, `tests/entities`,
+`tests/features`, and `tests/shared`; architecture and repository tooling have their own
+top-level test directories. For a dependency-aware local run against a Git base:
+
+```powershell
+python scripts/run_affected_tests.py --base origin/main --head HEAD
+```
+
+The selector follows transitive Python imports and adds the mirrored feature tests. It
+fails closed to the full suite for deleted/unknown source files, project configuration,
+CI, or selector changes. Pull-request CI uses this affected set on Windows and Linux with
+Python 3.11 and 3.12. Pushes to `main` always run the full suite; Ruff, mypy, and Bandit
+remain separate quality gates.
 
 ## Configure
 
@@ -148,6 +159,24 @@ model. ACP-owned databases are bootstrapped once into WAL mode and use versioned
 cross-process migrations. Legacy orphan events are preserved in `orphaned_events`
 instead of being discarded. The external Antigravity account database is never migrated
 by this runtime.
+
+After an unexpected coordinator exit, ordinary reconciliation remains fail-closed: a
+live Codex/AGY runner keeps its slot quarantined. To recover one job and terminate only
+a child whose durable process-instance identity still matches, opt in explicitly:
+
+```powershell
+agent-control reconcile `
+  --job-id <job-id> `
+  --terminate-verified-runners `
+  --config .\config\workspaces.toml
+```
+
+ACP records the runner PID together with its OS start identity and executable. The
+opt-in path reopens that exact process object (a Windows process handle or Linux pidfd),
+compares the durable identity, and only then terminates it and releases the slot. A
+missing identity, reused PID, unsupported platform, or verification error leaves the
+process and slot quarantined. Jobs created before identity capture was introduced are
+therefore never force-recovered automatically.
 
 ### Weighted Codex Concurrency
 
@@ -297,16 +326,19 @@ agent-control inbox show agent_job:<job-id> --config .\config\workspaces.toml
 agent-control inbox resolve agent_job:<job-id> --decision accepted --config .\config\workspaces.toml
 ```
 
-Inbox resolution records root review only. For a plan-bound job, run `plan accept`
-separately to unlock dependent tasks. Parent-thread filtering keeps a resumed root task
-from loading unrelated subagent results that happen to share the same repository.
-Normal acceptance requires a valid, review-ready `verification.json`; missing, malformed,
-or status-mismatched verification remains visible but cannot be accepted as verified work.
+The low-level `inbox resolve`, `plan accept`, and `review attach` commands remain
+available for repair and compatibility, but they are independent writes. For normal
+plan-bound acceptance, use `accept-handoff` so all three decisions commit or roll back
+together. Parent-thread filtering keeps a resumed root task from loading unrelated
+subagent results that happen to share the same repository. Normal acceptance requires a
+valid, review-ready `verification.json`; missing, malformed, or status-mismatched
+verification remains visible but cannot be accepted as verified work.
 
 ## Plan Supervisor Workflow
 
-The plan supervisor includes a durable one-shot dispatcher, not a background daemon.
-Each `dispatch` call atomically claims up to `--max-jobs` ready tasks, materializes their
+The plan supervisor has both a durable one-shot dispatcher and a foreground autonomous
+runner. It is intentionally not a permanently installed background daemon. Each
+`dispatch` pass atomically claims up to `--max-jobs` ready tasks, materializes their
 private briefs, and starts jobs through the existing policy/slot runner. Concurrent
 dispatchers cannot claim the same task. A dispatch or worker failure is durable and is
 never retried automatically; the root must request `retry` explicitly.
@@ -342,6 +374,27 @@ agent-control plan summary main-to-dev-transfer --config .\config\workspaces.tom
 agent-control plan dispatch main-to-dev-transfer --max-jobs 2 --config .\config\workspaces.toml
 ```
 
+For a large executable plan, run the crash-resumable foreground supervisor instead of
+calling `dispatch` after every state change:
+
+```powershell
+agent-control plan run main-to-dev-transfer `
+  --until-review `
+  --max-jobs 2 `
+  --config .\config\workspaces.toml
+```
+
+`plan run --until-review` loops through `dispatch -> watch -> reconcile -> dispatch` and
+stops before any root decision. It also stops safely on a completed plan, a failed or
+cancelled task or plan, a dispatch failure, or a ready task without an execution spec. It never
+accepts, rejects, or retries work. Omit `--timeout-sec` to keep the foreground command
+running until one of those boundaries; pass a timeout when invoking it from a bounded
+automation. Restarting the same command resumes from SQLite without duplicating claims.
+After root review and `plan accept`/`plan retry`, run the command again to continue the
+remaining dependency graph. The equivalent MCP tool is
+`agent_plan_run_until_review`; its default call timeout is 25 seconds and callers may
+pass a larger value or `null`.
+
 Only tasks with an `execution` object are dispatchable. Tasks without one remain valid
 for manual `start --plan-id --plan-task-id` binding. After a failed attempt, optionally
 replace the private brief and explicitly retry before the next dispatch:
@@ -352,6 +405,18 @@ agent-control plan retry main-to-dev-transfer schema `
   --config .\config\workspaces.toml
 agent-control plan dispatch main-to-dev-transfer --max-jobs 1 --config .\config\workspaces.toml
 ```
+
+Cancel the whole plan when no further dispatch should occur:
+
+```powershell
+agent-control plan cancel main-to-dev-transfer --config .\config\workspaces.toml
+```
+
+Cancellation first persists `cancelling`, fences every new dispatch, marks unstarted
+tasks cancelled, and requests cooperative cancellation from every unfinished bound job.
+It becomes `cancelled` only after active/finalizing jobs leave their active states. A
+dispatch that raced with cancellation is still bound for audit and immediately receives
+a cancellation request, so it cannot become an untracked worker.
 
 Bind a worker launch directly to a logical task. A retry can use a new job task ID while
 keeping `--plan-task-id` stable:
@@ -372,14 +437,18 @@ the worker even if structured verification is missing, so a malformed handoff ca
 a slot alive forever. It still cannot pass normal acceptance:
 
 ```powershell
-agent-control plan accept main-to-dev-transfer schema `
-  --sha <accepted-commit> `
+agent-control accept-handoff main-to-dev-transfer schema `
+  --review-span-id <root-review-span> `
+  --accepted-sha <accepted-commit> `
   --config .\config\workspaces.toml
 ```
 
-`plan accept` is the dependency-gate decision that unlocks dependants. It is separate
-from `review attach`, which records root-review token/time accounting; use both when you
-want both orchestration state and economic attribution.
+`accept-handoff` infers the exact `agent_job:<job-id>` inbox item from the bound plan
+task, validates the durable verification payload, resolves the inbox item, unlocks plan
+dependants, and records a root-verified accepted outcome on the supplied review span in
+one SQLite transaction. If review-span or attempt validation fails, none of those writes
+survive. When `--accepted-sha` is omitted, ACP uses the delivered checkpoint SHA when one
+exists. `plan accept` remains the lower-level dependency-gate-only command.
 
 The first summary returns the current projection and a `cursor`. Pass that cursor back to
 receive only new entries in `changes`; current state remains available through the
@@ -538,6 +607,35 @@ agent-control archive --older-than-days 14 --limit 50 --config .\config\workspac
 agent-control archive --older-than-days 14 --limit 50 --apply --config .\config\workspaces.toml
 ```
 
+Plan data has a separate explicit lifecycle. Only a completed or cancelled plan with no
+active tasks or pending inbox items can be archived. Archived plans are hidden from the
+default list but remain inspectable until retention expires:
+
+```powershell
+agent-control plan archive main-to-dev-transfer --config .\config\workspaces.toml
+agent-control plan list --include-archived --config .\config\workspaces.toml
+```
+
+Retention is a dry-run unless `--apply` is supplied:
+
+```powershell
+agent-control gc --older-than-days 30 --limit 500 --config .\config\workspaces.toml
+agent-control gc --older-than-days 30 --limit 500 --apply --config .\config\workspaces.toml
+```
+
+GC removes expired archived plans and their plan events, events belonging to archived
+jobs, full payloads for resolved inbox items, old quarantined orphan events, and verified
+checkpoint refs. Pending inbox items and unarchived jobs are never eligible. A controller
+ref is deleted only inside `refs/agent-control-plane/jobs/` and only when its current SHA
+exactly matches the durable inbox SHA; mismatches are reported and preserved. Compact
+inbox metadata, job/attempt metrics, and root-review outcomes remain as audit evidence.
+
+Runtime ownership is split along these boundaries: `JobLauncher` owns launch validation
+and worker creation, `FinalizationService` owns terminal delivery and slot release,
+`PlanDispatcher` owns durable claims, and `ArchiveService`/`RetentionService` own storage
+lifecycle. `AgentControlPlane` remains the API facade instead of containing those
+implementations inline.
+
 ## Codex MCP Server
 
 Install with the `mcp` extra and copy `docs/codex-mcp.example.toml` into your Codex
@@ -560,11 +658,16 @@ The MCP server exposes tools such as:
 - `agent_plan_accept_task`
 - `agent_plan_reject_task`
 - `agent_plan_dispatch`
+- `agent_plan_run_until_review`
 - `agent_plan_retry_task`
+- `agent_plan_cancel`
+- `agent_plan_archive`
 - `agent_plan_list`
+- `agent_retention_gc`
 - `agent_review_inbox_list`
 - `agent_review_inbox_get`
 - `agent_review_inbox_resolve`
+- `agent_accept_handoff`
 - `agent_sync_subagent_results`
 - `agent_tail_job`
 - `agent_result_job`
@@ -596,6 +699,8 @@ Treat `queued` and `running` as in-progress states, not successful completion.
   change ownership or make a preserved slot available again.
 - Worker identity, heartbeat, finalization intent, and finalization outcome are durable.
   A stale PID alone is never trusted as worker ownership.
+- Orphan runner termination is opt-in and requires a matching durable process-instance
+  identity; default reconciliation only quarantines a still-live runner.
 - Failed agent runs are not restarted over dirty workspaces by default.
 - Terminal slot cleanup happens only after a controller ref and inbox record are durable;
   concurrent late edits or unverifiable refs leave the slot dirty.

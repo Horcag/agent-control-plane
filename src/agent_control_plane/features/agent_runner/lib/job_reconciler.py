@@ -8,6 +8,11 @@ from typing import Any
 
 from agent_control_plane.entities.job import JobRecord, JobStore
 from agent_control_plane.entities.slot import SlotStore
+from agent_control_plane.features.agent_runner.lib.process_identity import (
+    ProcessIdentity,
+    ProcessTerminationResult,
+    ProcessTerminationState,
+)
 from agent_control_plane.features.agent_runner.lib.worker_lease import (
     WorkerLeaseError,
     WorkerLeaseState,
@@ -33,6 +38,7 @@ class JobReconciler:
         finalize: Callable[[str, bool], JobRecord],
         write_orphan_result: Callable[[JobRecord, str], None],
         process_is_alive: Callable[[int], bool],
+        terminate_verified_process: Callable[[ProcessIdentity], ProcessTerminationResult],
         stale_after_sec: float = 30.0,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -44,22 +50,34 @@ class JobReconciler:
         self.finalize = finalize
         self.write_orphan_result = write_orphan_result
         self.process_is_alive = process_is_alive
+        self.terminate_verified_process = terminate_verified_process
         self.stale_after_sec = stale_after_sec
         self.clock = clock
 
-    def reconcile(self, job_id: str | None = None) -> dict[str, Any]:
+    def reconcile(
+        self,
+        job_id: str | None = None,
+        *,
+        terminate_verified_runners: bool = False,
+    ) -> dict[str, Any]:
         jobs = self._candidates(job_id)
         report: dict[str, list[str]] = {
             "reconciled_orphaned_jobs": [],
             "reconciled_terminal_jobs": [],
             "live_jobs": [],
             "live_runner_conflicts": [],
+            "runner_identity_conflicts": [],
+            "terminated_orphan_runners": [],
             "worker_identity_conflicts": [],
             "errors": [],
         }
         for job in jobs:
             try:
-                self._reconcile_job(job, report)
+                self._reconcile_job(
+                    job,
+                    report,
+                    terminate_verified_runners=terminate_verified_runners,
+                )
             except Exception as exc:  # noqa: BLE001 - one corrupt job must not stop the sweep
                 report["errors"].append(f"{job.job_id}: {exc}")
         return report
@@ -77,7 +95,13 @@ class JobReconciler:
                 continue
         return list(candidates.values())
 
-    def _reconcile_job(self, job: JobRecord, report: dict[str, list[str]]) -> None:
+    def _reconcile_job(
+        self,
+        job: JobRecord,
+        report: dict[str, list[str]],
+        *,
+        terminate_verified_runners: bool,
+    ) -> None:
         if self.is_terminal(job):
             self._reconcile_terminal(job, report)
             return
@@ -96,6 +120,21 @@ class JobReconciler:
                 if pid is not None and self.process_is_alive(pid)
             }
         )
+        if live_runner_pids:
+            if terminate_verified_runners and not self._terminate_orphan_runners(
+                job,
+                live_runner_pids,
+                report,
+            ):
+                report["live_runner_conflicts"].append(job.job_id)
+                return
+            live_runner_pids = sorted(
+                {
+                    pid
+                    for pid in (job.runner_pid, job.agy_pid)
+                    if pid is not None and self.process_is_alive(pid)
+                }
+            )
         if live_runner_pids:
             message = (
                 f"Worker lease is gone for {job.job_id}, but runner PID(s) "
@@ -119,6 +158,48 @@ class JobReconciler:
         if finalized.finalization_status != "completed":
             raise RuntimeError(finalized.finalization_error or "finalization remains incomplete")
         report["reconciled_orphaned_jobs"].append(job.job_id)
+
+    def _terminate_orphan_runners(
+        self,
+        job: JobRecord,
+        live_runner_pids: list[int],
+        report: dict[str, list[str]],
+    ) -> bool:
+        if job.runner_process_identity is None:
+            message = (
+                f"Runner PID(s) {live_runner_pids} for {job.job_id} have no durable "
+                "process identity; refusing termination."
+            )
+            self.store.add_event(job.job_id, "error", message)
+            report["runner_identity_conflicts"].append(job.job_id)
+            return False
+        try:
+            identity = ProcessIdentity.from_json(job.runner_process_identity)
+        except ValueError as exc:
+            message = f"Runner identity for {job.job_id} is invalid; refusing termination: {exc}"
+            self.store.add_event(job.job_id, "error", message)
+            report["runner_identity_conflicts"].append(job.job_id)
+            return False
+        if set(live_runner_pids) != {identity.pid}:
+            message = (
+                f"Live runner PID set {live_runner_pids} does not match the durable "
+                f"identity PID {identity.pid} for {job.job_id}; refusing termination."
+            )
+            self.store.add_event(job.job_id, "error", message)
+            report["runner_identity_conflicts"].append(job.job_id)
+            return False
+
+        outcome = self.terminate_verified_process(identity)
+        self.store.add_event(job.job_id, "warning", outcome.message)
+        if outcome.state not in {
+            ProcessTerminationState.TERMINATED,
+            ProcessTerminationState.NOT_FOUND,
+        }:
+            report["runner_identity_conflicts"].append(job.job_id)
+            return False
+        if outcome.state is ProcessTerminationState.TERMINATED:
+            report["terminated_orphan_runners"].append(job.job_id)
+        return True
 
     def _reconcile_terminal(self, job: JobRecord, report: dict[str, list[str]]) -> None:
         slot_owned = False

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
+from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
 from agent_control_plane.entities.job import JobStore
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 
@@ -40,8 +40,8 @@ class FailureReportingTest(unittest.TestCase):
             )
             log_path = root / "runs" / "job-1" / "attempt-001.log"
 
-            message = AgentControlPlane._missing_result_message(job, result, log_path)
-            AgentControlPlane._write_blocked_result_if_missing(job, message)
+            message = JobExecutionService.missing_result_message(job, result, log_path)
+            JobExecutionService.write_blocked_result_if_missing(job, message)
 
             text = job.result_path.read_text(encoding="utf-8")
             state = inspect_result(job.result_path, 0.0)
@@ -88,7 +88,7 @@ class FailureReportingTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            message = AgentControlPlane._missing_result_message(job, result, log_path)
+            message = JobExecutionService.missing_result_message(job, result, log_path)
 
             self.assertIn("agy quota exhausted", message)
             self.assertIn("result file is older than job start", message)

@@ -1,3 +1,6 @@
+from agent_control_plane.features.result_handoff.lib.acceptance import (
+    HandoffAcceptanceService,
+)
 from agent_control_plane.features.result_handoff.lib.codex_rollouts import (
     CodexSubagentCompletion,
     scan_codex_subagent_completions,
@@ -17,6 +20,7 @@ from agent_control_plane.features.result_handoff.lib.verification_bundle import 
 
 __all__ = [
     "CodexSubagentCompletion",
+    "HandoffAcceptanceService",
     "SlotCheckpoint",
     "SlotCheckpointError",
     "build_verification_bundle",

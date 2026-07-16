@@ -183,48 +183,81 @@ class ReviewMetricsStore:
         _validate_choice("outcome", outcome, REVIEW_OUTCOMES)
         if defects_found < 0 or false_positives < 0:
             raise ValueError("Review counters must be non-negative")
-        self.get_span(span_id)
+        self.initialize()
         with self._connect() as db:
-            if db.execute("select 1 from jobs where job_id = ?", (job_id,)).fetchone() is None:
-                raise KeyError(f"Job not found: {job_id}")
-            if (
-                attempt_no is not None
-                and db.execute(
-                    "select 1 from attempts where job_id = ? and attempt_no = ?",
-                    (job_id, attempt_no),
-                ).fetchone()
-                is None
-            ):
-                raise KeyError(f"Attempt not found: {job_id}#{attempt_no}")
-            db.execute(
-                """
-                insert into review_job_outcomes (
-                    span_id, job_id, attempt_no, outcome, root_verified,
-                    accepted_sha, defects_found, false_positives, notes, recorded_at
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                on conflict(span_id, job_id) do update set
-                    attempt_no = excluded.attempt_no,
-                    outcome = excluded.outcome,
-                    root_verified = excluded.root_verified,
-                    accepted_sha = excluded.accepted_sha,
-                    defects_found = excluded.defects_found,
-                    false_positives = excluded.false_positives,
-                    notes = excluded.notes,
-                    recorded_at = excluded.recorded_at
-                """,
-                (
-                    span_id,
-                    job_id,
-                    attempt_no,
-                    outcome,
-                    int(root_verified),
-                    accepted_sha,
-                    defects_found,
-                    false_positives,
-                    notes,
-                    utc_now(),
-                ),
+            db.execute("begin immediate")
+            self.attach_job_in_transaction(
+                db,
+                span_id,
+                job_id=job_id,
+                outcome=outcome,
+                attempt_no=attempt_no,
+                root_verified=root_verified,
+                accepted_sha=accepted_sha,
+                defects_found=defects_found,
+                false_positives=false_positives,
+                notes=notes,
             )
+
+    def attach_job_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        span_id: str,
+        *,
+        job_id: str,
+        outcome: str,
+        attempt_no: int | None = None,
+        root_verified: bool = False,
+        accepted_sha: str | None = None,
+        defects_found: int = 0,
+        false_positives: int = 0,
+        notes: str | None = None,
+    ) -> None:
+        _validate_choice("outcome", outcome, REVIEW_OUTCOMES)
+        if defects_found < 0 or false_positives < 0:
+            raise ValueError("Review counters must be non-negative")
+        if db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone() is None:
+            raise KeyError(f"Review span not found: {span_id}")
+        if db.execute("select 1 from jobs where job_id = ?", (job_id,)).fetchone() is None:
+            raise KeyError(f"Job not found: {job_id}")
+        if (
+            attempt_no is not None
+            and db.execute(
+                "select 1 from attempts where job_id = ? and attempt_no = ?",
+                (job_id, attempt_no),
+            ).fetchone()
+            is None
+        ):
+            raise KeyError(f"Attempt not found: {job_id}#{attempt_no}")
+        db.execute(
+            """
+            insert into review_job_outcomes (
+                span_id, job_id, attempt_no, outcome, root_verified,
+                accepted_sha, defects_found, false_positives, notes, recorded_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            on conflict(span_id, job_id) do update set
+                attempt_no = excluded.attempt_no,
+                outcome = excluded.outcome,
+                root_verified = excluded.root_verified,
+                accepted_sha = excluded.accepted_sha,
+                defects_found = excluded.defects_found,
+                false_positives = excluded.false_positives,
+                notes = excluded.notes,
+                recorded_at = excluded.recorded_at
+            """,
+            (
+                span_id,
+                job_id,
+                attempt_no,
+                outcome,
+                int(root_verified),
+                accepted_sha,
+                defects_found,
+                false_positives,
+                notes,
+                utc_now(),
+            ),
+        )
 
     def finish_span(
         self,

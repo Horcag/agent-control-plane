@@ -108,9 +108,7 @@ def test_plan_watch_parser_requires_a_cursor() -> None:
 
 
 def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
-    dispatch = _build_parser().parse_args(
-        ["plan", "dispatch", "transfer", "--max-jobs", "3"]
-    )
+    dispatch = _build_parser().parse_args(["plan", "dispatch", "transfer", "--max-jobs", "3"])
     retry = _build_parser().parse_args(
         ["plan", "retry", "transfer", "schema", "--brief-file", "repair.md"]
     )
@@ -145,6 +143,47 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
     assert add.backend == "codex"
 
 
+def test_plan_run_parser_exposes_autonomous_until_review_controls() -> None:
+    args = _build_parser().parse_args(
+        [
+            "plan",
+            "run",
+            "transfer",
+            "--until-review",
+            "--max-jobs",
+            "3",
+            "--poll-interval-sec",
+            "2",
+            "--timeout-sec",
+            "60",
+        ]
+    )
+
+    assert args.plan_command == "run"
+    assert args.plan_id == "transfer"
+    assert args.until_review is True
+    assert args.max_jobs == 3
+    assert args.poll_interval_sec == 2
+    assert args.timeout_sec == 60
+
+
+def test_plan_lifecycle_and_retention_parsers_are_explicit() -> None:
+    cancel = _build_parser().parse_args(["plan", "cancel", "transfer"])
+    archive = _build_parser().parse_args(["plan", "archive", "transfer"])
+    listed = _build_parser().parse_args(["plan", "list", "--include-archived"])
+    retention = _build_parser().parse_args(
+        ["gc", "--older-than-days", "30", "--limit", "200", "--apply"]
+    )
+
+    assert cancel.plan_command == "cancel"
+    assert archive.plan_command == "archive"
+    assert listed.include_archived is True
+    assert retention.command == "gc"
+    assert retention.older_than_days == 30
+    assert retention.limit == 200
+    assert retention.apply is True
+
+
 def test_plan_manifest_round_trips_through_real_cli(capsys) -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -174,6 +213,88 @@ def test_plan_manifest_round_trips_through_real_cli(capsys) -> None:
         summary = json.loads(capsys.readouterr().out)
         assert summary["cursor"] == created["cursor"]
         assert summary["changes"] == []
+
+        assert (
+            main(
+                [
+                    "plan",
+                    "run",
+                    "transfer",
+                    "--until-review",
+                    "--timeout-sec",
+                    "1",
+                    "--config",
+                    str(config),
+                ]
+            )
+            == 0
+        )
+        run = json.loads(capsys.readouterr().out)
+        assert run["reason"] == "manual_dispatch_required"
+        assert run["snapshot"]["ready_next"][0]["task_id"] == "schema"
+
+
+def test_plan_cancel_archive_and_gc_round_trip_through_real_cli(capsys) -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        config = root / "workspaces.toml"
+        config.write_text(_config_text(root), encoding="utf-8")
+
+        assert (
+            main(
+                [
+                    "plan",
+                    "create",
+                    "--plan-id",
+                    "lifecycle",
+                    "--title",
+                    "Lifecycle",
+                    "--config",
+                    str(config),
+                ]
+            )
+            == 0
+        )
+        capsys.readouterr()
+        assert main(["plan", "cancel", "lifecycle", "--config", str(config)]) == 0
+        cancelled = json.loads(capsys.readouterr().out)
+        assert cancelled["snapshot"]["status"] == "cancelled"
+
+        assert main(["plan", "archive", "lifecycle", "--config", str(config)]) == 0
+        archived = json.loads(capsys.readouterr().out)
+        assert archived["archived_at"] is not None
+
+        assert main(["plan", "list", "--config", str(config)]) == 0
+        assert json.loads(capsys.readouterr().out) == []
+        assert (
+            main(
+                [
+                    "plan",
+                    "list",
+                    "--include-archived",
+                    "--config",
+                    str(config),
+                ]
+            )
+            == 0
+        )
+        assert json.loads(capsys.readouterr().out)[0]["plan_id"] == "lifecycle"
+
+        assert (
+            main(
+                [
+                    "gc",
+                    "--older-than-days",
+                    "0",
+                    "--apply",
+                    "--config",
+                    str(config),
+                ]
+            )
+            == 0
+        )
+        collected = json.loads(capsys.readouterr().out)
+        assert collected["applied"]["plans"] == 1
 
 
 def _config_text(root: Path) -> str:

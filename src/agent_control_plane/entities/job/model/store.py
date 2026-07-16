@@ -31,6 +31,7 @@ JOB_COLUMNS = {
     "log_path",
     "worker_pid",
     "runner_pid",
+    "runner_process_identity",
     "agy_pid",
     "started_at",
     "finished_at",
@@ -62,6 +63,7 @@ class JobRecord:
     log_path: Path | None
     worker_pid: int | None
     runner_pid: int | None
+    runner_process_identity: str | None
     agy_pid: int | None
     backend: str
     agy_model: str | None
@@ -104,6 +106,19 @@ class JobStore:
             checksum="job-store-v1-20260715",
             migrate=self._migrate_schema,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=2,
+            checksum="job-store-runner-process-identity-v2-20260715",
+            migrate=self._migrate_runner_process_identity,
+        )
+
+    @staticmethod
+    def _migrate_runner_process_identity(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        if "runner_process_identity" not in columns:
+            db.execute("alter table jobs add column runner_process_identity text")
 
     @classmethod
     def _migrate_schema(cls, db: sqlite3.Connection) -> None:
@@ -313,7 +328,8 @@ class JobStore:
                 """
                 update jobs
                 set status = ?, finished_at = ?, last_error = ?,
-                    worker_pid = null, runner_pid = null, agy_pid = null,
+                    worker_pid = null, runner_pid = null, runner_process_identity = null,
+                    agy_pid = null,
                     worker_instance_id = null, worker_heartbeat_at = null,
                     finalization_status = 'pending', finalization_error = null,
                     finalized_at = null, updated_at = ?
@@ -341,7 +357,8 @@ class JobStore:
                 """
                 update jobs
                 set status = ?, finished_at = ?, last_error = ?,
-                    worker_pid = null, runner_pid = null, agy_pid = null,
+                    worker_pid = null, runner_pid = null, runner_process_identity = null,
+                    agy_pid = null,
                     worker_instance_id = null, worker_heartbeat_at = null,
                     finalization_status = 'pending', finalization_error = null,
                     finalized_at = null, updated_at = ?
@@ -725,6 +742,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         log_path=_optional_path(row["log_path"]),
         worker_pid=row["worker_pid"],
         runner_pid=row["runner_pid"],
+        runner_process_identity=row["runner_process_identity"],
         agy_pid=row["agy_pid"],
         backend=normalize_backend(row["backend"]),
         agy_model=row["agy_model"],

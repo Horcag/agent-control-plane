@@ -56,7 +56,7 @@ extra_rules = [
 ]
 
 [tool.ruff]
-src = ["src", "tests"]
+src = ["src", "tests", "scripts"]
 line-length = 100
 target-version = "py311"
 

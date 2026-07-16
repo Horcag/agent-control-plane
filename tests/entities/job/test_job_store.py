@@ -26,10 +26,15 @@ class JobStoreTest(unittest.TestCase):
                 status="running",
                 worker_pid=123,
                 runner_pid=456,
+                runner_process_identity=(
+                    '{"schema_version":1,"pid":456,'
+                    '"started_key":"test:1","executable":"python"}'
+                ),
             )
             self.assertEqual(updated.status, "running")
             self.assertEqual(updated.worker_pid, 123)
             self.assertEqual(updated.runner_pid, 456)
+            self.assertIsNotNone(updated.runner_process_identity)
 
             store.add_event("job-1", "info", "started")
             self.assertEqual(store.recent_events("job-1")[-1][2], "started")
@@ -88,6 +93,40 @@ class JobStoreTest(unittest.TestCase):
             # Fetch from DB and check again
             fetched = store.get_job("job-native")
             self.assertEqual(fetched.workspace_access, "native")
+
+    def test_runner_identity_v2_migrates_a_database_already_at_v1(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "jobs.sqlite3"
+            store = JobStore(database)
+            store.initialize()
+            db = sqlite3.connect(database)
+            try:
+                db.execute("alter table jobs drop column runner_process_identity")
+                db.execute(
+                    "delete from schema_migrations where component = 'job_store' and version = 2"
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            store.initialize()
+
+            db = sqlite3.connect(database)
+            try:
+                columns = {row[1] for row in db.execute("pragma table_info(jobs)")}
+                migration = db.execute(
+                    "select checksum from schema_migrations "
+                    "where component = 'job_store' and version = 2"
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertIn("runner_process_identity", columns)
+            self.assertEqual(
+                migration,
+                ("job-store-runner-process-identity-v2-20260715",),
+            )
 
     def test_old_jobs_table_migration(self) -> None:
         import sqlite3

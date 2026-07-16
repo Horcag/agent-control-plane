@@ -1,8 +1,22 @@
 from agent_control_plane.features.agent_runner.lib.codex_runner import CodexExecRunner
+from agent_control_plane.features.agent_runner.lib.job_launcher import (
+    JobLauncher,
+    JobLaunchError,
+    JobLaunchOptions,
+)
 from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     ModelProfile,
     ModelRoutingPolicy,
+)
+from agent_control_plane.features.agent_runner.lib.process_identity import (
+    ProcessIdentity,
+    ProcessTerminationResult,
+    ProcessTerminationState,
+    capture_process_identity,
+    process_is_alive,
+    supports_verified_process_termination,
+    terminate_verified_process,
 )
 from agent_control_plane.features.agent_runner.lib.prompt_builder import build_task_prompt
 from agent_control_plane.features.agent_runner.lib.pty_runner import (
@@ -53,9 +67,15 @@ __all__ = [
     "CodexRateLimitReader",
     "FinalizationLease",
     "GlobalQuotaBroker",
+    "JobLaunchError",
+    "JobLaunchOptions",
+    "JobLauncher",
     "JobReconciler",
     "ModelProfile",
     "ModelRoutingPolicy",
+    "ProcessIdentity",
+    "ProcessTerminationResult",
+    "ProcessTerminationState",
     "PtyAgyRunner",
     "QuotaDecision",
     "ResultState",
@@ -64,8 +84,12 @@ __all__ = [
     "WorkerLeaseProbe",
     "WorkerLeaseState",
     "build_task_prompt",
+    "capture_process_identity",
     "codex_job_capacity_units",
     "inspect_result",
     "normalize_backend",
     "probe_worker_lease",
+    "process_is_alive",
+    "supports_verified_process_termination",
+    "terminate_verified_process",
 ]

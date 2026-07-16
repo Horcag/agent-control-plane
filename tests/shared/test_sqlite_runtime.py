@@ -166,11 +166,11 @@ def test_schema_migration_is_applied_once_across_two_processes(tmp_path: Path) -
         """
     )
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    env["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
     processes = [
         subprocess.Popen(  # nosec B603
             [sys.executable, "-c", script, str(database)],
-            cwd=Path(__file__).parents[1],
+            cwd=Path(__file__).parents[2],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -94,7 +94,7 @@ class AntigravityManagerAdapterTest(unittest.TestCase):
 
     def test_helper_does_not_embed_oauth_credentials(self) -> None:
         helper_path = (
-            Path(__file__).resolve().parents[1]
+            Path(__file__).resolve().parents[3]
             / "src"
             / "agent_control_plane"
             / "features"
@@ -114,7 +114,7 @@ class AntigravityManagerAdapterTest(unittest.TestCase):
 
     def test_helper_accepts_manager_prerelease_install_directories(self) -> None:
         helper_path = (
-            Path(__file__).resolve().parents[1]
+            Path(__file__).resolve().parents[3]
             / "src"
             / "agent_control_plane"
             / "features"

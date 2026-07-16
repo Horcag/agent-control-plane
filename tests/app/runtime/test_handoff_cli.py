@@ -36,6 +36,33 @@ def test_inbox_resolve_parser_keeps_review_separate_from_plan_acceptance() -> No
     assert args.decision == "accepted"
 
 
+def test_accept_handoff_parser_collects_all_atomic_decision_inputs() -> None:
+    args = _build_parser().parse_args(
+        [
+            "accept-handoff",
+            "transfer",
+            "schema",
+            "--review-span-id",
+            "review-1",
+            "--accepted-sha",
+            "abc123",
+            "--attempt",
+            "2",
+            "--defects-found",
+            "1",
+            "--notes",
+            "verified",
+        ]
+    )
+
+    assert args.plan_id == "transfer"
+    assert args.task_id == "schema"
+    assert args.review_span_id == "review-1"
+    assert args.accepted_sha == "abc123"
+    assert args.attempt == 2
+    assert args.defects_found == 1
+
+
 def test_slot_checkpoint_parser_requires_the_terminal_job_identity() -> None:
     args = _build_parser().parse_args(["slots", "checkpoint", "app-1", "--job-id", "job-1"])
 
@@ -45,7 +72,9 @@ def test_slot_checkpoint_parser_requires_the_terminal_job_identity() -> None:
 
 
 def test_reconcile_and_internal_worker_identity_are_explicit_cli_inputs() -> None:
-    reconcile = _build_parser().parse_args(["reconcile", "--job-id", "job-1"])
+    reconcile = _build_parser().parse_args(
+        ["reconcile", "--job-id", "job-1", "--terminate-verified-runners"]
+    )
     worker = _build_parser().parse_args(
         [
             "run-job",
@@ -58,4 +87,5 @@ def test_reconcile_and_internal_worker_identity_are_explicit_cli_inputs() -> Non
 
     assert reconcile.command == "reconcile"
     assert reconcile.job_id == "job-1"
+    assert reconcile.terminate_verified_runners is True
     assert worker.worker_instance_id == "worker-1"

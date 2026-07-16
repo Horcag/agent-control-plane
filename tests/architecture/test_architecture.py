@@ -6,7 +6,7 @@ from pytest_fsd.config import load_config
 
 
 def test_project_architecture(monkeypatch) -> None:
-    project_root = Path(__file__).resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[2]
     config = load_config(str(project_root))
 
     # pytest-fsd uses base_path both as an import package and as a filesystem root.
