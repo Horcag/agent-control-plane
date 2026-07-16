@@ -53,9 +53,13 @@ codex_deep_tool_call_budget = 120
 codex_global_quota_database = "${USERPROFILE}/.codex/agent-control-plane/global-quota.sqlite3"
 codex_global_max_concurrent_jobs = 2
 codex_global_max_burst_jobs = 8
-# Legacy option name: ACP applies this threshold to the primary rate-limit window
-# reported by Codex, regardless of whether that window is five hours or longer.
+# Legacy option name for the primary-domain reported rate-limit window.
+# The primary-domain window may be longer than five hours.
 codex_five_hour_soft_limit_percent = 75
+# Optional separate Spark quota-window threshold. Set to 100 to defer Spark while
+# reported usage remains 100 and reset is still in the future.
+codex_spark_soft_limit_percent = 100
+codex_spark_models = ["gpt-5.3-codex-spark"]
 codex_quota_poll_sec = 30
 codex_sessions_root = "${USERPROFILE}/.codex/sessions"
 guardrail_poll_sec = 2

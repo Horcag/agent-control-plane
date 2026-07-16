@@ -609,6 +609,59 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(broker.capacity_units, [30, 30])
             self.assertEqual(control.store.get_job(job.job_id).status, "running")
 
+    def test_codex_quota_domain_appears_in_status_summary_and_watch_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            _create_job(
+                control,
+                root,
+                workspace,
+                "job-quota-domain",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.3-codex-spark",
+            )
+
+            status = control.status_job("job-quota-domain")
+            summary = control.summary_job("job-quota-domain")
+            watch = control.watch_job(
+                "job-quota-domain",
+                include_details=False,
+                poll_interval_sec=0,
+                timeout_sec=0,
+            )
+
+            self.assertEqual(status["codex_quota_domain"], "spark")
+            self.assertEqual(summary["codex_quota_domain"], "spark")
+            self.assertEqual(watch["codex_quota_domain"], "spark")
+
+    def test_quota_wait_records_domain_in_event_and_passes_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-quota-domain",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.3-codex-spark",
+            )
+            broker = _SequenceQuotaBroker()
+            control.quota_broker = broker  # type: ignore[assignment]
+
+            with patch("agent_control_plane.app.runtime.job_execution_service.time.sleep"):
+                acquired = control.job_execution.wait_for_codex_quota(job)
+
+            self.assertTrue(acquired)
+            self.assertEqual(broker.models, ["gpt-5.3-codex-spark", "gpt-5.3-codex-spark"])
+            events = control.store.recent_events(job.job_id)
+            self.assertTrue(any("domain=spark" in event[2] for event in events))
+
     def test_read_only_slot_job_skips_ide_and_dependency_preparation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -944,6 +997,7 @@ class _RecordingQuotaBroker:
     def __init__(self) -> None:
         self.capacity_units: list[int] = []
         self.released_jobs: list[str] = []
+        self.models: list[str | None] = []
 
     def try_acquire(
         self,
@@ -951,14 +1005,18 @@ class _RecordingQuotaBroker:
         *,
         worker_pid: int,
         capacity_units: int,
+        model: str | None = None,
     ) -> QuotaDecision:
         self.capacity_units.append(capacity_units)
+        self.models.append(model)
+        quota_domain = "spark" if model == "gpt-5.3-codex-spark" else "primary"
         return QuotaDecision(
             acquired=True,
             reason=None,
             active_jobs=1,
             active_capacity_units=capacity_units,
             max_capacity_units=60,
+            quota_domain=quota_domain,
         )
 
     def release(self, job_id: str) -> None:
@@ -969,6 +1027,7 @@ class _SequenceQuotaBroker:
     def __init__(self) -> None:
         self.calls = 0
         self.capacity_units: list[int] = []
+        self.models: list[str | None] = []
 
     def try_acquire(
         self,
@@ -976,9 +1035,12 @@ class _SequenceQuotaBroker:
         *,
         worker_pid: int,
         capacity_units: int,
+        model: str | None = None,
     ) -> QuotaDecision:
         self.calls += 1
         self.capacity_units.append(capacity_units)
+        self.models.append(model)
+        quota_domain = "spark" if model == "gpt-5.3-codex-spark" else "primary"
         if self.calls == 1:
             return QuotaDecision(
                 acquired=False,
@@ -986,6 +1048,7 @@ class _SequenceQuotaBroker:
                 active_jobs=2,
                 active_capacity_units=60,
                 max_capacity_units=60,
+                quota_domain=quota_domain,
             )
         return QuotaDecision(
             acquired=True,
@@ -993,6 +1056,7 @@ class _SequenceQuotaBroker:
             active_jobs=1,
             active_capacity_units=capacity_units,
             max_capacity_units=60,
+            quota_domain=quota_domain,
         )
 
 

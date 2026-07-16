@@ -176,11 +176,32 @@ A Luna job that escalates to Terra keeps its original lease and waits until the 
 weight fits. Unknown model names are charged the full 30 units to fail closed. Physical
 slot ownership remains exclusive and can impose a lower limit than the global quota.
 
+`control.defaults.codex_spark_models` defines a dedicated model list for the "spark"
+domain. If a current model exactly matches any configured value (case-insensitive),
+that job uses a separate spark window with its own soft cap, configured with
+`control.defaults.codex_spark_soft_limit_percent`, while still sharing sessions,
+history, analytics, and weighted concurrency. Usage/reset snapshots and soft-cap decisions
+are applied independently by domain.
+
 The rate-limit soft cap is independent of these concurrency weights. The legacy config
-name `codex_five_hour_soft_limit_percent` is applied to whichever primary window Codex
-reports; that window may be longer than five hours. At or above the threshold, ACP
-defers all Codex models, including Luna. A future model-aware reserve should be an
-explicit policy rather than an accidental bypass of the configured cap.
+name `codex_five_hour_soft_limit_percent` is applied to the primary reported window;
+that window may be longer than five hours. At or above the threshold, ACP defers all
+primary-domain Codex models, including Luna and Terra. If the usage reaches `100`, the
+primary domain is deferred until its next reset.
+Primary and Spark still share session history, analytics, and local weighted capacity.
+Usage and reset snapshots are separate for each domain, and soft-cap decisions are made
+per-domain.
+Spark-domain models use their own threshold (`codex_spark_soft_limit_percent`), with
+explicitly deferred behavior remaining at reported usage `100` when reset time is in the
+future.
+
+Before running the command, create `.agent-work/tasks/spark-example/brief.md` with the task
+instructions.
+Use the following CLI command to select Spark-domain invocation:
+
+```powershell
+agent-control start --config config/workspaces.toml --task-id spark-example --route acp --backend codex --codex-model gpt-5.3-codex-spark --codex-reasoning-effort high --wait
+```
 
 ## Why Medium
 

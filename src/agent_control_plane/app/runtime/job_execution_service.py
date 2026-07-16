@@ -245,6 +245,7 @@ class JobExecutionService:
                 job.job_id,
                 worker_pid=os.getpid(),
                 capacity_units=capacity_units,
+                model=active_profile.model,
             )
             if decision.acquired:
                 self.update_active_worker_job(job.job_id, status="running")
@@ -747,6 +748,7 @@ class JobExecutionService:
             "info",
             "Global Codex quota acquired for "
             f"{profile.model}/{profile.reasoning_effort}; "
+            f"domain={decision.quota_domain}; "
             f"active_jobs={decision.active_jobs}, "
             f"capacity={decision.active_capacity_units}/{decision.max_capacity_units}",
         )
@@ -765,7 +767,10 @@ class JobExecutionService:
         )
         if decision.retry_after_sec is not None:
             detail += f", retry_after_sec={round(decision.retry_after_sec, 1)}"
-        return f"Waiting for global Codex quota: {decision.reason or 'unavailable'} ({detail})"
+        return (
+            f"Waiting for global Codex quota: {decision.reason or 'unavailable'} "
+            f"(domain={decision.quota_domain}; {detail})"
+        )
 
     def _auto_switch_agy_after_quota_failure(
         self,

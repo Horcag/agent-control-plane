@@ -4,8 +4,10 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 from agent_control_plane.features.agent_runner.lib.quota_broker import (
@@ -14,6 +16,46 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
     RateLimitSnapshot,
     codex_job_capacity_units,
 )
+
+
+def build_turn_context_event(model: str | None, *, timestamp: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    if model is not None:
+        payload["model"] = model
+    return {
+        "type": "turn_context",
+        "timestamp": timestamp,
+        "payload": payload,
+    }
+
+
+def build_token_count_event(
+    used_percent: float,
+    resets_at: float,
+    *,
+    timestamp: str,
+    payload_model: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": "token_count",
+        "rate_limits": {
+            "primary": {"used_percent": used_percent, "resets_at": resets_at},
+        },
+    }
+    if payload_model is not None:
+        payload["model"] = payload_model
+    return {
+        "type": "event_msg",
+        "timestamp": timestamp,
+        "payload": payload,
+    }
+
+
+def write_jsonl_events(path: Path, *events: dict[str, Any]) -> None:
+    path.write_text(
+        "\n".join(json.dumps(event) for event in events) + "\n",
+        encoding="utf-8",
+    )
 
 
 class GlobalQuotaBrokerTest(unittest.TestCase):
@@ -35,13 +77,15 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
             broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            live_pid = os.getpid()
+            dead_pid = live_pid + 1
 
             with patch(
                 "agent_control_plane.features.agent_runner.lib.quota_broker._pid_alive",
-                side_effect=lambda pid: pid == 202,
+                side_effect=lambda pid: pid == dead_pid,
             ):
-                self.assertTrue(broker.try_acquire("job-1", worker_pid=101).acquired)
-                decision = broker.try_acquire("job-2", worker_pid=202)
+                self.assertTrue(broker.try_acquire("job-1", worker_pid=live_pid).acquired)
+                decision = broker.try_acquire("job-2", worker_pid=dead_pid)
 
             self.assertTrue(decision.acquired)
             self.assertEqual(decision.active_jobs, 1)
@@ -58,26 +102,135 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 database,
                 max_concurrent_jobs=2,
                 soft_limit_percent=75.0,
-                rate_limit_reader=lambda: snapshot,
+                rate_limit_reader=lambda _domain: snapshot,
                 clock=lambda: 1_100.0,
             )
 
-            decision = broker.try_acquire("job-1", worker_pid=101)
+            decision = broker.try_acquire("job-1", worker_pid=os.getpid())
 
             self.assertFalse(decision.acquired)
             self.assertEqual(decision.reason, "rate_limit_soft_cap")
             self.assertEqual(decision.retry_after_sec, 900.0)
             self.assertEqual(decision.active_jobs, 0)
 
+    def test_primary_snapshot_does_not_throttle_spark_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            snapshot = RateLimitSnapshot(
+                used_percent=81.0,
+                resets_at=2_000.0,
+                observed_at=1_000.0,
+            )
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=2,
+                soft_limit_percent=75.0,
+                spark_soft_limit_percent=100.0,
+                rate_limit_reader=lambda _domain: snapshot,
+                clock=lambda: 1_100.0,
+            )
+
+            primary = broker.try_acquire(
+                "job-primary",
+                worker_pid=os.getpid(),
+                model="gpt-5.6-terra",
+            )
+            spark = broker.try_acquire(
+                "job-spark",
+                worker_pid=os.getpid(),
+                model="gpt-5.3-codex-spark",
+            )
+
+            self.assertFalse(primary.acquired)
+            self.assertEqual(primary.reason, "rate_limit_soft_cap")
+            self.assertEqual(primary.quota_domain, "primary")
+            self.assertTrue(spark.acquired)
+            self.assertEqual(spark.quota_domain, "spark")
+            self.assertEqual(spark.active_jobs, 1)
+
+    def test_rate_limit_soft_cap_is_domain_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+
+            snapshots = {
+                "primary": RateLimitSnapshot(
+                    used_percent=81.0,
+                    resets_at=2_000.0,
+                    observed_at=1_000.0,
+                    quota_domain="primary",
+                ),
+                "spark": RateLimitSnapshot(
+                    used_percent=70.0,
+                    resets_at=2_000.0,
+                    observed_at=1_000.0,
+                    quota_domain="spark",
+                ),
+            }
+
+            def reader(quota_domain: str) -> RateLimitSnapshot:
+                return snapshots[quota_domain]
+
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=2,
+                soft_limit_percent=75.0,
+                spark_soft_limit_percent=75.0,
+                rate_limit_reader=reader,
+                clock=lambda: 1_100.0,
+            )
+
+            primary = broker.try_acquire(
+                "job-primary",
+                worker_pid=os.getpid(),
+                model="gpt-5.6-terra",
+            )
+            spark = broker.try_acquire(
+                "job-spark",
+                worker_pid=os.getpid(),
+                model="gpt-5.3-codex-spark",
+            )
+
+            self.assertFalse(primary.acquired)
+            self.assertEqual(primary.reason, "rate_limit_soft_cap")
+            self.assertEqual(primary.quota_domain, "primary")
+            self.assertTrue(spark.acquired)
+            self.assertEqual(spark.quota_domain, "spark")
+
+    def test_lease_records_quota_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+            )
+            worker_pid = os.getpid()
+            self.assertTrue(
+                broker.try_acquire(
+                    "spark-1", worker_pid=worker_pid, model="gpt-5.3-codex-spark"
+                ).acquired
+            )
+
+            db = sqlite3.connect(database)
+            try:
+                row = db.execute(
+                    "select quota_domain from leases where job_id = ?",
+                    ("spark-1",),
+                ).fetchone()
+            finally:
+                db.close()
+
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "spark")
+
     def test_release_makes_capacity_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
             broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            worker_pid = os.getpid()
 
-            self.assertTrue(broker.try_acquire("job-1", worker_pid=101).acquired)
+            self.assertTrue(broker.try_acquire("job-1", worker_pid=worker_pid).acquired)
             broker.release("job-1")
-
-            self.assertTrue(broker.try_acquire("job-2", worker_pid=202).acquired)
+            self.assertTrue(broker.try_acquire("job-2", worker_pid=worker_pid).acquired)
 
     def test_model_and_effort_map_to_stable_capacity_units(self) -> None:
         self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "high"), 6)
@@ -197,7 +350,8 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                     """
                 )
                 db.execute(
-                    "insert into leases values (?, ?, ?, ?)",
+                    "insert into leases (job_id, worker_pid, acquired_at, heartbeat_at) "
+                    "values (?, ?, ?, ?)",
                     ("legacy-sol", os.getpid(), 1.0, 1.0),
                 )
                 db.commit()
@@ -219,40 +373,374 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             self.assertEqual(blocked.reason, "weighted_capacity_limit")
             self.assertEqual(blocked.active_capacity_units, 30)
 
+    def test_domain_soft_caps_can_be_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cases = [
+                (
+                    "primary_full_spark_free",
+                    RateLimitSnapshot(
+                        used_percent=100.0,
+                        resets_at=2_000.0,
+                        observed_at=1_000.0,
+                        quota_domain="primary",
+                    ),
+                    RateLimitSnapshot(
+                        used_percent=10.0,
+                        resets_at=2_000.0,
+                        observed_at=1_000.0,
+                        quota_domain="spark",
+                    ),
+                ),
+                (
+                    "spark_full_primary_free",
+                    RateLimitSnapshot(
+                        used_percent=10.0,
+                        resets_at=2_000.0,
+                        observed_at=1_000.0,
+                        quota_domain="primary",
+                    ),
+                    RateLimitSnapshot(
+                        used_percent=100.0,
+                        resets_at=2_000.0,
+                        observed_at=1_000.0,
+                        quota_domain="spark",
+                    ),
+                ),
+            ]
+            for domain, primary_snapshot, spark_snapshot in cases:
+                with self.subTest(domain=domain):
+                    case_database = Path(temp) / f"{domain}-global-quota.sqlite3"
+                    reader = {
+                        "primary": primary_snapshot,
+                        "spark": spark_snapshot,
+                    }.__getitem__
+
+                    broker = GlobalQuotaBroker(
+                        case_database,
+                        max_concurrent_jobs=2,
+                        soft_limit_percent=75.0,
+                        spark_soft_limit_percent=75.0,
+                        rate_limit_reader=reader,
+                        clock=lambda: 1_100.0,
+                    )
+                    primary = broker.try_acquire(
+                        f"{domain}-primary",
+                        worker_pid=os.getpid(),
+                        model="gpt-5.6-terra",
+                    )
+                    spark = broker.try_acquire(
+                        f"{domain}-spark",
+                        worker_pid=os.getpid(),
+                        model="gpt-5.3-codex-spark",
+                    )
+
+                    self.assertEqual(primary.quota_domain, "primary")
+                    self.assertEqual(spark.quota_domain, "spark")
+                    if domain == "primary_full_spark_free":
+                        self.assertFalse(primary.acquired)
+                        self.assertEqual(primary.reason, "rate_limit_soft_cap")
+                        self.assertTrue(spark.acquired)
+                    else:
+                        self.assertFalse(spark.acquired)
+                        self.assertEqual(spark.reason, "rate_limit_soft_cap")
+                        self.assertTrue(primary.acquired)
+
+    def test_primary_and_spark_share_weighted_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            self.assertTrue(
+                broker.try_acquire(
+                    "primary",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.6-terra",
+                ).acquired
+            )
+            spark = broker.try_acquire(
+                "spark",
+                worker_pid=os.getpid(),
+                model="gpt-5.3-codex-spark",
+            )
+            self.assertFalse(spark.acquired)
+            self.assertEqual(spark.reason, "weighted_capacity_limit")
+
+    def test_migrates_v1_db_and_records_v2_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            db = sqlite3.connect(database)
+            try:
+                db.execute(
+                    """
+                    create table schema_migrations (
+                        component text not null,
+                        version integer not null,
+                        checksum text not null,
+                        applied_at text not null,
+                        primary key(component, version)
+                    )
+                    """
+                )
+                db.execute(
+                    """
+                    create table leases (
+                        job_id text primary key,
+                        worker_pid integer not null,
+                        acquired_at real not null,
+                        heartbeat_at real not null,
+                        capacity_units integer not null default 30
+                    )
+                    """
+                )
+                db.execute(
+                    "insert into schema_migrations values (?, ?, ?, ?)",
+                    (
+                        "global_quota_broker",
+                        1,
+                        "global-quota-broker-v1-20260715",
+                        "2026-01-01T00:00:00+00:00",
+                    ),
+                )
+                db.execute(
+                    "insert into leases (job_id, worker_pid, acquired_at, heartbeat_at, capacity_units) "
+                    "values (?, ?, ?, ?, 30)",
+                    ("legacy", os.getpid(), 1.0, 1.0),
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            GlobalQuotaBroker(database, max_concurrent_jobs=1, max_burst_jobs=1)
+            db_read = sqlite3.connect(database)
+            try:
+                row = db_read.execute(
+                    "select quota_domain from leases where job_id = ?",
+                    ("legacy",),
+                ).fetchone()
+                count_v2 = db_read.execute(
+                    "select count(*) from schema_migrations where component = ? and version = ?",
+                    ("global_quota_broker", 2),
+                ).fetchone()
+            finally:
+                db_read.close()
+            if row is None:
+                self.fail("Migration v1 row not found after upgrade to schema version 2")
+            if count_v2 is None:
+                self.fail("Schema migration row for version 2 was not added")
+            self.assertEqual(row[0], "primary")
+            self.assertEqual(count_v2[0], 1)
+            GlobalQuotaBroker(database, max_concurrent_jobs=1, max_burst_jobs=1)
+            db_read = sqlite3.connect(database)
+            try:
+                checksum_row = db_read.execute(
+                    "select checksum from schema_migrations where component = ? and version = ?",
+                    ("global_quota_broker", 2),
+                ).fetchone()
+            finally:
+                db_read.close()
+            if checksum_row is None:
+                self.fail("Missing migration checksum entry for schema version 2")
+            self.assertEqual(checksum_row[0], "global-quota-broker-v2-20260716")
+
 
 class CodexRateLimitReaderTest(unittest.TestCase):
-    def test_reads_latest_primary_snapshot_from_recent_session(self) -> None:
+    def test_latest_prefers_observed_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             sessions = Path(temp) / "sessions" / "2026" / "07" / "11"
             sessions.mkdir(parents=True)
-            rollout = sessions / "rollout-thread.jsonl"
-            rollout.write_text(
-                json.dumps(
-                    {
-                        "timestamp": "2026-07-11T06:00:00Z",
-                        "type": "event_msg",
-                        "payload": {
-                            "type": "token_count",
-                            "rate_limits": {
-                                "primary": {
-                                    "used_percent": 79.0,
-                                    "resets_at": 2_000,
-                                }
-                            },
-                        },
-                    }
+            newer = sessions / "newer.jsonl"
+            older = sessions / "older.jsonl"
+            now = time.time()
+            reader = CodexRateLimitReader(Path(temp) / "sessions")
+
+            with self.subTest("newer_spark_older_terra"):
+                write_jsonl_events(
+                    newer,
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-11T06:00:05Z"
+                    ),
+                    build_token_count_event(2.0, 2_000.0, timestamp="2026-07-11T06:00:05Z"),
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-11T06:00:10Z"),
+                    build_token_count_event(5.0, 2_000.0, timestamp="2026-07-11T06:00:10Z"),
                 )
-                + "\n",
-                encoding="utf-8",
+                write_jsonl_events(
+                    older,
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-11T06:00:20Z"
+                    ),
+                    build_token_count_event(80.0, 2_000.0, timestamp="2026-07-11T06:00:20Z"),
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-11T06:00:25Z"),
+                    build_token_count_event(100.0, 2_000.0, timestamp="2026-07-11T06:00:25Z"),
+                )
+                os.utime(newer, (now, now))
+                os.utime(older, (now - 5_000.0, now - 5_000.0))
+                self.assertEqual(reader.latest("spark").used_percent, 80.0)
+                self.assertEqual(reader.latest("primary").used_percent, 100.0)
+
+            with self.subTest("newer_terra_older_spark"):
+                write_jsonl_events(
+                    newer,
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-11T06:01:20Z"
+                    ),
+                    build_token_count_event(5.0, 2_000.0, timestamp="2026-07-11T06:01:20Z"),
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-11T06:01:21Z"),
+                    build_token_count_event(2.0, 2_000.0, timestamp="2026-07-11T06:01:21Z"),
+                )
+                write_jsonl_events(
+                    older,
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-11T06:01:05Z"
+                    ),
+                    build_token_count_event(100.0, 2_000.0, timestamp="2026-07-11T06:01:05Z"),
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-11T06:01:15Z"),
+                    build_token_count_event(80.0, 2_000.0, timestamp="2026-07-11T06:01:15Z"),
+                )
+                os.utime(newer, (now, now))
+                os.utime(older, (now - 5_000.0, now - 5_000.0))
+                self.assertEqual(reader.latest("spark").used_percent, 5.0)
+                self.assertEqual(reader.latest("primary").used_percent, 2.0)
+
+    def test_turn_context_sequence_switches_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions" / "2026" / "07" / "12"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout.jsonl"
+
+            with self.subTest("spark_to_terra"):
+                write_jsonl_events(
+                    rollout,
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-12T06:00:00Z"
+                    ),
+                    build_token_count_event(55.0, 2_000.0, timestamp="2026-07-12T06:00:05Z"),
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-12T06:00:10Z"),
+                    build_token_count_event(80.0, 2_000.0, timestamp="2026-07-12T06:00:15Z"),
+                )
+                reader = CodexRateLimitReader(Path(temp) / "sessions")
+                self.assertEqual(reader.latest("spark").used_percent, 55.0)
+                self.assertEqual(reader.latest("primary").used_percent, 80.0)
+
+            write_jsonl_events(rollout)
+            with self.subTest("terra_to_spark"):
+                write_jsonl_events(
+                    rollout,
+                    build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-12T06:01:00Z"),
+                    build_token_count_event(55.0, 2_000.0, timestamp="2026-07-12T06:01:05Z"),
+                    build_turn_context_event(
+                        "gpt-5.3-codex-spark", timestamp="2026-07-12T06:01:10Z"
+                    ),
+                    build_token_count_event(35.0, 2_000.0, timestamp="2026-07-12T06:01:15Z"),
+                )
+                reader = CodexRateLimitReader(Path(temp) / "sessions")
+                self.assertEqual(reader.latest("spark").used_percent, 35.0)
+                self.assertEqual(reader.latest("primary").used_percent, 55.0)
+
+    def test_turn_context_state_resets_and_ignores_payload_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions" / "2026" / "07" / "13"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout.jsonl"
+
+            cases = [
+                (
+                    "missing_model_resets",
+                    [
+                        build_turn_context_event(
+                            "gpt-5.3-codex-spark",
+                            timestamp="2026-07-13T06:00:00Z",
+                        ),
+                        build_turn_context_event(
+                            None,
+                            timestamp="2026-07-13T06:00:05Z",
+                        ),
+                        build_token_count_event(
+                            45.0,
+                            2_000.0,
+                            timestamp="2026-07-13T06:00:10Z",
+                        ),
+                    ],
+                    "primary",
+                ),
+                (
+                    "blank_model_resets",
+                    [
+                        build_turn_context_event(
+                            "gpt-5.3-codex-spark",
+                            timestamp="2026-07-13T06:01:00Z",
+                        ),
+                        build_turn_context_event(
+                            "",
+                            timestamp="2026-07-13T06:01:05Z",
+                        ),
+                        build_token_count_event(
+                            46.0,
+                            2_000.0,
+                            timestamp="2026-07-13T06:01:10Z",
+                        ),
+                    ],
+                    "primary",
+                ),
+                (
+                    "unknown_model_defaults_primary",
+                    [
+                        build_turn_context_event(
+                            "gpt-5.6-mystery",
+                            timestamp="2026-07-13T06:02:00Z",
+                        ),
+                        build_token_count_event(
+                            47.0,
+                            2_000.0,
+                            timestamp="2026-07-13T06:02:05Z",
+                        ),
+                    ],
+                    "primary",
+                ),
+                (
+                    "unrelated_payload_model_ignored",
+                    [
+                        build_turn_context_event(
+                            "gpt-5.3-codex-spark",
+                            timestamp="2026-07-13T06:03:00Z",
+                        ),
+                        build_token_count_event(
+                            48.0,
+                            2_000.0,
+                            timestamp="2026-07-13T06:03:05Z",
+                            payload_model="gpt-5.6-terra",
+                        ),
+                    ],
+                    "spark",
+                ),
+            ]
+            for description, events, expected_domain in cases:
+                with self.subTest(description=description):
+                    write_jsonl_events(rollout, *events)
+                    snapshot = CodexRateLimitReader(Path(temp) / "sessions").latest(expected_domain)
+                    self.assertIsNotNone(snapshot)
+                    if snapshot is None:
+                        self.fail("Missing quota-domain snapshot")
+                    self.assertEqual(snapshot.quota_domain, expected_domain)
+
+    def test_tail_without_preceding_context_defaults_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp) / "sessions" / "2026" / "07" / "14"
+            sessions.mkdir(parents=True)
+            rollout = sessions / "rollout.jsonl"
+            write_jsonl_events(
+                rollout,
+                build_token_count_event(
+                    49.0,
+                    2_000.0,
+                    timestamp="2026-07-14T06:00:00Z",
+                ),
             )
 
-            snapshot = CodexRateLimitReader(Path(temp) / "sessions").latest()
+            reader = CodexRateLimitReader(Path(temp) / "sessions")
+            primary = reader.latest("primary")
+            spark = reader.latest("spark")
 
-            self.assertIsNotNone(snapshot)
-            assert snapshot is not None
-            self.assertEqual(snapshot.used_percent, 79.0)
-            self.assertEqual(snapshot.resets_at, 2_000.0)
-
-
-if __name__ == "__main__":
-    unittest.main()
+            self.assertIsNotNone(primary)
+            if primary is None:
+                self.fail("Missing primary snapshot")
+            self.assertEqual(primary.quota_domain, "primary")
+            self.assertIsNone(spark)

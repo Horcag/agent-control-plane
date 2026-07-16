@@ -29,6 +29,7 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
     GlobalQuotaBroker,
     QuotaDecision,
     codex_job_capacity_units,
+    codex_quota_domain,
 )
 from agent_control_plane.features.agent_runner.lib.result_detector import (
     ResultState,
@@ -86,6 +87,7 @@ __all__ = [
     "build_task_prompt",
     "capture_process_identity",
     "codex_job_capacity_units",
+    "codex_quota_domain",
     "inspect_result",
     "normalize_backend",
     "probe_worker_lease",

@@ -48,6 +48,7 @@ codex_deep_reasoning_effort = "medium"
 codex_global_quota_database = "global/quota.sqlite3"
 codex_global_max_concurrent_jobs = 2
 codex_five_hour_soft_limit_percent = 75
+codex_spark_soft_limit_percent = 88
 codex_quota_poll_sec = 30
 codex_sessions_root = "sessions"
 terminal_slot_policy = "checkpoint"
@@ -127,7 +128,12 @@ path = "slots/reports-1"
             )
             self.assertEqual(config.defaults.codex_global_max_concurrent_jobs, 2)
             self.assertEqual(config.defaults.codex_global_max_burst_jobs, 8)
+            self.assertEqual(
+                config.defaults.codex_spark_models,
+                ("gpt-5.3-codex-spark",),
+            )
             self.assertEqual(config.defaults.codex_five_hour_soft_limit_percent, 75.0)
+            self.assertEqual(config.defaults.codex_spark_soft_limit_percent, 88.0)
             self.assertEqual(config.defaults.codex_quota_poll_sec, 30.0)
             self.assertEqual(
                 config.defaults.codex_sessions_root,
@@ -195,6 +201,42 @@ path = "slots/reports-1"
             self.assertEqual(
                 tuple(path.as_posix() for path in config.routes["reports"].exclude_dirs),
                 ("dist", "frontend/build"),
+            )
+
+    def test_loads_codex_spark_models_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+agy_command = "agy"
+
+[control.defaults]
+codex_spark_models = ["gpt-5.3-codex-spark", "gpt-5.6-spark"]
+
+[routes]
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+backend = "codex"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(
+                config.defaults.codex_spark_models,
+                ("gpt-5.3-codex-spark", "gpt-5.6-spark"),
             )
 
     def test_native_quality_contract_config(self) -> None:

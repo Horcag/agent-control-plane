@@ -112,7 +112,9 @@ class ControlDefaults:
     codex_global_max_concurrent_jobs: int = 2
     codex_global_max_burst_jobs: int = 8
     codex_five_hour_soft_limit_percent: float = 75.0
+    codex_spark_soft_limit_percent: float = 100.0
     codex_quota_poll_sec: float = 30.0
+    codex_spark_models: tuple[str, ...] = ("gpt-5.3-codex-spark",)
     codex_sessions_root: Path | None = None
     auto_switch_agy_on_quota: bool = False
     auto_switch_agy_strategy: str = "best"
@@ -276,6 +278,13 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         codex_five_hour_soft_limit_percent=_percent_value(
             defaults_raw.get("codex_five_hour_soft_limit_percent", 75.0),
             "codex_five_hour_soft_limit_percent",
+        ),
+        codex_spark_soft_limit_percent=_percent_value(
+            defaults_raw.get("codex_spark_soft_limit_percent", 100.0),
+            "codex_spark_soft_limit_percent",
+        ),
+        codex_spark_models=_string_tuple(
+            defaults_raw.get("codex_spark_models", ["gpt-5.3-codex-spark"])
         ),
         codex_quota_poll_sec=_positive_float(
             defaults_raw.get("codex_quota_poll_sec", 30.0),

@@ -49,6 +49,7 @@ from agent_control_plane.features.agent_runner import (
     ModelProfile,
     ModelRoutingPolicy,
     PtyAgyRunner,
+    codex_quota_domain,
     inspect_result,
     normalize_backend,
     process_is_alive,
@@ -136,6 +137,8 @@ class AgentControlPlane:
                 max_concurrent_jobs=defaults.codex_global_max_concurrent_jobs,
                 max_burst_jobs=defaults.codex_global_max_burst_jobs,
                 soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
+                spark_soft_limit_percent=defaults.codex_spark_soft_limit_percent,
+                spark_models=defaults.codex_spark_models,
                 rate_limit_reader=rate_limit_reader,
             )
         self.finalization = FinalizationService(
@@ -241,6 +244,9 @@ class AgentControlPlane:
                 "max_burst_jobs": self.config.defaults.codex_global_max_burst_jobs,
                 "primary_window_soft_limit_percent": (
                     self.config.defaults.codex_five_hour_soft_limit_percent
+                ),
+                "spark_window_soft_limit_percent": (
+                    self.config.defaults.codex_spark_soft_limit_percent
                 ),
                 "five_hour_soft_limit_percent": (
                     self.config.defaults.codex_five_hour_soft_limit_percent
@@ -547,6 +553,7 @@ class AgentControlPlane:
             "backend": job.backend,
             "agy_model": job.agy_model,
             "codex_model": job.codex_model,
+            "codex_quota_domain": self._codex_quota_domain(job),
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
@@ -602,6 +609,7 @@ class AgentControlPlane:
             "backend": job.backend,
             "agy_model": job.agy_model,
             "codex_model": job.codex_model,
+            "codex_quota_domain": self._codex_quota_domain(job),
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
@@ -744,6 +752,7 @@ class AgentControlPlane:
             "backend": job.backend,
             "agy_model": job.agy_model,
             "codex_model": job.codex_model,
+            "codex_quota_domain": self._codex_quota_domain(job),
             "codex_reasoning_effort": job.codex_reasoning_effort,
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
@@ -771,6 +780,14 @@ class AgentControlPlane:
                 }
             )
         return payload
+
+    def _codex_quota_domain(self, job: JobRecord) -> str:
+        if normalize_backend(job.backend) != CODEX_BACKEND:
+            return "primary"
+        return codex_quota_domain(
+            job.codex_model or self.config.defaults.codex_model,
+            self.config.defaults.codex_spark_models,
+        )
 
     def _native_quality_summary(self, job: JobRecord) -> dict[str, Any]:
         expected = resolve_native_quality_contract(

@@ -27,11 +27,20 @@ _REASONING_CAPACITY_WEIGHTS = {
     "high": 3,
     "xhigh": 3,
 }
+_DEFAULT_SPARK_MODELS = ("gpt-5.3-codex-spark",)
+
+
+def codex_quota_domain(model: str | None, spark_models: tuple[str, ...]) -> str:
+    if not model:
+        return "primary"
+    normalized_model = model.strip().lower()
+    if not normalized_model:
+        return "primary"
+    normalized_spark_models = {candidate.strip().lower() for candidate in spark_models}
+    return "spark" if normalized_model in normalized_spark_models else "primary"
 
 
 def codex_job_capacity_units(model: str, reasoning_effort: str) -> int:
-    """Return weighted concurrency units; unknown models consume one full slot."""
-
     family = model.strip().lower().rsplit("-", 1)[-1]
     model_weight = _MODEL_CAPACITY_WEIGHTS.get(family)
     if model_weight is None:
@@ -45,6 +54,8 @@ class RateLimitSnapshot:
     used_percent: float
     resets_at: float
     observed_at: float
+    model: str | None = None
+    quota_domain: str = "primary"
 
 
 @dataclass(frozen=True)
@@ -55,65 +66,72 @@ class QuotaDecision:
     retry_after_sec: float | None = None
     active_capacity_units: int = 0
     max_capacity_units: int = 0
+    quota_domain: str = "primary"
 
 
 class CodexRateLimitReader:
-    """Read the newest primary Codex rate-limit snapshot from local rollouts."""
+    """Read domain-aware Codex rate-limit snapshots from local rollouts."""
 
-    def __init__(self, sessions_root: Path, *, max_files: int = 24) -> None:
+    def __init__(
+        self,
+        sessions_root: Path,
+        *,
+        max_files: int = 24,
+        spark_models: tuple[str, ...] = _DEFAULT_SPARK_MODELS,
+    ) -> None:
         self.sessions_root = sessions_root
         self.max_files = max(1, max_files)
+        self.spark_models = tuple(spark_models)
 
-    def latest(self) -> RateLimitSnapshot | None:
+    def latest(self, quota_domain: str = "primary") -> RateLimitSnapshot | None:
         if not self.sessions_root.exists():
             return None
+        target_domain = quota_domain.strip().lower()
+        if target_domain not in {"primary", "spark"}:
+            target_domain = "primary"
         candidates = sorted(
             self.sessions_root.rglob("*.jsonl"),
             key=_safe_mtime,
             reverse=True,
         )[: self.max_files]
+        latest_snapshot: RateLimitSnapshot | None = None
         for path in candidates:
-            snapshot = self._latest_in_file(path)
-            if snapshot is not None:
-                return snapshot
-        return None
+            snapshot = self._latest_in_file(path, target_domain)
+            if snapshot is None:
+                continue
+            if latest_snapshot is None or snapshot.observed_at > latest_snapshot.observed_at:
+                latest_snapshot = snapshot
+        return latest_snapshot
 
-    @staticmethod
-    def _latest_in_file(path: Path) -> RateLimitSnapshot | None:
+    def _latest_in_file(self, path: Path, target_domain: str) -> RateLimitSnapshot | None:
         try:
             raw = _read_tail(path, max_bytes=1_048_576)
         except OSError:
             return None
-        for line in reversed(raw.splitlines()):
+        current_model: str | None = None
+        latest_snapshot: RateLimitSnapshot | None = None
+        for line in raw.splitlines():
             event = _json_object(line)
             if event is None:
                 continue
-            payload = event.get("payload")
-            if not isinstance(payload, dict) or payload.get("type") != "token_count":
-                continue
-            rate_limits = payload.get("rate_limits")
-            if not isinstance(rate_limits, dict):
-                rate_limits = event.get("rate_limits")
-            if not isinstance(rate_limits, dict):
-                continue
-            primary = rate_limits.get("primary")
-            if not isinstance(primary, dict):
-                continue
-            used_percent = _number(primary.get("used_percent"))
-            resets_at = _number(primary.get("resets_at"))
-            if used_percent is None or resets_at is None:
-                continue
-            observed_at = _timestamp(event.get("timestamp")) or _safe_mtime(path)
-            return RateLimitSnapshot(
-                used_percent=used_percent,
-                resets_at=resets_at,
-                observed_at=observed_at,
-            )
-        return None
+            model_updated, next_model = _read_turn_context_model(event)
+            if model_updated:
+                current_model = next_model
+            for snapshot in _extract_rate_limit_snapshots(
+                event,
+                current_model,
+                self.spark_models,
+                path,
+            ):
+                if snapshot.quota_domain == target_domain and (
+                    latest_snapshot is None or snapshot.observed_at > latest_snapshot.observed_at
+                ):
+                    latest_snapshot = snapshot
+        return latest_snapshot
 
 
 class GlobalQuotaBroker:
-    """Cross-process concurrency and primary-window quota broker backed by SQLite."""
+    """Cross-process concurrency and rate-limit broker backed by SQLite."""
 
     def __init__(
         self,
@@ -122,7 +140,9 @@ class GlobalQuotaBroker:
         max_concurrent_jobs: int,
         max_burst_jobs: int | None = None,
         soft_limit_percent: float = 100.0,
-        rate_limit_reader: Callable[[], RateLimitSnapshot | None] | None = None,
+        spark_soft_limit_percent: float = 100.0,
+        rate_limit_reader: Callable[[str], RateLimitSnapshot | None] | None = None,
+        spark_models: tuple[str, ...] = _DEFAULT_SPARK_MODELS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if max_concurrent_jobs <= 0:
@@ -136,12 +156,16 @@ class GlobalQuotaBroker:
             raise ValueError("max_burst_jobs must be at least max_concurrent_jobs")
         if not 0 < soft_limit_percent <= 100:
             raise ValueError("soft_limit_percent must be in (0, 100]")
+        if not 0 < spark_soft_limit_percent <= 100:
+            raise ValueError("spark_soft_limit_percent must be in (0, 100]")
         self.database_path = database_path
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_burst_jobs = effective_burst_jobs
         self.max_capacity_units = max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
         self.soft_limit_percent = soft_limit_percent
+        self.spark_soft_limit_percent = spark_soft_limit_percent
         self.rate_limit_reader = rate_limit_reader
+        self.spark_models = tuple(spark_models)
         self.clock = clock
         self._initialize()
 
@@ -151,13 +175,22 @@ class GlobalQuotaBroker:
         *,
         worker_pid: int,
         capacity_units: int = FULL_CODEX_JOB_CAPACITY_UNITS,
+        model: str | None = None,
     ) -> QuotaDecision:
+        quota_domain = codex_quota_domain(model, self.spark_models)
         if worker_pid <= 0:
             raise ValueError("worker_pid must be positive")
         if not 0 < capacity_units <= FULL_CODEX_JOB_CAPACITY_UNITS:
             raise ValueError(f"capacity_units must be in [1, {FULL_CODEX_JOB_CAPACITY_UNITS}]")
         now = self.clock()
-        snapshot = self.rate_limit_reader() if self.rate_limit_reader is not None else None
+        snapshot = (
+            self.rate_limit_reader(quota_domain) if self.rate_limit_reader is not None else None
+        )
+        if snapshot is not None and snapshot.quota_domain != quota_domain:
+            snapshot = None
+        soft_limit_percent = (
+            self.spark_soft_limit_percent if quota_domain == "spark" else self.soft_limit_percent
+        )
 
         with self._connect() as db:
             db.execute("begin immediate")
@@ -174,7 +207,7 @@ class GlobalQuotaBroker:
 
             if (
                 snapshot is not None
-                and snapshot.used_percent >= self.soft_limit_percent
+                and snapshot.used_percent >= soft_limit_percent
                 and snapshot.resets_at > now
             ):
                 return QuotaDecision(
@@ -184,10 +217,11 @@ class GlobalQuotaBroker:
                     retry_after_sec=max(0.0, snapshot.resets_at - now),
                     active_capacity_units=active_capacity_units,
                     max_capacity_units=self.max_capacity_units,
+                    quota_domain=quota_domain,
                 )
 
             existing = db.execute(
-                "select worker_pid, capacity_units from leases where job_id = ?",
+                "select worker_pid, capacity_units, quota_domain from leases where job_id = ?",
                 (job_id,),
             ).fetchone()
             if existing is not None:
@@ -201,16 +235,18 @@ class GlobalQuotaBroker:
                         active_jobs=active_jobs,
                         active_capacity_units=active_capacity_units,
                         max_capacity_units=self.max_capacity_units,
+                        quota_domain=quota_domain,
                     )
                 db.execute(
                     """
                     update leases
                     set worker_pid     = ?,
                         heartbeat_at   = ?,
-                        capacity_units = ?
+                        capacity_units = ?,
+                        quota_domain = ?
                     where job_id = ?
                     """,
-                    (worker_pid, now, capacity_units, job_id),
+                    (worker_pid, now, capacity_units, quota_domain, job_id),
                 )
                 return QuotaDecision(
                     acquired=True,
@@ -218,6 +254,7 @@ class GlobalQuotaBroker:
                     active_jobs=active_jobs,
                     active_capacity_units=resized_capacity_units,
                     max_capacity_units=self.max_capacity_units,
+                    quota_domain=quota_domain,
                 )
 
             if active_jobs >= self.max_burst_jobs:
@@ -227,6 +264,7 @@ class GlobalQuotaBroker:
                     active_jobs=active_jobs,
                     active_capacity_units=active_capacity_units,
                     max_capacity_units=self.max_capacity_units,
+                    quota_domain=quota_domain,
                 )
             if active_capacity_units + capacity_units > self.max_capacity_units:
                 return QuotaDecision(
@@ -235,6 +273,7 @@ class GlobalQuotaBroker:
                     active_jobs=active_jobs,
                     active_capacity_units=active_capacity_units,
                     max_capacity_units=self.max_capacity_units,
+                    quota_domain=quota_domain,
                 )
 
             db.execute(
@@ -243,10 +282,11 @@ class GlobalQuotaBroker:
                                     worker_pid,
                                     acquired_at,
                                     heartbeat_at,
-                                    capacity_units)
-                values (?, ?, ?, ?, ?)
+                                    capacity_units,
+                                    quota_domain)
+                values (?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, worker_pid, now, now, capacity_units),
+                (job_id, worker_pid, now, now, capacity_units, quota_domain),
             )
             return QuotaDecision(
                 acquired=True,
@@ -254,6 +294,7 @@ class GlobalQuotaBroker:
                 active_jobs=active_jobs + 1,
                 active_capacity_units=active_capacity_units + capacity_units,
                 max_capacity_units=self.max_capacity_units,
+                quota_domain=quota_domain,
             )
 
     def release(self, job_id: str) -> None:
@@ -266,11 +307,18 @@ class GlobalQuotaBroker:
             component="global_quota_broker",
             version=1,
             checksum="global-quota-broker-v1-20260715",
-            migrate=self._migrate_schema,
+            migrate=self._migrate_schema_v1,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="global_quota_broker",
+            version=2,
+            checksum="global-quota-broker-v2-20260716",
+            migrate=self._migrate_schema_v2,
         )
 
     @staticmethod
-    def _migrate_schema(db: sqlite3.Connection) -> None:
+    def _migrate_schema_v1(db: sqlite3.Connection) -> None:
         db.execute(
             f"""
             create table if not exists leases (
@@ -290,6 +338,12 @@ class GlobalQuotaBroker:
             )
 
     @staticmethod
+    def _migrate_schema_v2(db: sqlite3.Connection) -> None:
+        columns = {str(row["name"]) for row in db.execute("pragma table_info(leases)")}
+        if "quota_domain" not in columns:
+            db.execute("alter table leases add column quota_domain text not null default 'primary'")
+
+    @staticmethod
     def _reclaim_dead_leases(db: sqlite3.Connection) -> None:
         rows = db.execute("select job_id, worker_pid from leases").fetchall()
         dead = [str(row["job_id"]) for row in rows if not _pid_alive(int(row["worker_pid"]))]
@@ -300,6 +354,89 @@ class GlobalQuotaBroker:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with control_database(self.database_path) as db:
             yield db
+
+
+def _extract_rate_limit_snapshots(
+    event: dict[str, Any],
+    model: str | None,
+    spark_models: tuple[str, ...],
+    path: Path,
+) -> tuple[RateLimitSnapshot, ...]:
+    if not _is_token_count_event(event):
+        return ()
+    rate_limits = _rate_limits(event)
+    if not isinstance(rate_limits, dict):
+        return ()
+    observed_at = _timestamp(event.get("timestamp")) or _safe_mtime(path)
+    snapshot = _rate_limit_with_model(
+        model,
+        rate_limits.get("primary"),
+        observed_at,
+        spark_models,
+    )
+    return (snapshot,) if snapshot is not None else ()
+
+
+def _rate_limit_with_model(
+    model: str | None,
+    limit_payload: Any,
+    observed_at: float,
+    spark_models: tuple[str, ...],
+) -> RateLimitSnapshot | None:
+    if not isinstance(limit_payload, dict):
+        return None
+    used_percent = _number(limit_payload.get("used_percent"))
+    resets_at = _number(limit_payload.get("resets_at"))
+    if used_percent is None or resets_at is None:
+        return None
+    domain = codex_quota_domain(model, spark_models)
+    if domain not in {"primary", "spark"}:
+        domain = "primary"
+    return RateLimitSnapshot(
+        used_percent=used_percent,
+        resets_at=resets_at,
+        observed_at=observed_at,
+        model=model,
+        quota_domain=domain,
+    )
+
+
+def _read_turn_context_model(event: dict[str, Any]) -> tuple[bool, str | None]:
+    if event.get("type") == "turn_context":
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return True, None
+        return True, _normalize_model(payload.get("model"))
+    if not isinstance(event.get("turn_context"), dict):
+        return False, None
+    return True, _normalize_model(event["turn_context"].get("model"))
+
+
+def _normalize_model(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized or None
+
+
+def _rate_limits(event: dict[str, Any]) -> Any:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("type") != "token_count":
+        return None
+    limits = payload.get("rate_limits")
+    if isinstance(limits, dict):
+        return limits
+    return event.get("rate_limits")
+
+
+def _is_token_count_event(event: dict[str, Any]) -> bool:
+    if event.get("type") == "event_msg":
+        return True
+    if not isinstance(event.get("payload"), dict):
+        return False
+    return event["payload"].get("type") == "token_count"
 
 
 def _pid_alive(pid: int) -> bool:
