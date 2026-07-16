@@ -114,6 +114,7 @@ codex_model = "gpt-5.6-terra"
 codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
 workspace_access = "ide_mcp"
+native_quality_policy = "worker"
 terminal_slot_policy = "checkpoint"
 allow_dirty = false
 yolo = false
@@ -248,6 +249,49 @@ The trade-off is deliberate: native mode has no IDEA diagnostics/refactors, and 
 Codex `workspace-write` protects `.git`, so the root reviewer normally creates the
 commit after reviewing the diff. `--yolo` can remove that protection but is not the
 default or recommended workflow.
+
+Native-mode quality is an executable contract, independent of model quality tiers:
+
+- `native_quality_policy = "off"` disables route-specific gate matching and controller
+  reruns; baseline verification integrity still rejects a completed change with no
+  successful check.
+- `worker` (the default) requires a completed change to contain at least one successful
+  check in `verification.json`. Route-specific gates, when configured, must be reported
+  with the exact command and working directory.
+- `controller` additionally reruns every matching route gate with `shell=False` after
+  creating the terminal checkpoint. Its report is bound to both the contract SHA-256 and
+  checkpoint tree SHA. A missing, failed, timed-out, drifted, or uncovered gate makes the
+  handoff non-review-ready. The checkpoint remains durable and ordinary failures still
+  release a clean slot; if a gate mutates the worktree, cleanup fails closed and the slot
+  is quarantined.
+
+Controller mode requires `terminal_slot_policy = "checkpoint"` and an assigned slot.
+Configure gates under the route; an empty `include_globs` applies to every change:
+
+```toml
+[routes.app]
+path = "../my-project"
+required_branch = "main"
+native_quality_policy = "controller"
+
+[[routes.app.native_quality_gates]]
+name = "tests"
+command = ["python", "-m", "pytest"]
+working_dir = "."
+timeout_sec = 1200
+include_globs = []
+
+[[routes.app.native_quality_gates]]
+name = "ruff"
+command = ["python", "-m", "ruff", "check", "src", "tests"]
+working_dir = "."
+timeout_sec = 300
+include_globs = ["*.py", "**/*.py", "pyproject.toml"]
+```
+
+Commands must already exist in the prepared slot; quality execution never installs
+dependencies. The native prompt requires the fastest relevant scoped check after each
+coherent edit batch and all matching mandatory gates before `Status: completed`.
 
 Set `agy_model` in `[control.defaults]` or on a route when Antigravity must use an
 explicit model. A job-level `--agy-model` override has highest priority. ACP persists
@@ -500,7 +544,11 @@ versioned shape:
 
 ACP validates the schema and status match, hashes the canonical payload, and compares its
 changed-file claims with the verified checkpoint tree. Worker claims remain explicitly
-untrusted until root review.
+untrusted until root review. A completed result with changed files is invalid when its
+check list is empty or contains a failed/non-zero check. Under a native route quality
+contract, `review_ready` additionally requires every matching worker gate and, in
+`controller` mode, controller-executed evidence for the exact checkpoint. The worker's
+machine-readable changed-file set must also match the checkpoint exactly.
 
 ## Start A Job
 

@@ -6,6 +6,11 @@ from pathlib import Path
 from agent_control_plane.features.agent_runner.lib.agy_idea_prompt import build_agy_task_prompt
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.native_quality import (
+    NativeQualityContract,
+    format_gate_command,
+    resolve_native_quality_contract,
+)
 
 
 def build_task_prompt(
@@ -20,12 +25,19 @@ def build_task_prompt(
     read_only: bool = False,
     codex_tool_call_budget: int = 0,
     workspace_access: str = "ide_mcp",
+    native_quality_contract: NativeQualityContract | None = None,
 ) -> str:
     task_dir = config.coordination_root / "tasks" / task_id
     brief_path = task_dir / "brief.md"
     progress_path = task_dir / "agent-progress.md"
     verification_path = result_path.with_name("verification.json")
     verification_rules = _verification_rules(verification_path)
+    quality_contract = native_quality_contract or resolve_native_quality_contract(
+        config,
+        route,
+        workspace_access=workspace_access,
+        read_only=read_only,
+    )
 
     if workspace_access == "native":
         _required_file(brief_path)
@@ -39,6 +51,7 @@ def build_task_prompt(
 - Your first coordination action MUST be to update the progress file: {progress_path} with: Current phase, Confirmed facts, Target files, Next action, Changed files, and Open risks.
 - Write the final result file to: {result_path} only after all work and verification are actually complete."""
 
+        native_quality_rules = _native_quality_rules(quality_contract)
         return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
@@ -63,7 +76,8 @@ Mandatory execution rules:
 - You are FORBIDDEN from using or discovering AgentBridge, IntelliJ IDEA, or DataSpell MCP servers or tools.
 - Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
 - Preserve user changes. Keep changes narrow, task-scoped, and minimal.
-- Run tests and inspect diffs before claiming completion.
+{native_quality_rules}
+- Inspect the final diff before claiming completion.
 - You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
 - You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID.
 - Write the final result in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
@@ -414,6 +428,43 @@ The file must be JSON only, use schema_version 1, and contain exactly:
 - unverified: an array of concrete remaining risks or omitted checks.
 Example: {{"schema_version":1,"status":"completed","changed_files":[],"checks":[{{"command":"pytest -q","cwd":".","outcome":"passed","exit_code":0,"summary":"3 passed"}}],"unverified":[]}}
 Missing or malformed verification.json does not keep the worker alive, but it blocks normal acceptance."""
+
+
+def _native_quality_rules(contract: NativeQualityContract) -> str:
+    if contract.policy == "off":
+        return "- Run relevant tests and linters before claiming completion."
+    lines = [
+        f"- Native quality policy: {contract.policy}",
+        "- During implementation, after each coherent edit batch, run the fastest relevant "
+        "scoped linter, type check, or test. Do not postpone all feedback until the end.",
+    ]
+    if contract.gates:
+        lines.append(
+            "- Before completion, run every configured gate whose Applies to patterns match at "
+            "least one changed file:"
+        )
+        for gate in contract.gates:
+            applies_to = ", ".join(gate.include_globs) or "every changed file"
+            lines.append(
+                f"  - [{gate.name}] cwd={gate.working_dir.as_posix()}: "
+                f"{format_gate_command(gate)}; Applies to: {applies_to}"
+            )
+    else:
+        lines.append("- Before completion, run at least one relevant check for the changed files.")
+    lines.extend(
+        (
+            "- Record each mandatory command exactly, with its cwd, exit code, and outcome in "
+            "verification.json.",
+            "- Do not write Status: completed when a mandatory check was skipped, failed, or "
+            "reported without evidence; use partial or blocked and name the gap.",
+        )
+    )
+    if contract.policy == "controller":
+        lines.append(
+            "- ACP will independently rerun the matching configured gates against the exact "
+            "checkpoint before the handoff can become review-ready."
+        )
+    return "\n".join(lines)
 
 
 def _required_file(path: Path) -> Path:

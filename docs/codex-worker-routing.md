@@ -50,6 +50,16 @@ refactors. In the safe `workspace-write` sandbox, `.git` remains protected, so t
 reviewer normally creates the commit after accepting the diff. Read-only native jobs
 persist their structured final response through Codex last-message recovery.
 
+Native jobs can add a route-scoped quality contract. `worker` requires successful
+machine-readable worker checks; `controller` also reruns matching configured commands
+after checkpoint creation and binds the evidence to the contract hash and checkpoint
+tree. Controller mode requires a slot plus `terminal_slot_policy = "checkpoint"`.
+Commands run without a shell and must use dependencies already present in the prepared
+slot. Configure `include_globs` to select language-specific checks and keep one universal
+gate for documentation, configuration, and otherwise-unmapped changes. Failed gates
+block `review_ready` without discarding the checkpoint. A gate that mutates the worktree
+causes cleanup to fail closed and quarantines the slot.
+
 ## Terminal Handoff and Slot Release
 
 Set `[control.defaults].terminal_slot_policy = "checkpoint"` when slots should become
@@ -74,7 +84,10 @@ Workers write `result.md` for human review and a sibling schema-v1 `verification
 for machine validation. The Markdown status remains the terminal signal, so a missing or
 malformed bundle cannot strand a slot. ACP records the bundle as `valid`, `missing`, or
 `invalid`, compares changed-file claims with the checkpoint tree, and refuses normal
-acceptance unless the handoff is valid and review-ready.
+acceptance unless the handoff is valid and review-ready. Completed changes require at
+least one passed zero-exit check; configured native gates must be reported exactly, and
+the machine-readable changed-file set must match the checkpoint. Controller mode also
+requires independently executed checkpoint-bound evidence.
 
 For multi-task work, put execution specs on durable plan tasks. Use the one-shot
 `plan dispatch`/`agent_plan_dispatch` operation for externally scheduled passes, or

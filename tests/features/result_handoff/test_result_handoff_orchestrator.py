@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -18,10 +20,16 @@ from agent_control_plane.shared.codex_session_usage import TokenUsage
 from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
+    NativeQualityGateConfig,
     RouteConfig,
     SlotConfig,
 )
 from agent_control_plane.shared.git_tools import run_git, workspace_state
+from agent_control_plane.shared.native_quality import (
+    NativeQualityContract,
+    resolve_native_quality_contract,
+    write_native_quality_contract,
+)
 
 
 def test_terminal_dirty_job_is_checkpointed_delivered_and_slot_becomes_available(
@@ -100,6 +108,253 @@ Not verified / remaining risks:
     assert repeated_item.checkpoint_sha == item.checkpoint_sha
     assert repeated_item.delivery_status == "checkpointed"
     assert repeated_item.slot_released is True
+
+
+def test_native_controller_quality_is_rerun_and_bound_to_checkpoint(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    (slot / "worker.txt").write_text("quality checked\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is True
+    assert bundle["quality_contract"]["policy"] == "controller"
+    assert bundle["worker_quality"]["status"] == "passed"
+    assert bundle["controller_quality"]["state"] == "valid"
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    assert (
+        bundle["controller_quality"]["payload"]["checkpoint_tree_sha"] == item.checkpoint_tree_sha
+    )
+    assert item.slot_released is True
+    assert workspace_state(slot).porcelain == ""
+
+
+def test_native_controller_failure_blocks_acceptance_but_releases_clean_slot(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "raise SystemExit(7)")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality-fail",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    (slot / "worker.txt").write_text("durable but rejected\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is False
+    assert bundle["worker_quality"]["status"] == "passed"
+    assert bundle["controller_quality"]["payload"]["status"] == "failed"
+    assert item.slot_released is True
+    assert workspace_state(slot).porcelain == ""
+
+
+def test_native_quality_requires_worker_changed_files_to_match_checkpoint(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality-files",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    verification_path = job.result_path.with_name("verification.json")
+    verification = json.loads(verification_path.read_text(encoding="utf-8"))
+    verification["changed_files"] = [{"path": "other.txt", "change": "added"}]
+    verification_path.write_text(json.dumps(verification), encoding="utf-8")
+    (slot / "worker.txt").write_text("actual checkpoint file\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is False
+    assert bundle["worker_quality"]["status"] == "failed"
+    assert bundle["worker_quality"]["changed_files_missing"] == ["worker.txt"]
+    assert bundle["worker_quality"]["changed_files_unobserved"] == ["other.txt"]
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+
+
+def test_native_controller_gate_that_mutates_workspace_quarantines_slot(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('gate-mutated.txt').write_text('unexpected')",
+    )
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="mutating", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality-mutates",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    (slot / "worker.txt").write_text("checkpointed original\n", encoding="utf-8")
+
+    finished = control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert finished.finalization_status == "failed"
+    assert item.delivery_status == "checkpoint_failed"
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["review_ready"] is False
+    assert "Workspace changed after checkpoint" in (item.checkpoint_error or "")
+    assert item.slot_released is False
+    assert workspace_state(slot).dirty
+    assert run_git(slot, "show", f"{item.checkpoint_sha}:worker.txt") == "checkpointed original"
+
+
+def test_persisted_quality_contract_drift_is_not_executed(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    expected_command = (sys.executable, "-c", "print('expected')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="expected", command=expected_command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality-drift",
+        status_result="completed",
+        workspace_access="native",
+    )
+    drifted_command = (
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('drift-executed.txt').write_text('bad')",
+    )
+    write_native_quality_contract(
+        job.run_dir,
+        NativeQualityContract(
+            policy="controller",
+            gates=(NativeQualityGateConfig(name="drifted", command=drifted_command),),
+        ),
+    )
+    _write_completed_result(job.result_path, command=shlex.join(expected_command))
+    (slot / "worker.txt").write_text("durable result\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert not (slot / "drift-executed.txt").exists()
+    assert item.slot_released is True
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["review_ready"] is False
+    assert "drifted" in (item.verification_bundle["quality_contract"]["error"] or "")
+
+
+def test_missing_strict_quality_contract_is_not_replaced_at_finalization(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    expected_command = (sys.executable, "-c", "print('must-not-run')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="expected", command=expected_command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-native-quality-missing",
+        status_result="completed",
+        workspace_access="native",
+    )
+    (job.run_dir / "native-quality-contract.json").unlink()
+    _write_completed_result(job.result_path, command=shlex.join(expected_command))
+    (slot / "worker.txt").write_text("durable result\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert not (job.run_dir / "native-quality.json").exists()
+    assert item.slot_released is True
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["review_ready"] is False
+    assert "missing" in (item.verification_bundle["quality_contract"]["error"] or "")
 
 
 def test_plan_acceptance_requires_valid_structured_verification(tmp_path: Path) -> None:
@@ -361,6 +616,7 @@ def _active_slot_job(
     job_id: str,
     *,
     status_result: str,
+    workspace_access: str = "ide_mcp",
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -384,10 +640,18 @@ def _active_slot_job(
         yolo=False,
         allow_dirty=False,
         read_only=False,
+        workspace_access=workspace_access,
         slot_name="app-1",
     )
     control.slots.sync_configured_slots()
     control.slot_store.acquire_slot("app-1", job.job_id)
+    quality_contract = resolve_native_quality_contract(
+        control.config,
+        job.route,
+        workspace_access=job.workspace_access,
+        read_only=job.read_only,
+    )
+    write_native_quality_contract(job.run_dir, quality_contract)
     return job
 
 
@@ -451,6 +715,8 @@ def _config(
     slot: Path,
     *,
     terminal_slot_policy: str,
+    native_quality_policy: str | None = None,
+    native_quality_gates: tuple[NativeQualityGateConfig, ...] = (),
 ) -> ControlConfig:
     defaults = ControlDefaults(
         timeout_sec=10,
@@ -488,11 +754,53 @@ def _config(
                     source_roots=(Path("src"),),
                     test_roots=(Path("tests"),),
                     exclude_dirs=(),
+                    native_quality_policy=native_quality_policy,
+                    native_quality_gates=native_quality_gates,
                 )
             }
         ),
         slots=MappingProxyType({"app-1": SlotConfig(name="app-1", route="app", path=slot)}),
         slot_prepare=(),
+    )
+
+
+def _write_completed_result(result_path: Path, *, command: str) -> None:
+    result_path.write_text(
+        """Status: completed
+
+Changed files:
+- worker.txt
+
+What changed:
+- Added a worker result.
+
+Verification performed:
+- mandatory quality gate passed
+
+Not verified / remaining risks:
+- none
+""",
+        encoding="utf-8",
+    )
+    result_path.with_name("verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "changed_files": [{"path": "worker.txt", "change": "added"}],
+                "checks": [
+                    {
+                        "command": command,
+                        "cwd": ".",
+                        "outcome": "passed",
+                        "exit_code": 0,
+                        "summary": "worker reported the mandatory gate passed",
+                    }
+                ],
+                "unverified": [],
+            }
+        ),
+        encoding="utf-8",
     )
 
 

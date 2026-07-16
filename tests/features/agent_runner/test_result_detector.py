@@ -86,6 +86,47 @@ class ResultDetectorTest(unittest.TestCase):
             self.assertEqual(mismatched.verification_state, "invalid")
             self.assertIn("status", mismatched.verification_error or "")
 
+    def test_completed_changes_require_at_least_one_successful_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result = root / "result.md"
+            result.write_text("Status: completed\n", encoding="utf-8")
+            verification = root / "verification.json"
+            base = {
+                "schema_version": 1,
+                "status": "completed",
+                "changed_files": [{"path": "src/app.py", "change": "modified"}],
+                "unverified": [],
+            }
+            verification.write_text(
+                json.dumps({**base, "checks": []}),
+                encoding="utf-8",
+            )
+            missing = inspect_result(result, started_at=0.0)
+            verification.write_text(
+                json.dumps(
+                    {
+                        **base,
+                        "checks": [
+                            {
+                                "command": "pytest -q",
+                                "cwd": ".",
+                                "outcome": "failed",
+                                "exit_code": 1,
+                                "summary": "one failed",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            failed = inspect_result(result, started_at=0.0)
+
+            self.assertEqual(missing.verification_state, "invalid")
+            self.assertIn("at least one check", missing.verification_error or "")
+            self.assertEqual(failed.verification_state, "invalid")
+            self.assertIn("passed checks", failed.verification_error or "")
+
     def test_detects_inline_code_status_without_matching_prose(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.md"

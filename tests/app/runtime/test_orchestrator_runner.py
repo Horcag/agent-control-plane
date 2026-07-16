@@ -26,6 +26,7 @@ from agent_control_plane.features.agent_runner.lib.result_detector import inspec
 from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
+    NativeQualityGateConfig,
     RouteConfig,
     SlotConfig,
 )
@@ -78,12 +79,22 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 "native",
             )
             self.assertEqual(
+                control.status_job(job_override.job_id)["native_quality"]["policy"],
+                "worker",
+            )
+            self.assertEqual(
+                control.status_job(job_override.job_id)["native_quality"]["contract_state"],
+                "matches",
+            )
+            self.assertEqual(
                 control.summary_job(job_override.job_id)["workspace_access"],
                 "native",
             )
             smoke = control.smoke()
             self.assertEqual(smoke["workspace_access"], "native")
+            self.assertEqual(smoke["native_quality_policy"], "worker")
             self.assertEqual(smoke["routes"]["main"]["workspace_access"], "ide_mcp")
+            self.assertEqual(smoke["routes"]["main"]["native_quality_policy"], "worker")
 
     def test_invalid_and_agy_native_modes_are_rejected_before_job_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -114,6 +125,59 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             launch.assert_not_called()
             self.assertEqual(control.store.list_jobs(), [])
+
+    def test_controller_native_quality_requires_checkpointed_slot_and_persists_contract(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_path = _git_repo(root / "repo", "main")
+            slot_path = _git_repo(root / "slots" / "main-1", "main")
+            base = _config_with_slot(root, route_path, slot_path)
+            route = replace(
+                base.routes["main"],
+                native_quality_policy="controller",
+                native_quality_gates=(
+                    NativeQualityGateConfig(
+                        name="tests",
+                        command=("python", "-m", "pytest"),
+                    ),
+                ),
+            )
+            preserve = replace(base, routes=MappingProxyType({"main": route}))
+            control = AgentControlPlane(preserve)
+            _brief(control.config.coordination_root, "preserve")
+
+            with self.assertRaisesRegex(PolicyError, "checkpointed slot"):
+                control.start_job(
+                    StartOptions(
+                        task_id="preserve",
+                        route="main",
+                        slot="main-1",
+                        workspace_access="native",
+                    )
+                )
+
+            checkpoint = replace(
+                preserve,
+                defaults=replace(preserve.defaults, terminal_slot_policy="checkpoint"),
+            )
+            control = AgentControlPlane(checkpoint)
+            _brief(control.config.coordination_root, "strict")
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="strict",
+                        route="main",
+                        slot="main-1",
+                        workspace_access="native",
+                    )
+                )
+
+            contract = job.run_dir / "native-quality-contract.json"
+            self.assertTrue(contract.is_file())
+            self.assertIn('"policy": "controller"', contract.read_text(encoding="utf-8"))
+            self.assertIn("python -m pytest", job.prompt_path.read_text(encoding="utf-8"))
 
     def test_native_slot_skips_only_ide_module_provisioning(self) -> None:
         for workspace_access, expected_ide_calls in (("native", 0), ("ide_mcp", 1)):

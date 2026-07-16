@@ -18,9 +18,11 @@ from agent_control_plane.features.agent_runner import (
     WorkerLeaseError,
 )
 from agent_control_plane.features.result_handoff import (
+    NativeQualityGateRunner,
     SlotCheckpoint,
     SlotCheckpointError,
     build_verification_bundle,
+    checkpoint_changed_files,
     clean_checkpointed_workspace,
     create_slot_checkpoint,
     verify_slot_checkpoint,
@@ -31,6 +33,11 @@ from agent_control_plane.shared.git_tools import (
     GitError,
     compact_status_preview,
     workspace_state,
+)
+from agent_control_plane.shared.native_quality import (
+    NativeQualityContract,
+    inspect_native_quality_contract,
+    resolve_native_quality_contract,
 )
 
 
@@ -46,6 +53,7 @@ class FinalizationService:
         slots: SlotManager,
         review_inbox: ReviewInboxStore,
         quota_broker: GlobalQuotaBroker | None,
+        native_quality_runner: NativeQualityGateRunner,
         is_terminal: Callable[[JobRecord], bool],
     ) -> None:
         self.config = config
@@ -54,6 +62,7 @@ class FinalizationService:
         self.slots = slots
         self.review_inbox = review_inbox
         self.quota_broker = quota_broker
+        self.native_quality_runner = native_quality_runner
         self.is_terminal = is_terminal
 
     def finish(
@@ -334,6 +343,26 @@ class FinalizationService:
             delivery_status = (
                 "checkpointed" if job_status == "completed" else "salvage_checkpointed"
             )
+            contract, contract_error = self._native_quality_contract(job)
+            if (
+                job_status == "completed"
+                and job.workspace_access == "native"
+                and not job.read_only
+                and contract.policy == "controller"
+                and contract_error is None
+            ):
+                changed_files = tuple(
+                    change["path"]
+                    for change in checkpoint_changed_files(job.workspace_path, checkpoint)
+                )
+                if changed_files:
+                    self.native_quality_runner.run(
+                        workspace_path=job.workspace_path,
+                        run_dir=job.run_dir,
+                        checkpoint_tree_sha=checkpoint.tree_sha,
+                        changed_files=changed_files,
+                        contract=contract,
+                    )
             self._upsert_job_review(
                 job,
                 delivery_status=delivery_status,
@@ -409,11 +438,19 @@ class FinalizationService:
         slot_released: bool,
     ) -> ReviewInboxItem:
         result_text = _read_result_text(job.result_path, fallback=job.last_error)
+        quality_contract, quality_contract_error = self._native_quality_contract(job)
         verification_bundle = build_verification_bundle(
             job.result_path,
             workspace_path=job.workspace_path,
             checkpoint=checkpoint,
             checkpoint_error=checkpoint_error,
+            run_dir=job.run_dir,
+            source_status=job.status,
+            workspace_changed=(
+                True if checkpoint is not None or "dirty" in delivery_status else None
+            ),
+            quality_contract=quality_contract,
+            quality_contract_error=quality_contract_error,
         )
         return self.review_inbox.upsert(
             ReviewInboxDraft(
@@ -438,6 +475,19 @@ class FinalizationService:
                 slot_released=slot_released,
             )
         )
+
+    def _native_quality_contract(
+        self,
+        job: JobRecord,
+    ) -> tuple[NativeQualityContract, str | None]:
+        expected = resolve_native_quality_contract(
+            self.config,
+            job.route,
+            workspace_access=job.workspace_access,
+            read_only=job.read_only,
+        )
+        inspection = inspect_native_quality_contract(job.run_dir, expected)
+        return expected, inspection.error
 
     def _release_slot_status(
         self,

@@ -167,11 +167,50 @@ def changed_files_since(repo_root: Path, base: str, head: str = "HEAD") -> tuple
     return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
 
+def changed_worktree_files(repo_root: Path) -> tuple[str, ...]:
+    result = subprocess.run(  # nosec B603
+        ["git", "status", "--porcelain=v1", "-z", "-uall"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "git status failed"
+        raise RuntimeError(detail)
+    entries = result.stdout.split("\0")
+    paths: set[str] = set()
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2] != " ":
+            raise RuntimeError("malformed git status entry")
+        status = entry[:2]
+        paths.add(_normalize_path(entry[3:]))
+        if status[0] in {"R", "C"} or status[1] in {"R", "C"}:
+            if index >= len(entries) or not entries[index]:
+                raise RuntimeError("malformed git rename/copy entry")
+            paths.add(_normalize_path(entries[index]))
+            index += 1
+    return tuple(sorted(paths))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Run tests affected by the transitive Python import graph.",
     )
-    parser.add_argument("--base", required=True, help="Git base revision for the change set")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--base", help="Git base revision for the change set")
+    source.add_argument(
+        "--worktree",
+        action="store_true",
+        help="Select from tracked, untracked, renamed, and deleted worktree paths",
+    )
     parser.add_argument("--head", default="HEAD", help="Git head revision (default: HEAD)")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Repository root")
     parser.add_argument("--list", action="store_true", help="Print selection JSON without pytest")
@@ -179,7 +218,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo_root = args.repo.resolve(strict=False)
     try:
-        changed = changed_files_since(repo_root, args.base, args.head)
+        changed = (
+            changed_worktree_files(repo_root)
+            if args.worktree
+            else changed_files_since(repo_root, args.base, args.head)
+        )
         selection = select_affected_tests(repo_root, changed)
     except RuntimeError as exc:
         changed = ()

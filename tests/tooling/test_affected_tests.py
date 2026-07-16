@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from scripts.run_affected_tests import select_affected_tests
+from scripts.run_affected_tests import changed_worktree_files, select_affected_tests
 
 
 def test_source_change_follows_transitive_import_graph(tmp_path: Path) -> None:
@@ -81,7 +81,43 @@ def test_selector_or_project_configuration_change_runs_full_suite(tmp_path: Path
     assert project.full_suite
 
 
+def test_changed_worktree_files_includes_tracked_untracked_and_deleted_paths(
+    tmp_path: Path,
+) -> None:
+    _write(tmp_path, "src/example/core.py", "VALUE = 1\n")
+    _write(tmp_path, "src/example/deleted.py", "VALUE = 2\n")
+    _git(tmp_path, "init")
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=ACP Test",
+        "-c",
+        "user.email=acp-test@example.invalid",
+        "commit",
+        "-m",
+        "base",
+    )
+    (tmp_path / "src/example/core.py").write_text("VALUE = 3\n", encoding="utf-8")
+    (tmp_path / "src/example/deleted.py").unlink()
+    _write(tmp_path, "tests/test_new.py", "def test_new():\n    assert True\n")
+
+    changed = changed_worktree_files(tmp_path)
+
+    assert changed == (
+        "src/example/core.py",
+        "src/example/deleted.py",
+        "tests/test_new.py",
+    )
+
+
 def _write(root: Path, relative_path: str, content: str) -> None:
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _git(path: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)

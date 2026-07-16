@@ -11,7 +11,12 @@ from agent_control_plane.features.agent_runner.lib.prompt_builder import (
     _idea_create_root,
     build_task_prompt,
 )
-from agent_control_plane.shared.config import ControlConfig, ControlDefaults, RouteConfig
+from agent_control_plane.shared.config import (
+    ControlConfig,
+    ControlDefaults,
+    NativeQualityGateConfig,
+    RouteConfig,
+)
 
 
 class PromptBuilderTest(unittest.TestCase):
@@ -461,6 +466,55 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("Maintain live progress/state in:", native_writable)
             self.assertNotIn("mcp__agentbridge_idea_", native_writable)
             self.assertNotIn("Use only the IDEA MCP server", native_writable)
+            self.assertIn("after each coherent edit batch", native_writable)
+            self.assertIn("verification.json", native_writable)
+
+            controller_config = replace(
+                config,
+                routes=MappingProxyType(
+                    {
+                        "main": replace(
+                            config.routes["main"],
+                            native_quality_policy="controller",
+                            native_quality_gates=(
+                                NativeQualityGateConfig(
+                                    name="affected-tests",
+                                    command=(
+                                        "python",
+                                        "scripts/run_affected_tests.py",
+                                        "--worktree",
+                                    ),
+                                    include_globs=(),
+                                ),
+                                NativeQualityGateConfig(
+                                    name="ruff",
+                                    command=("python", "-m", "ruff", "check", "src"),
+                                    include_globs=("*.py", "**/*.py"),
+                                ),
+                            ),
+                        )
+                    }
+                ),
+            )
+            controller_prompt = build_task_prompt(
+                config=controller_config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="native",
+                read_only=False,
+            )
+            self.assertIn("Native quality policy: controller", controller_prompt)
+            self.assertIn(
+                "python scripts/run_affected_tests.py --worktree",
+                controller_prompt,
+            )
+            self.assertIn("Applies to: every changed file", controller_prompt)
+            self.assertIn("Applies to: *.py, **/*.py", controller_prompt)
+            self.assertIn("ACP will independently rerun", controller_prompt)
+            self.assertIn("Do not write Status: completed", controller_prompt)
 
             # Assertions for native read-only
             self.assertIn("This is a READ-ONLY job.", native_readonly)

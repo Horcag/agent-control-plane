@@ -91,6 +91,13 @@ def _validate_payload(payload: Any, *, expected_status: str | None) -> dict[str,
         )
     changed_files = _changed_files(payload["changed_files"])
     checks = _checks(payload["checks"])
+    if status == "completed" and changed_files:
+        if not checks:
+            raise ValueError("completed changes require at least one check")
+        if any(
+            check["outcome"] != "passed" or check["exit_code"] not in {None, 0} for check in checks
+        ):
+            raise ValueError("completed changes require only passed checks with a zero exit code")
     unverified = _string_list("unverified", payload["unverified"], limit=200)
     return {
         "schema_version": 1,

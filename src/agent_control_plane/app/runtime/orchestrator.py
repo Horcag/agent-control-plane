@@ -63,6 +63,7 @@ from agent_control_plane.features.plan_supervision import (
 )
 from agent_control_plane.features.result_handoff import (
     HandoffAcceptanceService,
+    NativeQualityGateRunner,
     scan_codex_subagent_completions,
 )
 from agent_control_plane.features.slot_lifecycle import (
@@ -74,6 +75,10 @@ from agent_control_plane.shared.config import ControlConfig, load_config
 from agent_control_plane.shared.git_tools import (
     GitError,
     workspace_state,
+)
+from agent_control_plane.shared.native_quality import (
+    inspect_native_quality_contract,
+    resolve_native_quality_contract,
 )
 from agent_control_plane.shared.verification_report import inspect_verification_report
 
@@ -145,6 +150,7 @@ class AgentControlPlane:
             slots=self.slots,
             review_inbox=self.review_inbox,
             quota_broker=self._quota_broker,
+            native_quality_runner=NativeQualityGateRunner(),
             is_terminal=self._is_terminal,
         )
         self.job_guardrails = JobGuardrails(defaults.forbidden_status_globs)
@@ -203,6 +209,7 @@ class AgentControlPlane:
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
             "workspace_access": self.config.defaults.workspace_access,
+            "native_quality_policy": self.config.defaults.native_quality_policy,
             "terminal_slot_policy": self.config.defaults.terminal_slot_policy,
             "codex_tool_call_budgets": {
                 "mechanical": self.config.defaults.codex_mechanical_tool_call_budget,
@@ -265,6 +272,19 @@ class AgentControlPlane:
                     "workspace_access": (
                         route.workspace_access or self.config.defaults.workspace_access
                     ),
+                    "native_quality_policy": (
+                        route.native_quality_policy or self.config.defaults.native_quality_policy
+                    ),
+                    "native_quality_gates": [
+                        {
+                            "name": gate.name,
+                            "command": list(gate.command),
+                            "working_dir": gate.working_dir.as_posix(),
+                            "timeout_sec": gate.timeout_sec,
+                            "include_globs": list(gate.include_globs),
+                        }
+                        for gate in route.native_quality_gates
+                    ],
                     "agy_mcp_server": route.agy_mcp_server or "idea",
                     "worktree_root": str(route.worktree_root) if route.worktree_root else None,
                     "worktree_base": str(route.worktree_base),
@@ -623,6 +643,7 @@ class AgentControlPlane:
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
             "workspace_access": job.workspace_access,
+            "native_quality": self._native_quality_summary(job),
             "worker_pid": job.worker_pid,
             "worker_instance_id": job.worker_instance_id,
             "worker_heartbeat_at": job.worker_heartbeat_at,
@@ -677,6 +698,7 @@ class AgentControlPlane:
             "codex_quality_tier": job.codex_quality_tier,
             "codex_tool_call_budget": job.codex_tool_call_budget,
             "workspace_access": job.workspace_access,
+            "native_quality": self._native_quality_summary(job),
             "worker_pid": job.worker_pid,
             "worker_instance_id": job.worker_instance_id,
             "worker_heartbeat_at": job.worker_heartbeat_at,
@@ -825,6 +847,7 @@ class AgentControlPlane:
             "result_status": result_state.status,
             "result_path": str(job.result_path),
             "workspace_access": job.workspace_access,
+            "native_quality": self._native_quality_summary(job),
         }
         if log_cursor is not None:
             delta, next_cursor, truncated = _read_log_delta(
@@ -840,6 +863,24 @@ class AgentControlPlane:
                 }
             )
         return payload
+
+    def _native_quality_summary(self, job: JobRecord) -> dict[str, Any]:
+        expected = resolve_native_quality_contract(
+            self.config,
+            job.route,
+            workspace_access=job.workspace_access,
+            read_only=job.read_only,
+        )
+        inspection = inspect_native_quality_contract(job.run_dir, expected)
+        return {
+            "policy": expected.policy,
+            "gates": [gate.name for gate in expected.gates],
+            "expected_sha256": expected.sha256,
+            "persisted_sha256": inspection.persisted_sha256,
+            "contract_state": inspection.state,
+            "contract_path": str(inspection.path),
+            "error": inspection.error,
+        }
 
     def cancel_job(self, job_id: str) -> JobRecord:
         self.store.add_event(job_id, "warning", "Cancel requested")

@@ -19,6 +19,10 @@ from agent_control_plane.features.agent_runner.lib.runner import (
 )
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.native_quality import (
+    resolve_native_quality_contract,
+    write_native_quality_contract,
+)
 
 
 class JobLaunchError(RuntimeError):
@@ -195,6 +199,19 @@ class JobLauncher:
             raise JobLaunchError(
                 f"workspace_access must be exactly 'ide_mcp' or 'native', got {workspace_access!r}"
             )
+        quality_contract = resolve_native_quality_contract(
+            self.config,
+            options.route,
+            workspace_access=workspace_access,
+            read_only=options.read_only,
+        )
+        if quality_contract.policy == "controller" and (
+            options.slot is None or self.config.defaults.terminal_slot_policy != "checkpoint"
+        ):
+            raise JobLaunchError(
+                "native_quality_policy=controller requires a checkpointed slot "
+                "(pass --slot and set terminal_slot_policy='checkpoint')"
+            )
 
         backend = _backend_option(
             options.backend,
@@ -283,6 +300,7 @@ class JobLauncher:
                 read_only=options.read_only,
                 codex_tool_call_budget=codex_tool_call_budget or 0,
                 workspace_access=workspace_access,
+                native_quality_contract=quality_contract,
             )
         except (FileNotFoundError, ValueError) as exc:
             raise JobLaunchError(str(exc)) from exc
@@ -352,6 +370,7 @@ class JobLauncher:
                 read_only=options.read_only,
             )
             run_dir.mkdir(parents=True, exist_ok=False)
+            write_native_quality_contract(run_dir, quality_contract)
             prompt_path.write_text(prompt, encoding="utf-8")
         except Exception as exc:
             message = f"Could not initialize job artifacts: {exc}"

@@ -134,6 +134,7 @@ path = "slots/reports-1"
                 (root / "sessions").resolve(strict=False),
             )
             self.assertEqual(config.defaults.terminal_slot_policy, "checkpoint")
+            self.assertEqual(config.defaults.native_quality_policy, "worker")
             self.assertEqual(config.defaults.runs_layout, "date")
             self.assertEqual(config.defaults.auto_archive_days, 7)
             self.assertEqual(config.defaults.auto_archive_limit, 200)
@@ -195,6 +196,143 @@ path = "slots/reports-1"
                 tuple(path.as_posix() for path in config.routes["reports"].exclude_dirs),
                 ("dist", "frontend/build"),
             )
+
+    def test_native_quality_contract_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+native_quality_policy = "off"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+native_quality_policy = "controller"
+
+[[routes.main.native_quality_gates]]
+name = "affected-tests"
+command = ["python", "scripts/run_affected_tests.py", "--worktree"]
+working_dir = "."
+timeout_sec = 300
+
+[[routes.main.native_quality_gates]]
+name = "ruff"
+command = ["python", "-m", "ruff", "check", "src", "tests"]
+include_globs = ["*.py", "**/*.py", "pyproject.toml"]
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            route = config.routes["main"]
+            self.assertEqual(config.defaults.native_quality_policy, "off")
+            self.assertEqual(route.native_quality_policy, "controller")
+            self.assertEqual(
+                [gate.name for gate in route.native_quality_gates],
+                ["affected-tests", "ruff"],
+            )
+            self.assertEqual(route.native_quality_gates[0].command[-1], "--worktree")
+            self.assertEqual(route.native_quality_gates[0].working_dir, Path("."))
+            self.assertEqual(route.native_quality_gates[0].timeout_sec, 300)
+            self.assertEqual(
+                route.native_quality_gates[1].include_globs,
+                ("*.py", "**/*.py", "pyproject.toml"),
+            )
+
+    def test_native_quality_contract_rejects_unsafe_or_ambiguous_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "workspaces.toml"
+            base = """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+native_quality_policy = "controller"
+"""
+            invalid_cases = (
+                (
+                    "unknown policy",
+                    base.replace(
+                        'native_quality_policy = "controller"',
+                        'native_quality_policy = "magic"',
+                    ),
+                    "native_quality_policy",
+                ),
+                (
+                    "missing gates",
+                    base,
+                    "requires at least one native_quality_gate",
+                ),
+                (
+                    "escaping cwd",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "escape"
+command = ["python", "-m", "pytest"]
+working_dir = "../other"
+""",
+                    "working_dir must stay inside",
+                ),
+                (
+                    "duplicate names",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "tests"
+command = ["python", "-m", "pytest"]
+[[routes.main.native_quality_gates]]
+name = "tests"
+command = ["python", "-m", "ruff", "check", "."]
+""",
+                    "duplicate native quality gate",
+                ),
+                (
+                    "dependency install",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "install"
+command = ["uv", "sync", "--frozen"]
+""",
+                    "must be a read-only quality check",
+                ),
+                (
+                    "mutating formatter",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "format"
+command = ["python", "-m", "ruff", "format", "src"]
+""",
+                    "must be a read-only quality check",
+                ),
+            )
+            for label, payload, message in invalid_cases:
+                with self.subTest(label=label):
+                    config_path.write_text(payload, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_config(config_path)
 
     def test_workspace_access_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

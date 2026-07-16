@@ -30,6 +30,9 @@ codex_reasoning_effort = "medium"
 codex_sandbox_mode = "workspace-write"
 # Backward-compatible default. Use "native" to run Codex without AgentBridge/IDEA.
 workspace_access = "ide_mcp"
+# "worker" requires successful checks in verification.json. "controller" also
+# reruns route-specific gates against the checkpoint. "off" disables route-specific gates.
+native_quality_policy = "worker"
 # "preserve" leaves terminal changes in a dirty slot. "checkpoint" first stores
 # them in a controller-owned Git ref and review inbox, then cleans and releases the slot.
 terminal_slot_policy = "checkpoint"
@@ -101,6 +104,23 @@ exclude_dirs = [
   "node_modules",
 ]
 codex_forbidden_tool_markers = []
+
+# Optional strict native-mode contract. Controller mode requires checkpointed slot jobs.
+# Gate commands run without a shell, must already be installed in the prepared slot,
+# and should be read-only checks. Empty include_globs means every changed file.
+# native_quality_policy = "controller"
+# [[routes.app.native_quality_gates]]
+# name = "tests"
+# command = ["python", "-m", "pytest"]
+# working_dir = "."
+# timeout_sec = 1200
+# include_globs = []
+# [[routes.app.native_quality_gates]]
+# name = "ruff"
+# command = ["python", "-m", "ruff", "check", "src", "tests"]
+# working_dir = "."
+# timeout_sec = 300
+# include_globs = ["*.py", "**/*.py", "pyproject.toml"]
 
 [slots."app-1"]
 route = "app"

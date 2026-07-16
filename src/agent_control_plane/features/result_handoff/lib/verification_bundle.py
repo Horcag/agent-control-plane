@@ -4,11 +4,19 @@ import re
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.features.result_handoff.lib.native_quality import (
+    inspect_native_quality_report,
+)
 from agent_control_plane.features.result_handoff.lib.slot_checkpoint import (
     SlotCheckpoint,
     SlotCheckpointError,
     checkpoint_changed_files,
     verify_slot_checkpoint,
+)
+from agent_control_plane.shared.native_quality import (
+    NativeQualityContract,
+    format_gate_command,
+    selected_native_quality_gates,
 )
 from agent_control_plane.shared.verification_report import inspect_verification_report
 
@@ -82,7 +90,13 @@ def build_verification_bundle(
     workspace_path: Path | None = None,
     checkpoint: SlotCheckpoint | None = None,
     checkpoint_error: str | None = None,
+    run_dir: Path | None = None,
+    source_status: str | None = None,
+    workspace_changed: bool | None = None,
+    quality_contract: NativeQualityContract | None = None,
+    quality_contract_error: str | None = None,
 ) -> dict[str, Any]:
+    contract = quality_contract or NativeQualityContract(policy="off")
     result_error: str | None = None
     try:
         text = result_path.read_text(encoding="utf-8", errors="replace") if result_path else ""
@@ -128,17 +142,77 @@ def build_verification_bundle(
         if isinstance(worker_payload, dict)
         else set()
     )
+    changed_paths = tuple(change["path"] for change in actual_changes)
+    if not changed_paths:
+        changed_paths = tuple(sorted(worker_changes or claimed))
+    has_changes = workspace_changed if workspace_changed is not None else bool(changed_paths)
+    effective_status = source_status or result["status"]
+    quality_required = bool(
+        contract.policy != "off" and effective_status == "completed" and has_changes
+    )
+    worker_quality = _assess_worker_quality(
+        worker_verification,
+        workspace_path=workspace_path,
+        changed_paths=changed_paths,
+        checkpoint_paths=(
+            tuple(change["path"] for change in actual_changes) if actual_changes else None
+        ),
+        contract=contract,
+        required=quality_required,
+    )
+    controller_required = quality_required and contract.policy == "controller"
+    if controller_required and run_dir is not None and checkpoint is not None:
+        controller_quality = inspect_native_quality_report(
+            run_dir,
+            checkpoint_tree_sha=checkpoint.tree_sha,
+            changed_files=changed_paths,
+            contract=contract,
+        )
+    elif controller_required:
+        controller_quality = {
+            "state": "missing",
+            "path": str(run_dir / "native-quality.json") if run_dir is not None else None,
+            "payload": None,
+            "error": "controller quality requires a verified checkpoint report",
+            "claims_trust": "controller_executed",
+        }
+    else:
+        controller_quality = {
+            "state": "not_required",
+            "path": str(run_dir / "native-quality.json") if run_dir is not None else None,
+            "payload": None,
+            "error": None,
+            "claims_trust": "controller_executed",
+        }
+    controller_passed = not controller_required or (
+        controller_quality["state"] == "valid"
+        and isinstance(controller_quality.get("payload"), dict)
+        and controller_quality["payload"].get("status") == "passed"
+    )
     return {
         "schema_version": 1,
         "review_ready": bool(
             result["format_valid"]
+            and result["status"] == "completed"
+            and effective_status == "completed"
             and result_error is None
             and artifact_error is None
             and worker_verification["state"] == "valid"
+            and quality_contract_error is None
+            and worker_quality["status"] in {"passed", "not_required"}
+            and controller_passed
         ),
         "result": result,
         "result_error": result_error,
         "worker_verification": worker_verification,
+        "quality_contract": {
+            "policy": contract.policy,
+            "sha256": contract.sha256,
+            "gates": [gate.name for gate in contract.gates],
+            "error": quality_contract_error,
+        },
+        "worker_quality": worker_quality,
+        "controller_quality": controller_quality,
         "changed_files_actual": actual_changes,
         "changed_file_claims_not_observed": sorted(claimed - actual) if actual_changes else [],
         "changed_files_not_claimed": sorted(actual - claimed) if claimed else sorted(actual),
@@ -154,6 +228,131 @@ def build_verification_bundle(
             "error": artifact_error,
         },
     }
+
+
+def _assess_worker_quality(
+    worker_verification: dict[str, Any],
+    *,
+    workspace_path: Path | None,
+    changed_paths: tuple[str, ...],
+    checkpoint_paths: tuple[str, ...] | None,
+    contract: NativeQualityContract,
+    required: bool,
+) -> dict[str, Any]:
+    if not required:
+        return {
+            "required": False,
+            "status": "not_required",
+            "required_gates": [],
+            "missing_gates": [],
+            "changed_files_missing": [],
+            "changed_files_unobserved": [],
+            "reason": None,
+            "claims_trust": "worker_reported",
+        }
+    payload = worker_verification.get("payload")
+    checks = payload.get("checks", []) if isinstance(payload, dict) else []
+    if worker_verification.get("state") != "valid" or not isinstance(payload, dict):
+        return {
+            "required": True,
+            "status": "failed",
+            "required_gates": [],
+            "missing_gates": [],
+            "changed_files_missing": [],
+            "changed_files_unobserved": [],
+            "reason": "worker verification is not valid",
+            "claims_trust": "worker_reported",
+        }
+    worker_paths = {
+        str(change.get("path", ""))
+        for change in payload.get("changed_files", [])
+        if isinstance(change, dict) and change.get("path")
+    }
+    expected_paths = set(checkpoint_paths or ())
+    changed_files_missing = sorted(expected_paths - worker_paths)
+    changed_files_unobserved = sorted(worker_paths - expected_paths) if checkpoint_paths else []
+    if changed_files_missing or changed_files_unobserved:
+        selected = selected_native_quality_gates(contract, changed_paths)
+        return {
+            "required": True,
+            "status": "failed",
+            "required_gates": [gate.name for gate in selected],
+            "missing_gates": [],
+            "changed_files_missing": changed_files_missing,
+            "changed_files_unobserved": changed_files_unobserved,
+            "reason": "worker changed-files evidence does not match the checkpoint",
+            "claims_trust": "worker_reported",
+        }
+    if not contract.gates:
+        passed = bool(checks) and all(
+            check.get("outcome") == "passed" and check.get("exit_code") in {None, 0}
+            for check in checks
+        )
+        return {
+            "required": True,
+            "status": "passed" if passed else "failed",
+            "required_gates": [],
+            "missing_gates": [],
+            "changed_files_missing": [],
+            "changed_files_unobserved": [],
+            "reason": None if passed else "no successful worker check was reported",
+            "claims_trust": "worker_reported",
+        }
+    selected = selected_native_quality_gates(contract, changed_paths)
+    missing: list[str] = []
+    for gate in selected:
+        expected_command = format_gate_command(gate)
+        if not any(
+            _reported_gate_matches(
+                check,
+                expected_command=expected_command,
+                expected_cwd=gate.working_dir,
+                workspace_path=workspace_path,
+            )
+            for check in checks
+        ):
+            missing.append(gate.name)
+    if not selected:
+        reason = "no configured quality gate matched the changed files"
+    elif missing:
+        reason = "mandatory worker quality gates are missing from verification.json"
+    else:
+        reason = None
+    return {
+        "required": True,
+        "status": "passed" if selected and not missing else "failed",
+        "required_gates": [gate.name for gate in selected],
+        "missing_gates": missing,
+        "changed_files_missing": [],
+        "changed_files_unobserved": [],
+        "reason": reason,
+        "claims_trust": "worker_reported",
+    }
+
+
+def _reported_gate_matches(
+    check: dict[str, Any],
+    *,
+    expected_command: str,
+    expected_cwd: Path,
+    workspace_path: Path | None,
+) -> bool:
+    command = str(check.get("command", "")).strip().strip("`")
+    if command != expected_command:
+        return False
+    if check.get("outcome") != "passed" or check.get("exit_code") not in {None, 0}:
+        return False
+    reported_cwd = str(check.get("cwd", "")).strip()
+    if reported_cwd.replace("\\", "/") == expected_cwd.as_posix():
+        return True
+    if workspace_path is None:
+        return False
+    try:
+        return Path(reported_cwd).resolve(strict=False) == (workspace_path / expected_cwd).resolve(
+            strict=False
+        )
+    except OSError:
+        return False
 
 
 def _section_key(label: str) -> str:

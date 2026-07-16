@@ -22,6 +22,11 @@
 - A durable result must contain a plain-line `Status: completed`, `Status: partial`, or `Status: blocked` marker. Inline-code status is tolerated for recovery, but generated prompts should use the plain form.
 - Writable workers must also produce schema-v1 `verification.json`. Missing or invalid
   verification may terminate a worker, but it must block normal root acceptance.
+- Native quality gates are controller configuration, not worker input. Execute them
+  without a shell, never install dependencies, bind controller evidence to the immutable
+  contract hash and checkpoint tree, and block `review_ready` on missing, failed,
+  timed-out, drifted, uncovered, or contradictory evidence. A gate that changes the
+  worktree must fail closed through checkpoint cleanup and quarantine the slot.
 - In `ide_mcp` mode, isolate simultaneously loaded checkouts that share Python/TypeScript namespaces: a route with `ide_sdk_name` gets one IDEA module per slot, using the exact installed SDK and no cross-slot module dependencies.
 - In `ide_mcp` mode, use `agentbridge-slots-root` only for routes without a dedicated SDK and without overlapping package namespaces. Configure duplicate analysis as `SAME_MODULE` so useful intra-slot findings remain enabled while branch-clone matches are excluded.
 - In safe native `workspace-write`, treat `.git` as protected: inspect status/diffs but leave commits to the root reviewer unless yolo was explicitly authorized.

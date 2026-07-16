@@ -4,7 +4,7 @@ import os
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, cast
 
@@ -13,6 +13,15 @@ from agent_control_plane.shared.agent_backends import (
     SUPPORTED_BACKENDS,
     normalize_backend,
 )
+
+
+@dataclass(frozen=True)
+class NativeQualityGateConfig:
+    name: str
+    command: tuple[str, ...]
+    working_dir: Path = Path(".")
+    timeout_sec: int = 300
+    include_globs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -36,6 +45,8 @@ class RouteConfig:
     codex_reasoning_effort: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] | None = None
     workspace_access: str | None = None
+    native_quality_policy: str | None = None
+    native_quality_gates: tuple[NativeQualityGateConfig, ...] = ()
     monitor_route_root: bool = True
 
 
@@ -76,6 +87,7 @@ class ControlDefaults:
     codex_reasoning_effort: str = "low"
     codex_sandbox_mode: str = "workspace-write"
     workspace_access: str = "ide_mcp"
+    native_quality_policy: str = "worker"
     terminal_slot_policy: str = "preserve"
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
@@ -203,6 +215,9 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             defaults_raw.get("codex_sandbox_mode", "workspace-write")
         ),
         workspace_access=_workspace_access_value(defaults_raw.get("workspace_access", "ide_mcp")),
+        native_quality_policy=_native_quality_policy_value(
+            defaults_raw.get("native_quality_policy", "worker")
+        ),
         terminal_slot_policy=_terminal_slot_policy_value(
             defaults_raw.get("terminal_slot_policy", "preserve")
         ),
@@ -287,6 +302,16 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             raise ValueError(f"[routes.{name}] must be a table")
         route_worktree_root = _optional_path(value, "worktree_root", project_root)
         route_path = _path(value, "path", project_root)
+        native_quality_gates = _native_quality_gates(name, value.get("native_quality_gates", []))
+        native_quality_policy = _optional_native_quality_policy_value(
+            value.get("native_quality_policy")
+        )
+        effective_native_quality_policy = native_quality_policy or defaults.native_quality_policy
+        if effective_native_quality_policy == "controller" and not native_quality_gates:
+            raise ValueError(
+                f"routes.{name} native_quality_policy='controller' requires at least one "
+                "native_quality_gate"
+            )
         routes[name] = RouteConfig(
             name=name,
             path=route_path,
@@ -315,6 +340,8 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
                 value.get("codex_forbidden_tool_markers")
             ),
             workspace_access=_optional_workspace_access_value(value.get("workspace_access")),
+            native_quality_policy=native_quality_policy,
+            native_quality_gates=native_quality_gates,
             monitor_route_root=bool(value.get("monitor_route_root", True)),
         )
 
@@ -475,6 +502,145 @@ def _optional_workspace_access_value(value: Any) -> str | None:
     if value is None:
         return None
     return _workspace_access_value(value)
+
+
+def _native_quality_policy_value(value: Any) -> str:
+    policy = _string_value(value).strip().lower()
+    if policy not in {"off", "worker", "controller"}:
+        raise ValueError("native_quality_policy must be off, worker, or controller")
+    return policy
+
+
+def _optional_native_quality_policy_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _native_quality_policy_value(value)
+
+
+def _native_quality_gates(
+    route_name: str,
+    value: Any,
+) -> tuple[NativeQualityGateConfig, ...]:
+    if not isinstance(value, list):
+        raise ValueError(f"routes.{route_name}.native_quality_gates must be an array of tables")
+    gates: list[NativeQualityGateConfig] = []
+    seen_names: set[str] = set()
+    for index, item in enumerate(value):
+        label = f"routes.{route_name}.native_quality_gates[{index}]"
+        if not isinstance(item, dict):
+            raise ValueError(f"{label} must be a table")
+        name = _string_value(item.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"{label}.name must be non-empty")
+        if name in seen_names:
+            raise ValueError(f"routes.{route_name} has duplicate native quality gate: {name}")
+        seen_names.add(name)
+        command_raw = item.get("command")
+        if not isinstance(command_raw, list) or not command_raw:
+            raise ValueError(f"{label}.command must be a non-empty array")
+        command = tuple(_string_value(part).strip() for part in command_raw)
+        if any(not part for part in command):
+            raise ValueError(f"{label}.command entries must be non-empty")
+        if not _native_quality_command_is_read_only(command):
+            raise ValueError(f"{label}.command must be a read-only quality check")
+        working_dir_text = _string_value(item.get("working_dir", ".")).strip() or "."
+        working_dir = Path(working_dir_text)
+        if (
+            PurePosixPath(working_dir_text).is_absolute()
+            or PureWindowsPath(working_dir_text).is_absolute()
+            or ".." in PurePosixPath(working_dir_text.replace("\\", "/")).parts
+        ):
+            raise ValueError(f"{label}.working_dir must stay inside the task workspace")
+        include_globs = _string_tuple(item.get("include_globs", []))
+        if any(
+            PurePosixPath(pattern.replace("\\", "/")).is_absolute()
+            or ".." in PurePosixPath(pattern.replace("\\", "/")).parts
+            for pattern in include_globs
+        ):
+            raise ValueError(f"{label}.include_globs must contain relative patterns")
+        gates.append(
+            NativeQualityGateConfig(
+                name=name,
+                command=command,
+                working_dir=working_dir,
+                timeout_sec=_positive_gate_timeout(item.get("timeout_sec", 300), label),
+                include_globs=tuple(pattern.replace("\\", "/") for pattern in include_globs),
+            )
+        )
+    return tuple(gates)
+
+
+def _positive_gate_timeout(value: Any, label: str) -> int:
+    timeout = int(value)
+    if timeout <= 0:
+        raise ValueError(f"{label}.timeout_sec must be positive")
+    return timeout
+
+
+def _native_quality_command_is_read_only(command: tuple[str, ...]) -> bool:
+    executable = command[0].replace("\\", "/").rsplit("/", maxsplit=1)[-1].lower()
+    for suffix in (".exe", ".cmd", ".bat"):
+        executable = executable.removesuffix(suffix)
+    arguments = tuple(part.lower() for part in command[1:])
+    if executable.startswith("python") and len(arguments) >= 2 and arguments[0] == "-m":
+        executable = arguments[1]
+        arguments = arguments[2:]
+    if executable in {"cmd", "powershell", "pwsh", "bash", "sh", "zsh"}:
+        return False
+    if executable in {"npx", "bunx", "pnpx", "uvx", "pipx"}:
+        return False
+    if any(flag in arguments for flag in {"--fix", "--unsafe-fixes", "--write"}):
+        return False
+    if executable == "ruff" and arguments[:1] == ("format",) and "--check" not in arguments:
+        return False
+    if executable in {"black", "prettier"} and "--check" not in arguments:
+        return False
+    if (
+        executable == "uv"
+        and arguments[:1]
+        and arguments[0]
+        in {
+            "sync",
+            "add",
+            "remove",
+            "lock",
+            "pip",
+            "run",
+        }
+    ):
+        return False
+    if executable in {"pip", "pip3"} and arguments[:1] in {("install",), ("uninstall",)}:
+        return False
+    if (
+        executable in {"npm", "bun", "pnpm", "yarn", "poetry", "cargo"}
+        and arguments[:1]
+        and arguments[0] in {"install", "i", "ci", "add", "remove", "exec", "dlx", "x"}
+    ):
+        return False
+    if executable == "go" and arguments[:1] in {("get",), ("install",)}:
+        return False
+    return not (
+        executable == "git"
+        and arguments[:1]
+        and arguments[0]
+        in {
+            "add",
+            "am",
+            "apply",
+            "checkout",
+            "cherry-pick",
+            "clean",
+            "commit",
+            "merge",
+            "pull",
+            "push",
+            "rebase",
+            "reset",
+            "restore",
+            "revert",
+            "switch",
+        }
+    )
 
 
 def _terminal_slot_policy_value(value: Any) -> str:
