@@ -58,7 +58,9 @@ For development checks:
 ```powershell
 python -m pip install -e ".[dev,mcp]"
 python -m ruff check src tests scripts
-python -m mypy src scripts/run_affected_tests.py
+python -m ruff format --check src tests scripts
+python -m mypy --platform linux src scripts/run_affected_tests.py
+python -m mypy --platform win32 src scripts/run_affected_tests.py
 python -m bandit -q -c pyproject.toml -r src scripts
 python -m pytest
 ```
