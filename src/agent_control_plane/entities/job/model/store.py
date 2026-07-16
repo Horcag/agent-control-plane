@@ -700,7 +700,9 @@ class JobStore:
             details = ", ".join(
                 f"{row['table']}:{row['rowid']}->{row['parent']}" for row in violations[:5]
             )
-            raise RuntimeError(f"Unresolved ACP foreign-key violations after job migration: {details}")
+            raise RuntimeError(
+                f"Unresolved ACP foreign-key violations after job migration: {details}"
+            )
 
 
 def new_job_id(task_id: str) -> str:

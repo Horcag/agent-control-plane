@@ -163,9 +163,5 @@ def _stop_reason(snapshot: dict[str, Any]) -> str | None:
 
 
 def _running_job_ids(snapshot: dict[str, Any]) -> tuple[str, ...]:
-    job_ids = {
-        str(task["job_id"])
-        for task in snapshot.get("running") or []
-        if task.get("job_id")
-    }
+    job_ids = {str(task["job_id"]) for task in snapshot.get("running") or [] if task.get("job_id")}
     return tuple(sorted(job_ids))

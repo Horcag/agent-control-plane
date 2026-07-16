@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -16,14 +17,14 @@ from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, Sl
 
 def build_server(config_path: str | None = None) -> Any:
     try:
-        from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+        fast_mcp = importlib.import_module("mcp.server.fastmcp").FastMCP
     except ImportError as exc:
         raise RuntimeError(
             'The MCP server dependency is missing. Install with: python -m pip install -e ".[mcp]"'
         ) from exc
 
     control = AgentControlPlane.from_config_path(config_path)
-    mcp = FastMCP("agent-control-plane")
+    mcp = fast_mcp("agent-control-plane")
 
     @mcp.tool()
     def agent_smoke() -> dict[str, Any]:

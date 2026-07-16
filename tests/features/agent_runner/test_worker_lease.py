@@ -19,10 +19,7 @@ def test_worker_lease_distinguishes_live_released_and_foreign_instances(
     lease.acquire()
     try:
         assert probe_worker_lease(run_dir, "worker-a").state is WorkerLeaseState.HELD_MATCH
-        assert (
-            probe_worker_lease(run_dir, "worker-b").state
-            is WorkerLeaseState.HELD_MISMATCH
-        )
+        assert probe_worker_lease(run_dir, "worker-b").state is WorkerLeaseState.HELD_MISMATCH
     finally:
         lease.release()
 

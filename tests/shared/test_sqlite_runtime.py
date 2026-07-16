@@ -105,9 +105,7 @@ def test_all_control_stores_initialize_concurrently_on_one_database(tmp_path: Pa
     with control_database(database) as db:
         tables = {
             row[0]
-            for row in db.execute(
-                "select name from sqlite_master where type = 'table'"
-            ).fetchall()
+            for row in db.execute("select name from sqlite_master where type = 'table'").fetchall()
         }
         with pytest.raises(sqlite3.IntegrityError):
             db.execute(
@@ -130,17 +128,13 @@ def test_job_migration_quarantines_orphan_events(tmp_path: Path) -> None:
             "insert into events (job_id, created_at, level, message) values (?, ?, ?, ?)",
             ("missing-job", "2026-07-15T00:00:00+00:00", "warning", "preserve me"),
         )
-        db.execute(
-            "delete from schema_migrations where component = 'job_store'"
-        )
+        db.execute("delete from schema_migrations where component = 'job_store'")
 
     store.initialize()
 
     with control_database(database) as db:
         assert db.execute("pragma foreign_key_check").fetchall() == []
-        orphan = db.execute(
-            "select job_id, message, reason from orphaned_events"
-        ).fetchone()
+        orphan = db.execute("select job_id, message, reason from orphaned_events").fetchone()
     assert tuple(orphan) == ("missing-job", "preserve me", "missing_parent_job")
 
 
@@ -183,9 +177,12 @@ def test_schema_migration_is_applied_once_across_two_processes(tmp_path: Path) -
     assert [process.returncode for process in processes] == [0, 0], results
     with control_database(database) as db:
         assert db.execute("select count(*) from migration_probe").fetchone()[0] == 1
-        assert db.execute(
-            """
+        assert (
+            db.execute(
+                """
             select count(*) from schema_migrations
             where component = 'process_probe' and version = 1
             """
-        ).fetchone()[0] == 1
+            ).fetchone()[0]
+            == 1
+        )

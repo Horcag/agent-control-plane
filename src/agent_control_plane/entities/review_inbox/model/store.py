@@ -490,14 +490,10 @@ def _item_from_row(row: sqlite3.Row) -> ReviewInboxItem:
             row["payload_result_sha256"] if "payload_result_sha256" in columns else None
         ),
         verification_state=(
-            row["payload_verification_state"]
-            if "payload_verification_state" in columns
-            else None
+            row["payload_verification_state"] if "payload_verification_state" in columns else None
         ),
         verification_schema=(
-            row["payload_verification_schema"]
-            if "payload_verification_schema" in columns
-            else None
+            row["payload_verification_schema"] if "payload_verification_schema" in columns else None
         ),
         verification_json=(
             _json_object(row["payload_verification_json"])
@@ -505,9 +501,7 @@ def _item_from_row(row: sqlite3.Row) -> ReviewInboxItem:
             else None
         ),
         verification_sha256=(
-            row["payload_verification_sha256"]
-            if "payload_verification_sha256" in columns
-            else None
+            row["payload_verification_sha256"] if "payload_verification_sha256" in columns else None
         ),
         payload_captured_at=(
             row["payload_captured_at"] if "payload_captured_at" in columns else None
@@ -567,9 +561,7 @@ def _verification_payload(bundle: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "state": state,
         "schema_version": (
-            worker.get("schema_version")
-            if isinstance(worker.get("schema_version"), int)
-            else None
+            worker.get("schema_version") if isinstance(worker.get("schema_version"), int) else None
         ),
         "payload": payload,
         "sha256": worker.get("sha256") if isinstance(worker.get("sha256"), str) else None,

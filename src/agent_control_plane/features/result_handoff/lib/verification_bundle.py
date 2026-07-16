@@ -41,7 +41,11 @@ def parse_result_report(text: str) -> dict[str, Any]:
     for raw_line in text.splitlines():
         status_match = _STATUS_PATTERN.match(raw_line)
         if status_match:
-            status = "completed" if status_match.group(1).lower() == "success" else status_match.group(1).lower()
+            status = (
+                "completed"
+                if status_match.group(1).lower() == "success"
+                else status_match.group(1).lower()
+            )
             current_section = None
             continue
         section_match = _SECTION_PATTERN.match(raw_line)
@@ -119,10 +123,11 @@ def build_verification_bundle(
     claimed = set(result["changed_files_claimed"])
     actual = {change["path"] for change in actual_changes}
     worker_payload = worker_verification.get("payload")
-    worker_changes = {
-        change["path"]
-        for change in worker_payload.get("changed_files", [])
-    } if isinstance(worker_payload, dict) else set()
+    worker_changes = (
+        {change["path"] for change in worker_payload.get("changed_files", [])}
+        if isinstance(worker_payload, dict)
+        else set()
+    )
     return {
         "schema_version": 1,
         "review_ready": bool(

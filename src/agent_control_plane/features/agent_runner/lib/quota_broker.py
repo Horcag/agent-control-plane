@@ -308,7 +308,8 @@ def _pid_alive(pid: int) -> bool:
     if os.name == "nt":
         process_query_limited_information = 0x1000
         still_active = 259
-        kernel32 = ctypes.windll.kernel32
+        windows_ctypes: Any = ctypes
+        kernel32 = windows_ctypes.windll.kernel32
         kernel32.OpenProcess.argtypes = (
             ctypes.c_uint32,
             ctypes.c_int,

@@ -233,8 +233,9 @@ def _terminate_verified_linux_process(
 def _wait_for_pidfd(pidfd: int, timeout_sec: float) -> bool:
     import select
 
-    poller = select.poll()  # type: ignore[attr-defined]
-    poller.register(pidfd, select.POLLIN)  # type: ignore[attr-defined]
+    posix_select: Any = select
+    poller = posix_select.poll()
+    poller.register(pidfd, posix_select.POLLIN)
     return bool(poller.poll(max(0, round(timeout_sec * 1000))))
 
 
@@ -242,7 +243,8 @@ def _windows_process_is_alive(pid: int) -> bool:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    windows_ctypes: Any = ctypes
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     open_process.restype = wintypes.HANDLE
@@ -266,7 +268,8 @@ def _capture_windows_process_identity(pid: int) -> ProcessIdentity | None:
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    windows_ctypes: Any = ctypes
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     open_process.restype = wintypes.HANDLE
@@ -342,7 +345,8 @@ def _terminate_verified_windows_process(
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    windows_ctypes: Any = ctypes
+    kernel32 = windows_ctypes.WinDLL("kernel32", use_last_error=True)
     open_process = kernel32.OpenProcess
     open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     open_process.restype = wintypes.HANDLE
@@ -352,7 +356,7 @@ def _terminate_verified_windows_process(
     access = 0x0001 | 0x00100000 | 0x1000
     handle = open_process(access, False, expected.pid)
     if not handle:
-        error = ctypes.get_last_error()
+        error = windows_ctypes.get_last_error()
         state = (
             ProcessTerminationState.NOT_FOUND
             if error in {87, 1168}
@@ -381,7 +385,7 @@ def _terminate_verified_windows_process(
         terminate_process.argtypes = (wintypes.HANDLE, wintypes.UINT)
         terminate_process.restype = wintypes.BOOL
         if not terminate_process(handle, 1):
-            error = ctypes.get_last_error()
+            error = windows_ctypes.get_last_error()
             return ProcessTerminationResult(
                 ProcessTerminationState.ERROR,
                 expected.pid,

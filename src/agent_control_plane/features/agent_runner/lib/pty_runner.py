@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import queue
 import re
 import threading
@@ -40,7 +41,7 @@ class PtyAgyRunner:
         pid_observed: Callable[[int | None], None],
     ) -> AgyRunResult:
         try:
-            from winpty import PtyProcess  # type: ignore[import-untyped]
+            pty_process = importlib.import_module("winpty").PtyProcess
         except ImportError as exc:
             return AgyRunResult(
                 status="blocked",
@@ -64,7 +65,7 @@ class PtyAgyRunner:
             log.flush()
 
             try:
-                proc = PtyProcess.spawn(
+                proc = pty_process.spawn(
                     command,
                     cwd=str(spec.workspace_path),
                     dimensions=(40, 180),

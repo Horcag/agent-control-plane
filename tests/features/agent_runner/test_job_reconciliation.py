@@ -279,9 +279,7 @@ def test_reconcile_kills_verified_child_after_coordinator_death(tmp_path: Path) 
     helper_path = Path(__file__).parent / "helpers" / "orphan_coordinator.py"
     environment = os.environ.copy()
     source_root = Path(__file__).resolve().parents[3] / "src"
-    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get(
-        "PYTHONPATH", ""
-    )
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get("PYTHONPATH", "")
     coordinator = subprocess.Popen(  # nosec B603
         [
             sys.executable,

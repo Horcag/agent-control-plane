@@ -7,9 +7,7 @@ from pathlib import Path
 from typing import Any
 
 MAX_VERIFICATION_BYTES = 64 * 1024
-_REQUIRED_KEYS = frozenset(
-    {"schema_version", "status", "changed_files", "checks", "unverified"}
-)
+_REQUIRED_KEYS = frozenset({"schema_version", "status", "changed_files", "checks", "unverified"})
 _STATUSES = frozenset({"completed", "partial", "blocked"})
 _CHANGE_KINDS = frozenset({"added", "modified", "deleted", "renamed", "untracked"})
 _CHECK_OUTCOMES = frozenset({"passed", "failed", "not_run"})
@@ -54,9 +52,7 @@ def inspect_verification_report(
         if started_at is not None and stat.st_mtime < started_at:
             raise ValueError("verification.json is older than job start")
         if stat.st_size > MAX_VERIFICATION_BYTES:
-            raise ValueError(
-                f"verification.json exceeds {MAX_VERIFICATION_BYTES} byte limit"
-            )
+            raise ValueError(f"verification.json exceeds {MAX_VERIFICATION_BYTES} byte limit")
         payload = json.loads(path.read_text(encoding="utf-8"))
         normalized = _validate_payload(payload, expected_status=expected_status)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
@@ -131,7 +127,9 @@ def _checks(value: Any) -> list[dict[str, Any]]:
                 f"checks[{index}] must contain only command, cwd, outcome, exit_code, summary"
             )
         exit_code = item["exit_code"]
-        if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
             raise ValueError(f"checks[{index}].exit_code must be an integer or null")
         normalized.append(
             {

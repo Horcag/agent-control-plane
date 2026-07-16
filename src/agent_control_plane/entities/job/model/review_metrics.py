@@ -216,7 +216,10 @@ class ReviewMetricsStore:
         _validate_choice("outcome", outcome, REVIEW_OUTCOMES)
         if defects_found < 0 or false_positives < 0:
             raise ValueError("Review counters must be non-negative")
-        if db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone() is None:
+        if (
+            db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone()
+            is None
+        ):
             raise KeyError(f"Review span not found: {span_id}")
         if db.execute("select 1 from jobs where job_id = ?", (job_id,)).fetchone() is None:
             raise KeyError(f"Job not found: {job_id}")

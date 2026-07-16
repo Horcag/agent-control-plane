@@ -140,7 +140,8 @@ def _try_lock(handle: BinaryIO) -> bool:
     handle.seek(0)
     try:
         if os.name == "nt":
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            windows_msvcrt = cast(Any, msvcrt)
+            windows_msvcrt.locking(handle.fileno(), windows_msvcrt.LK_NBLCK, 1)
         else:
             posix_fcntl = cast(Any, fcntl)
             posix_fcntl.flock(
@@ -155,7 +156,8 @@ def _try_lock(handle: BinaryIO) -> bool:
 def _unlock(handle: BinaryIO) -> None:
     handle.seek(0)
     if os.name == "nt":
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        windows_msvcrt = cast(Any, msvcrt)
+        windows_msvcrt.locking(handle.fileno(), windows_msvcrt.LK_UNLCK, 1)
         return
     posix_fcntl = cast(Any, fcntl)
     posix_fcntl.flock(handle.fileno(), posix_fcntl.LOCK_UN)

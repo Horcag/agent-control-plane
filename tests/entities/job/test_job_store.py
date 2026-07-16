@@ -27,8 +27,7 @@ class JobStoreTest(unittest.TestCase):
                 worker_pid=123,
                 runner_pid=456,
                 runner_process_identity=(
-                    '{"schema_version":1,"pid":456,'
-                    '"started_key":"test:1","executable":"python"}'
+                    '{"schema_version":1,"pid":456,"started_key":"test:1","executable":"python"}'
                 ),
             )
             self.assertEqual(updated.status, "running")
