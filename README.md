@@ -1,776 +1,202 @@
 # Agent Control Plane
 
-Agent Control Plane is a local job orchestrator for delegating bounded coding tasks to
-agent CLIs while preserving route, branch, slot, log, and result state.
+Agent Control Plane (ACP) is a local control plane for bounded coding jobs. It assigns
+agents to isolated slots, records prompts and results, supervises terminal completion,
+and leaves the final review and merge decision with a human or coordinating agent.
 
-It currently supports two runner backends:
+## Why ACP exists
 
-- `codex`: runs `codex exec` in the selected workspace.
-- `agy`: runs Google Antigravity CLI (`agy`) through a PTY-backed runner.
+Launching several agent processes is not coordination: work can collide in one checkout,
+disappear into a terminal, or be reported successful while still running. ACP adds
+durable job state, route and branch checks, exclusive slots, dependency-aware plans,
+bounded logs, review-inbox handoffs, and verification evidence. It coordinates agents;
+it does not decide whether their patches should be accepted.
 
-Codex jobs also support two workspace access modes: the backward-compatible
-`ide_mcp` mode through AgentBridge/IDEA and a compact `native` mode that runs directly
-in the assigned slot without AgentBridge.
+ACP is useful for repeatable, auditable delegation across repositories or parallel tasks.
+It is overkill for one short prompt in one clean checkout, and it is not a hosted queue,
+cloud scheduler, or unattended merge service.
 
-The project is intentionally local-first. It does not host a web service, push code, or
-manage cloud credentials for you. It coordinates local repositories and writes durable
-run artifacts under `runs/`.
+## Architecture
 
-## Why Use It
-
-Use this project when you want an assistant or local automation to hand off a clearly
-scoped task to another agent process and then monitor it to a terminal result instead of
-leaving work in a vague `queued` or `running` state.
-
-The control plane gives you:
-
-- named routes for repositories and required branches;
-- reusable slot worktrees for isolated edit/fix tasks;
-- background job execution with logs, prompt files, result files, and SQLite state;
-- durable dependency plans with one-shot, crash-safe task dispatch;
-- compact review-inbox lists backed by full, hashed result payloads;
-- dry-run-first slot cleanup and run archiving;
-- guardrails for dirty workspaces and read-only review jobs;
-- an optional MCP server for Codex integration.
+```mermaid
+flowchart LR
+    C[Coordinator] --> CLI[agent-control CLI]
+    CLI --> DB[(SQLite job state)]
+    CLI --> R[Runner: Codex or AGY]
+    R --> S[Isolated route slot]
+    R --> A[Run artifacts]
+    A --> I[Review inbox]
+    I --> H[Human or root acceptance]
+```
 
 ## Requirements
 
-- Python 3.11 or newer.
-- Git available on `PATH`.
-- Codex CLI if you use `backend = "codex"`.
-- Google Antigravity CLI (`agy`) if you use `backend = "agy"`.
-- Windows is the best-tested environment for the `agy` PTY runner. The Codex backend is
-  plain subprocess execution and is less Windows-specific.
+- Python 3.11 or newer and Git on `PATH`.
+- Codex CLI or Google Antigravity CLI (`agy`) only for the backend you choose.
+- No agent CLI, IDEA, or network access is needed for the offline demo below.
 
 ## Install
 
-From a clone of this repository:
+From a clone, install the command with `pipx` or `uv`:
+
+```powershell
+pipx install .
+uv tool install .
+```
+
+For editable development work:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e ".[mcp]"
-```
-
-For development checks:
-
-```powershell
 python -m pip install -e ".[dev,mcp]"
-python -m ruff check src tests scripts
-python -m ruff format --check src tests scripts
-python -m mypy --platform linux src scripts/run_affected_tests.py
-python -m mypy --platform win32 src scripts/run_affected_tests.py
-python -m bandit -q -c pyproject.toml -r src scripts
-python -m pytest
 ```
 
-Tests mirror the production boundaries under `tests/app`, `tests/entities`,
-`tests/features`, and `tests/shared`; architecture and repository tooling have their own
-top-level test directories. For a dependency-aware local run against a Git base:
+## Five-minute offline demo
+
+The demo uses local fixtures and does not call an agent, IDEA, or the network. Run it,
+inspect the recorded result, then cross the explicit acceptance boundary:
 
 ```powershell
-python scripts/run_affected_tests.py --base origin/main --head HEAD
+agent-control demo run --output ../agent-control-demo
+agent-control demo show ../agent-control-demo
+agent-control demo accept ../agent-control-demo
 ```
 
-The selector follows transitive Python imports and adds the mirrored feature tests. It
-fails closed to the full suite for deleted/unknown source files, project configuration,
-CI, or selector changes. Pull-request CI uses this affected set on Windows and Linux with
-Python 3.11 and 3.12. Pushes to `main` always run the full suite; Ruff, mypy, and Bandit
-remain separate quality gates.
+The output directory is disposable. Acceptance is neither an automatic merge nor a push.
+
+## Production quickstart
+
+Create a private config, define a route and slots, validate it, then supervise a job:
+
+```powershell
+Copy-Item .\config\workspaces.example.toml .\config\workspaces.toml
+agent-control smoke --config .\config\workspaces.toml
+agent-control slots sync --config .\config\workspaces.toml
+agent-control start --config .\config\workspaces.toml `
+  --task-id review-auth-flow --route app --slot app-1 `
+  --expected-branch codex/review-auth-flow --wait --live
+```
+
+Use `--workspace-access native` for Codex-native tools, or the IDE-backed mode when IDEA
+diagnostics are part of the route. Supervise with `--wait`, `watch`, or a heartbeat:
+`queued` and `running` are never completion.
+
+## Safety and review boundary
+
+ACP refuses dirty workspaces by default, keeps slot assignment exclusive, and records
+durable prompts, logs, process identity, results, and verification. Dangerous bypass is
+opt-in. Checkpoint cleanup waits for durable controller evidence; ACP does not push, merge,
+or accept a patch. Review the diff and verification before recording acceptance.
+
+## Further reading
+
+- [Operations](docs/operations.md)
+- [Recovery matrix](docs/recovery-matrix.md)
+- [Compatibility](docs/compatibility.md)
+- [Upgrading](docs/upgrading.md)
+- [Changelog](CHANGELOG.md)
+- [Releasing](docs/releasing.md)
+
+See the tracked configuration example for route, slot, runner, and quality-gate options.
 
 ## Configure
 
-Create a local config from the tracked example:
+Copy the ignored local config and edit it for your machine:
 
 ```powershell
 Copy-Item .\config\workspaces.example.toml .\config\workspaces.toml
 ```
 
-Then edit `config/workspaces.toml` for your machine. Git ignores the local file, so
-private paths and local defaults do not get committed.
-
-Keep slot and generated worktree folders beside this repository, not inside it. The
-example uses `../agent-control-plane-slots` and `../agent-control-plane-worktrees` to avoid
-nested VCS state and noisy IDE indexing in the control-plane checkout.
-
-A minimal route looks like this:
+The local file is ignored: keep machine-specific paths and defaults there, outside
+versioned public content. Relative paths resolve from this repository root. A minimal
+route and slot configuration is:
 
 ```toml
 [control]
 coordination_root = ".agent-work"
 runs_root = "runs"
 database = "runs/jobs.sqlite3"
-worktree_root = "../agent-control-plane-worktrees"
-worktree_base = "../my-project"
-slot_root = "../agent-control-plane-slots"
-agy_command = "agy"
-codex_command = "codex"
-
-[control.defaults]
-backend = "codex"
-agy_model = "Gemini 3.5 Flash (High)"
-codex_model = "gpt-5.6-terra"
-codex_reasoning_effort = "medium"
-codex_sandbox_mode = "workspace-write"
-workspace_access = "ide_mcp"
-native_quality_policy = "worker"
-terminal_slot_policy = "checkpoint"
-allow_dirty = false
-yolo = false
-prepare_slots = true
-runs_layout = "date"
-codex_global_max_concurrent_jobs = 2
-codex_global_max_burst_jobs = 8
+worktree_root = "../acp-worktrees"
+slot_root = "../acp-slots"
 
 [routes.app]
 path = "../my-project"
 required_branch = "main"
-worktree_root = "../agent-control-plane-worktrees"
-worktree_base = "../my-project"
-source_roots = ["."]
-test_roots = ["tests"]
-exclude_dirs = [".venv", "build", "dist", "node_modules"]
-ide_sdk_name = "Python 3.12 (my-project)"
-ide_sdk_type = "Python SDK"
 
 [slots."app-1"]
 route = "app"
-path = "../agent-control-plane-slots/app-1"
+path = "../acp-slots/app-1"
 ```
 
-Config paths may be absolute or relative. Relative paths are resolved from the repository
-root containing the `config/` directory. `ide_sdk_name` must exactly match an SDK already
-registered in IDEA.
-
-Routes that expose overlapping package or symbol names, such as several checkouts of the
-same repository, must use a configured SDK. The control plane then creates one isolated
-IDEA module per slot, without dependencies between slot modules. Shared modules remain
-available only for non-overlapping routes. The generated inspection profile limits duplicate
-analysis to `SAME_MODULE`, preserving useful duplicate detection inside a slot while ignoring
-identical files in sibling checkouts.
-
-Validate the config before starting jobs:
+Validate the config, then synchronize declared slots:
 
 ```powershell
 agent-control smoke --config .\config\workspaces.toml
+agent-control slots sync --config .\config\workspaces.toml
 ```
 
-`smoke` initializes the SQLite database and reports configured routes, slot state,
-available runner commands, and run-archive settings. It does not send a prompt to any
-model. ACP-owned databases are bootstrapped once into WAL mode and use versioned,
-cross-process migrations. Legacy orphan events are preserved in `orphaned_events`
-instead of being discarded. The external Antigravity account database is never migrated
-by this runtime.
-
-After an unexpected coordinator exit, ordinary reconciliation remains fail-closed: a
-live Codex/AGY runner keeps its slot quarantined. To recover one job and terminate only
-a child whose durable process-instance identity still matches, opt in explicitly:
-
-```powershell
-agent-control reconcile `
-  --job-id <job-id> `
-  --terminate-verified-runners `
-  --config .\config\workspaces.toml
-```
-
-ACP records the runner PID together with its OS start identity and executable. The
-opt-in path reopens that exact process object (a Windows process handle or Linux pidfd),
-compares the durable identity, and only then terminates it and releases the slot. A
-missing identity, reused PID, unsupported platform, or verification error leaves the
-process and slot quarantined. Jobs created before identity capture was introduced are
-therefore never force-recovered automatically.
-
-### Weighted Codex Concurrency
-
-`codex_global_max_concurrent_jobs` is a weighted capacity budget measured in
-Sol-high-equivalent slots, not a literal process limit. Each nominal concurrency unit
-supplies 30 capacity units. Luna, Terra, and Sol jobs consume fewer or more units
-according to the effective model and reasoning effort; unknown model names consume all
-30 units.
-
-`codex_global_max_burst_jobs` is the separate hard process-count safety limit and
-defaults to four times the weighted slot count. With the example values above, ACP may run
-up to eight cheap Luna jobs when physical slots are free, while no more than two Sol-high
-jobs fit the weighted budget. Slot assignment remains exclusive. If a running job
-escalates to a heavier profile, ACP
-atomically resizes its lease and waits when the larger lease would exceed the budget.
-
-The separate `codex_five_hour_soft_limit_percent` setting has a legacy name. ACP
-applies it to the primary rate-limit window reported by Codex, regardless of that
-window's actual duration. Once the threshold is reached, the guardrail blocks every
-Codex profile, including Luna; weighted concurrency does not bypass the rate-limit cap.
-
-Managed Luna, Terra, and Sol profiles accept reasoning efforts `none`, `low`,
-`medium`, `high`, and `xhigh`. ACP rejects any other effort for those profiles
-before it creates a job record or launches a worker. Explicit custom model names remain
-pass-through because their supported effort set is backend-defined.
+For operational procedures and recovery behavior, see [Operations](docs/operations.md)
+and the [Recovery matrix](docs/recovery-matrix.md).
 
 ## Core Concepts
 
-A route is a named repository target. It declares the canonical repository path and the
-branch that must be checked out before a job may use it.
+A route names a repository target, including its canonical path and required branch. A
+slot is an isolated worktree assigned to that route; agents edit there while the canonical
+checkout remains untouched. Keep slot directories outside this repository.
 
-A slot is a reusable worktree path tied to a route. Slots let agents edit in isolated
-workspaces while your canonical checkout stays untouched. Keep the slot parent outside
-this repository, preferably as a sibling directory.
+A job is one delegated task with durable prompt, log, result, and SQLite records. A plan
+groups logical tasks into a dependency graph so ready work can be dispatched and retried.
+The review inbox is the handoff point for results and verification; delivery is not
+acceptance.
 
-A job is one delegated task. Each job gets a `job_id`, prompt path, log path, result path,
-and SQLite record.
+The backend selects the runner (`codex` or `agy`). Workspace access is separate: `ide_mcp`
+uses the configured IDE integration, while `native` uses Codex-native shell and file tools
+in the assigned workspace. Set it globally, per route, or per job; the most specific
+setting wins. Native mode is Codex-only and does not provide IDEA diagnostics/refactors.
 
-A plan is a durable dependency graph of logical tasks. A task may also carry a private
-execution specification, allowing ACP to claim and start dependency-ready work in a
-one-shot dispatch pass. Jobs may be retried with new physical task IDs while remaining
-attached to the same logical plan task. Snapshots expose only a brief hash/length,
-progress, root-acceptance state, compact result excerpts, and a monotonic event cursor;
-they never return the full execution brief.
+For operational procedures and failure handling, see [Operations](docs/operations.md) and
+the [Recovery matrix](docs/recovery-matrix.md). Quality gates run only when configured;
+their evidence must be present in `verification.json` before a result can be review-ready.
 
-The review inbox is the durable handoff boundary for terminal jobs and completed Codex
-subagents. List operations return bounded excerpts and summaries. `inbox show` joins the
-separate durable payload containing the full result, SHA-256 identity, structured
-verification, rollout path, checkpoint identity, and root-review state. Delivery still
-does not imply plan acceptance.
-
-A backend is the runner implementation. Use `codex` for `codex exec` and `agy` for the
-Antigravity CLI.
-
-For Codex, workspace access is separate from the backend:
-
-- `ide_mcp` is the default and preserves the existing AgentBridge contract, IDEA
-  diagnostics/refactors, IDE Git operations, and terminal scoping.
-- `native` uses Codex-native shell, `rg`, and file-edit tools in the exact assigned
-  workspace. It skips IDEA module provisioning and disables the route-selected and
-  known AgentBridge servers, reducing prompt and MCP-call overhead.
-
-Set `workspace_access` globally, override it on a route, or pass
-`--workspace-access`; job override wins over route, then global default. Native mode is
-Codex-only, so ACP rejects `backend = "agy"` plus `workspace_access = "native"`.
-The trade-off is deliberate: native mode has no IDEA diagnostics/refactors, and safe
-Codex `workspace-write` protects `.git`, so the root reviewer normally creates the
-commit after reviewing the diff. `--yolo` can remove that protection but is not the
-default or recommended workflow.
-
-Native-mode quality is an executable contract, independent of model quality tiers:
-
-- `native_quality_policy = "off"` disables route-specific gate matching and controller
-  reruns; baseline verification integrity still rejects a completed change with no
-  successful check.
-- `worker` (the default) requires a completed change to contain at least one successful
-  check in `verification.json`. Matching gates with `run_on = "worker"` or `"both"` must
-  be reported with the exact expanded command and working directory.
-- `controller` independently runs matching gates with `run_on = "controller"` or
-  `"both"`, using `shell=False` after creating the terminal checkpoint. Controller-only
-  gates are not duplicated by the worker. Its report is bound to both the contract
-  SHA-256 and checkpoint tree SHA. A missing, failed, timed-out, drifted, or uncovered
-  gate makes the handoff non-review-ready. The checkpoint remains durable and ordinary
-  failures still release a clean slot; if a gate mutates the worktree, cleanup fails
-  closed and the slot is quarantined.
-
-Controller mode requires `terminal_slot_policy = "checkpoint"` and an assigned slot.
-Configure gates under the route; an empty `include_globs` applies to every change:
-
-```toml
-[routes.app]
-path = "../my-project"
-required_branch = "main"
-native_quality_policy = "controller"
-native_quality_max_parallel = 2
-
-[[routes.app.native_quality_gates]]
-name = "affected-tests"
-command = ["python", "scripts/run_affected_tests.py", "--worktree"]
-working_dir = "."
-timeout_sec = 1200
-include_globs = []
-run_on = "controller"
-
-[[routes.app.native_quality_gates]]
-name = "ruff-changed"
-command = ["python", "-m", "ruff", "check", "{changed_python_files}"]
-working_dir = "."
-timeout_sec = 300
-include_globs = ["*.py", "**/*.py"]
-run_on = "both"
-```
-
-Commands must already exist in the prepared slot; quality execution never installs
-dependencies. `native_quality_max_parallel` is bounded to `1..4`; keep it at `1` for
-resource-sensitive projects and use `2` for independent read-only checks. An exact
-`{changed_python_files}` argument expands deterministically to sorted, existing changed
-Python files using workspace-relative paths. Deleted Python files still affect dependency
-tests and full type checks but are not passed to file-based linters. Placeholder gates
-with no remaining Python input are not selected. The native prompt requires the fastest
-relevant scoped check after each coherent edit batch and all matching worker gates before
-`Status: completed`.
-
-Set `agy_model` in `[control.defaults]` or on a route when Antigravity must use an
-explicit model. A job-level `--agy-model` override has highest priority. ACP persists
-the resolved model and passes it to `agy --model`, so quota failures and imported
-usage can be attributed to the model that actually ran.
-
-For AGY jobs that must edit managed slots outside the open IDEA base directory, set
-`agy_mcp_server` on the route to the AgentBridge server name from Antigravity's
-`User/mcp.json` (for example, `agentbridge-ide`). ACP then requires exact workspace
-paths through AgentBridge and forbids junction/symlink aliases. Without this setting,
-AGY keeps the legacy native `idea` MCP contract for compatibility.
-
-## Slot Workflow
-
-Create or synchronize slots after editing the config:
-
-```powershell
-agent-control slots sync --config .\config\workspaces.toml
-agent-control slots list --config .\config\workspaces.toml
-agent-control slots create app-1 --config .\config\workspaces.toml
-agent-control slots ensure-root-module --remove-slot-modules --config .\config\workspaces.toml
-```
-
-IDE module commands update `.idea/modules.xml` and `.idea/workspace.xml`; they cannot
-query the live IDE runtime. Their JSON distinguishes `workspace_configured_loaded` from
-`runtime_loaded` (reported as unknown) and sets `ide_reload_required` when files changed.
-Reload the IDEA project/model before relying on a newly written module. In `ide_mcp`
-jobs, every terminal command also performs an explicit `Set-Location`/`cd` to the
-assigned workspace because the IDE terminal working-directory argument is not reliable
-on every host.
-
-For a new route or a new slot, `bootstrap` can add the missing config and optionally
-create the worktree:
-
-```powershell
-agent-control slots bootstrap app-2 `
-  --route app `
-  --repo-path C:\path\to\my-project `
-  --config .\config\workspaces.toml
-```
-
-Check out a clean inactive slot to a task branch:
-
-```powershell
-agent-control slots checkout app-1 `
-  --branch codex/my-task `
-  --start-point origin/main `
-  --config .\config\workspaces.toml
-```
-
-Cleanup is dry-run unless `--apply` is passed:
-
-```powershell
-agent-control slots cleanup --max-per-route 2 --config .\config\workspaces.toml
-agent-control slots cleanup --max-per-route 2 --apply --config .\config\workspaces.toml
-```
-
-With `terminal_slot_policy = "checkpoint"`, a dirty terminal job is captured as a local
-commit under `refs/agent-control-plane/jobs/<job-hash>`. ACP verifies that ref and writes
-the review-inbox item before resetting the slot to its unchanged branch `HEAD`. It never
-pushes, merges, moves the branch, or accepts the work. If the workspace changes after the
-checkpoint or verification fails, cleanup is refused and the slot remains dirty.
-
-Use the manual command for a terminal job that predates this policy:
-
-```powershell
-agent-control slots checkpoint app-1 `
-  --job-id <terminal-job-id> `
-  --config .\config\workspaces.toml
-```
-
-Inspect pending job and Codex-subagent deliveries without replaying their full logs:
-
-```powershell
-agent-control inbox sync-subagents --config .\config\workspaces.toml
-agent-control inbox list --sync-subagents --parent-thread-id <root-thread-id> --config .\config\workspaces.toml
-agent-control inbox show agent_job:<job-id> --config .\config\workspaces.toml
-agent-control inbox resolve agent_job:<job-id> --decision accepted --config .\config\workspaces.toml
-```
-
-The low-level `inbox resolve`, `plan accept`, and `review attach` commands remain
-available for repair and compatibility, but they are independent writes. For normal
-plan-bound acceptance, use `accept-handoff` so all three decisions commit or roll back
-together. Parent-thread filtering keeps a resumed root task from loading unrelated
-subagent results that happen to share the same repository. Normal acceptance requires a
-valid, review-ready `verification.json`; missing, malformed, or status-mismatched
-verification remains visible but cannot be accepted as verified work.
+The checkpoint is the boundary between worker output and root review. ACP verifies the
+checkpoint and review-inbox record, but never pushes, merges, or accepts a patch. The root
+reviewer inspects the diff and verification before acceptance.
 
 ## Plan Supervisor Workflow
 
-The plan supervisor has both a durable one-shot dispatcher and a foreground autonomous
-runner. It is intentionally not a permanently installed background daemon. Each
-`dispatch` pass atomically claims up to `--max-jobs` ready tasks, materializes their
-private briefs, and starts jobs through the existing policy/slot runner. Concurrent
-dispatchers cannot claim the same task. A dispatch or worker failure is durable and is
-never retried automatically; the root must request `retry` explicitly.
-
-Create a whole plan in one call from a JSON manifest:
-
-```json
-{
-  "plan_id": "main-to-dev-transfer",
-  "title": "Restore main to dev parity",
-  "objective": "Transfer and verify the remaining product behavior",
-  "tasks": [
-    {
-      "task_id": "schema",
-      "title": "Transfer schema",
-      "execution": {
-        "route": "app",
-        "slot": "app-1",
-        "backend": "codex",
-        "workspace_access": "native",
-        "codex_quality_tier": "mechanical",
-        "brief": "Transfer only the bounded schema behavior and run focused checks."
-      }
-    },
-    {"task_id": "api", "title": "Transfer API", "depends_on": ["schema"]}
-  ]
-}
-```
+A durable plan is the coordination boundary: it stores tasks, dependencies, execution routes,
+attempts, and bounded state projections in SQLite. Dispatch claims ready tasks atomically;
+dependent tasks stay locked until the root records acceptance. Use the foreground supervisor
+for crash-resumable execution:
 
 ```powershell
 agent-control plan create --manifest .\transfer-plan.json --config .\config\workspaces.toml
-agent-control plan summary main-to-dev-transfer --config .\config\workspaces.toml
-agent-control plan dispatch main-to-dev-transfer --max-jobs 2 --config .\config\workspaces.toml
+agent-control plan run transfer --until-review --max-jobs 2 --config .\config\workspaces.toml
+agent-control plan summary transfer --config .\config\workspaces.toml
+agent-control plan watch transfer --since <cursor> --timeout-sec 25 --config .\config\workspaces.toml
 ```
 
-For a large executable plan, run the crash-resumable foreground supervisor instead of
-calling `dispatch` after every state change:
+`plan run --until-review` stops at review boundaries, failures, cancellation, or missing
+execution specs. It never accepts, rejects, retries, pushes, or merges work. Retry and
+acceptance are explicit root decisions; review the diff, checkpoint, result, and verification
+before unlocking dependants. Use bounded cursors and excerpts from plan summaries and watches;
+full logs remain in the run artifacts.
 
-```powershell
-agent-control plan run main-to-dev-transfer `
-  --until-review `
-  --max-jobs 2 `
-  --config .\config\workspaces.toml
-```
+## Safety Boundaries
 
-`plan run --until-review` loops through `dispatch -> watch -> reconcile -> dispatch` and
-stops before any root decision. It also stops safely on a completed plan, a failed or
-cancelled task or plan, a dispatch failure, or a ready task without an execution spec. It never
-accepts, rejects, or retries work. Omit `--timeout-sec` to keep the foreground command
-running until one of those boundaries; pass a timeout when invoking it from a bounded
-automation. Restarting the same command resumes from SQLite without duplicating claims.
-After root review and `plan accept`/`plan retry`, run the command again to continue the
-remaining dependency graph. The equivalent MCP tool is
-`agent_plan_run_until_review`; its default call timeout is 25 seconds and callers may
-pass a larger value or `null`.
+ACP refuses dirty workspaces by default and keeps slot ownership exclusive. Native routes use
+Codex-native tools in the declared workspace; IDE-backed routes remain isolated per slot.
+Dangerous bypass is opt-in. Recovery is fail-closed: stale or unverifiable process identity,
+late edits, missing evidence, and mismatched checkpoint refs leave work quarantined. ACP never
+pushes, merges, or treats worker delivery as acceptance. Keep private configs, prompts, logs,
+SQLite state, and generated worktrees outside versioned public content.
 
-Only tasks with an `execution` object are dispatchable. Tasks without one remain valid
-for manual `start --plan-id --plan-task-id` binding. After a failed attempt, optionally
-replace the private brief and explicitly retry before the next dispatch:
+## Current Alpha Status
 
-```powershell
-agent-control plan retry main-to-dev-transfer schema `
-  --brief-file .\schema-repair.md `
-  --config .\config\workspaces.toml
-agent-control plan dispatch main-to-dev-transfer --max-jobs 1 --config .\config\workspaces.toml
-```
-
-Cancel the whole plan when no further dispatch should occur:
-
-```powershell
-agent-control plan cancel main-to-dev-transfer --config .\config\workspaces.toml
-```
-
-Cancellation first persists `cancelling`, fences every new dispatch, marks unstarted
-tasks cancelled, and requests cooperative cancellation from every unfinished bound job.
-It becomes `cancelled` only after active/finalizing jobs leave their active states. A
-dispatch that raced with cancellation is still bound for audit and immediately receives
-a cancellation request, so it cannot become an untracked worker.
-
-Bind a worker launch directly to a logical task. A retry can use a new job task ID while
-keeping `--plan-task-id` stable:
-
-```powershell
-agent-control start `
-  --task-id schema-repair-r2 `
-  --plan-id main-to-dev-transfer `
-  --plan-task-id schema `
-  --route app `
-  --slot app-1 `
-  --config .\config\workspaces.toml
-```
-
-A successful, fully finalized worker result enters `awaiting_review`; it does not unlock
-dependants until the root agent records acceptance. The Markdown result status terminates
-the worker even if structured verification is missing, so a malformed handoff cannot keep
-a slot alive forever. It still cannot pass normal acceptance:
-
-```powershell
-agent-control accept-handoff main-to-dev-transfer schema `
-  --review-span-id <root-review-span> `
-  --accepted-sha <accepted-commit> `
-  --config .\config\workspaces.toml
-```
-
-`accept-handoff` infers the exact `agent_job:<job-id>` inbox item from the bound plan
-task, validates the durable verification payload, resolves the inbox item, unlocks plan
-dependants, and records a root-verified accepted outcome on the supplied review span in
-one SQLite transaction. If review-span or attempt validation fails, none of those writes
-survive. When `--accepted-sha` is omitted, ACP uses the delivered checkpoint SHA when one
-exists. `plan accept` remains the lower-level dependency-gate-only command.
-
-The first summary returns the current projection and a `cursor`. Pass that cursor back to
-receive only new entries in `changes`; current state remains available through the
-bounded state lists, `completed_tasks`, `item_counts`, and `truncated` metadata. This
-keeps blockers, review requests, running work, completed identities, and ready tasks
-visible without replaying full logs:
-
-```powershell
-agent-control plan summary main-to-dev-transfer `
-  --since <cursor> `
-  --event-limit 100 `
-  --item-limit 20 `
-  --config .\config\workspaces.toml
-```
-
-Use `plan watch` with the returned cursor to let ACP monitor SQLite and return only when
-the plan changes, instead of making the coordinating agent poll every job:
-
-```powershell
-agent-control plan watch main-to-dev-transfer `
-  --since <cursor> `
-  --timeout-sec 25 `
-  --config .\config\workspaces.toml
-```
-
-Full logs and result files remain in their normal run artifacts. Plan snapshots include a
-bounded result excerpt but never embed worker logs, keeping the main-agent context small.
-
-Every writable worker is instructed to create a sibling `verification.json` with this
-versioned shape:
-
-```json
-{
-  "schema_version": 1,
-  "status": "completed",
-  "changed_files": [{"path": "src/app.py", "change": "modified"}],
-  "checks": [{
-    "command": "pytest -q tests/test_app.py",
-    "cwd": ".",
-    "outcome": "passed",
-    "exit_code": 0,
-    "summary": "3 passed"
-  }],
-  "unverified": []
-}
-```
-
-ACP validates the schema and status match, hashes the canonical payload, and compares its
-changed-file claims with the verified checkpoint tree. Worker claims remain explicitly
-untrusted until root review. A completed result with changed files is invalid when its
-check list is empty or contains a failed/non-zero check. Under a native route quality
-contract, `review_ready` additionally requires every matching worker gate and, in
-`controller` mode, controller-executed evidence for the exact checkpoint. The worker's
-machine-readable changed-file set must also match the checkpoint exactly.
-
-## Start A Job
-
-Run a supervised Codex job in a slot:
-
-```powershell
-agent-control start `
-  --config .\config\workspaces.toml `
-  --task-id fix-login-validation `
-  --route app `
-  --slot app-1 `
-  --expected-branch codex/my-task `
-  --wait `
-  --live `
-  --poll-interval-sec 30 `
-  --lines 120
-```
-
-Run the same class of job without AgentBridge/IDEA:
-
-```powershell
-agent-control start `
-  --config .\config\workspaces.toml `
-  --task-id fix-login-validation-native `
-  --route app `
-  --slot app-1 `
-  --expected-branch codex/my-task `
-  --workspace-access native `
-  --wait `
-  --live
-```
-
-Run a read-only review job:
-
-```powershell
-agent-control start `
-  --config .\config\workspaces.toml `
-  --task-id review-auth-flow `
-  --route app `
-  --slot app-1 `
-  --expected-branch codex/review-auth-flow `
-  --read-only `
-  --wait `
-  --live
-```
-
-Override backend or model per job when needed:
-
-```powershell
-agent-control start `
-  --config .\config\workspaces.toml `
-  --task-id agy-canary `
-  --route app `
-  --slot app-1 `
-  --backend agy `
-  --wait `
-  --live
-```
-
-If you enable automatic Antigravity account switching with token refresh, keep OAuth
-client credentials outside the repository and set them in the local environment:
-`AGENT_CONTROL_PLANE_OAUTH_CLIENT_ID`, `AGENT_CONTROL_PLANE_OAUTH_CLIENT_SECRET`, and
-optionally `AGENT_CONTROL_PLANE_OAUTH_CLIENT_KEY`.
-
-## Inspect Jobs
-
-```powershell
-agent-control list --config .\config\workspaces.toml --limit 20
-agent-control status <job-id> --config .\config\workspaces.toml
-agent-control summary <job-id> --config .\config\workspaces.toml --lines 40
-agent-control analytics --config .\config\workspaces.toml --model gpt-5.6-terra --valid-only
-agent-control watch <job-id> --config .\config\workspaces.toml --live --lines 120
-agent-control tail <job-id> --config .\config\workspaces.toml --lines 120
-agent-control result <job-id> --config .\config\workspaces.toml
-agent-control cancel <job-id> --config .\config\workspaces.toml
-```
-
-Codex attempts keep raw `attempt-*.events.jsonl` streams and persist duration, token,
-cache-hit, tool-call, result-status, failure, and estimated credit/API-cost metrics in
-SQLite. `status` and `summary` include the latest attempt; `analytics` aggregates
-comparable model/effort runs.
-
-Root review is accounted separately so agent savings are not overstated. Start from the
-current Codex rollout or import an existing marker, checkpoint phase boundaries, attach
-the acceptance outcome for each job, and finish the span:
-
-```powershell
-agent-control review start --config .\config\workspaces.toml --name transfer --session <rollout.jsonl>
-agent-control review checkpoint <span-id> review --config .\config\workspaces.toml
-agent-control review attach <span-id> <job-id> accepted --root-verified --accepted-sha <sha> --config .\config\workspaces.toml
-agent-control review finish <span-id> --config .\config\workspaces.toml
-agent-control review show <span-id> --config .\config\workspaces.toml
-```
-
-The report uses `uncached input + output` as comparable tokens and publishes
-`review_tax = root comparable / accepted agent comparable`. Codex attempts also have
-hard tool-call budgets per quality tier (45 mechanical, 80 balanced, 120 deep by
-default); `start --codex-tool-call-budget` is the explicit override. In `ide_mcp`,
-terminal MCP calls must use the exact task ID as their tab name. In `native`, started
-command and file-change events count toward the same budget without an IDE tab.
-
-Archive old terminal runs:
-
-```powershell
-agent-control archive --older-than-days 14 --limit 50 --config .\config\workspaces.toml
-agent-control archive --older-than-days 14 --limit 50 --apply --config .\config\workspaces.toml
-```
-
-Plan data has a separate explicit lifecycle. Only a completed or cancelled plan with no
-active tasks or pending inbox items can be archived. Archived plans are hidden from the
-default list but remain inspectable until retention expires:
-
-```powershell
-agent-control plan archive main-to-dev-transfer --config .\config\workspaces.toml
-agent-control plan list --include-archived --config .\config\workspaces.toml
-```
-
-Retention is a dry-run unless `--apply` is supplied:
-
-```powershell
-agent-control gc --older-than-days 30 --limit 500 --config .\config\workspaces.toml
-agent-control gc --older-than-days 30 --limit 500 --apply --config .\config\workspaces.toml
-```
-
-GC removes expired archived plans and their plan events, events belonging to archived
-jobs, full payloads for resolved inbox items, old quarantined orphan events, and verified
-checkpoint refs. Pending inbox items and unarchived jobs are never eligible. A controller
-ref is deleted only inside `refs/agent-control-plane/jobs/` and only when its current SHA
-exactly matches the durable inbox SHA; mismatches are reported and preserved. Compact
-inbox metadata, job/attempt metrics, and root-review outcomes remain as audit evidence.
-
-Runtime ownership is split along these boundaries: `JobLauncher` owns launch validation
-and worker creation, `FinalizationService` owns terminal delivery and slot release,
-`PlanDispatcher` owns durable claims, and `ArchiveService`/`RetentionService` own storage
-lifecycle. `AgentControlPlane` remains the API facade instead of containing those
-implementations inline.
-
-## Codex MCP Server
-
-Install with the `mcp` extra and copy `docs/codex-mcp.example.toml` into your Codex
-`config.toml`, replacing the placeholder paths with your clone path. Use the clone's
-absolute `.venv\Scripts\python.exe`, keep the MCP tool timeout longer than the watch
-window, and restart Codex after changing the MCP block.
-
-The MCP server exposes tools such as:
-
-- `agent_start_job`
-- `agent_watch_job`
-- `agent_status_job`
-- `agent_summary_job`
-- `agent_analytics`
-- `agent_plan_create`
-- `agent_plan_add_task`
-- `agent_plan_bind_job`
-- `agent_plan_snapshot`
-- `agent_plan_watch`
-- `agent_plan_accept_task`
-- `agent_plan_reject_task`
-- `agent_plan_dispatch`
-- `agent_plan_run_until_review`
-- `agent_plan_retry_task`
-- `agent_plan_cancel`
-- `agent_plan_archive`
-- `agent_plan_list`
-- `agent_retention_gc`
-- `agent_review_inbox_list`
-- `agent_review_inbox_get`
-- `agent_review_inbox_resolve`
-- `agent_accept_handoff`
-- `agent_sync_subagent_results`
-- `agent_tail_job`
-- `agent_result_job`
-- `agent_cancel_job`
-- `agent_archive_jobs`
-- `agent_smoke`
-- `agent_reconcile`
-- `agent_slots_sync`
-- `agent_slots_list`
-- `agent_slots_bootstrap`
-- `agent_slots_create`
-- `agent_slots_checkout`
-- `agent_slots_checkpoint`
-- `agent_slots_cleanup`
-
-When Codex delegates through this control plane, the handoff should be supervised:
-start with `--wait`, call `watch`, or set up external monitoring before ending the turn.
-Treat `queued` and `running` as in-progress states, not successful completion.
-
-## Safety Model
-
-- `allow_dirty = false` refuses dirty workspaces by default.
-- `--read-only` records a baseline and marks the job as `guardrail_violation` if files
-  change.
-- `yolo = false` keeps `--dangerously-bypass-approvals-and-sandbox` disabled unless a
-  caller passes an explicit `--yolo` override.
-- Slot assignment is exclusive while a slot has an active job.
-- Ordinary slot inspection is read-only; only explicit lifecycle/reconciliation paths may
-  change ownership or make a preserved slot available again.
-- Worker identity, heartbeat, finalization intent, and finalization outcome are durable.
-  A stale PID alone is never trusted as worker ownership.
-- Orphan runner termination is opt-in and requires a matching durable process-instance
-  identity; default reconciliation only quarantines a still-live runner.
-- Failed agent runs are not restarted over dirty workspaces by default.
-- Terminal slot cleanup happens only after a controller ref and inbox record are durable;
-  concurrent late edits or unverifiable refs leave the slot dirty.
-- `runs/`, `.agent-work/`, local SQLite databases, and `config/workspaces.toml` are
-  ignored because they can contain private prompts, logs, paths, and repository state.
-- The example keeps slots and generated worktrees outside this repository; legacy in-repo
-  `.slots/` and `.worktrees/` folders are also ignored if they exist locally.
-
-## Project Status
-
-This is an alpha local-automation tool. Keep configs private, review generated patches
-before merging them, and start with read-only jobs until your route and slot setup is
-proven on your machine.
+ACP is an alpha local-automation tool. The offline demo is the safest first check; production
+use should begin with read-only jobs, explicit branch and slot validation, supervised completion,
+and root review. Treat `queued` and `running` as in-progress states, not success. Before
+upgrading or releasing, consult [Operations](docs/operations.md), [Recovery matrix](docs/recovery-matrix.md),
+[Compatibility](docs/compatibility.md), [Upgrading](docs/upgrading.md), and
+[Releasing](docs/releasing.md). Review release history in [CHANGELOG.md](CHANGELOG.md).

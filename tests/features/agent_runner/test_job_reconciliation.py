@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -187,6 +188,105 @@ def test_reconcile_reuses_checkpoint_after_crash_before_slot_release(tmp_path: P
     assert control.slots.inspect_slot("app-1").status == "available"
 
 
+@pytest.mark.skipif(
+    not supports_verified_process_termination(),
+    reason="OS has no safe exact-process termination primitive",
+)
+def test_reconcile_replays_exact_process_killed_after_checkpoint_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-finalization-kill")
+    (slot / "worker.txt").write_text("checkpoint once\n", encoding="utf-8")
+    control.store.mark_finished(job.job_id, "completed")
+    ready_path = tmp_path / "finalization-ready"
+    release_path = tmp_path / "finalization-release"
+    helper_script = """
+import runpy
+import sys
+import time
+from pathlib import Path
+
+test_path, root, route, slot, job_id, ready_path, release_path = sys.argv[1:]
+namespace = runpy.run_path(test_path)
+config = namespace["_config"](Path(root), Path(route), Path(slot))
+from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
+import agent_control_plane.app.runtime.finalization_service as finalization_service
+
+original_cleanup = finalization_service.clean_checkpointed_workspace
+
+def block_after_durable_handoff(*args, **kwargs):
+    Path(ready_path).write_text("checkpoint and inbox durable", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while not Path(release_path).exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return original_cleanup(*args, **kwargs)
+
+finalization_service.clean_checkpointed_workspace = block_after_durable_handoff
+AgentControlPlane(config).finalization.replay(job_id, allow_inactive=False)
+"""
+    environment = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[3] / "src"
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get("PYTHONPATH", "")
+    finalizer = subprocess.Popen(  # nosec B603
+        [
+            sys.executable,
+            "-c",
+            helper_script,
+            str(Path(__file__).resolve()),
+            str(tmp_path),
+            str(route),
+            str(slot),
+            job.job_id,
+            str(ready_path),
+            str(release_path),
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    identity: ProcessIdentity | None = None
+    try:
+        _wait_for_file(ready_path, finalizer)
+        identity = capture_process_identity(finalizer.pid)
+        assert identity is not None
+        before = control.review_inbox.get(f"agent_job:{job.job_id}")
+        assert before.checkpoint_sha is not None
+        assert before.slot_released is False
+        assert control.slots.inspect_slot("app-1").status == "finalizing"
+
+        terminated = terminate_verified_process(identity)
+        finalizer.wait(timeout=5)
+
+        assert terminated.state is ProcessTerminationState.TERMINATED
+        report = AgentControlPlane(config).reconcile_jobs(job.job_id)
+        after = control.review_inbox.get(f"agent_job:{job.job_id}")
+        with sqlite3.connect(config.database_path) as database:
+            inbox_rows = database.execute(
+                "select count(*) from review_inbox_items where source_kind = ? and source_id = ?",
+                ("agent_job", job.job_id),
+            ).fetchone()[0]
+
+        assert report["errors"] == []
+        assert job.job_id in report["reconciled_terminal_jobs"]
+        assert after.checkpoint_sha == before.checkpoint_sha
+        assert inbox_rows == 1
+        assert after.slot_released is True
+        assert control.slots.inspect_slot("app-1").status == "available"
+    finally:
+        release_path.touch(exist_ok=True)
+        if identity is not None and capture_process_identity(identity.pid) == identity:
+            terminate_verified_process(identity)
+        if finalizer.poll() is None:
+            terminate_spawned_process(finalizer)
+
+
 def test_reconcile_treats_reused_live_pid_without_worker_lease_as_orphan(
     tmp_path: Path,
 ) -> None:
@@ -263,6 +363,60 @@ def test_orphan_runner_requires_explicit_verified_termination(tmp_path: Path) ->
     assert recovered["reconciled_orphaned_jobs"] == [job.job_id]
     assert control.store.get_job(job.job_id).status == "worker_error"
     assert control.slots.inspect_slot("app-1").active_job_id is None
+
+
+@pytest.mark.skipif(
+    not supports_verified_process_termination(),
+    reason="OS has no safe exact-process termination primitive",
+)
+def test_reconcile_does_not_terminate_live_process_with_mismatched_durable_identity(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-live-identity-mismatch")
+    unrelated = subprocess.Popen(  # nosec B603
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    identity: ProcessIdentity | None = None
+    try:
+        identity = capture_process_identity(unrelated.pid)
+        assert identity is not None
+        control.store.assign_worker(
+            job.job_id,
+            "worker-gone",
+            worker_pid=unrelated.pid,
+            heartbeat_at="2000-01-01T00:00:00+00:00",
+        )
+        control.store.update_job(
+            job.job_id,
+            runner_pid=unrelated.pid,
+            runner_process_identity=ProcessIdentity(
+                pid=identity.pid,
+                started_key=identity.started_key + ":mismatch",
+                executable=identity.executable,
+            ).to_json(),
+        )
+
+        report = AgentControlPlane(config).reconcile_jobs(
+            job.job_id,
+            terminate_verified_runners=True,
+        )
+
+        assert report["terminated_orphan_runners"] == []
+        assert job.job_id in report["live_runner_conflicts"]
+        assert capture_process_identity(unrelated.pid) == identity
+        assert control.slots.inspect_slot("app-1").active_job_id == job.job_id
+    finally:
+        if identity is not None and capture_process_identity(identity.pid) == identity:
+            terminate_verified_process(identity)
+        if unrelated.poll() is None:
+            terminate_spawned_process(unrelated)
 
 
 @pytest.mark.skipif(

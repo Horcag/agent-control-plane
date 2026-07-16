@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -70,6 +73,48 @@ def test_cleanup_fails_closed_when_workspace_changed_after_checkpoint(tmp_path: 
     assert workspace_state(repo).dirty
 
 
+def test_cleanup_fails_closed_when_another_process_edits_after_checkpoint(tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("checkpointed\n", encoding="utf-8")
+    checkpoint = create_slot_checkpoint(
+        repo,
+        job_id="cross-process-editor",
+        task_id="recovery-drill",
+        terminal_status="completed",
+        scratch_root=tmp_path / "scratch",
+    )
+    ready_path = tmp_path / "editor-ready"
+    editor = subprocess.Popen(  # nosec B603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "repo = Path(sys.argv[1]); ready = Path(sys.argv[2]); "
+                "(repo / 'tracked.txt').write_text('edited elsewhere\\n', encoding='utf-8'); "
+                "ready.write_text('ready', encoding='utf-8')"
+            ),
+            str(repo),
+            str(ready_path),
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_file(ready_path, editor)
+        editor.wait(timeout=5)
+        with pytest.raises(SlotCheckpointError, match="changed after checkpoint"):
+            clean_checkpointed_workspace(repo, checkpoint, scratch_root=tmp_path / "scratch")
+        assert run_git(repo, "rev-parse", checkpoint.ref_name) == checkpoint.commit_sha
+        assert "tracked.txt" in workspace_state(repo).porcelain
+    finally:
+        if editor.poll() is None:
+            editor.terminate()
+            editor.wait(timeout=5)
+
+
 def test_existing_job_ref_with_different_tree_is_never_overwritten(tmp_path: Path) -> None:
     repo = _committed_repo(tmp_path / "repo")
     (repo / "tracked.txt").write_text("first\n", encoding="utf-8")
@@ -117,3 +162,14 @@ def _committed_repo(path: Path) -> Path:
 
 def _run(path: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        if process.poll() is not None:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"Editor exited before ready: {stderr}")
+        if time.monotonic() >= deadline:
+            raise AssertionError("Editor did not become ready")
+        time.sleep(0.05)

@@ -1,9 +1,22 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 from agent_control_plane.app.runtime.cli import _build_parser, main
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
+from agent_control_plane.app.runtime.plan_cli import read_plan_manifest
+
+
+def test_root_parser_registers_extracted_demo_and_plan_groups() -> None:
+    root_help = " ".join(_build_parser().format_help().split())
+
+    assert "demo" in root_help
+    assert "Run or inspect the self-contained offline pipeline demo" in root_help
+    assert "plan" in root_help
+    assert "Manage durable multi-job supervisor plans" in root_help
 
 
 def test_plan_summary_parser_accepts_cursor_and_limits() -> None:
@@ -27,6 +40,20 @@ def test_plan_summary_parser_accepts_cursor_and_limits() -> None:
     assert args.since == 7
     assert args.event_limit == 25
     assert args.item_limit == 5
+
+
+def test_plan_manifest_parser_is_available_without_the_cli_composition_module(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "plan.json"
+    manifest.write_text('{"plan_id": "transfer", "tasks": []}', encoding="utf-8")
+
+    assert read_plan_manifest(str(manifest)) == {"plan_id": "transfer", "tasks": []}
+
+
+def test_cli_composition_keeps_legacy_entrypoint_imports() -> None:
+    assert callable(_build_parser)
+    assert callable(main)
 
 
 def test_start_parser_can_bind_a_retry_to_a_logical_plan_task() -> None:
@@ -141,6 +168,63 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
     assert add.route == "app"
     assert add.brief_file == "api.md"
     assert add.backend == "codex"
+
+
+def test_cli_restart_requires_explicit_retry_after_failed_dispatch(tmp_path: Path) -> None:
+    config = tmp_path / "workspaces.toml"
+    config.write_text(_config_text(tmp_path), encoding="utf-8")
+    manifest = tmp_path / "plan.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "plan_id": "restart-drill",
+                "title": "Restart drill",
+                "tasks": [
+                    {
+                        "task_id": "dispatch",
+                        "title": "Dispatch",
+                        "execution": {"route": "missing", "brief": "Fail safely"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    created = _run_cli(
+        tmp_path, "plan", "create", "--manifest", str(manifest), "--config", str(config)
+    )
+    first = _run_cli(tmp_path, "plan", "dispatch", "restart-drill", "--config", str(config))
+    second = _run_cli(tmp_path, "plan", "dispatch", "restart-drill", "--config", str(config))
+    retried = _run_cli(
+        tmp_path, "plan", "retry", "restart-drill", "dispatch", "--config", str(config)
+    )
+    third = _run_cli(tmp_path, "plan", "dispatch", "restart-drill", "--config", str(config))
+
+    assert created["plan_id"] == "restart-drill"
+    assert first["claimed"] == 1
+    assert first["failures"][0]["attempt_no"] == 1
+    assert second["claimed"] == 0
+    assert second["failures"] == []
+    assert retried["task"]["state"] == "ready"
+    assert retried["task"]["attempt_no"] == 1
+    assert third["claimed"] == 1
+    assert third["failures"][0]["attempt_no"] == 2
+
+
+def _run_cli(cwd: Path, *arguments: str) -> dict[str, object]:
+    environment = os.environ.copy()
+    source_root = Path(__file__).resolve().parents[3] / "src"
+    environment["PYTHONPATH"] = str(source_root) + os.pathsep + environment.get("PYTHONPATH", "")
+    completed = subprocess.run(
+        [sys.executable, "-m", "agent_control_plane.app.runtime.cli", *arguments],
+        cwd=cwd,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 def test_plan_run_parser_exposes_autonomous_until_review_controls() -> None:

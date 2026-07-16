@@ -56,11 +56,7 @@ from agent_control_plane.features.agent_runner import (
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
 from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
-from agent_control_plane.features.plan_supervision import (
-    PlanDispatcher,
-    PlanRunOptions,
-    PlanSupervisor,
-)
+from agent_control_plane.features.plan_supervision import PlanService
 from agent_control_plane.features.result_handoff import (
     HandoffAcceptanceService,
     NativeQualityGateRunner,
@@ -80,7 +76,6 @@ from agent_control_plane.shared.native_quality import (
     inspect_native_quality_contract,
     resolve_native_quality_contract,
 )
-from agent_control_plane.shared.verification_report import inspect_verification_report
 
 
 class PolicyError(RuntimeError):
@@ -163,6 +158,18 @@ class AgentControlPlane:
             finalizer=self.finalization,
             runner_factory=lambda backend: self._runner_for_backend(backend),
             quota_broker=self._quota_broker,
+        )
+        self.plan_service = PlanService(
+            coordination_root=config.coordination_root,
+            job_store=self.store,
+            plan_store=self.plan_store,
+            review_inbox=self.review_inbox,
+            launch=self._launch_plan_claim,
+            cancel_job=self.cancel_job,
+            accept_handoff=self._accept_plan_handoff,
+            reconcile_jobs=self.reconcile_jobs,
+            process_is_alive=process_is_alive,
+            policy_error=PolicyError,
         )
 
     @property
@@ -340,14 +347,9 @@ class AgentControlPlane:
         objective: str = "",
         tasks: tuple[PlanTaskDefinition, ...] = (),
     ) -> dict[str, Any]:
-        self.store.initialize()
-        self.plan_store.create_plan(
-            plan_id=plan_id,
-            title=title,
-            objective=objective,
-            tasks=tasks,
+        return self.plan_service.create_plan(
+            plan_id=plan_id, title=title, objective=objective, tasks=tasks
         )
-        return self.plan_store.snapshot(plan_id)
 
     def add_plan_task(
         self,
@@ -358,21 +360,16 @@ class AgentControlPlane:
         depends_on: tuple[str, ...] = (),
         execution: PlanExecutionSpec | None = None,
     ) -> dict[str, Any]:
-        self.store.initialize()
-        self.plan_store.add_task(
+        return self.plan_service.add_plan_task(
             plan_id,
-            PlanTaskDefinition(
-                task_id=task_id,
-                title=title,
-                depends_on=depends_on,
-                execution=execution,
-            ),
+            task_id=task_id,
+            title=title,
+            depends_on=depends_on,
+            execution=execution,
         )
-        return self.plan_store.snapshot(plan_id)
 
     def bind_plan_job(self, plan_id: str, task_id: str, job_id: str) -> dict[str, Any]:
-        self.plan_store.bind_job(plan_id, task_id, job_id)
-        return self.plan_store.snapshot(plan_id)
+        return self.plan_service.bind_plan_job(plan_id, task_id, job_id)
 
     def accept_plan_task(
         self,
@@ -381,10 +378,7 @@ class AgentControlPlane:
         *,
         accepted_sha: str | None = None,
     ) -> dict[str, Any]:
-        self._validate_plan_task_acceptance(plan_id, task_id)
-        cursor = self.plan_store.snapshot(plan_id)["cursor"]
-        self.plan_store.accept_task(plan_id, task_id, accepted_sha=accepted_sha)
-        return self.plan_store.snapshot(plan_id, since=cursor)
+        return self.plan_service.accept_plan_task(plan_id, task_id, accepted_sha=accepted_sha)
 
     def accept_handoff(
         self,
@@ -398,13 +392,7 @@ class AgentControlPlane:
         false_positives: int = 0,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        self._validate_plan_task_acceptance(plan_id, task_id)
-        return HandoffAcceptanceService(
-            self.config.database_path,
-            plan_store=self.plan_store,
-            review_inbox=self.review_inbox,
-            review_metrics=self.review_metrics,
-        ).accept(
+        return self.plan_service.accept_handoff(
             plan_id,
             task_id,
             review_span_id=review_span_id,
@@ -415,50 +403,11 @@ class AgentControlPlane:
             notes=notes,
         )
 
-    def _validate_plan_task_acceptance(self, plan_id: str, task_id: str) -> dict[str, Any]:
-        target = self.plan_store.review_target(plan_id, task_id)
-        result_path = target.get("result_path")
-        verification = (
-            inspect_verification_report(
-                Path(result_path),
-                expected_status=target.get("job_status"),
-            )
-            if result_path
-            else None
-        )
-        if verification is None or verification.state != "valid":
-            detail = verification.error if verification is not None else "result path is missing"
-            raise PolicyError(
-                f"Plan task verification is not valid for acceptance: "
-                f"{plan_id}/{task_id}: {verification.state if verification else 'missing'}"
-                + (f" ({detail})" if detail else "")
-            )
-        try:
-            inbox_item = self.review_inbox.get(f"agent_job:{target['job_id']}")
-        except KeyError:
-            inbox_item = None
-        if inbox_item is not None and (
-            inbox_item.verification_state != "valid"
-            or not isinstance(inbox_item.verification_bundle, dict)
-            or inbox_item.verification_bundle.get("review_ready") is not True
-        ):
-            raise PolicyError(
-                f"Plan task handoff is not review-ready for acceptance: {plan_id}/{task_id}"
-            )
-        return target
-
     def reject_plan_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
-        cursor = self.plan_store.snapshot(plan_id)["cursor"]
-        self.plan_store.reject_task(plan_id, task_id)
-        return self.plan_store.snapshot(plan_id, since=cursor)
+        return self.plan_service.reject_plan_task(plan_id, task_id)
 
     def dispatch_plan(self, plan_id: str, *, max_jobs: int = 1) -> dict[str, Any]:
-        return PlanDispatcher(
-            plan_store=self.plan_store,
-            coordination_root=self.config.coordination_root,
-            launch=self._launch_plan_claim,
-            process_is_alive=process_is_alive,
-        ).dispatch(plan_id, max_jobs=max_jobs)
+        return self.plan_service.dispatch_plan(plan_id, max_jobs=max_jobs)
 
     def _launch_plan_claim(self, claim: PlanDispatchClaim) -> JobRecord:
         return self.start_job(
@@ -476,6 +425,14 @@ class AgentControlPlane:
             )
         )
 
+    def _accept_plan_handoff(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
+        return HandoffAcceptanceService(
+            self.config.database_path,
+            plan_store=self.plan_store,
+            review_inbox=self.review_inbox,
+            review_metrics=self.review_metrics,
+        ).accept(plan_id, task_id, **kwargs)
+
     def retry_plan_task(
         self,
         plan_id: str,
@@ -483,34 +440,13 @@ class AgentControlPlane:
         *,
         brief_override: str | None = None,
     ) -> dict[str, Any]:
-        retried = self.plan_store.retry_task(
-            plan_id,
-            task_id,
-            brief_override=brief_override,
-        )
-        return {"task": retried, "snapshot": self.plan_store.snapshot(plan_id)}
+        return self.plan_service.retry_plan_task(plan_id, task_id, brief_override=brief_override)
 
     def cancel_plan(self, plan_id: str) -> dict[str, Any]:
-        cancellation = self.plan_store.request_cancel(plan_id)
-        cancelled_jobs: list[str] = []
-        failures: list[dict[str, str]] = []
-        for job_id in cancellation["active_job_ids"]:
-            try:
-                self.cancel_job(job_id)
-            except (KeyError, ValueError) as exc:
-                failures.append({"job_id": job_id, "error": str(exc)})
-            else:
-                cancelled_jobs.append(job_id)
-        return {
-            **cancellation,
-            "cancelled_jobs": cancelled_jobs,
-            "failures": failures,
-            "snapshot": self.plan_store.snapshot(plan_id),
-        }
+        return self.plan_service.cancel_plan(plan_id)
 
     def archive_plan(self, plan_id: str) -> dict[str, Any]:
-        self.plan_store.archive_plan(plan_id)
-        return self.plan_store.snapshot(plan_id)
+        return self.plan_service.archive_plan(plan_id)
 
     def plan_snapshot(
         self,
@@ -520,11 +456,8 @@ class AgentControlPlane:
         event_limit: int = 100,
         item_limit: int = 20,
     ) -> dict[str, Any]:
-        return self.plan_store.snapshot(
-            plan_id,
-            since=since,
-            event_limit=event_limit,
-            item_limit=item_limit,
+        return self.plan_service.plan_snapshot(
+            plan_id, since=since, event_limit=event_limit, item_limit=item_limit
         )
 
     def watch_plan(
@@ -537,39 +470,14 @@ class AgentControlPlane:
         event_limit: int = 100,
         item_limit: int = 20,
     ) -> dict[str, Any]:
-        if poll_interval_sec < 0:
-            raise ValueError("poll_interval_sec must be non-negative")
-        if timeout_sec is not None and timeout_sec < 0:
-            raise ValueError("timeout_sec must be non-negative")
-        if poll_interval_sec == 0 and timeout_sec is None:
-            raise ValueError("poll_interval_sec=0 requires a timeout_sec")
-
-        started = time.monotonic()
-        while True:
-            snapshot = self.plan_snapshot(
-                plan_id,
-                since=since,
-                event_limit=event_limit,
-                item_limit=item_limit,
-            )
-            elapsed = time.monotonic() - started
-            if snapshot["changes"] or snapshot["status"] in {
-                "completed",
-                "cancelled",
-            }:
-                snapshot["timed_out"] = False
-                snapshot["watch_elapsed_sec"] = round(elapsed, 3)
-                return snapshot
-            if timeout_sec is not None and elapsed >= timeout_sec:
-                snapshot["timed_out"] = True
-                snapshot["watch_elapsed_sec"] = round(elapsed, 3)
-                return snapshot
-            sleep_for = poll_interval_sec
-            if timeout_sec is not None:
-                sleep_for = min(sleep_for, max(0.0, timeout_sec - elapsed))
-            if sleep_for <= 0:
-                continue
-            time.sleep(sleep_for)
+        return self.plan_service.watch_plan(
+            plan_id,
+            since=since,
+            poll_interval_sec=poll_interval_sec,
+            timeout_sec=timeout_sec,
+            event_limit=event_limit,
+            item_limit=item_limit,
+        )
 
     def run_plan_until_review(
         self,
@@ -579,13 +487,11 @@ class AgentControlPlane:
         poll_interval_sec: float = 5.0,
         timeout_sec: float | None = None,
     ) -> dict[str, Any]:
-        return PlanSupervisor(self).run_until_review(
+        return self.plan_service.run_plan_until_review(
             plan_id,
-            PlanRunOptions(
-                max_jobs=max_jobs,
-                poll_interval_sec=poll_interval_sec,
-                timeout_sec=timeout_sec,
-            ),
+            max_jobs=max_jobs,
+            poll_interval_sec=poll_interval_sec,
+            timeout_sec=timeout_sec,
         )
 
     def list_plans(
@@ -594,7 +500,7 @@ class AgentControlPlane:
         *,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return self.plan_store.list_plans(limit, include_archived=include_archived)
+        return self.plan_service.list_plans(limit, include_archived=include_archived)
 
     def start_job(self, options: StartOptions) -> JobRecord:
         try:

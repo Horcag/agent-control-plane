@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +15,13 @@ from agent_control_plane.entities.plan import (
     PlanStore,
     PlanTaskDefinition,
 )
+from agent_control_plane.features.agent_runner import (
+    capture_process_identity,
+    process_is_alive,
+    supports_verified_process_termination,
+    terminate_verified_process,
+)
+from agent_control_plane.features.plan_supervision import PlanDispatcher
 from agent_control_plane.shared.codex_session_usage import TokenUsage
 
 
@@ -365,6 +376,89 @@ def test_ready_task_claim_is_atomic_across_two_plan_store_instances(tmp_path: Pa
     assert first.snapshot("dispatch")["running"][0]["state"] == "dispatching"
 
 
+def test_cross_process_sqlite_lock_serializes_one_durable_dispatch_claim(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+    ready_path = tmp_path / "lock-ready"
+    release_path = tmp_path / "lock-release"
+    lock_script = """
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+db = sqlite3.connect(sys.argv[1])
+db.execute("begin exclusive")
+Path(sys.argv[2]).write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 10
+release = Path(sys.argv[3])
+while not release.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+db.commit()
+db.close()
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    locker = subprocess.Popen(  # nosec B603
+        [sys.executable, "-c", lock_script, str(database), str(ready_path), str(release_path)],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    claim_script = (
+        "import sys; from pathlib import Path; "
+        "from agent_control_plane.entities.plan import PlanStore; "
+        "Path(sys.argv[2]).write_text('started', encoding='utf-8'); "
+        "claims = PlanStore(Path(sys.argv[1])).claim_ready_tasks('dispatch', limit=1); "
+        "Path(sys.argv[3]).write_text(str(len(claims)), encoding='utf-8')"
+    )
+    claimant: subprocess.Popen[str] | None = None
+    try:
+        _wait_for_file(ready_path, locker)
+        claimant = subprocess.Popen(  # nosec B603
+            [
+                sys.executable,
+                "-c",
+                claim_script,
+                str(database),
+                str(tmp_path / "claim-started"),
+                str(tmp_path / "claim-count"),
+            ],
+            cwd=Path(__file__).parents[2],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _wait_for_file(tmp_path / "claim-started", claimant)
+        assert claimant.poll() is None
+        release_path.write_text("release", encoding="utf-8")
+        locker.wait(timeout=10)
+        claimant.wait(timeout=10)
+        assert (tmp_path / "claim-count").read_text(encoding="utf-8") == "1"
+        assert PlanStore(database).claim_ready_tasks("dispatch", limit=1) == []
+    finally:
+        release_path.touch(exist_ok=True)
+        for process in (claimant, locker):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
 def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     jobs = JobStore(database)
@@ -496,6 +590,103 @@ def test_dead_dispatch_owner_is_reconciled_to_explicit_retry_state(tmp_path: Pat
     assert plans.claim_ready_tasks("dispatch") == []
 
 
+@pytest.mark.skipif(
+    not supports_verified_process_termination(),
+    reason="OS has no safe exact-process termination primitive",
+)
+def test_dispatch_reconciles_coordinator_killed_after_claim_before_launch(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(route="dev", brief="Do it"),
+            ),
+        ),
+    )
+    ready_path = tmp_path / "dispatch-ready"
+    release_path = tmp_path / "dispatch-release"
+    helper_script = """
+import sys
+import time
+from pathlib import Path
+
+from agent_control_plane.entities.plan import PlanStore
+from agent_control_plane.features.plan_supervision import PlanDispatcher
+
+database, coordination_root, ready_path, release_path = map(Path, sys.argv[1:])
+
+def launch(_claim):
+    ready_path.write_text("claimed", encoding="utf-8")
+    deadline = time.monotonic() + 30
+    while not release_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    raise RuntimeError("test barrier released")
+
+PlanDispatcher(
+    plan_store=PlanStore(database),
+    coordination_root=coordination_root,
+    launch=launch,
+    process_is_alive=lambda _pid: False,
+).dispatch("dispatch")
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[2] / "src")
+    coordinator = subprocess.Popen(  # nosec B603
+        [
+            sys.executable,
+            "-c",
+            helper_script,
+            str(database),
+            str(tmp_path / ".agent-work"),
+            str(ready_path),
+            str(release_path),
+        ],
+        cwd=Path(__file__).parents[2],
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    identity = None
+    try:
+        _wait_for_file(ready_path, coordinator)
+        identity = capture_process_identity(coordinator.pid)
+        assert identity is not None
+
+        terminated = terminate_verified_process(identity)
+        coordinator.wait(timeout=5)
+
+        assert terminated.pid == coordinator.pid
+        assert terminated.state.value == "terminated"
+        recovered = PlanDispatcher(
+            plan_store=PlanStore(database),
+            coordination_root=tmp_path / ".agent-work",
+            launch=lambda _claim: pytest.fail("recovery must not relaunch an abandoned claim"),
+            process_is_alive=process_is_alive,
+        ).dispatch("dispatch")
+
+        assert recovered["reconciled_dispatches"] == ["task"]
+        assert recovered["claimed"] == 0
+        assert plans.snapshot("dispatch")["blocked"][0]["state"] == "dispatch_failed"
+        assert plans.retry_task("dispatch", "task")["state"] == "ready"
+    finally:
+        release_path.touch(exist_ok=True)
+        if identity is not None and capture_process_identity(identity.pid) == identity:
+            terminate_verified_process(identity)
+        if coordinator.poll() is None:
+            coordinator.terminate()
+            coordinator.wait(timeout=5)
+
+
 def _plan_store(root: Path) -> PlanStore:
     jobs = JobStore(root / "jobs.sqlite3")
     jobs.initialize()
@@ -534,3 +725,14 @@ def _create_job(
         read_only=False,
         backend="codex",
     )
+
+
+def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 10
+    while not path.exists():
+        if process.poll() is not None:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(f"Lock holder exited before ready: {stderr}")
+        if time.monotonic() >= deadline:
+            raise AssertionError("Lock holder did not become ready")
+        time.sleep(0.05)

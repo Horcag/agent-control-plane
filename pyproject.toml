@@ -35,6 +35,12 @@ dev = [
 [project.scripts]
 agent-control = "agent_control_plane.app.runtime.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/Horcag/agent-control-plane"
+Documentation = "https://github.com/Horcag/agent-control-plane/tree/main/docs"
+Issues = "https://github.com/Horcag/agent-control-plane/issues"
+Changelog = "https://github.com/Horcag/agent-control-plane/blob/main/CHANGELOG.md"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = true

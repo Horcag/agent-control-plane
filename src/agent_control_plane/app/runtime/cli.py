@@ -7,16 +7,20 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.app.runtime.cli_commands import add_demo_parser, add_plan_parser
+from agent_control_plane.app.runtime.demo import (
+    OfflineDemoError,
+    accept_demo,
+    run_demo,
+    show_demo,
+)
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
     PolicyError,
     StartOptions,
 )
-from agent_control_plane.app.runtime.review_cli import (
-    add_review_parser,
-    handle_review_command,
-)
-from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
+from agent_control_plane.app.runtime.plan_cli import handle_plan_command
+from agent_control_plane.app.runtime.review_cli import add_review_parser, handle_review_command
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
@@ -25,6 +29,20 @@ from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, Sl
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "demo":
+        try:
+            if args.demo_command == "run":
+                _print_json(run_demo(Path(args.output), no_failure=args.no_failure))
+                return 0
+            if args.demo_command == "show":
+                _print_json(show_demo(Path(args.root)))
+                return 0
+            if args.demo_command == "accept":
+                _print_json(accept_demo(Path(args.root)))
+                return 0
+        except OfflineDemoError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     try:
         control = AgentControlPlane.from_config_path(args.config)
     except (FileNotFoundError, ValueError) as exc:
@@ -44,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "plan":
-            _print_json(_handle_plan_command(control, args))
+            _print_json(handle_plan_command(control, args))
             return 0
         if args.command == "gc":
             _print_json(
@@ -360,6 +378,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    add_demo_parser(subparsers)
+
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")
 
     reconcile = subparsers.add_parser(
@@ -580,138 +600,7 @@ def _build_parser() -> argparse.ArgumentParser:
     accept_handoff.add_argument("--false-positives", type=int, default=0)
     accept_handoff.add_argument("--notes")
 
-    plan = subparsers.add_parser("plan", help="Manage durable multi-job supervisor plans")
-    plan_subparsers = plan.add_subparsers(dest="plan_command", required=True)
-
-    plan_create = plan_subparsers.add_parser(
-        "create",
-        parents=[common],
-        help="Create a plan directly or from a JSON manifest",
-    )
-    plan_create.add_argument("--plan-id")
-    plan_create.add_argument("--title")
-    plan_create.add_argument("--objective", default="")
-    plan_create.add_argument("--manifest", help="JSON plan manifest with tasks and dependencies")
-
-    plan_add = plan_subparsers.add_parser(
-        "add-task",
-        parents=[common],
-        help="Add one logical task to an existing plan",
-    )
-    plan_add.add_argument("plan_id")
-    plan_add.add_argument("--task-id", required=True)
-    plan_add.add_argument("--title", required=True)
-    plan_add.add_argument("--depends-on", action="append", default=[])
-    plan_add.add_argument("--route")
-    plan_add.add_argument("--brief-file")
-    plan_add.add_argument("--slot")
-    plan_add.add_argument("--backend", choices=SUPPORTED_BACKENDS)
-    plan_add.add_argument("--workspace-access", choices=("ide_mcp", "native"))
-    plan_add.add_argument("--read-only", action="store_true")
-    plan_add.add_argument("--codex-quality-tier")
-
-    plan_bind = plan_subparsers.add_parser(
-        "bind",
-        parents=[common],
-        help="Bind an existing job to a logical plan task",
-    )
-    plan_bind.add_argument("plan_id")
-    plan_bind.add_argument("task_id")
-    plan_bind.add_argument("job_id")
-
-    plan_accept = plan_subparsers.add_parser(
-        "accept",
-        parents=[common],
-        help="Record root acceptance and unlock dependent tasks",
-    )
-    plan_accept.add_argument("plan_id")
-    plan_accept.add_argument("task_id")
-    plan_accept.add_argument("--sha")
-
-    plan_reject = plan_subparsers.add_parser(
-        "reject",
-        parents=[common],
-        help="Record root rejection for a plan task",
-    )
-    plan_reject.add_argument("plan_id")
-    plan_reject.add_argument("task_id")
-
-    plan_summary = plan_subparsers.add_parser(
-        "summary",
-        parents=[common],
-        help="Return compact plan state and optionally only changes after a cursor",
-    )
-    plan_summary.add_argument("plan_id")
-    plan_summary.add_argument("--since", type=int)
-    plan_summary.add_argument("--event-limit", type=int, default=100)
-    plan_summary.add_argument("--item-limit", type=int, default=20)
-
-    plan_watch = plan_subparsers.add_parser(
-        "watch",
-        parents=[common],
-        help="Long-poll until the plan cursor advances or the timeout expires",
-    )
-    plan_watch.add_argument("plan_id")
-    plan_watch.add_argument("--since", type=int, required=True)
-    plan_watch.add_argument("--poll-interval-sec", type=float, default=5.0)
-    plan_watch.add_argument("--timeout-sec", type=float, default=25.0)
-    plan_watch.add_argument("--event-limit", type=int, default=100)
-    plan_watch.add_argument("--item-limit", type=int, default=20)
-
-    plan_dispatch = plan_subparsers.add_parser(
-        "dispatch",
-        parents=[common],
-        help="Claim and start dependency-ready executable tasks in one durable pass",
-    )
-    plan_dispatch.add_argument("plan_id")
-    plan_dispatch.add_argument("--max-jobs", type=int, default=1)
-
-    plan_run = plan_subparsers.add_parser(
-        "run",
-        parents=[common],
-        help="Continuously dispatch, watch, and reconcile until root review is required",
-    )
-    plan_run.add_argument("plan_id")
-    plan_run.add_argument(
-        "--until-review",
-        action="store_true",
-        required=True,
-        help="Stop before root acceptance, rejection, or explicit retry decisions",
-    )
-    plan_run.add_argument("--max-jobs", type=int, default=1)
-    plan_run.add_argument("--poll-interval-sec", type=float, default=5.0)
-    plan_run.add_argument(
-        "--timeout-sec",
-        type=float,
-        help="Maximum supervisor runtime; omitted means run until a safe stop boundary",
-    )
-
-    plan_retry = plan_subparsers.add_parser(
-        "retry",
-        parents=[common],
-        help="Explicitly make one failed plan task dispatchable again",
-    )
-    plan_retry.add_argument("plan_id")
-    plan_retry.add_argument("task_id")
-    plan_retry.add_argument("--brief-file")
-
-    plan_cancel = plan_subparsers.add_parser(
-        "cancel",
-        parents=[common],
-        help="Stop future dispatch and request cancellation of unfinished plan jobs",
-    )
-    plan_cancel.add_argument("plan_id")
-
-    plan_archive = plan_subparsers.add_parser(
-        "archive",
-        parents=[common],
-        help="Mark a completed or cancelled, fully reviewed plan as retention-eligible",
-    )
-    plan_archive.add_argument("plan_id")
-
-    plan_list = plan_subparsers.add_parser("list", parents=[common], help="List recent plans")
-    plan_list.add_argument("--limit", type=int, default=20)
-    plan_list.add_argument("--include-archived", action="store_true")
+    add_plan_parser(subparsers, common)
 
     retention_gc = subparsers.add_parser(
         "gc",
@@ -973,170 +862,6 @@ def _compact_multiline(value: str, *, limit: int = 240) -> str:
 
 def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, default=str))
-
-
-def _handle_plan_command(control: AgentControlPlane, args: argparse.Namespace) -> Any:
-    if args.plan_command == "create":
-        manifest = _read_plan_manifest(args.manifest) if args.manifest else {}
-        plan_id = args.plan_id or manifest.get("plan_id")
-        title = args.title or manifest.get("title")
-        objective = args.objective or manifest.get("objective", "")
-        if not plan_id or not title:
-            raise ValueError(
-                "plan create requires --plan-id and --title, or a manifest containing both"
-            )
-        tasks = _plan_task_definitions(manifest.get("tasks", []))
-        return control.create_plan(
-            plan_id=str(plan_id),
-            title=str(title),
-            objective=str(objective),
-            tasks=tasks,
-        )
-    if args.plan_command == "add-task":
-        return control.add_plan_task(
-            args.plan_id,
-            task_id=args.task_id,
-            title=args.title,
-            depends_on=tuple(args.depends_on),
-            execution=_cli_plan_execution_spec(args),
-        )
-    if args.plan_command == "bind":
-        return control.bind_plan_job(args.plan_id, args.task_id, args.job_id)
-    if args.plan_command == "accept":
-        return control.accept_plan_task(args.plan_id, args.task_id, accepted_sha=args.sha)
-    if args.plan_command == "reject":
-        return control.reject_plan_task(args.plan_id, args.task_id)
-    if args.plan_command == "summary":
-        return control.plan_snapshot(
-            args.plan_id,
-            since=args.since,
-            event_limit=args.event_limit,
-            item_limit=args.item_limit,
-        )
-    if args.plan_command == "watch":
-        return control.watch_plan(
-            args.plan_id,
-            since=args.since,
-            poll_interval_sec=args.poll_interval_sec,
-            timeout_sec=args.timeout_sec,
-            event_limit=args.event_limit,
-            item_limit=args.item_limit,
-        )
-    if args.plan_command == "dispatch":
-        return control.dispatch_plan(args.plan_id, max_jobs=args.max_jobs)
-    if args.plan_command == "run":
-        return control.run_plan_until_review(
-            args.plan_id,
-            max_jobs=args.max_jobs,
-            poll_interval_sec=args.poll_interval_sec,
-            timeout_sec=args.timeout_sec,
-        )
-    if args.plan_command == "retry":
-        brief_override = None
-        if args.brief_file:
-            try:
-                brief_override = Path(args.brief_file).read_text(encoding="utf-8")
-            except OSError as exc:
-                raise ValueError(f"Could not read retry brief {args.brief_file}: {exc}") from exc
-        return control.retry_plan_task(
-            args.plan_id,
-            args.task_id,
-            brief_override=brief_override,
-        )
-    if args.plan_command == "cancel":
-        return control.cancel_plan(args.plan_id)
-    if args.plan_command == "archive":
-        return control.archive_plan(args.plan_id)
-    if args.plan_command == "list":
-        return control.list_plans(args.limit, include_archived=args.include_archived)
-    raise ValueError(f"Unknown plan command: {args.plan_command}")
-
-
-def _read_plan_manifest(path: str) -> dict[str, Any]:
-    try:
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Could not read plan manifest {path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("Plan manifest must be a JSON object")
-    return payload
-
-
-def _plan_task_definitions(payload: Any) -> tuple[PlanTaskDefinition, ...]:
-    if not isinstance(payload, list):
-        raise ValueError("Plan manifest tasks must be a JSON array")
-    definitions = []
-    for item in payload:
-        if not isinstance(item, dict):
-            raise ValueError("Each plan task must be a JSON object")
-        depends_on = item.get("depends_on", [])
-        if not isinstance(depends_on, list) or not all(
-            isinstance(value, str) for value in depends_on
-        ):
-            raise ValueError("Plan task depends_on must be an array of task IDs")
-        definitions.append(
-            PlanTaskDefinition(
-                task_id=str(item.get("task_id", "")),
-                title=str(item.get("title", "")),
-                depends_on=tuple(depends_on),
-                execution=_plan_execution_spec(item.get("execution")),
-            )
-        )
-    return tuple(definitions)
-
-
-def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
-    if payload is None:
-        return None
-    if not isinstance(payload, dict):
-        raise ValueError("Plan task execution must be a JSON object")
-    read_only = payload.get("read_only", False)
-    if not isinstance(read_only, bool):
-        raise ValueError("Plan task execution read_only must be a boolean")
-    return PlanExecutionSpec(
-        route=str(payload.get("route", "")),
-        brief=str(payload.get("brief", "")),
-        slot=_optional_manifest_text(payload.get("slot")),
-        backend=_optional_manifest_text(payload.get("backend")),
-        workspace_access=_optional_manifest_text(payload.get("workspace_access")),
-        read_only=read_only,
-        codex_quality_tier=_optional_manifest_text(payload.get("codex_quality_tier")),
-    )
-
-
-def _cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | None:
-    values = (
-        args.route,
-        args.brief_file,
-        args.slot,
-        args.backend,
-        args.workspace_access,
-        args.codex_quality_tier,
-    )
-    if not any(value is not None for value in values) and not args.read_only:
-        return None
-    if not args.route or not args.brief_file:
-        raise ValueError("Executable plan tasks require both --route and --brief-file")
-    try:
-        brief = Path(args.brief_file).read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ValueError(f"Could not read plan brief {args.brief_file}: {exc}") from exc
-    return PlanExecutionSpec(
-        route=args.route,
-        brief=brief,
-        slot=args.slot,
-        backend=args.backend,
-        workspace_access=args.workspace_access,
-        read_only=args.read_only,
-        codex_quality_tier=args.codex_quality_tier,
-    )
-
-
-def _optional_manifest_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
 
 
 def _job_payload(job: Any) -> dict[str, Any]:
