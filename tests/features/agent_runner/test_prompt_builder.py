@@ -476,6 +476,7 @@ class PromptBuilderTest(unittest.TestCase):
                         "main": replace(
                             config.routes["main"],
                             native_quality_policy="controller",
+                            native_quality_max_parallel=2,
                             native_quality_gates=(
                                 NativeQualityGateConfig(
                                     name="affected-tests",
@@ -485,11 +486,19 @@ class PromptBuilderTest(unittest.TestCase):
                                         "--worktree",
                                     ),
                                     include_globs=(),
+                                    run_on="controller",
                                 ),
                                 NativeQualityGateConfig(
                                     name="ruff",
-                                    command=("python", "-m", "ruff", "check", "src"),
+                                    command=(
+                                        "python",
+                                        "-m",
+                                        "ruff",
+                                        "check",
+                                        "{changed_python_files}",
+                                    ),
                                     include_globs=("*.py", "**/*.py"),
+                                    run_on="both",
                                 ),
                             ),
                         )
@@ -507,13 +516,15 @@ class PromptBuilderTest(unittest.TestCase):
                 read_only=False,
             )
             self.assertIn("Native quality policy: controller", controller_prompt)
+            self.assertIn("Worker-required gates", controller_prompt)
+            self.assertIn("{changed_python_files}", controller_prompt)
+            self.assertIn("sorted final changed Python files", controller_prompt)
+            self.assertIn("Applies to: *.py, **/*.py", controller_prompt)
             self.assertIn(
-                "python scripts/run_affected_tests.py --worktree",
+                "Controller-executed gates (maximum 2 in parallel): affected-tests, ruff",
                 controller_prompt,
             )
-            self.assertIn("Applies to: every changed file", controller_prompt)
-            self.assertIn("Applies to: *.py, **/*.py", controller_prompt)
-            self.assertIn("ACP will independently rerun", controller_prompt)
+            self.assertNotIn("[affected-tests] cwd=", controller_prompt)
             self.assertIn("Do not write Status: completed", controller_prompt)
 
             # Assertions for native read-only

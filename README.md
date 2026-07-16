@@ -256,14 +256,15 @@ Native-mode quality is an executable contract, independent of model quality tier
   reruns; baseline verification integrity still rejects a completed change with no
   successful check.
 - `worker` (the default) requires a completed change to contain at least one successful
-  check in `verification.json`. Route-specific gates, when configured, must be reported
-  with the exact command and working directory.
-- `controller` additionally reruns every matching route gate with `shell=False` after
-  creating the terminal checkpoint. Its report is bound to both the contract SHA-256 and
-  checkpoint tree SHA. A missing, failed, timed-out, drifted, or uncovered gate makes the
-  handoff non-review-ready. The checkpoint remains durable and ordinary failures still
-  release a clean slot; if a gate mutates the worktree, cleanup fails closed and the slot
-  is quarantined.
+  check in `verification.json`. Matching gates with `run_on = "worker"` or `"both"` must
+  be reported with the exact expanded command and working directory.
+- `controller` independently runs matching gates with `run_on = "controller"` or
+  `"both"`, using `shell=False` after creating the terminal checkpoint. Controller-only
+  gates are not duplicated by the worker. Its report is bound to both the contract
+  SHA-256 and checkpoint tree SHA. A missing, failed, timed-out, drifted, or uncovered
+  gate makes the handoff non-review-ready. The checkpoint remains durable and ordinary
+  failures still release a clean slot; if a gate mutates the worktree, cleanup fails
+  closed and the slot is quarantined.
 
 Controller mode requires `terminal_slot_policy = "checkpoint"` and an assigned slot.
 Configure gates under the route; an empty `include_globs` applies to every change:
@@ -273,25 +274,34 @@ Configure gates under the route; an empty `include_globs` applies to every chang
 path = "../my-project"
 required_branch = "main"
 native_quality_policy = "controller"
+native_quality_max_parallel = 2
 
 [[routes.app.native_quality_gates]]
-name = "tests"
-command = ["python", "-m", "pytest"]
+name = "affected-tests"
+command = ["python", "scripts/run_affected_tests.py", "--worktree"]
 working_dir = "."
 timeout_sec = 1200
 include_globs = []
+run_on = "controller"
 
 [[routes.app.native_quality_gates]]
-name = "ruff"
-command = ["python", "-m", "ruff", "check", "src", "tests"]
+name = "ruff-changed"
+command = ["python", "-m", "ruff", "check", "{changed_python_files}"]
 working_dir = "."
 timeout_sec = 300
-include_globs = ["*.py", "**/*.py", "pyproject.toml"]
+include_globs = ["*.py", "**/*.py"]
+run_on = "both"
 ```
 
 Commands must already exist in the prepared slot; quality execution never installs
-dependencies. The native prompt requires the fastest relevant scoped check after each
-coherent edit batch and all matching mandatory gates before `Status: completed`.
+dependencies. `native_quality_max_parallel` is bounded to `1..4`; keep it at `1` for
+resource-sensitive projects and use `2` for independent read-only checks. An exact
+`{changed_python_files}` argument expands deterministically to sorted, existing changed
+Python files using workspace-relative paths. Deleted Python files still affect dependency
+tests and full type checks but are not passed to file-based linters. Placeholder gates
+with no remaining Python input are not selected. The native prompt requires the fastest
+relevant scoped check after each coherent edit batch and all matching worker gates before
+`Status: completed`.
 
 Set `agy_model` in `[control.defaults]` or on a route when Antigravity must use an
 explicit model. A job-level `--agy-model` override has highest priority. ACP persists

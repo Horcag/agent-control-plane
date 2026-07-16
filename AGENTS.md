@@ -26,7 +26,10 @@
   without a shell, never install dependencies, bind controller evidence to the immutable
   contract hash and checkpoint tree, and block `review_ready` on missing, failed,
   timed-out, drifted, uncovered, or contradictory evidence. A gate that changes the
-  worktree must fail closed through checkpoint cleanup and quarantine the slot.
+  worktree must fail closed through checkpoint cleanup and quarantine the slot. Preserve
+  the `run_on` boundary: worker-only gates are worker evidence, controller-only gates run
+  once after checkpoint, and `both` is reserved for cheap checks worth independently
+  repeating. Keep placeholder expansion deterministic and controller concurrency bounded.
 - In `ide_mcp` mode, isolate simultaneously loaded checkouts that share Python/TypeScript namespaces: a route with `ide_sdk_name` gets one IDEA module per slot, using the exact installed SDK and no cross-slot module dependencies.
 - In `ide_mcp` mode, use `agentbridge-slots-root` only for routes without a dedicated SDK and without overlapping package namespaces. Configure duplicate analysis as `SAME_MODULE` so useful intra-slot findings remain enabled while branch-clone matches are excluded.
 - In safe native `workspace-write`, treat `.git` as protected: inspect status/diffs but leave commits to the root reviewer unless yolo was explicitly authorized.

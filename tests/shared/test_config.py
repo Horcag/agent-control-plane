@@ -219,17 +219,20 @@ native_quality_policy = "off"
 path = "repo"
 required_branch = "main"
 native_quality_policy = "controller"
+native_quality_max_parallel = 2
 
 [[routes.main.native_quality_gates]]
 name = "affected-tests"
 command = ["python", "scripts/run_affected_tests.py", "--worktree"]
 working_dir = "."
 timeout_sec = 300
+run_on = "controller"
 
 [[routes.main.native_quality_gates]]
 name = "ruff"
-command = ["python", "-m", "ruff", "check", "src", "tests"]
-include_globs = ["*.py", "**/*.py", "pyproject.toml"]
+command = ["python", "-m", "ruff", "check", "{changed_python_files}"]
+include_globs = ["*.py", "**/*.py"]
+run_on = "both"
 """,
                 encoding="utf-8",
             )
@@ -239,16 +242,19 @@ include_globs = ["*.py", "**/*.py", "pyproject.toml"]
             route = config.routes["main"]
             self.assertEqual(config.defaults.native_quality_policy, "off")
             self.assertEqual(route.native_quality_policy, "controller")
+            self.assertEqual(route.native_quality_max_parallel, 2)
             self.assertEqual(
                 [gate.name for gate in route.native_quality_gates],
                 ["affected-tests", "ruff"],
             )
+            self.assertEqual(route.native_quality_gates[0].run_on, "controller")
+            self.assertEqual(route.native_quality_gates[1].run_on, "both")
             self.assertEqual(route.native_quality_gates[0].command[-1], "--worktree")
             self.assertEqual(route.native_quality_gates[0].working_dir, Path("."))
             self.assertEqual(route.native_quality_gates[0].timeout_sec, 300)
             self.assertEqual(
                 route.native_quality_gates[1].include_globs,
-                ("*.py", "**/*.py", "pyproject.toml"),
+                ("*.py", "**/*.py"),
             )
 
     def test_native_quality_contract_rejects_unsafe_or_ambiguous_config(self) -> None:
@@ -326,6 +332,51 @@ name = "format"
 command = ["python", "-m", "ruff", "format", "src"]
 """,
                     "must be a read-only quality check",
+                ),
+                (
+                    "unknown run stage",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "tests"
+command = ["python", "-m", "pytest"]
+run_on = "sometimes"
+""",
+                    "run_on must be worker, controller, or both",
+                ),
+                (
+                    "controller policy without controller gate",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "worker-only"
+command = ["python", "-m", "ruff", "check", "src"]
+run_on = "worker"
+""",
+                    "requires at least one controller quality gate",
+                ),
+                (
+                    "excessive parallelism",
+                    base.replace(
+                        'native_quality_policy = "controller"',
+                        'native_quality_policy = "controller"\nnative_quality_max_parallel = 5',
+                    )
+                    + """
+[[routes.main.native_quality_gates]]
+name = "tests"
+command = ["python", "-m", "pytest"]
+""",
+                    "native_quality_max_parallel must be between 1 and 4",
+                ),
+                (
+                    "unknown command placeholder",
+                    base
+                    + """
+[[routes.main.native_quality_gates]]
+name = "ruff"
+command = ["python", "-m", "ruff", "check", "{changed_files}"]
+""",
+                    "unsupported command placeholder",
                 ),
             )
             for label, payload, message in invalid_cases:

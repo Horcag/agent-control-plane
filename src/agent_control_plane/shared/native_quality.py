@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import posixpath
 import shlex
 import uuid
 from dataclasses import dataclass
@@ -14,24 +15,31 @@ from agent_control_plane.shared.config import (
     NativeQualityGateConfig,
 )
 
-NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION = 1
+NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION = 2
+CHANGED_PYTHON_FILES_PLACEHOLDER = "{changed_python_files}"
 
 
 @dataclass(frozen=True)
 class NativeQualityContract:
     policy: str
     gates: tuple[NativeQualityGateConfig, ...] = ()
+    max_parallel: int = 1
 
     def __post_init__(self) -> None:
         if self.policy not in {"off", "worker", "controller"}:
             raise ValueError("native quality policy must be off, worker, or controller")
-        if self.policy == "controller" and not self.gates:
-            raise ValueError("controller native quality policy requires configured gates")
+        if not 1 <= self.max_parallel <= 4:
+            raise ValueError("native quality max_parallel must be between 1 and 4")
+        if self.policy == "controller" and not any(
+            gate.run_on in {"controller", "both"} for gate in self.gates
+        ):
+            raise ValueError("controller native quality policy requires a controller gate")
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION,
             "policy": self.policy,
+            "max_parallel": self.max_parallel,
             "gates": [
                 {
                     "name": gate.name,
@@ -39,6 +47,7 @@ class NativeQualityContract:
                     "working_dir": gate.working_dir.as_posix(),
                     "timeout_sec": gate.timeout_sec,
                     "include_globs": list(gate.include_globs),
+                    "run_on": gate.run_on,
                 }
                 for gate in self.gates
             ],
@@ -58,22 +67,31 @@ class NativeQualityContract:
     def from_dict(cls, payload: Any) -> NativeQualityContract:
         if not isinstance(payload, dict):
             raise ValueError("native quality contract must be a JSON object")
-        if set(payload) != {"schema_version", "policy", "gates"}:
-            raise ValueError("native quality contract has an unexpected shape")
-        if payload["schema_version"] != NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION:
+        schema_version = payload.get("schema_version")
+        if schema_version not in {1, NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION}:
             raise ValueError("unsupported native quality contract schema")
+        expected_keys = (
+            {"schema_version", "policy", "gates"}
+            if schema_version == 1
+            else {"schema_version", "policy", "max_parallel", "gates"}
+        )
+        if set(payload) != expected_keys:
+            raise ValueError("native quality contract has an unexpected shape")
         gates_raw = payload["gates"]
         if not isinstance(gates_raw, list):
             raise ValueError("native quality contract gates must be an array")
         gates: list[NativeQualityGateConfig] = []
         for item in gates_raw:
-            if not isinstance(item, dict) or set(item) != {
+            expected_gate_keys = {
                 "name",
                 "command",
                 "working_dir",
                 "timeout_sec",
                 "include_globs",
-            }:
+            }
+            if schema_version == NATIVE_QUALITY_CONTRACT_SCHEMA_VERSION:
+                expected_gate_keys.add("run_on")
+            if not isinstance(item, dict) or set(item) != expected_gate_keys:
                 raise ValueError("native quality contract gate has an unexpected shape")
             command = item["command"]
             include_globs = item["include_globs"]
@@ -90,9 +108,14 @@ class NativeQualityContract:
                     working_dir=Path(str(item["working_dir"])),
                     timeout_sec=int(item["timeout_sec"]),
                     include_globs=tuple(include_globs),
+                    run_on=str(item.get("run_on", "both")),
                 )
             )
-        return cls(policy=str(payload["policy"]), gates=tuple(gates))
+        return cls(
+            policy=str(payload["policy"]),
+            gates=tuple(gates),
+            max_parallel=int(payload.get("max_parallel", 1)),
+        )
 
 
 @dataclass(frozen=True)
@@ -124,7 +147,8 @@ def resolve_native_quality_contract(
         else config.defaults.native_quality_policy
     )
     gates = route_config.native_quality_gates if route_config is not None else ()
-    return NativeQualityContract(policy=policy, gates=gates)
+    max_parallel = route_config.native_quality_max_parallel if route_config is not None else 1
+    return NativeQualityContract(policy=policy, gates=gates, max_parallel=max_parallel)
 
 
 def native_quality_contract_path(run_dir: Path) -> Path:
@@ -185,18 +209,78 @@ def inspect_native_quality_contract(
 def selected_native_quality_gates(
     contract: NativeQualityContract,
     changed_files: tuple[str, ...],
+    *,
+    stage: str | None = None,
+    command_files: tuple[str, ...] | None = None,
 ) -> tuple[NativeQualityGateConfig, ...]:
     normalized = tuple(path.replace("\\", "/").removeprefix("./") for path in changed_files)
+    available_python_files = _changed_python_files(
+        changed_files if command_files is None else command_files
+    )
     return tuple(
         gate
-        for gate in contract.gates
-        if not gate.include_globs
-        or any(_matches_any(path, gate.include_globs) for path in normalized)
+        for gate in native_quality_gates_for_stage(contract, stage)
+        if (
+            not gate.include_globs
+            or any(_matches_any(path, gate.include_globs) for path in normalized)
+        )
+        and (CHANGED_PYTHON_FILES_PLACEHOLDER not in gate.command or available_python_files)
     )
 
 
-def format_gate_command(gate: NativeQualityGateConfig) -> str:
-    return shlex.join(gate.command)
+def native_quality_gates_for_stage(
+    contract: NativeQualityContract,
+    stage: str | None,
+) -> tuple[NativeQualityGateConfig, ...]:
+    if stage not in {None, "worker", "controller"}:
+        raise ValueError("native quality stage must be worker or controller")
+    if stage is None:
+        return contract.gates
+    return tuple(gate for gate in contract.gates if gate.run_on in {stage, "both"})
+
+
+def expand_native_quality_command(
+    gate: NativeQualityGateConfig,
+    command_files: tuple[str, ...],
+) -> tuple[str, ...]:
+    if CHANGED_PYTHON_FILES_PLACEHOLDER not in gate.command:
+        return gate.command
+    python_files = _changed_python_files(command_files)
+    if not python_files:
+        raise ValueError(f"quality gate {gate.name} has no changed Python files to expand")
+    expanded: list[str] = []
+    working_dir = gate.working_dir.as_posix()
+    for argument in gate.command:
+        if argument == CHANGED_PYTHON_FILES_PLACEHOLDER:
+            for path in python_files:
+                relative_path = posixpath.relpath(path, start=working_dir)
+                expanded.append(
+                    relative_path if relative_path.startswith("../") else f"./{relative_path}"
+                )
+            continue
+        expanded.append(argument)
+    return tuple(expanded)
+
+
+def format_gate_command(
+    gate: NativeQualityGateConfig,
+    command_files: tuple[str, ...] | None = None,
+) -> str:
+    if command_files is None:
+        return shlex.join(gate.command)
+    return shlex.join(expand_native_quality_command(gate, command_files))
+
+
+def _changed_python_files(command_files: tuple[str, ...]) -> tuple[str, ...]:
+    normalized: set[str] = set()
+    for raw_path in command_files:
+        path = raw_path.replace("\\", "/").removeprefix("./")
+        candidate = PurePosixPath(path)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("native quality command files must stay inside the workspace")
+        if candidate.suffix.lower() == ".py":
+            normalized.add(candidate.as_posix())
+    return tuple(sorted(normalized))
 
 
 def _matches_any(path: str, patterns: tuple[str, ...]) -> bool:

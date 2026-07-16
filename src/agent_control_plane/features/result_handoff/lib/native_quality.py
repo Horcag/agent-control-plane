@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess  # nosec B404
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Protocol
 
 from agent_control_plane.shared.config import NativeQualityGateConfig
 from agent_control_plane.shared.native_quality import (
     NativeQualityContract,
+    expand_native_quality_command,
     format_gate_command,
     selected_native_quality_gates,
 )
@@ -40,10 +43,22 @@ class NativeQualityGateRunner:
         run_dir: Path,
         checkpoint_tree_sha: str,
         changed_files: tuple[str, ...],
+        command_files: tuple[str, ...] | None = None,
         contract: NativeQualityContract,
     ) -> dict[str, Any]:
-        selected = selected_native_quality_gates(contract, changed_files)
-        checks = [self._run_gate(workspace_path, gate) for gate in selected]
+        resolved_command_files = changed_files if command_files is None else command_files
+        selected = selected_native_quality_gates(
+            contract,
+            changed_files,
+            stage="controller",
+            command_files=resolved_command_files,
+        )
+        checks = self._run_selected_gates(
+            workspace_path,
+            selected,
+            resolved_command_files,
+            max_parallel=contract.max_parallel,
+        )
         if not selected:
             status = "failed"
             reason = "no configured quality gate matched the changed files"
@@ -54,26 +69,49 @@ class NativeQualityGateRunner:
             status = "failed"
             reason = "one or more controller quality gates failed"
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": status,
             "reason": reason,
             "checkpoint_tree_sha": checkpoint_tree_sha,
             "contract_sha256": contract.sha256,
             "changed_files": list(changed_files),
+            "command_files": list(resolved_command_files),
+            "max_parallel": contract.max_parallel,
             "checks": checks,
             "claims_trust": "controller_executed",
         }
         _write_report(run_dir / "native-quality.json", report)
         return report
 
+    def _run_selected_gates(
+        self,
+        workspace_path: Path,
+        gates: tuple[NativeQualityGateConfig, ...],
+        command_files: tuple[str, ...],
+        *,
+        max_parallel: int,
+    ) -> list[dict[str, Any]]:
+        if not gates:
+            return []
+        worker_count = min(max_parallel, len(gates))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            return list(
+                executor.map(
+                    lambda gate: self._run_gate(workspace_path, gate, command_files),
+                    gates,
+                )
+            )
+
     def _run_gate(
         self,
         workspace_path: Path,
         gate: NativeQualityGateConfig,
+        command_files: tuple[str, ...],
     ) -> dict[str, Any]:
         workspace = workspace_path.resolve(strict=False)
         cwd = (workspace / gate.working_dir).resolve(strict=False)
         started = time.monotonic()
+        command = expand_native_quality_command(gate, command_files)
         if not is_same_or_child(cwd, workspace):
             return _check_result(
                 gate,
@@ -82,6 +120,7 @@ class NativeQualityGateRunner:
                 exit_code=None,
                 duration_ms=_duration_ms(started),
                 output="quality gate working_dir escaped the task workspace",
+                command=command,
             )
         if not cwd.is_dir():
             return _check_result(
@@ -91,11 +130,12 @@ class NativeQualityGateRunner:
                 exit_code=None,
                 duration_ms=_duration_ms(started),
                 output="quality gate working_dir does not exist",
+                command=command,
             )
         with tempfile.TemporaryFile() as output_file:
             try:
                 completed = subprocess.run(  # nosec B603
-                    list(gate.command),
+                    list(command),
                     cwd=cwd,
                     stdout=output_file,
                     stderr=subprocess.STDOUT,
@@ -111,6 +151,7 @@ class NativeQualityGateRunner:
                     exit_code=None,
                     duration_ms=_duration_ms(started),
                     output=output or f"timed out after {gate.timeout_sec}s",
+                    command=command,
                 )
             except (OSError, ValueError) as exc:
                 return _check_result(
@@ -120,6 +161,7 @@ class NativeQualityGateRunner:
                     exit_code=None,
                     duration_ms=_duration_ms(started),
                     output=str(exc),
+                    command=command,
                 )
             output = _read_output_tail(output_file)
         return _check_result(
@@ -129,6 +171,7 @@ class NativeQualityGateRunner:
             exit_code=completed.returncode,
             duration_ms=_duration_ms(started),
             output=output,
+            command=command,
         )
 
 
@@ -140,11 +183,12 @@ def _check_result(
     exit_code: int | None,
     duration_ms: int,
     output: str,
+    command: tuple[str, ...],
 ) -> dict[str, Any]:
     return {
         "name": gate.name,
-        "command": list(gate.command),
-        "command_display": format_gate_command(gate),
+        "command": list(command),
+        "command_display": shlex.join(command),
         "cwd": str(cwd),
         "outcome": outcome,
         "exit_code": exit_code,
@@ -182,6 +226,7 @@ def inspect_native_quality_report(
     *,
     checkpoint_tree_sha: str,
     changed_files: tuple[str, ...],
+    command_files: tuple[str, ...] | None = None,
     contract: NativeQualityContract,
 ) -> dict[str, Any]:
     path = run_dir / "native-quality.json"
@@ -199,6 +244,7 @@ def inspect_native_quality_report(
             payload,
             checkpoint_tree_sha=checkpoint_tree_sha,
             changed_files=changed_files,
+            command_files=changed_files if command_files is None else command_files,
             contract=contract,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
@@ -223,6 +269,7 @@ def _validate_report(
     *,
     checkpoint_tree_sha: str,
     changed_files: tuple[str, ...],
+    command_files: tuple[str, ...],
     contract: NativeQualityContract,
 ) -> None:
     required = {
@@ -232,12 +279,14 @@ def _validate_report(
         "checkpoint_tree_sha",
         "contract_sha256",
         "changed_files",
+        "command_files",
+        "max_parallel",
         "checks",
         "claims_trust",
     }
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("controller quality report has an unexpected shape")
-    if payload["schema_version"] != 1:
+    if payload["schema_version"] != 2:
         raise ValueError("unsupported controller quality report schema")
     if payload["checkpoint_tree_sha"] != checkpoint_tree_sha:
         raise ValueError("controller quality report belongs to a different checkpoint tree")
@@ -247,12 +296,26 @@ def _validate_report(
         raise ValueError(
             "controller quality report changed-files evidence does not match checkpoint"
         )
+    if payload["command_files"] != list(command_files):
+        raise ValueError("controller quality report command files do not match checkpoint")
+    reported_parallelism = payload["max_parallel"]
+    if (
+        isinstance(reported_parallelism, bool)
+        or not isinstance(reported_parallelism, int)
+        or reported_parallelism != contract.max_parallel
+    ):
+        raise ValueError("controller quality report parallelism differs from its contract")
     if payload["claims_trust"] != "controller_executed":
         raise ValueError("controller quality report has an invalid trust marker")
     checks = payload["checks"]
     if not isinstance(checks, list) or not all(isinstance(check, dict) for check in checks):
         raise ValueError("controller quality report checks must be an array of objects")
-    selected = selected_native_quality_gates(contract, changed_files)
+    selected = selected_native_quality_gates(
+        contract,
+        changed_files,
+        stage="controller",
+        command_files=command_files,
+    )
     if [check.get("name") for check in checks] != [gate.name for gate in selected]:
         raise ValueError("controller quality report does not contain the selected gates")
     for check, gate in zip(checks, selected, strict=True):
@@ -268,9 +331,10 @@ def _validate_report(
         }
         if set(check) != required_check_keys:
             raise ValueError(f"controller quality report check shape is invalid for {gate.name}")
-        if check.get("command") != list(gate.command):
+        expected_command = expand_native_quality_command(gate, command_files)
+        if check.get("command") != list(expected_command):
             raise ValueError(f"controller quality report command drifted for gate {gate.name}")
-        if check.get("command_display") != format_gate_command(gate):
+        if check.get("command_display") != format_gate_command(gate, command_files):
             raise ValueError(f"controller quality display command drifted for gate {gate.name}")
         if not isinstance(check.get("cwd"), str) or not check["cwd"].strip():
             raise ValueError(f"controller quality report cwd is invalid for gate {gate.name}")

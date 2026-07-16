@@ -151,6 +151,175 @@ def test_native_controller_quality_is_rerun_and_bound_to_checkpoint(tmp_path: Pa
     assert workspace_state(slot).porcelain == ""
 
 
+def test_controller_only_gate_is_not_duplicated_by_worker(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    controller_command = (sys.executable, "-c", "print('controller-ok')")
+    worker_command = f"{shlex.quote(sys.executable)} -c \"print('worker-fast-check')\""
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(
+                name="controller",
+                command=controller_command,
+                run_on="controller",
+            ),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-controller-only-quality",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=worker_command)
+    (slot / "worker.txt").write_text("quality checked once by controller\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is True
+    assert bundle["worker_quality"]["required_gates"] == []
+    assert bundle["worker_quality"]["status"] == "passed"
+    assert [check["name"] for check in bundle["controller_quality"]["payload"]["checks"]] == [
+        "controller"
+    ]
+
+
+def test_shared_gate_uses_expanded_changed_python_files_for_both_stages(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command_template = (
+        sys.executable,
+        "-c",
+        "import sys; raise SystemExit(0 if sys.argv[1:] == ['./worker.py'] else 7)",
+        "{changed_python_files}",
+    )
+    expanded_command = (*command_template[:-1], "./worker.py")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(
+                name="python-files",
+                command=command_template,
+                include_globs=("*.py", "**/*.py"),
+                run_on="both",
+            ),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-shared-quality",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(
+        job.result_path,
+        command=shlex.join(expanded_command),
+        changed_file="worker.py",
+    )
+    (slot / "worker.py").write_text("print('quality checked')\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is True
+    assert bundle["worker_quality"]["required_gates"] == ["python-files"]
+    assert bundle["controller_quality"]["payload"]["checks"][0]["command"] == list(expanded_command)
+
+
+def test_deleted_python_file_skips_file_placeholder_but_keeps_controller_coverage(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    (slot / "legacy.py").write_text("print('legacy')\n", encoding="utf-8")
+    _git(slot, "add", "legacy.py")
+    _git(
+        slot,
+        "-c",
+        "user.name=ACP Test",
+        "-c",
+        "user.email=acp-test@example.invalid",
+        "commit",
+        "-m",
+        "add legacy file",
+    )
+    controller_command = (sys.executable, "-c", "print('deletion-covered')")
+    placeholder_command = (
+        sys.executable,
+        "-c",
+        "raise SystemExit(9)",
+        "{changed_python_files}",
+    )
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(
+                name="affected-tests",
+                command=controller_command,
+                run_on="controller",
+            ),
+            NativeQualityGateConfig(
+                name="ruff-changed",
+                command=placeholder_command,
+                include_globs=("*.py", "**/*.py"),
+                run_on="both",
+            ),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-python-deletion",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(
+        job.result_path,
+        command=f"{shlex.quote(sys.executable)} -c \"print('worker-deletion-check')\"",
+        changed_file="legacy.py",
+    )
+    (slot / "legacy.py").unlink()
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is True
+    assert bundle["worker_quality"]["required_gates"] == []
+    report = bundle["controller_quality"]["payload"]
+    assert report["command_files"] == []
+    assert [check["name"] for check in report["checks"]] == ["affected-tests"]
+
+
 def test_native_controller_failure_blocks_acceptance_but_releases_clean_slot(
     tmp_path: Path,
 ) -> None:
@@ -764,12 +933,17 @@ def _config(
     )
 
 
-def _write_completed_result(result_path: Path, *, command: str) -> None:
+def _write_completed_result(
+    result_path: Path,
+    *,
+    command: str,
+    changed_file: str = "worker.txt",
+) -> None:
     result_path.write_text(
-        """Status: completed
+        f"""Status: completed
 
 Changed files:
-- worker.txt
+- {changed_file}
 
 What changed:
 - Added a worker result.
@@ -787,7 +961,7 @@ Not verified / remaining risks:
             {
                 "schema_version": 1,
                 "status": "completed",
-                "changed_files": [{"path": "worker.txt", "change": "added"}],
+                "changed_files": [{"path": changed_file, "change": "added"}],
                 "checks": [
                     {
                         "command": command,

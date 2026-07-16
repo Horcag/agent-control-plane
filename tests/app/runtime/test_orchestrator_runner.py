@@ -137,10 +137,12 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             route = replace(
                 base.routes["main"],
                 native_quality_policy="controller",
+                native_quality_max_parallel=2,
                 native_quality_gates=(
                     NativeQualityGateConfig(
                         name="tests",
                         command=("python", "-m", "pytest"),
+                        run_on="controller",
                     ),
                 ),
             )
@@ -176,8 +178,13 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             contract = job.run_dir / "native-quality-contract.json"
             self.assertTrue(contract.is_file())
-            self.assertIn('"policy": "controller"', contract.read_text(encoding="utf-8"))
-            self.assertIn("python -m pytest", job.prompt_path.read_text(encoding="utf-8"))
+            contract_text = contract.read_text(encoding="utf-8")
+            self.assertIn('"policy": "controller"', contract_text)
+            self.assertIn('"max_parallel": 2', contract_text)
+            self.assertIn('"run_on": "controller"', contract_text)
+            prompt_text = job.prompt_path.read_text(encoding="utf-8")
+            self.assertIn("Controller-executed gates (maximum 2 in parallel): tests", prompt_text)
+            self.assertNotIn("python -m pytest", prompt_text)
 
     def test_native_slot_skips_only_ide_module_provisioning(self) -> None:
         for workspace_access, expected_ide_calls in (("native", 0), ("ide_mcp", 1)):

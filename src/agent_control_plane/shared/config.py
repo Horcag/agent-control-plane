@@ -22,6 +22,11 @@ class NativeQualityGateConfig:
     working_dir: Path = Path(".")
     timeout_sec: int = 300
     include_globs: tuple[str, ...] = ()
+    run_on: str = "both"
+
+    def __post_init__(self) -> None:
+        if self.run_on not in {"worker", "controller", "both"}:
+            raise ValueError("run_on must be worker, controller, or both")
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,7 @@ class RouteConfig:
     codex_forbidden_tool_markers: tuple[str, ...] | None = None
     workspace_access: str | None = None
     native_quality_policy: str | None = None
+    native_quality_max_parallel: int = 1
     native_quality_gates: tuple[NativeQualityGateConfig, ...] = ()
     monitor_route_root: bool = True
 
@@ -306,11 +312,21 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         native_quality_policy = _optional_native_quality_policy_value(
             value.get("native_quality_policy")
         )
+        native_quality_max_parallel = _native_quality_max_parallel_value(
+            value.get("native_quality_max_parallel", 1)
+        )
         effective_native_quality_policy = native_quality_policy or defaults.native_quality_policy
         if effective_native_quality_policy == "controller" and not native_quality_gates:
             raise ValueError(
                 f"routes.{name} native_quality_policy='controller' requires at least one "
                 "native_quality_gate"
+            )
+        if effective_native_quality_policy == "controller" and not any(
+            gate.run_on in {"controller", "both"} for gate in native_quality_gates
+        ):
+            raise ValueError(
+                f"routes.{name} native_quality_policy='controller' requires at least one "
+                "controller quality gate"
             )
         routes[name] = RouteConfig(
             name=name,
@@ -341,6 +357,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             ),
             workspace_access=_optional_workspace_access_value(value.get("workspace_access")),
             native_quality_policy=native_quality_policy,
+            native_quality_max_parallel=native_quality_max_parallel,
             native_quality_gates=native_quality_gates,
             monitor_route_root=bool(value.get("monitor_route_root", True)),
         )
@@ -517,6 +534,13 @@ def _optional_native_quality_policy_value(value: Any) -> str | None:
     return _native_quality_policy_value(value)
 
 
+def _native_quality_max_parallel_value(value: Any) -> int:
+    max_parallel = int(value)
+    if not 1 <= max_parallel <= 4:
+        raise ValueError("native_quality_max_parallel must be between 1 and 4")
+    return max_parallel
+
+
 def _native_quality_gates(
     route_name: str,
     value: Any,
@@ -543,6 +567,7 @@ def _native_quality_gates(
             raise ValueError(f"{label}.command entries must be non-empty")
         if not _native_quality_command_is_read_only(command):
             raise ValueError(f"{label}.command must be a read-only quality check")
+        _validate_native_quality_placeholders(command, label)
         working_dir_text = _string_value(item.get("working_dir", ".")).strip() or "."
         working_dir = Path(working_dir_text)
         if (
@@ -565,9 +590,27 @@ def _native_quality_gates(
                 working_dir=working_dir,
                 timeout_sec=_positive_gate_timeout(item.get("timeout_sec", 300), label),
                 include_globs=tuple(pattern.replace("\\", "/") for pattern in include_globs),
+                run_on=_native_quality_run_on_value(item.get("run_on", "both")),
             )
         )
     return tuple(gates)
+
+
+def _native_quality_run_on_value(value: Any) -> str:
+    run_on = _string_value(value).strip().lower()
+    if run_on not in {"worker", "controller", "both"}:
+        raise ValueError("run_on must be worker, controller, or both")
+    return run_on
+
+
+def _validate_native_quality_placeholders(command: tuple[str, ...], label: str) -> None:
+    placeholder = "{changed_python_files}"
+    placeholder_count = command.count(placeholder)
+    if placeholder_count > 1:
+        raise ValueError(f"{label}.command may contain {placeholder} only once")
+    for argument in command:
+        if argument.startswith("{") and argument.endswith("}") and argument != placeholder:
+            raise ValueError(f"{label}.command contains an unsupported command placeholder")
 
 
 def _positive_gate_timeout(value: Any, label: str) -> int:

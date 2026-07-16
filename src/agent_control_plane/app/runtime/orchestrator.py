@@ -275,6 +275,7 @@ class AgentControlPlane:
                     "native_quality_policy": (
                         route.native_quality_policy or self.config.defaults.native_quality_policy
                     ),
+                    "native_quality_max_parallel": route.native_quality_max_parallel,
                     "native_quality_gates": [
                         {
                             "name": gate.name,
@@ -282,6 +283,7 @@ class AgentControlPlane:
                             "working_dir": gate.working_dir.as_posix(),
                             "timeout_sec": gate.timeout_sec,
                             "include_globs": list(gate.include_globs),
+                            "run_on": gate.run_on,
                         }
                         for gate in route.native_quality_gates
                     ],
@@ -875,6 +877,13 @@ class AgentControlPlane:
         return {
             "policy": expected.policy,
             "gates": [gate.name for gate in expected.gates],
+            "worker_gates": [
+                gate.name for gate in expected.gates if gate.run_on in {"worker", "both"}
+            ],
+            "controller_gates": [
+                gate.name for gate in expected.gates if gate.run_on in {"controller", "both"}
+            ],
+            "max_parallel": expected.max_parallel,
             "expected_sha256": expected.sha256,
             "persisted_sha256": inspection.persisted_sha256,
             "contract_state": inspection.state,

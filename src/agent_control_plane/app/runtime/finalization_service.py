@@ -351,9 +351,12 @@ class FinalizationService:
                 and contract.policy == "controller"
                 and contract_error is None
             ):
-                changed_files = tuple(
+                checkpoint_changes = checkpoint_changed_files(job.workspace_path, checkpoint)
+                changed_files = tuple(change["path"] for change in checkpoint_changes)
+                command_files = tuple(
                     change["path"]
-                    for change in checkpoint_changed_files(job.workspace_path, checkpoint)
+                    for change in checkpoint_changes
+                    if not change["status"].startswith("D")
                 )
                 if changed_files:
                     self.native_quality_runner.run(
@@ -361,6 +364,7 @@ class FinalizationService:
                         run_dir=job.run_dir,
                         checkpoint_tree_sha=checkpoint.tree_sha,
                         changed_files=changed_files,
+                        command_files=command_files,
                         contract=contract,
                     )
             self._upsert_job_review(

@@ -145,6 +145,11 @@ def build_verification_bundle(
     changed_paths = tuple(change["path"] for change in actual_changes)
     if not changed_paths:
         changed_paths = tuple(sorted(worker_changes or claimed))
+    command_paths = (
+        tuple(change["path"] for change in actual_changes if not change["status"].startswith("D"))
+        if actual_changes
+        else changed_paths
+    )
     has_changes = workspace_changed if workspace_changed is not None else bool(changed_paths)
     effective_status = source_status or result["status"]
     quality_required = bool(
@@ -154,6 +159,7 @@ def build_verification_bundle(
         worker_verification,
         workspace_path=workspace_path,
         changed_paths=changed_paths,
+        command_paths=command_paths,
         checkpoint_paths=(
             tuple(change["path"] for change in actual_changes) if actual_changes else None
         ),
@@ -166,6 +172,7 @@ def build_verification_bundle(
             run_dir,
             checkpoint_tree_sha=checkpoint.tree_sha,
             changed_files=changed_paths,
+            command_files=command_paths,
             contract=contract,
         )
     elif controller_required:
@@ -209,6 +216,13 @@ def build_verification_bundle(
             "policy": contract.policy,
             "sha256": contract.sha256,
             "gates": [gate.name for gate in contract.gates],
+            "worker_gates": [
+                gate.name for gate in contract.gates if gate.run_on in {"worker", "both"}
+            ],
+            "controller_gates": [
+                gate.name for gate in contract.gates if gate.run_on in {"controller", "both"}
+            ],
+            "max_parallel": contract.max_parallel,
             "error": quality_contract_error,
         },
         "worker_quality": worker_quality,
@@ -235,6 +249,7 @@ def _assess_worker_quality(
     *,
     workspace_path: Path | None,
     changed_paths: tuple[str, ...],
+    command_paths: tuple[str, ...],
     checkpoint_paths: tuple[str, ...] | None,
     contract: NativeQualityContract,
     required: bool,
@@ -272,7 +287,12 @@ def _assess_worker_quality(
     changed_files_missing = sorted(expected_paths - worker_paths)
     changed_files_unobserved = sorted(worker_paths - expected_paths) if checkpoint_paths else []
     if changed_files_missing or changed_files_unobserved:
-        selected = selected_native_quality_gates(contract, changed_paths)
+        selected = selected_native_quality_gates(
+            contract,
+            changed_paths,
+            stage="worker",
+            command_files=command_paths,
+        )
         return {
             "required": True,
             "status": "failed",
@@ -283,7 +303,13 @@ def _assess_worker_quality(
             "reason": "worker changed-files evidence does not match the checkpoint",
             "claims_trust": "worker_reported",
         }
-    if not contract.gates:
+    selected = selected_native_quality_gates(
+        contract,
+        changed_paths,
+        stage="worker",
+        command_files=command_paths,
+    )
+    if not selected:
         passed = bool(checks) and all(
             check.get("outcome") == "passed" and check.get("exit_code") in {None, 0}
             for check in checks
@@ -298,10 +324,9 @@ def _assess_worker_quality(
             "reason": None if passed else "no successful worker check was reported",
             "claims_trust": "worker_reported",
         }
-    selected = selected_native_quality_gates(contract, changed_paths)
     missing: list[str] = []
     for gate in selected:
-        expected_command = format_gate_command(gate)
+        expected_command = format_gate_command(gate, command_paths)
         if not any(
             _reported_gate_matches(
                 check,
@@ -312,9 +337,7 @@ def _assess_worker_quality(
             for check in checks
         ):
             missing.append(gate.name)
-    if not selected:
-        reason = "no configured quality gate matched the changed files"
-    elif missing:
+    if missing:
         reason = "mandatory worker quality gates are missing from verification.json"
     else:
         reason = None

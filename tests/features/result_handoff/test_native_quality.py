@@ -9,7 +9,11 @@ from agent_control_plane.features.result_handoff import (
     inspect_native_quality_report,
 )
 from agent_control_plane.shared.config import NativeQualityGateConfig
-from agent_control_plane.shared.native_quality import NativeQualityContract
+from agent_control_plane.shared.native_quality import (
+    NativeQualityContract,
+    expand_native_quality_command,
+    selected_native_quality_gates,
+)
 
 
 def test_controller_quality_runs_only_matching_gates_and_persists_evidence(
@@ -27,6 +31,12 @@ def test_controller_quality_runs_only_matching_gates_and_persists_evidence(
                 working_dir=Path("."),
                 timeout_sec=10,
                 include_globs=("*.py", "**/*.py"),
+                run_on="controller",
+            ),
+            NativeQualityGateConfig(
+                name="worker-only",
+                command=(sys.executable, "-c", "raise SystemExit(8)"),
+                run_on="worker",
             ),
             NativeQualityGateConfig(
                 name="frontend",
@@ -53,6 +63,171 @@ def test_controller_quality_runs_only_matching_gates_and_persists_evidence(
     assert report["checks"][0]["outcome"] == "passed"
     assert "python-ok" in report["checks"][0]["output_tail"]
     assert (run_dir / "native-quality.json").is_file()
+
+
+def test_quality_gate_stage_selection_and_python_placeholder_are_deterministic() -> None:
+    worker = NativeQualityGateConfig(
+        name="worker",
+        command=("ruff", "check", "{changed_python_files}"),
+        include_globs=("*.py", "**/*.py"),
+        run_on="worker",
+    )
+    controller = NativeQualityGateConfig(
+        name="controller",
+        command=("python", "-m", "pytest"),
+        run_on="controller",
+    )
+    shared = NativeQualityGateConfig(
+        name="shared",
+        command=("ruff", "format", "--check", "{changed_python_files}"),
+        include_globs=("*.py", "**/*.py"),
+        run_on="both",
+    )
+    contract = NativeQualityContract(
+        policy="controller",
+        max_parallel=2,
+        gates=(worker, controller, shared),
+    )
+    changed_files = ("README.md", "tests\\test_z.py", "src/a.py", "src/a.py")
+
+    worker_gates = selected_native_quality_gates(
+        contract,
+        changed_files,
+        stage="worker",
+    )
+    controller_gates = selected_native_quality_gates(
+        contract,
+        changed_files,
+        stage="controller",
+    )
+
+    assert [gate.name for gate in worker_gates] == ["worker", "shared"]
+    assert [gate.name for gate in controller_gates] == ["controller", "shared"]
+    assert expand_native_quality_command(worker, changed_files) == (
+        "ruff",
+        "check",
+        "./src/a.py",
+        "./tests/test_z.py",
+    )
+
+
+def test_native_quality_contract_v2_round_trips_and_reads_v1_defaults() -> None:
+    contract = NativeQualityContract(
+        policy="controller",
+        max_parallel=2,
+        gates=(
+            NativeQualityGateConfig(
+                name="tests",
+                command=("python", "-m", "pytest"),
+                run_on="controller",
+            ),
+        ),
+    )
+
+    payload = contract.as_dict()
+    restored = NativeQualityContract.from_dict(payload)
+    legacy = NativeQualityContract.from_dict(
+        {
+            "schema_version": 1,
+            "policy": "controller",
+            "gates": [
+                {
+                    "name": "tests",
+                    "command": ["python", "-m", "pytest"],
+                    "working_dir": ".",
+                    "timeout_sec": 300,
+                    "include_globs": [],
+                }
+            ],
+        }
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["max_parallel"] == 2
+    assert payload["gates"][0]["run_on"] == "controller"
+    assert restored == contract
+    assert legacy.max_parallel == 1
+    assert legacy.gates[0].run_on == "both"
+
+
+def test_controller_quality_uses_bounded_parallelism_and_preserves_gate_order(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    barrier_script = (
+        "import sys,time; from pathlib import Path; "
+        "Path(sys.argv[1]).write_text('ready'); end=time.monotonic()+2; "
+        'exec("while not Path(sys.argv[2]).exists() and time.monotonic() < end:\\n'
+        ' time.sleep(0.01)"); '
+        "raise SystemExit(0 if Path(sys.argv[2]).exists() else 9)"
+    )
+    contract = NativeQualityContract(
+        policy="controller",
+        max_parallel=2,
+        gates=(
+            NativeQualityGateConfig(
+                name="first",
+                command=(sys.executable, "-c", barrier_script, "first.ready", "second.ready"),
+                timeout_sec=5,
+                run_on="controller",
+            ),
+            NativeQualityGateConfig(
+                name="second",
+                command=(sys.executable, "-c", barrier_script, "second.ready", "first.ready"),
+                timeout_sec=5,
+                run_on="controller",
+            ),
+        ),
+    )
+
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "parallel",
+        checkpoint_tree_sha="tree-parallel",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+
+    assert report["status"] == "passed"
+    assert report["max_parallel"] == 2
+    assert [check["name"] for check in report["checks"]] == ["first", "second"]
+
+
+def test_controller_quality_expands_only_non_deleted_command_files(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "src" / "kept.py").write_text("print('ok')\n", encoding="utf-8")
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(
+            NativeQualityGateConfig(
+                name="python-files",
+                command=(
+                    sys.executable,
+                    "-c",
+                    "import sys; print(*sys.argv[1:])",
+                    "{changed_python_files}",
+                ),
+                include_globs=("*.py", "**/*.py"),
+                run_on="controller",
+            ),
+        ),
+    )
+
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "expanded",
+        checkpoint_tree_sha="tree-expanded",
+        changed_files=("src/deleted.py", "src/kept.py", "README.md"),
+        command_files=("src/kept.py", "README.md"),
+        contract=contract,
+    )
+
+    assert report["status"] == "passed"
+    assert report["command_files"] == ["src/kept.py", "README.md"]
+    assert report["checks"][0]["command"][-1] == "./src/kept.py"
+    assert "deleted.py" not in report["checks"][0]["command_display"]
 
 
 def test_controller_quality_fails_closed_for_uncovered_or_failed_changes(
@@ -157,3 +332,37 @@ def test_controller_quality_inspection_rejects_contradictory_check_evidence(
 
     assert inspection["state"] == "invalid"
     assert "exit code" in (inspection["error"] or "")
+
+
+def test_controller_quality_inspection_rejects_boolean_parallelism(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    run_dir = tmp_path / "runs" / "tampered-parallelism"
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(
+            NativeQualityGateConfig(
+                name="passing",
+                command=(sys.executable, "-c", "print('ok')"),
+            ),
+        ),
+    )
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=run_dir,
+        checkpoint_tree_sha="tree-parallelism",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+    report["max_parallel"] = True
+    (run_dir / "native-quality.json").write_text(json.dumps(report), encoding="utf-8")
+
+    inspection = inspect_native_quality_report(
+        run_dir,
+        checkpoint_tree_sha="tree-parallelism",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+
+    assert inspection["state"] == "invalid"
+    assert "parallelism" in (inspection["error"] or "")

@@ -7,8 +7,10 @@ from agent_control_plane.features.agent_runner.lib.agy_idea_prompt import build_
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.native_quality import (
+    CHANGED_PYTHON_FILES_PLACEHOLDER,
     NativeQualityContract,
     format_gate_command,
+    native_quality_gates_for_stage,
     resolve_native_quality_contract,
 )
 
@@ -438,12 +440,14 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
         "- During implementation, after each coherent edit batch, run the fastest relevant "
         "scoped linter, type check, or test. Do not postpone all feedback until the end.",
     ]
-    if contract.gates:
+    worker_gates = native_quality_gates_for_stage(contract, "worker")
+    controller_gates = native_quality_gates_for_stage(contract, "controller")
+    if worker_gates:
         lines.append(
-            "- Before completion, run every configured gate whose Applies to patterns match at "
-            "least one changed file:"
+            "- Worker-required gates: before completion, run every gate whose Applies to "
+            "patterns match at least one changed file:"
         )
-        for gate in contract.gates:
+        for gate in worker_gates:
             applies_to = ", ".join(gate.include_globs) or "every changed file"
             lines.append(
                 f"  - [{gate.name}] cwd={gate.working_dir.as_posix()}: "
@@ -451,6 +455,11 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
             )
     else:
         lines.append("- Before completion, run at least one relevant check for the changed files.")
+    if any(CHANGED_PYTHON_FILES_PLACEHOLDER in gate.command for gate in worker_gates):
+        lines.append(
+            f"- Replace {CHANGED_PYTHON_FILES_PLACEHOLDER} with the sorted final changed Python "
+            "files that still exist, using workspace-relative ./ paths."
+        )
     lines.extend(
         (
             "- Record each mandatory command exactly, with its cwd, exit code, and outcome in "
@@ -460,9 +469,15 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
         )
     )
     if contract.policy == "controller":
+        controller_names = ", ".join(gate.name for gate in controller_gates)
         lines.append(
-            "- ACP will independently rerun the matching configured gates against the exact "
-            "checkpoint before the handoff can become review-ready."
+            f"- Controller-executed gates (maximum {contract.max_parallel} in parallel): "
+            f"{controller_names}."
+        )
+        lines.append(
+            "- ACP independently runs those matching controller gates against the exact "
+            "checkpoint before the handoff can become review-ready; worker-only gates are not "
+            "duplicated."
         )
     return "\n".join(lines)
 

@@ -53,12 +53,17 @@ persist their structured final response through Codex last-message recovery.
 Native jobs can add a route-scoped quality contract. `worker` requires successful
 machine-readable worker checks; `controller` also reruns matching configured commands
 after checkpoint creation and binds the evidence to the contract hash and checkpoint
-tree. Controller mode requires a slot plus `terminal_slot_policy = "checkpoint"`.
-Commands run without a shell and must use dependencies already present in the prepared
-slot. Configure `include_globs` to select language-specific checks and keep one universal
-gate for documentation, configuration, and otherwise-unmapped changes. Failed gates
-block `review_ready` without discarding the checkpoint. A gate that mutates the worktree
-causes cleanup to fail closed and quarantines the slot.
+tree. Use `run_on = "worker"`, `"controller"`, or `"both"` to avoid duplicating expensive
+authoritative checks in the worker. Controller mode requires a slot plus
+`terminal_slot_policy = "checkpoint"`. Commands run without a shell and must use
+dependencies already present in the prepared slot. Configure `include_globs` to select
+language-specific checks and keep one universal controller gate for documentation,
+configuration, and otherwise-unmapped changes. `{changed_python_files}` expands to the
+sorted changed Python files that still exist at the checkpoint, while dependency-aware
+tests continue to cover deletions. `native_quality_max_parallel` allows `1..4` concurrent
+read-only controller gates. Failed gates block `review_ready` without discarding the
+checkpoint. A gate that mutates the worktree causes cleanup to fail closed and
+quarantines the slot.
 
 ## Terminal Handoff and Slot Release
 
@@ -85,9 +90,10 @@ for machine validation. The Markdown status remains the terminal signal, so a mi
 malformed bundle cannot strand a slot. ACP records the bundle as `valid`, `missing`, or
 `invalid`, compares changed-file claims with the checkpoint tree, and refuses normal
 acceptance unless the handoff is valid and review-ready. Completed changes require at
-least one passed zero-exit check; configured native gates must be reported exactly, and
-the machine-readable changed-file set must match the checkpoint. Controller mode also
-requires independently executed checkpoint-bound evidence.
+least one passed zero-exit check; matching worker-stage native gates must be reported
+exactly after placeholder expansion, and the machine-readable changed-file set must match
+the checkpoint. Controller mode separately requires independently executed,
+checkpoint-bound controller-stage evidence.
 
 For multi-task work, put execution specs on durable plan tasks. Use the one-shot
 `plan dispatch`/`agent_plan_dispatch` operation for externally scheduled passes, or

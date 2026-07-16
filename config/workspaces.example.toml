@@ -109,18 +109,21 @@ codex_forbidden_tool_markers = []
 # Gate commands run without a shell, must already be installed in the prepared slot,
 # and should be read-only checks. Empty include_globs means every changed file.
 # native_quality_policy = "controller"
+# native_quality_max_parallel = 2
 # [[routes.app.native_quality_gates]]
-# name = "tests"
-# command = ["python", "-m", "pytest"]
+# name = "affected-tests"
+# command = ["python", "scripts/run_affected_tests.py", "--worktree"]
 # working_dir = "."
 # timeout_sec = 1200
 # include_globs = []
+# run_on = "controller"
 # [[routes.app.native_quality_gates]]
-# name = "ruff"
-# command = ["python", "-m", "ruff", "check", "src", "tests"]
+# name = "ruff-changed"
+# command = ["python", "-m", "ruff", "check", "{changed_python_files}"]
 # working_dir = "."
 # timeout_sec = 300
-# include_globs = ["*.py", "**/*.py", "pyproject.toml"]
+# include_globs = ["*.py", "**/*.py"]
+# run_on = "both"
 
 [slots."app-1"]
 route = "app"
