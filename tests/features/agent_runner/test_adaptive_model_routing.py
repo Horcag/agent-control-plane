@@ -566,8 +566,30 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
                 prior_weight=2.0,
             )
 
+    def test_adaptive_settings_reject_an_infeasible_history_window(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"history_window.*minimum_samples_per_candidate \* len\(candidates\).*2 \* 2 = 4",
+        ):
+            RoutingPolicy(
+                name="infeasible",
+                task_class="implementation",
+                tool_call_budget=90,
+                candidates=(
+                    ModelProfile("reliable-model", "medium"),
+                    ModelProfile("economical-model", "medium"),
+                ),
+                adaptive=AdaptiveRoutingSettings(
+                    minimum_samples_per_candidate=2,
+                    history_window=3,
+                    quality_floor=0.8,
+                    prior_quality=0.75,
+                    prior_weight=2.0,
+                ),
+            )
+
     def test_strict_history_metadata_is_filtered_before_history_window(self) -> None:
-        routing = _adaptive_routing(history_window=2)
+        routing = _adaptive_routing(history_window=4)
         version = routing.catalog.version
 
         history = (
@@ -621,10 +643,14 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
         )
 
         self.assertEqual(decision.selection_source, "configured_fallback")
+        self.assertIn("missing root review", decision.excluded_data_reasons)
         economical = next(
             score for score in decision.candidate_scores if score.model == "economical-model"
         )
-        self.assertIn("missing root review", economical.exclusion_reasons)
+        self.assertEqual(economical.sample_count, 0)
+        self.assertIsNone(economical.quality_score)
+        self.assertIsNone(economical.expected_api_usd)
+        self.assertIsNone(economical.expected_duration_sec)
 
     def test_rejection_or_defect_prevents_a_cheap_candidate_from_promotion(self) -> None:
         routing = ModelRoutingPolicy(

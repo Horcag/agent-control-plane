@@ -180,10 +180,12 @@ LUNA-001 or from any external single-run benchmark.
 
 Adaptive routing is fail-closed for each named policy:
 
-- `n=0`, `n=1`, and any under-sampled candidate retain the configured fallback,
-  which is the first candidate in the operator-supplied ladder.
-  - Promotion requires the configured `minimum_samples_per_candidate` repeated comparable
-  accepted runs.
+- Until every candidate has the configured `minimum_samples_per_candidate` repeated
+  comparable observations, routing retains the configured fallback, which is the first
+  candidate in the operator-supplied ladder. The stable fallback reason is
+  `insufficient comparative samples for every candidate`.
+- Promotion requires repeated comparable observations for every candidate; the observations
+  do not need to be successful, but they must be completed, comparable, and root-reviewed.
 - A run is comparable only when route, policy, `task_class` (cohort boundary),
   catalog source/version, automatic selection source, and valid terminal result status
   match exactly. Durable root review (`accepted`/`rejected`/`defects` outcome) must be
@@ -193,9 +195,9 @@ Adaptive routing is fail-closed for each named policy:
   task classes for high-risk routing decisions.
 - `task_class` groups comparable routes; it is a cohort boundary, not proof of identical
   prompt, context, build mode, tooling, or workspace state.
-- Quality evidence requires a completed result plus durable root acceptance/review.
-  Missing review fails closed; partial, blocked, or unreviewed results cannot promote a
-  candidate.
+- Only completed results with durable root acceptance count as quality successes. Missing
+  review fails closed; reviewed failures and rejections remain negative evidence, and root
+  defects invalidate a candidate through the quality guardrails.
 - Unknown price remains `null`. With `allow_missing_price = false`, a candidate with
   missing price is ineligible; only a policy that explicitly allows missing price may
   use it.
@@ -212,8 +214,8 @@ tools, acceptance criteria, and target files fixed. Evaluate:
 7. Estimated Codex credits and API-equivalent cost.
 
 Do not reorder or promote candidates from a single run. Use the configured ladder until
-the policy's repeated, comparable, accepted evidence satisfies every fail-closed rule
-above.
+the policy's repeated, comparable, root-reviewed observations satisfy every fail-closed
+rule above; only successful accepted observations contribute quality successes.
 
 ## Diagnostic anecdotes only (2026-07-10)
 

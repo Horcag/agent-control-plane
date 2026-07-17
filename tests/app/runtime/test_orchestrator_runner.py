@@ -237,7 +237,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIsNotNone(jobs[0].finished_at)
             self.assertIn("routing DB unavailable", jobs[0].last_error or "")
 
-    def test_automatic_codex_history_requires_comparative_samples_before_promotion(self) -> None:
+    def test_automatic_codex_history_can_promote_and_persist_reordered_ladder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -246,6 +246,14 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             history = [
                 _routing_history_mapping(control, "gpt-5.6-luna"),
                 _routing_history_mapping(control, "gpt-5.6-luna"),
+                {
+                    **_routing_history_mapping(control, "gpt-5.6-terra"),
+                    "duration_sec": 2.0,
+                },
+                {
+                    **_routing_history_mapping(control, "gpt-5.6-terra"),
+                    "duration_sec": 2.0,
+                },
             ]
 
             with (
@@ -263,13 +271,13 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             decision = control.store.routing_decision(job.job_id)
             self.assertIsNotNone(decision)
             assert decision is not None
-            self.assertEqual(job.codex_model, "gpt-5.6-terra")
-            self.assertEqual(decision["selection_source"], "configured_fallback")
+            self.assertEqual(job.codex_model, "gpt-5.6-luna")
+            self.assertEqual(decision["selection_source"], "history")
             self.assertEqual(
                 decision["ladder"],
                 [
-                    {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
                     {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+                    {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
                 ],
             )
 
@@ -310,6 +318,52 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 ),
             )
 
+    def test_restart_falls_back_to_stored_first_profile_when_current_policy_contract_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = _adaptive_config(root, workspace)
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "adaptive-contract-restart")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="adaptive-contract-restart",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            expected = (ModelProfile("gpt-5.6-terra", "low"),)
+            changed_policy = replace(config.routing_policies[0], tool_call_budget=92)
+            changed_config = replace(config, routing_policies=(changed_policy,))
+            restarted = AgentControlPlane(changed_config)
+
+            self.assertEqual(
+                restarted.job_execution._model_ladder_for_job(restarted.store.get_job(job.job_id)),
+                expected,
+            )
+
+            missing_policy = replace(
+                config.routing_policies[0],
+                name="replacement-policy",
+            )
+            missing_policy_config = replace(
+                config,
+                defaults=replace(config.defaults, codex_quality_tier="replacement-policy"),
+                routing_policies=(missing_policy,),
+            )
+            restarted_without_policy = AgentControlPlane(missing_policy_config)
+            self.assertEqual(
+                restarted_without_policy.job_execution._model_ladder_for_job(
+                    restarted_without_policy.store.get_job(job.job_id)
+                ),
+                expected,
+            )
+
     def test_persisted_automatic_decision_requires_exact_job_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -334,6 +388,13 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 {"requested_policy": "another-policy"},
                 {"tool_call_budget": (job.codex_tool_call_budget or 0) + 1},
                 {"catalog": {"source": "", "version": decision["catalog"]["version"]}},
+                {
+                    "catalog": {
+                        "source": decision["catalog"]["source"],
+                        "version": "other",
+                    }
+                },
+                {"task_class": "other"},
                 {"selection_source": "history", "configured_fallback": True},
             )
 
@@ -953,6 +1014,47 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 payload["fallback_reason"],
                 "insufficient comparative samples for every candidate",
             )
+
+    def test_explain_and_launcher_share_the_same_strict_history_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "adaptive-parity")
+            malformed = _routing_history_mapping(control, "gpt-5.6-luna")
+            del malformed["metrics_valid"]
+            history = [
+                malformed,
+                _routing_history_mapping(control, "gpt-5.6-luna"),
+                _routing_history_mapping(control, "gpt-5.6-luna"),
+                {
+                    **_routing_history_mapping(control, "gpt-5.6-terra"),
+                    "duration_sec": 2.0,
+                },
+                {
+                    **_routing_history_mapping(control, "gpt-5.6-terra"),
+                    "duration_sec": 2.0,
+                },
+            ]
+
+            with patch.object(control.store, "routing_history", return_value=history):
+                explained = control.model_routing_explain("adaptive-routing", "main")
+                with patch.object(control, "_launch_worker", return_value=123):
+                    job = control.start_job(
+                        StartOptions(
+                            task_id="adaptive-parity",
+                            route="main",
+                            backend=CODEX_BACKEND,
+                        )
+                    )
+
+            persisted = control.store.routing_decision(job.job_id)
+            self.assertIsNotNone(persisted)
+            assert persisted is not None
+            self.assertEqual(explained["selection_source"], persisted["selection_source"])
+            self.assertEqual(explained["chosen_model"], job.codex_model)
+            self.assertEqual(explained["ladder"], persisted["ladder"])
+            self.assertEqual(explained["candidate_scores"][0]["sample_count"], 2)
 
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

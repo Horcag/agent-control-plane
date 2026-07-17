@@ -267,6 +267,12 @@ required_branch = "main"
                     "minimum_samples_per_candidate = 1",
                     "at least two comparable samples are required",
                 ),
+                (
+                    "infeasible adaptive history window",
+                    "history_window = 20",
+                    "history_window = 5",
+                    r"history_window must be at least minimum_samples_per_candidate \* len\(candidates\)",
+                ),
             )
             for label, old, new, message in invalid_cases:
                 with self.subTest(label=label):
