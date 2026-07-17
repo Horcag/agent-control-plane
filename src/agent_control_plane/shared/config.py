@@ -152,17 +152,24 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parents[3] / "config" / "workspaces.toml"
 
 
-def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
+def load_config(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    config_contents: bytes | None = None,
+) -> ControlConfig:
     config_path = Path(path).expanduser() if path else default_config_path()
     config_path = config_path.resolve(strict=False)
-    if not config_path.exists():
+    if config_contents is None and not config_path.exists():
         example_path = config_path.with_name("workspaces.example.toml")
         raise FileNotFoundError(
             f"Config file not found: {config_path}. "
             f"Copy {example_path} to {config_path} and edit it, or pass --config."
         )
-    with config_path.open("rb") as handle:
-        raw = tomllib.load(handle)
+    if config_contents is None:
+        with config_path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    else:
+        raw = tomllib.loads(config_contents.decode("utf-8"))
 
     project_root = config_path.parent.parent.resolve(strict=False)
     control = _table(raw, "control")

@@ -201,8 +201,10 @@ class AgentControlPlane:
     def from_config_path(
         cls,
         config_path: str | os.PathLike[str] | None = None,
+        *,
+        config_contents: bytes | None = None,
     ) -> AgentControlPlane:
-        return cls(load_config(config_path))
+        return cls(load_config(config_path, config_contents=config_contents))
 
     def smoke(self) -> dict[str, Any]:
         self.store.initialize()

@@ -3,6 +3,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib
+import os
+import sys
+import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Any
@@ -15,17 +21,32 @@ from agent_control_plane.app.runtime.orchestrator import (
 from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS, normalize_backend
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
+from agent_control_plane.shared.config import default_config_path
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
+_CONFIG_LOAD_ATTEMPTS = 2
+_CONFIG_LOCK_TIMEOUT_SEC = 2.0
+_CONFIG_LOCK_RETRY_SEC = 0.02
+
+
+class ConfigFreshnessError(RuntimeError):
+    """Raised when config freshness cannot be preserved during an MCP call."""
 
 
 class ConfigFreshControl:
     """Refresh the control plane before each MCP tool invocation when config changes."""
 
     def __init__(self, config_path: str | None) -> None:
-        self._control = AgentControlPlane.from_config_path(config_path)
-        self._config_path = self._control.config.config_path.resolve(strict=False)
-        self._loaded_fingerprint = _config_fingerprint(self._config_path)
+        requested_path = Path(config_path).expanduser() if config_path else default_config_path()
+        self._config_path = requested_path.resolve(strict=False)
+        self._control, self._loaded_fingerprint = self._load_stable_control()
         self._config_reloaded = False
         self._lock = RLock()
+        self._attach_configured_slots_sync_guard(self._control, self._loaded_fingerprint)
 
     def smoke(self) -> dict[str, Any]:
         control = self._fresh_control()
@@ -52,15 +73,110 @@ class ConfigFreshControl:
             current_fingerprint = _config_fingerprint(self._config_path)
             if current_fingerprint == self._loaded_fingerprint:
                 return self._control
-            refreshed = AgentControlPlane.from_config_path(str(self._config_path))
-            self._control = refreshed
-            self._loaded_fingerprint = current_fingerprint
+            self._control, self._loaded_fingerprint = self._load_stable_control()
+            self._attach_configured_slots_sync_guard(self._control, self._loaded_fingerprint)
             self._config_reloaded = True
-            return refreshed
+            return self._control
+
+    def _load_stable_control(self) -> tuple[AgentControlPlane, str]:
+        for _ in range(_CONFIG_LOAD_ATTEMPTS):
+            config_contents = self._config_path.read_bytes()
+            fingerprint = _fingerprint_contents(config_contents)
+            try:
+                control = AgentControlPlane.from_config_path(
+                    str(self._config_path),
+                    config_contents=config_contents,
+                )
+            except Exception:
+                if _config_fingerprint(self._config_path) == fingerprint:
+                    raise
+                continue
+            if _config_fingerprint(self._config_path) == fingerprint:
+                return control, fingerprint
+        raise ConfigFreshnessError(
+            "configuration changed while it was being loaded; retry the MCP call"
+        )
+
+    def _attach_configured_slots_sync_guard(
+        self,
+        control: AgentControlPlane,
+        expected_fingerprint: str,
+    ) -> None:
+        control.slots.set_configured_slots_sync_guard(
+            lambda: _configured_slots_sync_guard(self._config_path, expected_fingerprint)
+        )
 
 
 def _config_fingerprint(config_path: Path) -> str:
-    return hashlib.sha256(config_path.read_bytes()).hexdigest()
+    return _fingerprint_contents(config_path.read_bytes())
+
+
+def _fingerprint_contents(config_contents: bytes) -> str:
+    return hashlib.sha256(config_contents).hexdigest()
+
+
+@contextmanager
+def _configured_slots_sync_guard(
+    config_path: Path,
+    expected_fingerprint: str,
+) -> Iterator[None]:
+    with _interprocess_config_lock(config_path):
+        if _config_fingerprint(config_path) != expected_fingerprint:
+            raise ConfigFreshnessError(
+                "configuration changed before configured slots synchronized; retry the MCP call"
+            )
+        yield
+
+
+@contextmanager
+def _interprocess_config_lock(config_path: Path) -> Iterator[None]:
+    lock_path = _config_lock_path(config_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0)
+        lock_file.write(b"\0")
+        lock_file.truncate(1)
+        lock_file.flush()
+        _acquire_config_lock(lock_file, lock_path)
+        try:
+            yield
+        finally:
+            _release_config_lock(lock_file)
+
+
+def _config_lock_path(config_path: Path) -> Path:
+    canonical_path = os.path.normcase(str(config_path.resolve(strict=False)))
+    fingerprint = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
+    return (
+        Path(tempfile.gettempdir()) / "agent-control-plane" / "config-locks" / f"{fingerprint}.lock"
+    )
+
+
+def _acquire_config_lock(lock_file: Any, lock_path: Path) -> None:
+    deadline = time.monotonic() + _CONFIG_LOCK_TIMEOUT_SEC
+    while True:
+        try:
+            if sys.platform == "win32":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise ConfigFreshnessError(
+                    f"timed out after {_CONFIG_LOCK_TIMEOUT_SEC:.1f}s acquiring "
+                    f"configured-slot config lock: {lock_path}"
+                ) from exc
+            time.sleep(_CONFIG_LOCK_RETRY_SEC)
+
+
+def _release_config_lock(lock_file: Any) -> None:
+    if sys.platform == "win32":
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def build_server(config_path: str | None = None) -> Any:

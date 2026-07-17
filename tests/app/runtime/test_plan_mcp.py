@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import sqlite3
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-from agent_control_plane.app.runtime.mcp_server import ConfigFreshControl, build_server
+from agent_control_plane.app.runtime import mcp_server
+from agent_control_plane.app.runtime.mcp_server import (
+    ConfigFreshControl,
+    ConfigFreshnessError,
+    build_server,
+)
+from agent_control_plane.entities.slot import SlotStore
 
 
 class _FakeFastMCP:
@@ -20,6 +28,30 @@ class _FakeFastMCP:
             return function
 
         return register
+
+
+class _SyncingSlots:
+    def __init__(self, store: SlotStore, path: Path) -> None:
+        self._store = store
+        self._path = path
+        self._sync_guard = nullcontext
+
+    def set_configured_slots_sync_guard(self, guard) -> None:
+        self._sync_guard = guard
+
+    def sync_configured_slots(self) -> None:
+        with self._sync_guard():
+            self._store.register_slot("acp-1", "acp", self._path)
+
+
+class _SyncingControl:
+    def __init__(self, config_path: Path, store: SlotStore, slot_path: Path) -> None:
+        self.config = SimpleNamespace(config_path=config_path)
+        self.slots = _SyncingSlots(store, slot_path)
+
+    def list_slots(self) -> list[dict[str, str]]:
+        self.slots.sync_configured_slots()
+        return [{"path": str(self.slots._path)}]
 
 
 def test_config_provider_reloads_before_a_tool_call_and_reports_fingerprints(tmp_path) -> None:
@@ -46,10 +78,14 @@ def test_config_provider_reloads_before_a_tool_call_and_reports_fingerprints(tmp
         assert provider.list_slots() == [{"path": "slots-new/acp-1"}]
         smoke = provider.smoke()
 
-    assert from_config_path.call_args_list == [
-        ((str(config_path),),),
-        ((str(config_path.resolve()),),),
+    assert [call.args[0] for call in from_config_path.call_args_list] == [
+        str(config_path.resolve()),
+        str(config_path.resolve()),
     ]
+    assert [
+        call.kwargs["config_contents"].replace(b"\r\n", b"\n")
+        for call in from_config_path.call_args_list
+    ] == [b"[control]\nslot_root = 'slots-old'\n", b"[control]\nslot_root = 'slots-new'\n"]
     assert smoke["config_fingerprint_loaded"] == smoke["config_fingerprint_current"]
     assert smoke["reload_required"] is False
     assert smoke["config_reloaded"] is True
@@ -73,6 +109,104 @@ def test_config_provider_does_not_call_stale_control_after_invalid_reload(tmp_pa
             provider.list_slots()
 
     initial.list_slots.assert_not_called()
+
+
+def test_config_provider_stable_load_retries_when_config_changes_during_construction(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "config" / "workspaces.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("slot = 'old'\n", encoding="utf-8")
+    old_control = Mock()
+    old_control.config = SimpleNamespace(config_path=config_path.resolve())
+    old_control.list_slots.return_value = [{"path": "old"}]
+    new_control = Mock()
+    new_control.config = SimpleNamespace(config_path=config_path.resolve())
+    new_control.list_slots.return_value = [{"path": "new"}]
+
+    def load_control(*_args, **_kwargs):
+        if load_control.calls == 0:
+            load_control.calls += 1
+            config_path.write_text("slot = 'new'\n", encoding="utf-8")
+            return old_control
+        return new_control
+
+    load_control.calls = 0
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        side_effect=load_control,
+    ):
+        provider = ConfigFreshControl(str(config_path))
+
+    assert provider.list_slots() == [{"path": "new"}]
+    old_control.list_slots.assert_not_called()
+
+
+def test_config_provider_rejects_old_control_before_it_overwrites_new_sqlite_slot_path(
+    tmp_path,
+) -> None:
+    config_path = tmp_path / "config" / "workspaces.toml"
+    config_path.parent.mkdir()
+    database_path = tmp_path / "runs" / "jobs.sqlite3"
+    old_slot = tmp_path / "slots-old" / "acp-1"
+    new_slot = tmp_path / "slots-new" / "acp-1"
+    config_path.write_text("slot = 'old'\n", encoding="utf-8")
+    store = SlotStore(database_path)
+    old_control = _SyncingControl(config_path.resolve(), store, old_slot)
+    new_control = _SyncingControl(config_path.resolve(), store, new_slot)
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        side_effect=[old_control, new_control],
+    ):
+        old_process = ConfigFreshControl(str(config_path))
+        selected_old_control = old_process._fresh_control()
+        config_path.write_text("slot = 'new'\n", encoding="utf-8")
+
+        new_process = ConfigFreshControl(str(config_path))
+        assert new_process.list_slots() == [{"path": str(new_slot)}]
+        with pytest.raises(ConfigFreshnessError, match="configuration changed"):
+            selected_old_control.list_slots()
+
+    with sqlite3.connect(database_path) as database:
+        stored_path = database.execute("select path from slots where name = 'acp-1'").fetchone()[0]
+    assert stored_path == str(new_slot)
+
+
+def test_config_lock_times_out_after_repeated_contention(monkeypatch, tmp_path) -> None:
+    lock_path = tmp_path / "config.lock"
+    lock_file = Mock()
+    lock_file.fileno.return_value = 42
+    lock_attempt = Mock(side_effect=OSError("lock is busy"))
+    monotonic = Mock(side_effect=[0.0, 1.0, 2.0])
+    sleep = Mock()
+
+    if sys.platform == "win32":
+        monkeypatch.setattr(mcp_server.msvcrt, "locking", lock_attempt)
+    else:
+        monkeypatch.setattr(mcp_server.fcntl, "flock", lock_attempt)
+    monkeypatch.setattr(mcp_server.time, "monotonic", monotonic)
+    monkeypatch.setattr(mcp_server.time, "sleep", sleep)
+
+    with pytest.raises(ConfigFreshnessError) as exc_info:
+        mcp_server._acquire_config_lock(lock_file, lock_path)
+
+    assert "timed out after 2.0s acquiring configured-slot config lock" in str(exc_info.value)
+    assert str(lock_path) in str(exc_info.value)
+    assert lock_attempt.call_count == 2
+    sleep.assert_called_once_with(mcp_server._CONFIG_LOCK_RETRY_SEC)
+
+
+def test_config_lock_file_stays_one_byte_after_repeated_acquisition(tmp_path) -> None:
+    config_path = tmp_path / "config" / "workspaces.toml"
+    lock_path = mcp_server._config_lock_path(config_path)
+
+    with mcp_server._interprocess_config_lock(config_path):
+        pass
+    with mcp_server._interprocess_config_lock(config_path):
+        pass
+
+    assert lock_path.read_bytes() == b"\0"
 
 
 def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -98,16 +100,25 @@ class SlotManager:
     def __init__(self, config: ControlConfig, store: SlotStore) -> None:
         self._config = config
         self._store = store
+        self._configured_slots_sync_guard: Callable[[], AbstractContextManager[None]] = nullcontext
+
+    def set_configured_slots_sync_guard(
+        self,
+        guard: Callable[[], AbstractContextManager[None]],
+    ) -> None:
+        """Set the MCP-owned freshness guard for configured-slot registration."""
+        self._configured_slots_sync_guard = guard
 
     def sync_configured_slots(self) -> list[SlotStatus]:
-        for slot in self._config.slots.values():
-            self._ensure_slot_path_allowed(slot.path)
-            self._store.register_slot(
-                slot.name,
-                slot.route,
-                slot.path,
-                note="configured in workspaces.toml",
-            )
+        with self._configured_slots_sync_guard():
+            for slot in self._config.slots.values():
+                self._ensure_slot_path_allowed(slot.path)
+                self._store.register_slot(
+                    slot.name,
+                    slot.route,
+                    slot.path,
+                    note="configured in workspaces.toml",
+                )
         return self.list_slots(sync=False)
 
     def list_slots(
