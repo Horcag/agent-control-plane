@@ -651,6 +651,16 @@ def _routing_policy_config(raw: Any, *, index: int) -> CodexRoutingPolicyConfig:
     ]
     if len(candidate_keys) != len(set(candidate_keys)):
         raise ValueError(f"{location}.candidates contains duplicate model and effort pairs")
+    adaptive = _adaptive_routing_config(raw.get("adaptive"), location=location)
+    if adaptive is not None:
+        minimum_history_window = adaptive.minimum_samples_per_candidate * len(candidates)
+        if adaptive.history_window < minimum_history_window:
+            raise ValueError(
+                f"{location}.adaptive.history_window must be at least "
+                "minimum_samples_per_candidate * len(candidates) "
+                f"({adaptive.minimum_samples_per_candidate} * {len(candidates)} "
+                f"= {minimum_history_window}); got {adaptive.history_window}"
+            )
     return CodexRoutingPolicyConfig(
         name=_configured_text(raw, "name", location),
         task_class=_configured_text(raw, "task_class", location),
@@ -659,7 +669,7 @@ def _routing_policy_config(raw: Any, *, index: int) -> CodexRoutingPolicyConfig:
             f"{location}.tool_call_budget",
         ),
         candidates=candidates,
-        adaptive=_adaptive_routing_config(raw.get("adaptive"), location=location),
+        adaptive=adaptive,
     )
 
 

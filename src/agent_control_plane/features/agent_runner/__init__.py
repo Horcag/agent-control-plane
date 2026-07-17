@@ -8,10 +8,14 @@ from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReco
 from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     AdaptiveRoutingSettings,
+    CandidateScore,
     ModelProfile,
     ModelRoutingPolicy,
+    RoutingDecision,
     RoutingHistoryRecord,
     RoutingPolicy,
+    parse_routing_history_record,
+    parse_routing_history_records,
 )
 from agent_control_plane.features.agent_runner.lib.process_identity import (
     ProcessIdentity,
@@ -65,6 +69,7 @@ __all__ = [
     "CODEX_SPARK_BACKEND",
     "SUPPORTED_BACKENDS",
     "AdaptiveRoutingSettings",
+    "CandidateScore",
     "AgentRunResult",
     "AgentRunSpec",
     "AgentRunner",
@@ -88,6 +93,7 @@ __all__ = [
     "QuotaDecision",
     "QuotaDomain",
     "ResultState",
+    "RoutingDecision",
     "RoutingHistoryRecord",
     "RoutingPolicy",
     "WorkerLease",
@@ -100,6 +106,8 @@ __all__ = [
     "codex_quota_domain",
     "inspect_result",
     "normalize_backend",
+    "parse_routing_history_record",
+    "parse_routing_history_records",
     "probe_worker_lease",
     "process_is_alive",
     "supports_verified_process_termination",

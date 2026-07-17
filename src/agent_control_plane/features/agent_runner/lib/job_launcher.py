@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import math
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -13,7 +12,7 @@ from agent_control_plane.entities.workspace import StartRequest, WorkspacePolicy
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     ModelRoutingPolicy,
     RoutingDecision,
-    RoutingHistoryRecord,
+    parse_routing_history_records,
 )
 from agent_control_plane.features.agent_runner.lib.prompt_builder import build_task_prompt
 from agent_control_plane.features.agent_runner.lib.runner import (
@@ -256,7 +255,7 @@ class JobLauncher:
                     configured_policy = self.model_routing.policy(codex_policy_name)
                     routing_decision = self.model_routing.decision_for_policy(
                         configured_policy.name,
-                        history=_routing_history_records(self.store.routing_history()),
+                        history=parse_routing_history_records(self.store.routing_history()),
                         route=options.route,
                     )
                     initial_profile = routing_decision.chosen_profile
@@ -456,65 +455,6 @@ T = TypeVar("T")
 
 def _option(value: T | None, default: T) -> T:
     return default if value is None else value
-
-
-def _routing_history_records(raw_history: Any) -> tuple[RoutingHistoryRecord, ...]:
-    if not isinstance(raw_history, (list, tuple)):
-        return ()
-    records: list[RoutingHistoryRecord] = []
-    for raw_record in raw_history:
-        if not isinstance(raw_record, Mapping):
-            continue
-        try:
-            model = raw_record["model"].strip()
-            reasoning_effort = raw_record["reasoning_effort"].strip().lower()
-            attempt_status = raw_record["attempt_status"].strip()
-            input_tokens = raw_record["input_tokens"]
-            cached_input_tokens = raw_record["cached_input_tokens"]
-            output_tokens = raw_record["output_tokens"]
-            duration_sec = float(raw_record["duration_sec"])
-            defects_found = raw_record["defects_found"]
-            if (
-                not model
-                or not reasoning_effort
-                or not attempt_status
-                or any(
-                    not isinstance(value, int) or isinstance(value, bool) or value < 0
-                    for value in (input_tokens, cached_input_tokens, output_tokens, defects_found)
-                )
-                or not math.isfinite(duration_sec)
-                or duration_sec < 0
-            ):
-                continue
-        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
-            continue
-        metrics_valid = raw_record.get("metrics_valid")
-        records.append(
-            RoutingHistoryRecord(
-                model=model,
-                reasoning_effort=reasoning_effort,
-                attempt_status=attempt_status,
-                result_status=_history_text(raw_record.get("result_status")),
-                input_tokens=input_tokens,
-                cached_input_tokens=cached_input_tokens,
-                output_tokens=output_tokens,
-                duration_sec=duration_sec,
-                root_outcome=_history_text(raw_record.get("root_outcome")),
-                defects_found=defects_found,
-                catalog_source=_history_text(raw_record.get("catalog_source")),
-                catalog_version=_history_text(raw_record.get("catalog_version")),
-                metrics_valid=metrics_valid if isinstance(metrics_valid, bool) else False,
-                route=_history_text(raw_record.get("route")),
-                policy_name=_history_text(raw_record.get("policy_name")),
-                task_class=_history_text(raw_record.get("task_class")),
-                selection_source=_history_text(raw_record.get("selection_source")),
-            )
-        )
-    return tuple(records)
-
-
-def _history_text(value: Any) -> str | None:
-    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _backend_option(*values: str | None) -> str:

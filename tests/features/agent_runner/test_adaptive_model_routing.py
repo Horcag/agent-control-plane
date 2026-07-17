@@ -5,17 +5,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.features.agent_runner.lib.model_catalog import (
-    CatalogModelMetadata,
-    CatalogRate,
-    ModelCatalog,
-)
-from agent_control_plane.features.agent_runner.lib.model_routing import (
+from agent_control_plane.features.agent_runner import (
     AdaptiveRoutingSettings,
     ModelProfile,
     ModelRoutingPolicy,
     RoutingHistoryRecord,
     RoutingPolicy,
+    parse_routing_history_record,
+    parse_routing_history_records,
+)
+from agent_control_plane.features.agent_runner.lib.model_catalog import (
+    CatalogModelMetadata,
+    CatalogRate,
+    ModelCatalog,
 )
 
 
@@ -73,6 +75,7 @@ def _history(
     task_class: str | None = "implementation",
     selection_source: str | None = "configured_fallback",
     catalog_version: str | None = None,
+    metrics_valid: bool = True,
 ) -> RoutingHistoryRecord:
     return RoutingHistoryRecord(
         model=model,
@@ -87,11 +90,36 @@ def _history(
         defects_found=defects_found,
         catalog_source="models_cache.json",
         catalog_version=catalog_version,
+        metrics_valid=metrics_valid,
         route=route,
         policy_name=policy_name,
         task_class=task_class,
         selection_source=selection_source,
     )
+
+
+def _history_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "model": "reliable-model",
+        "reasoning_effort": "medium",
+        "attempt_status": "completed",
+        "result_status": "completed",
+        "input_tokens": 1_000,
+        "cached_input_tokens": 0,
+        "output_tokens": 100,
+        "duration_sec": 30.0,
+        "root_outcome": "accepted",
+        "defects_found": 0,
+        "catalog_source": "models_cache.json",
+        "catalog_version": "test-version",
+        "metrics_valid": True,
+        "route": "main",
+        "policy_name": "code-change",
+        "task_class": "implementation",
+        "selection_source": "configured_fallback",
+    }
+    row.update(overrides)
+    return row
 
 
 def _adaptive_routing(
@@ -121,6 +149,59 @@ def _adaptive_routing(
 
 
 class AdaptiveModelRoutingTest(unittest.TestCase):
+    def test_history_parser_requires_exact_true_and_finite_nonnegative_metrics(self) -> None:
+        invalid_rows: tuple[tuple[str, dict[str, object] | None], ...] = (
+            ("missing metrics_valid", None),
+            ("false metrics_valid", {"metrics_valid": False}),
+            ("integer metrics_valid", {"metrics_valid": 1}),
+            ("string metrics_valid", {"metrics_valid": "true"}),
+            ("negative input", {"input_tokens": -1}),
+            ("negative cached input", {"cached_input_tokens": -1}),
+            ("cached input exceeds input", {"cached_input_tokens": 2_000}),
+            ("boolean output", {"output_tokens": True}),
+            ("negative defects", {"defects_found": -1}),
+            ("malformed duration", {"duration_sec": "not-a-number"}),
+            ("nan duration", {"duration_sec": float("nan")}),
+            ("infinite duration", {"duration_sec": float("inf")}),
+        )
+
+        for label, overrides in invalid_rows:
+            with self.subTest(label=label):
+                row = _history_row()
+                if overrides is None:
+                    del row["metrics_valid"]
+                else:
+                    row.update(overrides)
+                self.assertIsNone(parse_routing_history_record(row))
+                self.assertEqual(parse_routing_history_records([row]), ())
+
+    def test_history_record_default_is_not_comparable(self) -> None:
+        record = RoutingHistoryRecord(
+            model="reliable-model",
+            reasoning_effort="medium",
+            attempt_status="completed",
+            result_status="completed",
+            input_tokens=1_000,
+            cached_input_tokens=0,
+            output_tokens=100,
+            duration_sec=30.0,
+            root_outcome="accepted",
+            defects_found=0,
+            catalog_source="models_cache.json",
+            route="main",
+            policy_name="code-change",
+            task_class="implementation",
+            selection_source="configured_fallback",
+        )
+        decision = _adaptive_routing().decision_for_policy(
+            "code-change",
+            route="main",
+            history=(record,),
+        )
+
+        self.assertEqual(decision.candidate_scores[0].sample_count, 0)
+        self.assertIn("invalid attempt metrics", decision.excluded_data_reasons)
+
     def test_arbitrary_named_policy_uses_configured_order_when_history_is_insufficient(
         self,
     ) -> None:
@@ -347,6 +428,130 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
             decision.ladder[0],
             ModelProfile("economical-model", "medium"),
         )
+
+    def test_reviewed_bad_observations_satisfy_sampling_gate_but_cannot_be_selected(self) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(
+                *(
+                    _history(
+                        "reliable-model",
+                        policy_name="code-change",
+                        catalog_version=version,
+                        duration_sec=10.0,
+                    )
+                    for _ in range(2)
+                ),
+                *(
+                    _history(
+                        "economical-model",
+                        policy_name="code-change",
+                        catalog_version=version,
+                        root_outcome="rejected",
+                    )
+                    for _ in range(2)
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.selection_source, "history")
+        self.assertEqual(decision.ladder[0], ModelProfile("reliable-model", "medium"))
+        reliable = next(
+            score for score in decision.candidate_scores if score.model == "reliable-model"
+        )
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertEqual(economical.sample_count, 2)
+        self.assertEqual(economical.success_count, 0)
+        self.assertFalse(economical.eligible)
+        self.assertIn("root rejection or defect", economical.exclusion_reasons)
+        self.assertIn("quality floor not met", economical.exclusion_reasons)
+        self.assertTrue(reliable.eligible)
+
+    def test_missing_review_or_invalid_metrics_fail_closed_for_sampling(self) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+        accepted = tuple(
+            _history(
+                "reliable-model",
+                policy_name="code-change",
+                catalog_version=version,
+            )
+            for _ in range(2)
+        )
+
+        for reason, root_outcome in (
+            ("missing review", None),
+            ("blank review", " "),
+            ("unrecognized review", "defects"),
+        ):
+            with self.subTest(reason=reason):
+                decision = routing.decision_for_policy(
+                    "code-change",
+                    route="main",
+                    history=accepted
+                    + tuple(
+                        _history(
+                            "economical-model",
+                            policy_name="code-change",
+                            catalog_version=version,
+                            root_outcome=root_outcome,
+                        )
+                        for _ in range(2)
+                    ),
+                )
+                self.assertEqual(decision.selection_source, "configured_fallback")
+                self.assertEqual(decision.ladder[0], ModelProfile("reliable-model", "medium"))
+                self.assertIn(
+                    "insufficient comparative samples for every candidate",
+                    decision.excluded_data_reasons,
+                )
+                expected_reason = (
+                    "missing root review"
+                    if root_outcome is None or not root_outcome.strip()
+                    else "unrecognized root outcome"
+                )
+                self.assertIn(expected_reason, decision.excluded_data_reasons)
+                economical = next(
+                    score
+                    for score in decision.candidate_scores
+                    if score.model == "economical-model"
+                )
+                self.assertEqual(economical.sample_count, 0)
+                self.assertIsNone(economical.quality_score)
+                self.assertIsNone(economical.expected_api_usd)
+                self.assertIsNone(economical.expected_duration_sec)
+                self.assertIn("insufficient comparable samples", economical.exclusion_reasons)
+
+        with self.subTest(reason="invalid metrics"):
+            decision = routing.decision_for_policy(
+                "code-change",
+                route="main",
+                history=accepted
+                + tuple(
+                    _history(
+                        "economical-model",
+                        policy_name="code-change",
+                        catalog_version=version,
+                        metrics_valid=False,
+                    )
+                    for _ in range(2)
+                ),
+            )
+            self.assertEqual(decision.selection_source, "configured_fallback")
+            self.assertIn(
+                "insufficient comparative samples for every candidate",
+                decision.excluded_data_reasons,
+            )
+            economical = next(
+                score for score in decision.candidate_scores if score.model == "economical-model"
+            )
+            self.assertEqual(economical.sample_count, 0)
 
     def test_adaptive_settings_reject_too_few_samples(self) -> None:
         with self.assertRaisesRegex(

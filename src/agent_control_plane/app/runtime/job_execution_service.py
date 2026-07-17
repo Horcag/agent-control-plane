@@ -739,12 +739,21 @@ class JobExecutionService:
         stored_profile = _stored_codex_profile(job)
         if stored_profile is None:
             raise ValueError(f"Automatic Codex job {job.job_id} is missing its stored profile")
+        try:
+            policy = self.model_routing.policy(job.codex_quality_tier)
+        except ValueError:
+            return (stored_profile,)
+        if job.codex_tool_call_budget != policy.tool_call_budget:
+            return (stored_profile,)
         persisted_ladder = _persisted_routing_ladder(
             self.store.routing_decision(job.job_id),
             route=job.route,
             first_profile=stored_profile,
             quality_tier=job.codex_quality_tier,
-            tool_call_budget=job.codex_tool_call_budget,
+            tool_call_budget=policy.tool_call_budget,
+            task_class=policy.task_class,
+            catalog_source=self.model_routing.catalog.source,
+            catalog_version=self.model_routing.catalog.version,
         )
         return persisted_ladder or (stored_profile,)
 
@@ -909,6 +918,9 @@ def _persisted_routing_ladder(
     first_profile: ModelProfile,
     quality_tier: str | None,
     tool_call_budget: int | None,
+    task_class: str,
+    catalog_source: str,
+    catalog_version: str | None,
 ) -> tuple[ModelProfile, ...] | None:
     if not isinstance(payload, Mapping):
         return None
@@ -934,17 +946,29 @@ def _persisted_routing_ladder(
         or payload["tool_call_budget"] != tool_call_budget
     ):
         return None
-    if not isinstance(payload.get("task_class"), str) or not payload["task_class"].strip():
+    if (
+        not isinstance(task_class, str)
+        or not task_class.strip()
+        or not isinstance(payload.get("task_class"), str)
+        or payload["task_class"].strip() != task_class.strip()
+    ):
         return None
     catalog = payload.get("catalog")
     if not isinstance(catalog, Mapping):
         return None
-    if not isinstance(catalog.get("source"), str) or not catalog["source"].strip():
-        return None
-    catalog_version = catalog.get("version")
-    if catalog_version is not None and (
-        not isinstance(catalog_version, str) or not catalog_version.strip()
+    if (
+        not isinstance(catalog_source, str)
+        or not catalog_source.strip()
+        or not isinstance(catalog.get("source"), str)
+        or catalog["source"].strip() != catalog_source.strip()
     ):
+        return None
+    payload_catalog_version = catalog.get("version")
+    if payload_catalog_version is not None and (
+        not isinstance(payload_catalog_version, str) or not payload_catalog_version.strip()
+    ):
+        return None
+    if payload_catalog_version != catalog_version:
         return None
     selection_source = payload.get("selection_source")
     if selection_source not in {"configured_fallback", "history"}:

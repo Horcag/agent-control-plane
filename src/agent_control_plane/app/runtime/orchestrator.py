@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import subprocess  # nosec B404
 import sys
 import time
-from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -54,11 +52,11 @@ from agent_control_plane.features.agent_runner import (
     ModelRoutingPolicy,
     PtyAgyRunner,
     QuotaDomain,
-    RoutingHistoryRecord,
     RoutingPolicy,
     codex_quota_domain,
     inspect_result,
     normalize_backend,
+    parse_routing_history_records,
     process_is_alive,
     terminate_verified_process,
 )
@@ -126,74 +124,6 @@ def _configured_routing_policies(config: ControlConfig) -> tuple[RoutingPolicy, 
 
 
 _ROUTING_HISTORY_LIMIT = 200
-
-
-def _routing_history_record(value: Any) -> RoutingHistoryRecord | None:
-    if not isinstance(value, Mapping):
-        return None
-    model = _required_history_text(value.get("model"))
-    reasoning_effort = _required_history_text(value.get("reasoning_effort"))
-    attempt_status = _required_history_text(value.get("attempt_status"))
-    input_tokens = _history_nonnegative_int(value.get("input_tokens"))
-    cached_input_tokens = _history_nonnegative_int(value.get("cached_input_tokens"))
-    output_tokens = _history_nonnegative_int(value.get("output_tokens"))
-    duration_sec = _history_nonnegative_float(value.get("duration_sec"))
-    defects_found = _history_nonnegative_int(value.get("defects_found"))
-    metrics_valid = value.get("metrics_valid", True)
-    if (
-        model is None
-        or reasoning_effort is None
-        or attempt_status is None
-        or input_tokens is None
-        or cached_input_tokens is None
-        or output_tokens is None
-        or duration_sec is None
-        or defects_found is None
-        or not isinstance(metrics_valid, bool)
-    ):
-        return None
-    return RoutingHistoryRecord(
-        model=model,
-        reasoning_effort=reasoning_effort,
-        attempt_status=attempt_status,
-        result_status=_optional_history_text(value.get("result_status")),
-        input_tokens=input_tokens,
-        cached_input_tokens=cached_input_tokens,
-        output_tokens=output_tokens,
-        duration_sec=duration_sec,
-        root_outcome=_optional_history_text(value.get("root_outcome")),
-        defects_found=defects_found,
-        catalog_source=_optional_history_text(value.get("catalog_source")),
-        catalog_version=_optional_history_text(value.get("catalog_version")),
-        metrics_valid=metrics_valid,
-        route=_optional_history_text(value.get("route")),
-        policy_name=_optional_history_text(value.get("policy_name")),
-        task_class=_optional_history_text(value.get("task_class")),
-        selection_source=_optional_history_text(value.get("selection_source")),
-    )
-
-
-def _required_history_text(value: Any) -> str | None:
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _optional_history_text(value: Any) -> str | None:
-    if value is None:
-        return None
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _history_nonnegative_int(value: Any) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return None
-    return value
-
-
-def _history_nonnegative_float(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    number = float(value)
-    return number if math.isfinite(number) and number >= 0 else None
 
 
 TERMINAL_STATUSES = frozenset(
@@ -348,9 +278,7 @@ class AgentControlPlane:
 
         raw_history = self.store.routing_history(limit=_ROUTING_HISTORY_LIMIT)
         history_rows = raw_history if isinstance(raw_history, list) else ()
-        history = tuple(
-            record for row in history_rows if (record := _routing_history_record(row)) is not None
-        )
+        history = parse_routing_history_records(history_rows)
         decision = self.model_routing.decision_for_policy(
             configured_policy.name,
             history=history,

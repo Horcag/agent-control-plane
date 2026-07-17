@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 
 LEGACY_POLICY_NAMES = ("mechanical", "balanced", "deep")
 _TERMINAL_RESULT_STATUSES = frozenset({"completed", "partial", "blocked", "failed"})
 _AUTOMATIC_SELECTION_SOURCES = frozenset({"configured_fallback", "history"})
+_COMPARABLE_ROOT_OUTCOMES = frozenset({"accepted", "rejected"})
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,17 @@ class RoutingPolicy:
             raise ValueError("Routing policy candidates require model and reasoning effort")
         if len(normalized) != len(set(normalized)):
             raise ValueError(f"Routing policy has duplicate candidates: {self.name}")
+        if self.adaptive is not None:
+            minimum_history_window = self.adaptive.minimum_samples_per_candidate * len(
+                self.candidates
+            )
+            if self.adaptive.history_window < minimum_history_window:
+                raise ValueError(
+                    f"Routing policy {self.name!r} adaptive history_window must be at least "
+                    "minimum_samples_per_candidate * len(candidates) "
+                    f"({self.adaptive.minimum_samples_per_candidate} * {len(self.candidates)} "
+                    f"= {minimum_history_window}); got {self.adaptive.history_window}"
+                )
 
 
 @dataclass(frozen=True)
@@ -89,11 +102,87 @@ class RoutingHistoryRecord:
     defects_found: int
     catalog_source: str | None
     catalog_version: str | None = None
-    metrics_valid: bool = True
+    metrics_valid: bool = False
     route: str | None = None
     policy_name: str | None = None
     task_class: str | None = None
     selection_source: str | None = None
+
+
+def parse_routing_history_record(value: Any) -> RoutingHistoryRecord | None:
+    """Parse one persisted routing-history row with fail-closed telemetry rules."""
+    if not isinstance(value, Mapping) or value.get("metrics_valid") is not True:
+        return None
+    model = _history_text(value.get("model"))
+    reasoning_effort = _history_text(value.get("reasoning_effort"))
+    attempt_status = _history_text(value.get("attempt_status"))
+    input_tokens = _history_nonnegative_int(value.get("input_tokens"))
+    cached_input_tokens = _history_nonnegative_int(value.get("cached_input_tokens"))
+    output_tokens = _history_nonnegative_int(value.get("output_tokens"))
+    duration_sec = _history_nonnegative_float(value.get("duration_sec"))
+    defects_found = _history_nonnegative_int(value.get("defects_found"))
+    if (
+        model is None
+        or reasoning_effort is None
+        or attempt_status is None
+        or input_tokens is None
+        or cached_input_tokens is None
+        or output_tokens is None
+        or duration_sec is None
+        or defects_found is None
+        or cached_input_tokens > input_tokens
+    ):
+        return None
+    return RoutingHistoryRecord(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        attempt_status=attempt_status,
+        result_status=_history_text(value.get("result_status")),
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        duration_sec=duration_sec,
+        root_outcome=_history_text(value.get("root_outcome")),
+        defects_found=defects_found,
+        catalog_source=_history_text(value.get("catalog_source")),
+        catalog_version=_history_text(value.get("catalog_version")),
+        metrics_valid=True,
+        route=_history_text(value.get("route")),
+        policy_name=_history_text(value.get("policy_name")),
+        task_class=_history_text(value.get("task_class")),
+        selection_source=_history_text(value.get("selection_source")),
+    )
+
+
+def parse_routing_history_records(raw_history: Any) -> tuple[RoutingHistoryRecord, ...]:
+    """Parse persisted routing-history rows, dropping malformed or untrusted rows."""
+    if not isinstance(raw_history, (list, tuple)):
+        return ()
+    return tuple(
+        record
+        for raw_record in raw_history
+        if (record := parse_routing_history_record(raw_record)) is not None
+    )
+
+
+def _history_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _history_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _history_nonnegative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 @dataclass(frozen=True)
@@ -428,11 +517,17 @@ class ModelRoutingPolicy:
         comparable: list[RoutingHistoryRecord] = []
         excluded: list[str] = []
         for record in records:
-            if not record.metrics_valid:
+            if record.metrics_valid is not True:
                 excluded.append("invalid attempt metrics")
                 continue
             if record.result_status not in _TERMINAL_RESULT_STATUSES:
                 excluded.append("missing terminal result")
+                continue
+            if not _present(record.root_outcome):
+                excluded.append("missing root review")
+                continue
+            if record.root_outcome not in _COMPARABLE_ROOT_OUTCOMES:
+                excluded.append("unrecognized root outcome")
                 continue
             if not _present(record.route) or not _present(route):
                 excluded.append("missing route")
@@ -470,22 +565,17 @@ class ModelRoutingPolicy:
             if record.catalog_version != self.catalog.version:
                 excluded.append("incompatible catalog version")
                 continue
-            try:
-                usage = tuple(
-                    float(value)
-                    for value in (
-                        record.input_tokens,
-                        record.cached_input_tokens,
-                        record.output_tokens,
-                        record.duration_sec,
-                    )
-                )
-            except (TypeError, ValueError):
-                usage = ()
+            input_tokens = _history_nonnegative_int(record.input_tokens)
+            cached_input_tokens = _history_nonnegative_int(record.cached_input_tokens)
+            output_tokens = _history_nonnegative_int(record.output_tokens)
+            duration_sec = _history_nonnegative_float(record.duration_sec)
             if (
-                len(usage) != 4
-                or any(not math.isfinite(value) or value < 0 for value in usage)
-                or usage[1] > usage[0]
+                input_tokens is None
+                or cached_input_tokens is None
+                or output_tokens is None
+                or duration_sec is None
+                or cached_input_tokens > input_tokens
+                or _history_nonnegative_int(record.defects_found) is None
             ):
                 excluded.append("invalid raw usage")
                 continue
@@ -534,6 +624,8 @@ class ModelRoutingPolicy:
         reasons: list[str] = []
         if len(matches) < settings.minimum_samples_per_candidate:
             reasons.append("insufficient comparable samples")
+        if successes < settings.minimum_samples_per_candidate:
+            reasons.append("insufficient accepted comparable samples")
         if any(record.root_outcome is None for record in matches):
             reasons.append("missing root review")
         if review_penalties:
