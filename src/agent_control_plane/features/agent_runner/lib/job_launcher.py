@@ -72,7 +72,7 @@ class SlotStatusView(Protocol):
 
 
 class SlotLifecycleGateway(Protocol):
-    def inspect_slot(self, name: str, *, sync: bool = True) -> SlotStatusView: ...
+    def inspect_slot(self, name: str, *, scope: str | None = None) -> SlotStatusView: ...
 
     def acquire_for_job(
         self,

@@ -7,8 +7,11 @@ from agent_control_plane.features.agent_runner.lib.job_launcher import (
 from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
 from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.features.agent_runner.lib.model_routing import (
+    AdaptiveRoutingSettings,
     ModelProfile,
     ModelRoutingPolicy,
+    RoutingHistoryRecord,
+    RoutingPolicy,
 )
 from agent_control_plane.features.agent_runner.lib.process_identity import (
     ProcessIdentity,
@@ -61,6 +64,7 @@ __all__ = [
     "CODEX_BACKEND",
     "CODEX_SPARK_BACKEND",
     "SUPPORTED_BACKENDS",
+    "AdaptiveRoutingSettings",
     "AgentRunResult",
     "AgentRunSpec",
     "AgentRunner",
@@ -84,6 +88,8 @@ __all__ = [
     "QuotaDecision",
     "QuotaDomain",
     "ResultState",
+    "RoutingHistoryRecord",
+    "RoutingPolicy",
     "WorkerLease",
     "WorkerLeaseError",
     "WorkerLeaseProbe",

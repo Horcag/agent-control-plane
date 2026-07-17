@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import MappingProxyType
+from unittest.mock import patch
 
 from agent_control_plane.entities.slot import SlotStore
 from agent_control_plane.features.slot_lifecycle.lib.slot_manager import SlotError, SlotManager
@@ -12,6 +13,7 @@ from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
     RouteConfig,
+    SlotConfig,
     SlotPrepareCommand,
 )
 
@@ -48,7 +50,7 @@ class SlotManagerTest(unittest.TestCase):
             store.release_slot("used", "job-1")
             manager = SlotManager(config, store)
 
-            decisions = manager.cleanup(max_per_route=1, apply=False)
+            decisions = manager.cleanup(max_per_route=1, apply=False, route="main")
 
             self.assertEqual(len(decisions), 1)
             self.assertEqual(decisions[0].name, "unused")
@@ -212,8 +214,12 @@ class SlotManagerTest(unittest.TestCase):
             slot_root = root / "slots"
             config = _config(root, slot_root)
             store = SlotStore(root / "runs" / "jobs.sqlite3")
-            store.register_slot("active", "main", slot_root / "active")
-            store.register_slot("deleted", "main", slot_root / "deleted")
+            store.register_slot("active", "main", _git_repo(slot_root / "active", "slot/active"))
+            store.register_slot(
+                "deleted",
+                "main",
+                _git_repo(slot_root / "deleted", "slot/deleted"),
+            )
             store.mark_deleted("deleted", note="deleted")
             manager = SlotManager(config, store)
 
@@ -224,16 +230,154 @@ class SlotManagerTest(unittest.TestCase):
             self.assertEqual([status.name for status in all_statuses], ["active", "deleted"])
             self.assertEqual(all_statuses[1].status, "deleted")
 
+    def test_configured_inventory_is_read_only_and_uses_current_config_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            configured_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            persisted_path = _git_repo(slot_root / "previous-main-1", "slot/previous-main-1")
+            config = _config(
+                root,
+                slot_root,
+                slots={"main-1": SlotConfig("main-1", "main", configured_path)},
+            )
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", persisted_path)
+            persisted = store.require_slot("main-1")
+            manager = SlotManager(config, store)
+
+            status = manager.list_slots(route="main")[0]
+
+            self.assertEqual(status.scope, "configured")
+            self.assertEqual(status.path, configured_path)
+            self.assertIn("persisted path differs", status.problems[0])
+            self.assertEqual(store.require_slot("main-1"), persisted)
+
+    def test_configured_slot_without_registry_row_is_visible_without_a_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            configured_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            config = _config(
+                root,
+                slot_root,
+                slots={"main-1": SlotConfig("main-1", "main", configured_path)},
+            )
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            manager = SlotManager(config, store)
+
+            status = manager.list_slots(route="main")[0]
+
+            self.assertEqual(status.status, "unregistered")
+            self.assertEqual(status.scope, "configured")
+            self.assertEqual(store.list_slots(), [])
+
+    def test_list_slots_hides_stale_rows_unless_explicitly_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            stale_path = slot_root / "historical"
+            config = _config(root, slot_root)
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("historical", "main", stale_path)
+            manager = SlotManager(config, store)
+
+            self.assertEqual(manager.list_slots(route="main"), [])
+            audited = manager.list_slots(route="main", include_stale=True)
+
+            self.assertEqual(audited[0].scope, "stale")
+            self.assertEqual(audited[0].status, "stale")
+            self.assertIn("stale registry record", audited[0].problems)
+
+    def test_list_slots_filters_routes_before_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            acp_path = _git_repo(slot_root / "acp-1", "slot/acp-1")
+            config = _config(
+                root,
+                slot_root,
+                route_names=("main", "acp"),
+                slots={
+                    "main-1": SlotConfig("main-1", "main", slot_root / "main-1"),
+                    "acp-1": SlotConfig("acp-1", "acp", acp_path),
+                },
+            )
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-dynamic", "main", slot_root / "main-dynamic")
+            store.register_slot("acp-dynamic", "acp", acp_path)
+            manager = SlotManager(config, store)
+
+            with patch.object(manager, "inspect_slot", wraps=manager.inspect_slot) as inspect_slot:
+                statuses = manager.list_slots(route="acp")
+
+            self.assertEqual([status.name for status in statuses], ["acp-1", "acp-dynamic"])
+            self.assertEqual(
+                [call.args[0] for call in inspect_slot.call_args_list],
+                ["acp-1", "acp-dynamic"],
+            )
+
+    def test_acquire_registers_only_selected_configured_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            acp_path = _git_repo(slot_root / "acp-1", "slot/acp-1")
+            previous_acp_path = _git_repo(slot_root / "previous-acp-1", "slot/previous-acp-1")
+            main_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            config = _config(
+                root,
+                slot_root,
+                route_names=("main", "acp"),
+                slots={
+                    "main-1": SlotConfig("main-1", "main", main_path),
+                    "acp-1": SlotConfig("acp-1", "acp", acp_path),
+                },
+            )
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", main_path)
+            store.register_slot("acp-1", "main", previous_acp_path)
+            unchanged_main = store.require_slot("main-1")
+            manager = SlotManager(config, store)
+
+            record = manager.acquire_for_job("acp-1", job_id="job-1", route="acp")
+
+            self.assertEqual(record.status, "active")
+            self.assertEqual(record.route, "acp")
+            self.assertEqual(record.path, acp_path)
+            self.assertEqual(store.require_slot("main-1"), unchanged_main)
+
+    def test_cleanup_requires_scope_and_only_inspects_the_selected_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            main_path = _git_repo(slot_root / "main-1", "slot/main-1")
+            acp_path = _git_repo(slot_root / "acp-1", "slot/acp-1")
+            config = _config(root, slot_root, route_names=("main", "acp"))
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            store.register_slot("main-1", "main", main_path)
+            store.register_slot("acp-1", "acp", acp_path)
+            manager = SlotManager(config, store)
+
+            with self.assertRaisesRegex(SlotError, "scope"):
+                manager.cleanup(max_per_route=0)
+            with patch.object(manager, "inspect_slot", wraps=manager.inspect_slot) as inspect_slot:
+                decisions = manager.cleanup(max_per_route=0, route="acp")
+
+            self.assertEqual([decision.name for decision in decisions], ["acp-1"])
+            self.assertEqual([call.args[0] for call in inspect_slot.call_args_list], ["acp-1"])
+
 
 def _config(
     root: Path,
     slot_root: Path,
     reports_repo: Path | None = None,
     slot_prepare: tuple[SlotPrepareCommand, ...] = (),
+    route_names: tuple[str, ...] = ("main",),
+    slots: dict[str, SlotConfig] | None = None,
 ) -> ControlConfig:
     routes = {
-        "main": RouteConfig(
-            name="main",
+        route_name: RouteConfig(
+            name=route_name,
             path=root / "repo",
             required_branch="main",
             worktree_root=root / "worktrees",
@@ -242,6 +386,7 @@ def _config(
             test_roots=(Path("backend/tests"),),
             exclude_dirs=(),
         )
+        for route_name in route_names
     }
     if reports_repo is not None:
         routes["reports"] = RouteConfig(
@@ -277,7 +422,7 @@ def _config(
             forbidden_status_globs=("uv.lock", ".venv/**"),
         ),
         routes=MappingProxyType(routes),
-        slots=MappingProxyType({}),
+        slots=MappingProxyType(slots or {}),
         slot_prepare=slot_prepare,
     )
 

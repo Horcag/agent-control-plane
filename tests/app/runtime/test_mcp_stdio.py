@@ -52,15 +52,23 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
             with anyio.fail_after(5):
                 await session.initialize()
             smoke = await _call_tool(session, "agent_smoke", {}, timings)
-            await _call_tool(session, "agent_slots_list", {}, timings)
+            unscoped = await session.call_tool("agent_slots_list", {})
+            assert unscoped.isError is True
+            await _call_tool(session, "agent_slots_list", {"route": "acp"}, timings)
+            await _call_tool(session, "agent_slots_list", {"all_routes": True}, timings)
             await _call_tool(
                 session,
                 "agent_slots_cleanup",
-                {"max_per_route": 1, "apply": False},
+                {"max_per_route": 1, "apply": False, "route": "acp"},
                 timings,
             )
             _write_config(config_path, new_slot)
-            reloaded_slots = await _call_tool(session, "agent_slots_list", {}, timings)
+            reloaded_slots = await _call_tool(
+                session,
+                "agent_slots_list",
+                {"route": "acp"},
+                timings,
+            )
             reloaded_smoke = await _call_tool(session, "agent_smoke", {}, timings)
             with pytest.raises(TimeoutError):
                 with anyio.fail_after(0.01):
@@ -90,8 +98,8 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
     }
     assert results["smoke"]["codex_quality_profiles"] == {}
     with sqlite3.connect(tmp_path / "runs" / "jobs.sqlite3") as database:
-        stored_path = database.execute("select path from slots where name = 'acp-1'").fetchone()[0]
-    assert stored_path == str(new_slot.resolve())
+        slot_count = database.execute("select count(*) from slots").fetchone()[0]
+    assert slot_count == 0
 
 
 async def _call_tool(

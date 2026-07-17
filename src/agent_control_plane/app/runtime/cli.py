@@ -265,7 +265,14 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(control.sync_slots())
                 return 0
             if args.slot_command == "list":
-                _print_json(control.list_slots(include_deleted=args.include_deleted))
+                _print_json(
+                    control.list_slots(
+                        route=args.route,
+                        all_routes=args.all_routes,
+                        include_deleted=args.include_deleted,
+                        include_stale=args.include_stale,
+                    )
+                )
                 return 0
             if args.slot_command == "create":
                 _print_json(
@@ -337,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
                         max_per_route=args.max_per_route,
                         apply=args.apply,
                         force=args.force,
+                        route=args.route,
+                        all_routes=args.all_routes,
                     )
                 )
                 return 0
@@ -646,6 +655,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include deleted slot registry records",
     )
+    list_slots.add_argument(
+        "--include-stale",
+        action="store_true",
+        help="Include stale slot registry records for audit",
+    )
+    list_scope = list_slots.add_mutually_exclusive_group(required=True)
+    list_scope.add_argument("--route", help="Inspect slots for one configured route")
+    list_scope.add_argument("--all-routes", action="store_true", help="Inspect every route")
 
     create = slot_subparsers.add_parser("create", parents=[common], help="Create a slot worktree")
     create.add_argument("name")
@@ -758,6 +775,9 @@ def _build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--max-per-route", type=int, required=True)
     cleanup.add_argument("--apply", action="store_true", help="Actually delete candidates")
     cleanup.add_argument("--force", action="store_true", help="Allow dirty slots during cleanup")
+    cleanup_scope = cleanup.add_mutually_exclusive_group(required=True)
+    cleanup_scope.add_argument("--route", help="Clean slots for one configured route")
+    cleanup_scope.add_argument("--all-routes", action="store_true", help="Clean every route")
 
     manager = subparsers.add_parser(
         "manager",

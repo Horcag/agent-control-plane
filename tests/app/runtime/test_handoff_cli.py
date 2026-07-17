@@ -1,3 +1,5 @@
+import pytest
+
 from agent_control_plane.app.runtime.cli import _build_parser
 
 
@@ -69,6 +71,26 @@ def test_slot_checkpoint_parser_requires_the_terminal_job_identity() -> None:
     assert args.slot_command == "checkpoint"
     assert args.name == "app-1"
     assert args.job_id == "job-1"
+
+
+def test_slot_inventory_and_cleanup_require_one_explicit_scope() -> None:
+    parser = _build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["slots", "list"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["slots", "cleanup", "--max-per-route", "1"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["slots", "list", "--route", "app", "--all-routes"])
+
+    listed = parser.parse_args(["slots", "list", "--route", "app", "--include-stale"])
+    cleanup = parser.parse_args(["slots", "cleanup", "--max-per-route", "1", "--all-routes"])
+
+    assert listed.route == "app"
+    assert listed.all_routes is False
+    assert listed.include_stale is True
+    assert cleanup.route is None
+    assert cleanup.all_routes is True
 
 
 def test_reconcile_and_internal_worker_identity_are_explicit_cli_inputs() -> None:

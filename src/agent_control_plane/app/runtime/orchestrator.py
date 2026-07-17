@@ -40,6 +40,7 @@ from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
     CODEX_BACKEND,
     SUPPORTED_BACKENDS,
+    AdaptiveRoutingSettings,
     AgentRunner,
     CodexExecRunner,
     CodexRateLimitReader,
@@ -53,16 +54,13 @@ from agent_control_plane.features.agent_runner import (
     ModelRoutingPolicy,
     PtyAgyRunner,
     QuotaDomain,
+    RoutingHistoryRecord,
+    RoutingPolicy,
     codex_quota_domain,
     inspect_result,
     normalize_backend,
     process_is_alive,
     terminate_verified_process,
-)
-from agent_control_plane.features.agent_runner.lib.model_routing import (
-    AdaptiveRoutingSettings,
-    RoutingHistoryRecord,
-    RoutingPolicy,
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
 from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
@@ -1221,9 +1219,25 @@ class AgentControlPlane:
         )
         return result.as_dict()
 
-    def list_slots(self, *, include_deleted: bool = False) -> list[dict[str, Any]]:
+    def list_slots(
+        self,
+        *,
+        route: str | None = None,
+        all_routes: bool = False,
+        include_deleted: bool = False,
+        include_stale: bool = False,
+    ) -> list[dict[str, Any]]:
+        if route is not None and all_routes:
+            raise PolicyError("route and all_routes are mutually exclusive")
+        if route is None and not all_routes:
+            raise PolicyError("slot inventory scope is required; pass route or all_routes")
         return [
-            status.as_dict() for status in self.slots.list_slots(include_deleted=include_deleted)
+            status.as_dict()
+            for status in self.slots.list_slots(
+                route=route,
+                include_deleted=include_deleted,
+                include_stale=include_stale,
+            )
         ]
 
     def create_slot(
@@ -1318,6 +1332,8 @@ class AgentControlPlane:
         max_per_route: int,
         apply: bool = False,
         force: bool = False,
+        route: str | None = None,
+        all_routes: bool = False,
     ) -> list[dict[str, str]]:
         return [
             decision.as_dict()
@@ -1325,6 +1341,8 @@ class AgentControlPlane:
                 max_per_route=max_per_route,
                 apply=apply,
                 force=force,
+                route=route,
+                all_routes=all_routes,
             )
         ]
 

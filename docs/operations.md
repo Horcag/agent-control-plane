@@ -23,7 +23,7 @@ and reports route, slot, runner, and archive configuration; it does not launch a
 
 ```powershell
 agent-control slots sync --config .\config\workspaces.toml
-agent-control slots list --config .\config\workspaces.toml
+agent-control slots list --route app --config .\config\workspaces.toml
 agent-control slots checkout app-1 --branch codex/task --start-point origin/main --config .\config\workspaces.toml
 agent-control start --config .\config\workspaces.toml --task-id task --route app --slot app-1 --expected-branch codex/task --wait --live
 agent-control watch <job-id> --config .\config\workspaces.toml --live --lines 120

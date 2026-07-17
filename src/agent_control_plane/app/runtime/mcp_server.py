@@ -681,9 +681,19 @@ def build_server(config_path: str | None = None) -> Any:
         return control.sync_slots()
 
     @mcp.tool()
-    def agent_slots_list() -> list[dict[str, Any]]:
-        """Return slot usage, active job, and git state."""
-        return control.list_slots()
+    def agent_slots_list(
+        route: str | None = None,
+        all_routes: bool = False,
+        include_deleted: bool = False,
+        include_stale: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return explicitly scoped slot inventory; stale rows require an audit flag."""
+        return control.list_slots(
+            route=route,
+            all_routes=all_routes,
+            include_deleted=include_deleted,
+            include_stale=include_stale,
+        )
 
     @mcp.tool()
     def agent_slots_create(
@@ -830,6 +840,8 @@ def build_server(config_path: str | None = None) -> Any:
         max_per_route: int,
         apply: bool = False,
         force: bool = False,
+        route: str | None = None,
+        all_routes: bool = False,
     ) -> dict[str, Any]:
         """List or apply least-recently-used slot cleanup above a per-route limit."""
         try:
@@ -840,6 +852,8 @@ def build_server(config_path: str | None = None) -> Any:
                     max_per_route=max_per_route,
                     apply=apply,
                     force=force,
+                    route=route,
+                    all_routes=all_routes,
                 ),
             }
         except SlotError as exc:

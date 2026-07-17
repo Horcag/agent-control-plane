@@ -237,7 +237,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIsNotNone(jobs[0].finished_at)
             self.assertIn("routing DB unavailable", jobs[0].last_error or "")
 
-    def test_automatic_codex_history_can_promote_and_persist_reordered_ladder(self) -> None:
+    def test_automatic_codex_history_requires_comparative_samples_before_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -263,13 +263,13 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             decision = control.store.routing_decision(job.job_id)
             self.assertIsNotNone(decision)
             assert decision is not None
-            self.assertEqual(job.codex_model, "gpt-5.6-luna")
-            self.assertEqual(decision["selection_source"], "history")
+            self.assertEqual(job.codex_model, "gpt-5.6-terra")
+            self.assertEqual(decision["selection_source"], "configured_fallback")
             self.assertEqual(
                 decision["ladder"],
                 [
-                    {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
                     {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
+                    {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
                 ],
             )
 
@@ -930,7 +930,10 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
                 self.assertTrue(payload["configured_fallback"])
                 self.assertEqual(payload["selection_source"], "configured_fallback")
-                self.assertEqual(payload["fallback_reason"], "insufficient comparable history")
+                self.assertEqual(
+                    payload["fallback_reason"],
+                    "insufficient comparative samples for every candidate",
+                )
                 self.assertEqual(payload["candidate_scores"][0]["sample_count"], len(history))
 
     def test_model_routing_explain_ignores_malformed_history_rows(self) -> None:
@@ -946,7 +949,10 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             self.assertEqual(payload["candidate_scores"][0]["sample_count"], 1)
             self.assertTrue(payload["configured_fallback"])
-            self.assertEqual(payload["fallback_reason"], "insufficient comparable history")
+            self.assertEqual(
+                payload["fallback_reason"],
+                "insufficient comparative samples for every candidate",
+            )
 
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

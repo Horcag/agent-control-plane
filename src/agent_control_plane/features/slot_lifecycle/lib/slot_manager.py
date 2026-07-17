@@ -48,6 +48,7 @@ class SlotStatus:
     route: str
     path: Path
     status: str
+    scope: str
     configured: bool
     exists: bool
     is_git_workspace: bool
@@ -65,6 +66,7 @@ class SlotStatus:
             "route": self.route,
             "path": str(self.path),
             "status": self.status,
+            "scope": self.scope,
             "configured": self.configured,
             "exists": self.exists,
             "is_git_workspace": self.is_git_workspace,
@@ -112,37 +114,86 @@ class SlotManager:
     def sync_configured_slots(self) -> list[SlotStatus]:
         with self._configured_slots_sync_guard():
             for slot in self._config.slots.values():
-                self._ensure_slot_path_allowed(slot.path)
-                self._store.register_slot(
-                    slot.name,
-                    slot.route,
-                    slot.path,
-                    note="configured in workspaces.toml",
-                )
-        return self.list_slots(sync=False)
+                self._register_configured_slot(slot.name)
+        return self.list_slots()
+
+    def _register_configured_slot(self, name: str) -> SlotRecord:
+        configured = self._config.slots.get(name)
+        if configured is None:
+            raise SlotError(f"Slot {name} is not configured in workspaces.toml")
+        self._ensure_slot_path_allowed(configured.path)
+        record = self._store.get_slot(name)
+        metadata_changed = record is not None and (
+            record.route != configured.route
+            or record.path.resolve(strict=False) != configured.path.resolve(strict=False)
+        )
+        if record is not None and record.active_job_id is not None and metadata_changed:
+            raise SlotError(f"Cannot reconcile active slot {name} with current configuration")
+        if record is not None and record.active_job_id is not None:
+            return record
+        return self._store.register_slot(
+            configured.name,
+            configured.route,
+            configured.path,
+            note="configured in workspaces.toml",
+        )
 
     def list_slots(
         self,
         *,
-        sync: bool = True,
+        route: str | None = None,
         include_deleted: bool = False,
+        include_stale: bool = False,
     ) -> list[SlotStatus]:
-        if sync:
-            self.sync_configured_slots()
+        if route is not None and route not in self._config.routes:
+            raise SlotError(f"Unknown route: {route}")
         records = {record.name: record for record in self._store.list_slots()}
         statuses: list[SlotStatus] = []
+        for name, configured in sorted(self._config.slots.items()):
+            if route is not None and configured.route != route:
+                continue
+            record = records.get(name)
+            if record is not None and record.status == "deleted" and not include_deleted:
+                continue
+            statuses.append(self.inspect_slot(name, scope="configured"))
         for name, record in sorted(records.items()):
+            if name in self._config.slots:
+                continue
+            if route is not None and record.route != route:
+                continue
             if record.status == "deleted" and not include_deleted:
                 continue
-            statuses.append(self.inspect_slot(name, sync=False))
-        return statuses
+            if record.status == "deleted":
+                scope = "deleted"
+            elif self._is_valid_dynamic_record(record):
+                scope = "dynamic"
+            elif include_stale:
+                scope = "stale"
+            else:
+                continue
+            statuses.append(self.inspect_slot(name, scope=scope))
+        return sorted(statuses, key=lambda status: status.name)
 
-    def inspect_slot(self, name: str, *, sync: bool = True) -> SlotStatus:
-        if sync:
-            self.sync_configured_slots()
+    def _is_valid_dynamic_record(self, record: SlotRecord) -> bool:
+        return (
+            record.route in self._config.routes
+            and is_same_or_child(record.path, self._config.slot_root)
+            and record.path.exists()
+        )
+
+    def inspect_slot(self, name: str, *, scope: str | None = None) -> SlotStatus:
         configured = self._config.slots.get(name)
         record = self._store.get_slot(name)
-        if record is not None:
+        if configured is not None:
+            route = configured.route
+            path = configured.path
+            status = record.status if record is not None else "unregistered"
+            active_job_id = record.active_job_id if record is not None else None
+            use_count = record.use_count if record is not None else 0
+            last_used_at = record.last_used_at if record is not None else None
+            note = record.note if record is not None else None
+            slot_scope = scope or "configured"
+        elif record is not None:
             route = record.route
             path = record.path
             status = record.status
@@ -150,14 +201,7 @@ class SlotManager:
             use_count = record.use_count
             last_used_at = record.last_used_at
             note = record.note
-        elif configured is not None:
-            route = configured.route
-            path = configured.path
-            status = "unregistered"
-            active_job_id = None
-            use_count = 0
-            last_used_at = None
-            note = None
+            slot_scope = scope or "dynamic"
         else:
             raise SlotError(f"Unknown slot: {name}")
 
@@ -167,6 +211,13 @@ class SlotManager:
         dirty = ""
         problems: list[str] = []
 
+        if configured is not None and record is not None:
+            if record.route != configured.route:
+                problems.append("persisted route differs from current configuration")
+            if record.path.resolve(strict=False) != configured.path.resolve(strict=False):
+                problems.append("persisted path differs from current configuration")
+        if slot_scope == "stale":
+            problems.append("stale registry record")
         if not is_same_or_child(path, self._config.slot_root):
             problems.append(f"path is outside slot_root: {self._config.slot_root}")
         if route not in self._config.routes:
@@ -189,8 +240,8 @@ class SlotManager:
                 except GitError as exc:
                     problems.append(f"git status failed: {exc}")
 
-        display_status = status
-        if dirty and status == "available" and active_job_id is None:
+        display_status = "stale" if slot_scope == "stale" else status
+        if dirty and display_status == "available" and active_job_id is None:
             display_status = "dirty"
 
         return SlotStatus(
@@ -198,6 +249,7 @@ class SlotManager:
             route=route,
             path=path,
             status=display_status,
+            scope=slot_scope,
             configured=configured is not None,
             exists=exists,
             is_git_workspace=is_git,
@@ -220,7 +272,7 @@ class SlotManager:
         if status.dirty or status.problems:
             raise SlotError(f"Slot {name} is not clean enough to reconcile")
         self._store.mark_available(name, note="reconciled clean workspace")
-        return self.inspect_slot(name, sync=False)
+        return self.inspect_slot(name)
 
     def create_slot(
         self,
@@ -421,6 +473,12 @@ class SlotManager:
         route: str,
         allow_dirty: bool = False,
     ) -> SlotRecord:
+        configured = self._config.slots.get(name)
+        if configured is not None:
+            if configured.route != route:
+                raise SlotError(f"Slot {name} belongs to route {configured.route!r}, not {route!r}")
+            with self._configured_slots_sync_guard():
+                self._register_configured_slot(name)
         status = self.inspect_slot(name)
         if status.route != route:
             raise SlotError(f"Slot {name} belongs to route {status.route!r}, not {route!r}")
@@ -463,10 +521,16 @@ class SlotManager:
         max_per_route: int,
         apply: bool = False,
         force: bool = False,
+        route: str | None = None,
+        all_routes: bool = False,
     ) -> list[CleanupDecision]:
         if max_per_route < 0:
             raise SlotError("max_per_route must be non-negative")
-        statuses = self.list_slots()
+        if route is not None and all_routes:
+            raise SlotError("route and all_routes are mutually exclusive")
+        if route is None and not all_routes:
+            raise SlotError("route scope is required; pass route or all_routes")
+        statuses = self.list_slots(route=route)
         by_route: dict[str, list[SlotStatus]] = {}
         for status in statuses:
             if status.status == "deleted":

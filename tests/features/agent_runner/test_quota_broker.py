@@ -68,6 +68,8 @@ def _catalog(*metadata: CatalogModelMetadata) -> ModelCatalog:
         models={},
         metadata={item.model.lower(): item for item in metadata},
         cache_status="loaded",
+        source="test",
+        version="test",
     )
 
 
