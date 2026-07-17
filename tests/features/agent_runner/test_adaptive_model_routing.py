@@ -224,6 +224,19 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
         self.assertEqual(economical.sample_count, 1)
         self.assertIn("insufficient comparable samples", economical.exclusion_reasons)
 
+    def test_adaptive_settings_reject_too_few_samples(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "at least two comparable samples are required",
+        ):
+            AdaptiveRoutingSettings(
+                minimum_samples_per_candidate=1,
+                history_window=20,
+                quality_floor=0.8,
+                prior_quality=0.75,
+                prior_weight=2.0,
+            )
+
     def test_strict_history_metadata_is_filtered_before_history_window(self) -> None:
         routing = _adaptive_routing(history_window=2)
         version = routing.catalog.version

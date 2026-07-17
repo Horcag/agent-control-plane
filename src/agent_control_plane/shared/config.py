@@ -678,7 +678,7 @@ def _adaptive_routing_config(raw: Any, *, location: str) -> CodexAdaptiveRouting
     if not isinstance(raw, Mapping):
         raise ValueError(f"{location}.adaptive must be a table")
     return CodexAdaptiveRoutingConfig(
-        minimum_samples_per_candidate=_positive_int(
+        minimum_samples_per_candidate=_minimum_two_int(
             _required(raw, "minimum_samples_per_candidate"),
             f"{location}.adaptive.minimum_samples_per_candidate",
         ),
@@ -1104,6 +1104,15 @@ def _string_tuple(value: Any) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError("Expected a TOML array of strings")
     return tuple(_string_value(item) for item in value if _string_value(item).strip())
+
+
+def _minimum_two_int(value: Any, key: str) -> int:
+    parsed = int(value)
+    if parsed < 2:
+        raise ValueError(
+            f"{key} must be at least two; at least two comparable samples are required"
+        )
+    return parsed
 
 
 def _optional_string_tuple(value: Any) -> tuple[str, ...] | None:

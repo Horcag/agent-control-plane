@@ -29,8 +29,11 @@ class AdaptiveRoutingSettings:
     allow_missing_price: bool = False
 
     def __post_init__(self) -> None:
-        if self.minimum_samples_per_candidate <= 0:
-            raise ValueError("minimum_samples_per_candidate must be positive")
+        if self.minimum_samples_per_candidate < 2:
+            raise ValueError(
+                "minimum_samples_per_candidate must be at least two; "
+                "at least two comparable samples are required"
+            )
         if self.history_window <= 0:
             raise ValueError("history_window must be positive")
         if not 0.0 <= self.quality_floor <= 1.0:

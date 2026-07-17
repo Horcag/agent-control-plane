@@ -261,6 +261,12 @@ required_branch = "main"
                     '{ model = "fallback-model", reasoning_effort = "medium" }',
                     "duplicate model and effort pairs",
                 ),
+                (
+                    "too few adaptive samples",
+                    "minimum_samples_per_candidate = 3",
+                    "minimum_samples_per_candidate = 1",
+                    "at least two comparable samples are required",
+                ),
             )
             for label, old, new, message in invalid_cases:
                 with self.subTest(label=label):
