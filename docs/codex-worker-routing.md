@@ -170,13 +170,11 @@ capacity weight rather than a heuristic family-derived value.
 
 ## Evidence policy for adaptive routing
 
-Public coding benchmarks compare model tiers, not this repository's exact prompts and
-effort settings. They do not establish this repository's routing order. LUNA-001 and the
-local tables below are single-run diagnostic anecdotes; they are not comparative evidence
-and are entirely excluded from model-ordering decisions.
+Public coding benchmarks and ad-hoc runs compare sample outcomes, not this repository's
+exact prompts and effort settings. They do not determine routing decisions here. Only
+durable ACP records that satisfy this section's comparability and root-review rules count as routing evidence.
 
-Routing order is operator configuration. ACP does not import candidate order from
-LUNA-001 or from any external single-run benchmark.
+Routing order is operator configuration. ACP does not import candidate order from external benchmarks or ad-hoc experiments.
 
 Adaptive routing is fail-closed for each named policy:
 
@@ -216,68 +214,6 @@ tools, acceptance criteria, and target files fixed. Evaluate:
 Do not reorder or promote candidates from a single run. Use the configured ladder until
 the policy's repeated, comparable, root-reviewed observations satisfy every fail-closed
 rule above; only successful accepted observations contribute quality successes.
-
-## Diagnostic anecdotes only (2026-07-10)
-
-> **Diagnostic-only data, not comparative evidence.** Each row below is one run per
-> variant. These raw tables describe observed telemetry and must not seed, train, promote,
-> or order routing candidates.
-
-Read-only HH vacancy-state audits ran on commit `38639981` with identical stated
-acceptance criteria and clean AgentBridge slots. Identical stated setup does not turn
-one run per variant into statistically valid evidence.
-
-### Terra
-
-| Effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| low | completed | 223.2 s | 828,161 / 567,808 | 4,537 / 1,329 | 28 / 0 failed | 21.52 |
-| medium | completed | 221.7 s | 1,046,168 / 945,664 | 5,282 / 1,716 | 25 / 0 failed | 14.17 |
-| high | completed | 309.8 s | 900,926 / 725,504 | 8,692 / 4,851 | 21 / 0 failed | 18.76 |
-| xhigh | completed | 346.9 s | 1,103,937 / 843,008 | 11,748 / 7,062 | 22 / 0 failed | 25.98 |
-
-The recorded Terra rows describe pipeline coverage and observed duration/token values for
-this sample. They do not establish a Terra effort default or a candidate promotion.
-
-### Luna, Strict Path Protocol
-
-| Effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| low | partial | 152.1 s | 855,522 / 645,632 | 5,002 / 1,007 | 24 / 1 failed | 7.61 |
-| medium | completed | 181.9 s | 746,148 / 556,032 | 6,771 / 1,959 | 22 / 0 failed | 7.16 |
-| high | completed | 222.5 s | 877,465 / 742,912 | 9,189 / 4,129 | 26 / 1 failed | 6.60 |
-| xhigh | partial | 342.5 s | 1,216,448 / 1,000,704 | 14,455 / 7,947 | 28 / 0 failed | 10.06 |
-
-The recorded Luna rows describe result status, duration, token, and tool-call values for
-this sample. They do not establish a Luna effort default or a candidate promotion.
-
-The first Luna medium and xhigh attempts were excluded: project-wide IDE discovery read
-files from another indexed checkout. That failure produced the strict physical-path
-protocol and watchdog rules now enforced by the runner. The table's failed-tool value
-counts MCP call errors; a command can return a non-zero exit code inside a successful
-`run_command` call, which explains partial results with zero failed MCP calls. Each row is
-still one canary, not a statistical benchmark. Cached-input ratios dominate the single-run
-credit estimate, so credits are not expected to increase monotonically with effort.
-
-### Sol versus Terra, Strict Head-to-Head
-
-These three runs used the same six files, acceptance criteria, physical-path protocol,
-commit, and read-only sandbox:
-
-| Model / effort | Status | Duration | Input / cached | Output / reasoning | Tools | Credits |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Terra medium | completed | 152.3 s | 637,842 / 518,656 | 5,103 / 1,605 | 20 / 1 failed | 12.60 |
-| Sol low | completed | 179.1 s | 574,675 / 507,904 | 4,560 / 668 | 19 / 0 failed | 18.12 |
-| Sol medium | partial | 251.0 s | 776,079 / 711,168 | 7,043 / 1,705 | 24 / 0 failed | 22.29 |
-
-The recorded Sol/Terra rows describe observed duration, token, tool-call, and credit
-values for this sample. They do not establish a Terra or Sol default, reject a candidate,
-or determine candidate order.
-
-The checked-in credit and API rates are operator-supplied example values, not official or
-guaranteed-current prices. Raw input, cached-input, output, and reasoning token counts
-remain authoritative; unknown price remains `null` and is ineligible unless the policy
-explicitly allows missing price.
 
 ## Telemetry
 
