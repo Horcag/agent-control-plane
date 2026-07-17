@@ -15,6 +15,7 @@ from agent_control_plane.app.runtime.mcp_server import (
     ConfigFreshnessError,
     build_server,
 )
+from agent_control_plane.app.runtime.orchestrator import PolicyError
 from agent_control_plane.entities.slot import SlotStore
 
 
@@ -226,6 +227,7 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
 
     assert {
         "agent_model_catalog",
+        "agent_model_routing_explain",
         "agent_plan_create",
         "agent_plan_add_task",
         "agent_plan_bind_job",
@@ -273,6 +275,34 @@ def test_mcp_model_catalog_refreshes_after_config_change(monkeypatch, tmp_path: 
     assert from_config_path.call_count == 2
     initial.model_catalog_inspection.assert_called_once_with()
     refreshed.model_catalog_inspection.assert_called_once_with()
+
+
+def test_mcp_model_routing_explain_delegates_and_returns_clean_errors(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    payload = {"route": "main", "policy": "adaptive", "selection_source": "history"}
+    control = Mock()
+    control.model_routing_explain.return_value = payload
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        assert server.tools["agent_model_routing_explain"]("adaptive", "main") == payload
+        control.model_routing_explain.side_effect = PolicyError("Unknown route: missing")
+        assert server.tools["agent_model_routing_explain"]("adaptive", "missing") == {
+            "ok": False,
+            "error": "Unknown route: missing",
+        }
+
+    control.model_routing_explain.assert_called_with("adaptive", "missing")
 
 
 def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> None:

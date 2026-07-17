@@ -201,6 +201,14 @@ def build_server(config_path: str | None = None) -> Any:
         return control.model_catalog_inspection()
 
     @mcp.tool()
+    def agent_model_routing_explain(policy: str, route: str) -> dict[str, Any]:
+        """Explain bounded adaptive routing evidence for one named policy and route."""
+        try:
+            return control.model_routing_explain(policy, route)
+        except (PolicyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
     def agent_start_job(
         task_id: str,
         route: str,

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import subprocess  # nosec B404
 import sys
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,7 @@ from agent_control_plane.features.agent_runner import (
 )
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     AdaptiveRoutingSettings,
+    RoutingHistoryRecord,
     RoutingPolicy,
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
@@ -122,6 +125,77 @@ def _configured_routing_policies(config: ControlConfig) -> tuple[RoutingPolicy, 
             )
         )
     return tuple(policies)
+
+
+_ROUTING_HISTORY_LIMIT = 200
+
+
+def _routing_history_record(value: Any) -> RoutingHistoryRecord | None:
+    if not isinstance(value, Mapping):
+        return None
+    model = _required_history_text(value.get("model"))
+    reasoning_effort = _required_history_text(value.get("reasoning_effort"))
+    attempt_status = _required_history_text(value.get("attempt_status"))
+    input_tokens = _history_nonnegative_int(value.get("input_tokens"))
+    cached_input_tokens = _history_nonnegative_int(value.get("cached_input_tokens"))
+    output_tokens = _history_nonnegative_int(value.get("output_tokens"))
+    duration_sec = _history_nonnegative_float(value.get("duration_sec"))
+    defects_found = _history_nonnegative_int(value.get("defects_found"))
+    metrics_valid = value.get("metrics_valid", True)
+    if (
+        model is None
+        or reasoning_effort is None
+        or attempt_status is None
+        or input_tokens is None
+        or cached_input_tokens is None
+        or output_tokens is None
+        or duration_sec is None
+        or defects_found is None
+        or not isinstance(metrics_valid, bool)
+    ):
+        return None
+    return RoutingHistoryRecord(
+        model=model,
+        reasoning_effort=reasoning_effort,
+        attempt_status=attempt_status,
+        result_status=_optional_history_text(value.get("result_status")),
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        output_tokens=output_tokens,
+        duration_sec=duration_sec,
+        root_outcome=_optional_history_text(value.get("root_outcome")),
+        defects_found=defects_found,
+        catalog_source=_optional_history_text(value.get("catalog_source")),
+        catalog_version=_optional_history_text(value.get("catalog_version")),
+        metrics_valid=metrics_valid,
+        route=_optional_history_text(value.get("route")),
+        policy_name=_optional_history_text(value.get("policy_name")),
+        task_class=_optional_history_text(value.get("task_class")),
+        selection_source=_optional_history_text(value.get("selection_source")),
+    )
+
+
+def _required_history_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _optional_history_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _history_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _history_nonnegative_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number >= 0 else None
 
 
 TERMINAL_STATUSES = frozenset(
@@ -265,6 +339,42 @@ class AgentControlPlane:
 
     def model_catalog_inspection(self) -> dict[str, Any]:
         return self.model_catalog.inspection_payload()
+
+    def model_routing_explain(self, policy: str, route: str) -> dict[str, Any]:
+        if self.config.routes.get(route) is None:
+            raise PolicyError(f"Unknown route: {route}")
+        try:
+            configured_policy = self.model_routing.policy(policy)
+        except ValueError as exc:
+            raise PolicyError(str(exc)) from exc
+
+        raw_history = self.store.routing_history(limit=_ROUTING_HISTORY_LIMIT)
+        history_rows = raw_history if isinstance(raw_history, list) else ()
+        history = tuple(
+            record for row in history_rows if (record := _routing_history_record(row)) is not None
+        )
+        decision = self.model_routing.decision_for_policy(
+            configured_policy.name,
+            history=history,
+            route=route,
+        )
+        payload = decision.as_dict()
+        payload.update(
+            {
+                "route": route,
+                "policy": decision.requested_policy,
+                "chosen_model": decision.chosen_profile.model,
+                "chosen_reasoning_effort": decision.chosen_profile.reasoning_effort,
+                "fallback_reason": (
+                    "; ".join(decision.excluded_data_reasons)
+                    if decision.configured_fallback
+                    else None
+                ),
+                "catalog_source": decision.catalog_source,
+                "catalog_version": decision.catalog_version,
+            }
+        )
+        return payload
 
     def smoke(self) -> dict[str, Any]:
         self.store.initialize()

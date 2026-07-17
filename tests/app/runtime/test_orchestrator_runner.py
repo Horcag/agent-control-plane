@@ -879,6 +879,75 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(job.codex_reasoning_effort, "ultra")
             self.assertEqual(job.codex_tool_call_budget, 77)
 
+    def test_model_routing_explain_returns_adaptive_decision_and_calls_policy_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = _adaptive_control(root, workspace)
+            history = [
+                _routing_history_row(control),
+                _routing_history_row(control, duration_sec=40),
+            ]
+
+            with (
+                patch.object(
+                    control.store, "routing_history", return_value=history
+                ) as read_history,
+                patch.object(
+                    control.model_routing,
+                    "decision_for_policy",
+                    wraps=control.model_routing.decision_for_policy,
+                ) as decide,
+            ):
+                payload = control.model_routing_explain("adaptive", "main")
+
+            read_history.assert_called_once_with(limit=200)
+            decide.assert_called_once()
+            self.assertEqual(payload["route"], "main")
+            self.assertEqual(payload["policy"], "adaptive")
+            self.assertEqual(payload["task_class"], "implementation")
+            self.assertEqual(payload["chosen_model"], "gpt-5.6-luna")
+            self.assertEqual(payload["chosen_reasoning_effort"], "low")
+            self.assertEqual(payload["tool_call_budget"], 77)
+            self.assertEqual(payload["selection_source"], "history")
+            self.assertIsNone(payload["fallback_reason"])
+            self.assertEqual(payload["candidate_scores"][0]["sample_count"], 2)
+            self.assertEqual(payload["candidate_scores"][0]["expected_duration_sec"], 35.0)
+            self.assertEqual(payload["catalog"]["source"], control.model_catalog.source)
+
+    def test_model_routing_explain_shows_configured_fallback_for_zero_and_one_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = _adaptive_control(root, workspace)
+
+            for history in ([], [_routing_history_row(control)]):
+                with (
+                    self.subTest(sample_count=len(history)),
+                    patch.object(control.store, "routing_history", return_value=history),
+                ):
+                    payload = control.model_routing_explain("adaptive", "main")
+
+                self.assertTrue(payload["configured_fallback"])
+                self.assertEqual(payload["selection_source"], "configured_fallback")
+                self.assertEqual(payload["fallback_reason"], "insufficient comparable history")
+                self.assertEqual(payload["candidate_scores"][0]["sample_count"], len(history))
+
+    def test_model_routing_explain_ignores_malformed_history_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = _adaptive_control(root, workspace)
+            malformed = {"model": "gpt-5.6-luna", "reasoning_effort": "low", "input_tokens": "bad"}
+            valid = _routing_history_row(control)
+
+            with patch.object(control.store, "routing_history", return_value=[malformed, valid]):
+                payload = control.model_routing_explain("adaptive", "main")
+
+            self.assertEqual(payload["candidate_scores"][0]["sample_count"], 1)
+            self.assertTrue(payload["configured_fallback"])
+            self.assertEqual(payload["fallback_reason"], "insufficient comparable history")
+
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1607,6 +1676,56 @@ def _brief(coordination_root: Path, task_id: str) -> None:
     (coordination_root / "agent-protocol.md").write_text("# Protocol\n", encoding="utf-8")
     (coordination_root / "workspace-routing.md").write_text("# Routing\n", encoding="utf-8")
     (task_dir / "brief.md").write_text("# Brief\n", encoding="utf-8")
+
+
+def _adaptive_control(root: Path, workspace: Path) -> AgentControlPlane:
+    policy = CodexRoutingPolicyConfig(
+        name="adaptive",
+        task_class="implementation",
+        tool_call_budget=77,
+        candidates=(CodexRoutingCandidateConfig("gpt-5.6-luna", "low"),),
+        adaptive=CodexAdaptiveRoutingConfig(
+            minimum_samples_per_candidate=2,
+            history_window=20,
+            quality_floor=0.5,
+            prior_quality=0.5,
+            prior_weight=1.0,
+            allow_missing_price=True,
+        ),
+    )
+    config = _config(root, workspace)
+    config = replace(
+        config,
+        defaults=replace(config.defaults, codex_quality_tier="adaptive"),
+        routing_policies=(policy,),
+    )
+    return AgentControlPlane(config)
+
+
+def _routing_history_row(
+    control: AgentControlPlane,
+    *,
+    duration_sec: float = 30.0,
+) -> dict[str, Any]:
+    return {
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "low",
+        "attempt_status": "completed",
+        "result_status": "completed",
+        "input_tokens": 1_000,
+        "cached_input_tokens": 0,
+        "output_tokens": 100,
+        "duration_sec": duration_sec,
+        "metrics_valid": True,
+        "route": "main",
+        "policy_name": "adaptive",
+        "task_class": "implementation",
+        "selection_source": "configured_fallback",
+        "catalog_source": control.model_catalog.source,
+        "catalog_version": control.model_catalog.version,
+        "root_outcome": "accepted",
+        "defects_found": 0,
+    }
 
 
 def _create_job(

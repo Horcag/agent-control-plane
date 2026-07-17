@@ -56,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "model-catalog":
             _print_json(control.model_catalog_inspection())
             return 0
+        if args.command == "model-routing-explain":
+            _print_json(control.model_routing_explain(args.policy, args.route))
+            return 0
         if args.command == "reconcile":
             _print_json(
                 control.reconcile_jobs(
@@ -389,6 +392,13 @@ def _build_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="Inspect the bounded Codex model catalog",
     )
+    routing_explain = subparsers.add_parser(
+        "model-routing-explain",
+        parents=[common],
+        help="Explain the selected model for a named route and routing policy",
+    )
+    routing_explain.add_argument("policy", help="Configured Codex routing policy name")
+    routing_explain.add_argument("--route", required=True, help="Configured workspace route")
 
     reconcile = subparsers.add_parser(
         "reconcile",

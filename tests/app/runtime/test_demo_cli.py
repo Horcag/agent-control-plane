@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from agent_control_plane.app.runtime.cli import main
+from agent_control_plane.app.runtime.orchestrator import PolicyError
 
 
 def test_demo_run_show_and_accept_are_offline_and_durable(tmp_path: Path, capsys) -> None:
@@ -88,3 +89,53 @@ def test_model_catalog_command_prints_payload_from_selected_config(
     assert json.loads(capsys.readouterr().out) == payload
     from_config_path.assert_called_once_with(str(config_path))
     control.model_catalog_inspection.assert_called_once_with()
+
+
+def test_model_routing_explain_command_prints_json_and_reports_unknown_policy(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "custom-workspaces.toml"
+    payload = {"route": "main", "policy": "adaptive", "selection_source": "history"}
+    control = Mock()
+    control.model_routing_explain.return_value = payload
+
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=control,
+    ) as from_config_path:
+        assert (
+            main(
+                [
+                    "model-routing-explain",
+                    "adaptive",
+                    "--route",
+                    "main",
+                    "--config",
+                    str(config_path),
+                ]
+            )
+            == 0
+        )
+
+        assert json.loads(capsys.readouterr().out) == payload
+        from_config_path.assert_called_once_with(str(config_path))
+        control.model_routing_explain.assert_called_once_with("adaptive", "main")
+
+        control.model_routing_explain.side_effect = PolicyError(
+            "Unsupported Codex routing policy 'missing'"
+        )
+        assert (
+            main(
+                [
+                    "model-routing-explain",
+                    "missing",
+                    "--route",
+                    "main",
+                    "--config",
+                    str(config_path),
+                ]
+            )
+            == 2
+        )
+    assert "Unsupported Codex routing policy 'missing'" in capsys.readouterr().err
