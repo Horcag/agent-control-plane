@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -40,6 +41,16 @@ class CatalogModel:
     supported_reasoning_efforts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class CatalogPriceEstimate:
+    """Current catalog pricing reconstructed from raw token counts."""
+
+    estimated_credits: float | None
+    estimated_api_usd: float | None
+    rate_card_version: str | None
+    rate_card_source: str | None
+
+
 class ModelCatalog:
     """Read-only merger of the local Codex inventory and ACP-owned metadata."""
 
@@ -49,10 +60,14 @@ class ModelCatalog:
         models: dict[str, CatalogModel],
         metadata: dict[str, CatalogModelMetadata],
         cache_status: str,
+        source: str,
+        version: str | None,
     ) -> None:
         self._models = models
         self._metadata = metadata
         self.cache_status = cache_status
+        self.source = source
+        self.version = version
 
     @classmethod
     def load(
@@ -64,12 +79,18 @@ class ModelCatalog:
         now: float | None = None,
     ) -> ModelCatalog:
         normalized_metadata = _metadata_by_model(metadata)
-        cache_status, models = _load_cache(
+        cache_status, models, version = _load_cache(
             cache_path,
             max_cache_age_sec=max_cache_age_sec,
             now=time.time() if now is None else now,
         )
-        return cls(models=models, metadata=normalized_metadata, cache_status=cache_status)
+        return cls(
+            models=models,
+            metadata=normalized_metadata,
+            cache_status=cache_status,
+            source=cache_path.name,
+            version=version,
+        )
 
     @classmethod
     def from_config(cls, config: CodexModelCatalogConfig) -> ModelCatalog:
@@ -164,6 +185,62 @@ class ModelCatalog:
     def rate_metadata_for(self, model: str) -> CatalogModelMetadata | None:
         return self._metadata.get(_normalize_model(model))
 
+    def reprice(
+        self,
+        model: str,
+        *,
+        input_tokens: int,
+        cached_input_tokens: int,
+        output_tokens: int,
+    ) -> CatalogPriceEstimate:
+        """Recompute current estimates from raw usage instead of stale stored currency."""
+        metadata = self.rate_metadata_for(model)
+        if metadata is None:
+            return CatalogPriceEstimate(None, None, None, None)
+        uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+        return CatalogPriceEstimate(
+            estimated_credits=_estimate_rate(
+                metadata.credit_rate,
+                uncached_input_tokens=uncached_input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+            ),
+            estimated_api_usd=_estimate_rate(
+                metadata.api_usd_rate,
+                uncached_input_tokens=uncached_input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+            ),
+            rate_card_version=metadata.rate_card_version,
+            rate_card_source=metadata.rate_card_source,
+        )
+
+    def inspection_payload(self) -> dict[str, Any]:
+        """Return bounded, policy-safe catalog data without cache instruction blobs."""
+        return {
+            "status": self.cache_status,
+            "source": self.source,
+            "version": self.version,
+            "models": [
+                {
+                    "model": model.model,
+                    "visible": model.visible,
+                    "priority": model.priority,
+                    "default_reasoning_effort": model.default_reasoning_effort,
+                    "supported_reasoning_efforts": list(model.supported_reasoning_efforts),
+                    "quota_domain": metadata.quota_domain if metadata is not None else None,
+                    "rate_card_version": (
+                        metadata.rate_card_version if metadata is not None else None
+                    ),
+                    "rate_card_source": metadata.rate_card_source if metadata is not None else None,
+                    "has_credit_rate": metadata is not None and metadata.credit_rate is not None,
+                    "has_api_usd_rate": metadata is not None and metadata.api_usd_rate is not None,
+                }
+                for model in self._models.values()
+                for metadata in (self.rate_metadata_for(model.model),)
+            ],
+        }
+
     def quota_domain_for(self, model: str | None) -> str:
         if model is None:
             return "primary"
@@ -208,26 +285,27 @@ def _load_cache(
     *,
     max_cache_age_sec: float,
     now: float,
-) -> tuple[str, dict[str, CatalogModel]]:
+) -> tuple[str, dict[str, CatalogModel], str | None]:
     try:
         modified_at = cache_path.stat().st_mtime
     except OSError:
-        return "missing", {}
+        return "missing", {}, None
     if now - modified_at > max_cache_age_sec:
-        return "stale", {}
+        return "stale", {}, None
     try:
-        value = json.loads(cache_path.read_text(encoding="utf-8"))
+        raw = cache_path.read_bytes()
+        value = json.loads(raw)
     except (OSError, json.JSONDecodeError):
-        return "invalid", {}
+        return "invalid", {}, None
     if not isinstance(value, dict) or not isinstance(value.get("models"), list):
-        return "invalid", {}
+        return "invalid", {}, None
     models: dict[str, CatalogModel] = {}
     for item in value["models"]:
         parsed = _parse_model(item)
         if parsed is None:
-            return "invalid", {}
+            return "invalid", {}, None
         models[_normalize_model(parsed.model)] = parsed
-    return "loaded", models
+    return "loaded", models, hashlib.sha256(raw).hexdigest()[:16]
 
 
 def _parse_model(value: Any) -> CatalogModel | None:
@@ -310,3 +388,19 @@ def _visible(value: Any) -> bool:
 
 def _normalize_model(model: str) -> str:
     return model.strip().lower()
+
+
+def _estimate_rate(
+    rate: CatalogRate | None,
+    *,
+    uncached_input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+) -> float | None:
+    if rate is None:
+        return None
+    return (
+        uncached_input_tokens * rate.input
+        + max(0, cached_input_tokens) * rate.cached_input
+        + max(0, output_tokens) * rate.output
+    ) / 1_000_000
