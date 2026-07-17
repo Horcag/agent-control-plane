@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -345,10 +347,43 @@ def test_executable_task_spec_round_trips_without_returning_full_brief() -> None
             "workspace_access": "native",
             "read_only": False,
             "codex_quality_tier": "mechanical",
+            "codex_model": None,
+            "codex_reasoning_effort": None,
             "brief_sha256": "2d3f668e501d9979fac44adb78c7cf3b970a83cba93a0d62d0a769caf31b884d",
             "brief_chars": 27,
         }
         assert "secret implementation brief" not in str(task)
+
+
+def test_legacy_execution_json_without_plan_contract_fields_loads_as_none(tmp_path: Path) -> None:
+    plans = _plan_store(tmp_path)
+    plans.create_plan(
+        plan_id="legacy",
+        title="Legacy",
+        tasks=(
+            PlanTaskDefinition(
+                "schema",
+                "Schema",
+                execution=PlanExecutionSpec(route="dev", brief="legacy plan"),
+            ),
+        ),
+    )
+    legacy_payload = json.dumps({"route": "dev", "brief": "legacy plan", "backend": "codex"})
+
+    with sqlite3.connect(plans.database_path) as database:
+        database.execute(
+            """
+            update plan_tasks
+            set execution_json = ?
+            where plan_id = 'legacy' and task_id = 'schema'
+            """,
+            (legacy_payload,),
+        )
+        database.commit()
+
+    task = plans.snapshot("legacy")["ready_next"][0]
+    assert task["execution"]["codex_model"] is None
+    assert task["execution"]["codex_reasoning_effort"] is None
 
 
 def test_ready_task_claim_is_atomic_across_two_plan_store_instances(tmp_path: Path) -> None:
@@ -685,6 +720,32 @@ PlanDispatcher(
         if coordinator.poll() is None:
             coordinator.terminate()
             coordinator.wait(timeout=5)
+
+
+def test_plan_store_initialization_preserves_legacy_v4_and_registers_v5(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        db.execute(
+            """
+            insert into schema_migrations (component, version, checksum, applied_at)
+            values ('plan_store', 4, 'plan-slot-allocation-v4-20260716', '2026-07-16T00:00:00+00:00')
+            """
+        )
+        db.commit()
+
+    PlanStore(database).initialize()
+
+    with sqlite3.connect(database) as db:
+        migration_checksums = dict(
+            db.execute(
+                "select version, checksum from schema_migrations where component = 'plan_store'"
+            ).fetchall()
+        )
+
+    assert migration_checksums[4] == "plan-slot-allocation-v4-20260716"
+    assert migration_checksums[5] == "plan-execution-contract-v5-20260717"
 
 
 def _plan_store(root: Path) -> PlanStore:

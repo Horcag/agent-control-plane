@@ -7,7 +7,7 @@ from pathlib import Path
 
 from agent_control_plane.app.runtime.cli import _build_parser, main
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
-from agent_control_plane.app.runtime.plan_cli import read_plan_manifest
+from agent_control_plane.app.runtime.plan_cli import plan_execution_spec, read_plan_manifest
 
 
 def test_root_parser_registers_extracted_demo_and_plan_groups() -> None:
@@ -163,11 +163,17 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
             "codex",
             "--workspace-access",
             "native",
+            "--codex-model",
+            "gpt-5.3-codex-spark",
+            "--codex-reasoning-effort",
+            "high",
         ]
     )
     assert add.route == "app"
     assert add.brief_file == "api.md"
     assert add.backend == "codex"
+    assert add.codex_model == "gpt-5.3-codex-spark"
+    assert add.codex_reasoning_effort == "high"
 
 
 def test_cli_restart_requires_explicit_retry_after_failed_dispatch(tmp_path: Path) -> None:
@@ -210,6 +216,21 @@ def test_cli_restart_requires_explicit_retry_after_failed_dispatch(tmp_path: Pat
     assert retried["task"]["attempt_no"] == 1
     assert third["claimed"] == 1
     assert third["failures"][0]["attempt_no"] == 2
+
+
+def test_plan_execution_spec_reads_explicit_codex_contract() -> None:
+    execution = plan_execution_spec(
+        {
+            "route": "app",
+            "brief": "Spark run",
+            "codex_model": "gpt-5.3-codex-spark",
+            "codex_reasoning_effort": "high",
+        }
+    )
+
+    assert execution is not None
+    assert execution.codex_model == "gpt-5.3-codex-spark"
+    assert execution.codex_reasoning_effort == "high"
 
 
 def _run_cli(cwd: Path, *arguments: str) -> dict[str, object]:

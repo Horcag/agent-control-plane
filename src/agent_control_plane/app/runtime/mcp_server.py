@@ -713,6 +713,8 @@ def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         workspace_access=_optional_text(payload.get("workspace_access")),
         read_only=read_only,
         codex_quality_tier=_optional_text(payload.get("codex_quality_tier")),
+        codex_model=_optional_text(payload.get("codex_model")),
+        codex_reasoning_effort=_optional_text(payload.get("codex_reasoning_effort")),
     )
 
 

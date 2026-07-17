@@ -127,6 +127,8 @@ def plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         workspace_access=optional_manifest_text(payload.get("workspace_access")),
         read_only=read_only,
         codex_quality_tier=optional_manifest_text(payload.get("codex_quality_tier")),
+        codex_model=optional_manifest_text(payload.get("codex_model")),
+        codex_reasoning_effort=optional_manifest_text(payload.get("codex_reasoning_effort")),
     )
 
 
@@ -138,6 +140,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         args.backend,
         args.workspace_access,
         args.codex_quality_tier,
+        args.codex_model,
+        args.codex_reasoning_effort,
     )
     if not any(value is not None for value in values) and not args.read_only:
         return None
@@ -155,6 +159,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         workspace_access=args.workspace_access,
         read_only=args.read_only,
         codex_quality_tier=args.codex_quality_tier,
+        codex_model=args.codex_model,
+        codex_reasoning_effort=args.codex_reasoning_effort,
     )
 
 

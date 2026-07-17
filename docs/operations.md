@@ -67,6 +67,36 @@ root acceptance, and unlocks dependants. Delivery is not acceptance. Use `inbox 
 start`, `review checkpoint`, `review attach`, and `review finish` to account for root
 review separately.
 
+### Spark plan example (explicit model/effort)
+
+```json
+{
+  "plan_id": "spark-review",
+  "title": "Spark review pass",
+  "tasks": [
+    {
+      "task_id": "schema",
+      "title": "Review schema changes",
+      "execution": {
+        "route": "acp",
+        "brief": "Analyze schema deltas and provide a compatibility review.",
+        "backend": "codex",
+        "codex_model": "gpt-5.3-codex-spark",
+        "codex_reasoning_effort": "high"
+      }
+    }
+  ]
+}
+```
+
+```powershell
+agent-control plan create --manifest .\spark-review.json --config .\config\workspaces.toml
+agent-control plan dispatch spark-review --max-jobs 1 --config .\config\workspaces.toml
+```
+
+The plan task carries the explicit model and effort in durable storage, so delayed startup
+does not fall back to changed global defaults.
+
 ## Quality gates and recovery
 
 Worker/controller native gates are configured on the route. Commands must already be

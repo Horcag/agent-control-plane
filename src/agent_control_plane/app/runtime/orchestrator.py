@@ -424,6 +424,8 @@ class AgentControlPlane:
                 route=claim.execution.route,
                 backend=claim.execution.backend,
                 codex_quality_tier=claim.execution.codex_quality_tier,
+                codex_model=claim.execution.codex_model,
+                codex_reasoning_effort=claim.execution.codex_reasoning_effort,
                 slot=claim.execution.slot,
                 read_only=claim.execution.read_only,
                 plan_id=claim.plan_id,

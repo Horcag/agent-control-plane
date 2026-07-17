@@ -63,11 +63,20 @@ class PlanExecutionSpec:
     workspace_access: str | None = None
     read_only: bool = False
     codex_quality_tier: str | None = None
+    codex_model: str | None = None
+    codex_reasoning_effort: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "route", _required("execution route", self.route))
         object.__setattr__(self, "brief", _required("execution brief", self.brief))
-        for field_name in ("slot", "backend", "workspace_access", "codex_quality_tier"):
+        for field_name in (
+            "slot",
+            "backend",
+            "workspace_access",
+            "codex_quality_tier",
+            "codex_model",
+            "codex_reasoning_effort",
+        ):
             value = getattr(self, field_name)
             object.__setattr__(self, field_name, value.strip() if value and value.strip() else None)
 
@@ -130,6 +139,13 @@ class PlanStore:
             version=3,
             checksum="plan-lifecycle-v3-20260715",
             migrate=self._migrate_plan_lifecycle,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="plan_store",
+            version=5,
+            checksum="plan-execution-contract-v5-20260717",
+            migrate=self._migrate_plan_execution_contract,
         )
 
     @classmethod
@@ -248,6 +264,14 @@ class PlanStore:
             on plans(archived_at, updated_at)
             """
         )
+
+    @staticmethod
+    def _migrate_plan_execution_contract(db: sqlite3.Connection) -> None:
+        # Existing rows already store execution JSON. Missing fields are optional and
+        # now load as None through PlanExecutionSpec normalization.
+        # This no-op migration keeps older durable plans readable and preserves
+        # backward compatibility.
+        db.execute("pragma schema_version")
 
     def create_plan(
         self,
@@ -1417,6 +1441,8 @@ def _execution_json(execution: PlanExecutionSpec) -> str:
             "workspace_access": execution.workspace_access,
             "read_only": execution.read_only,
             "codex_quality_tier": execution.codex_quality_tier,
+            "codex_model": execution.codex_model,
+            "codex_reasoning_effort": execution.codex_reasoning_effort,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1440,6 +1466,8 @@ def _execution_from_json(value: str | None) -> PlanExecutionSpec | None:
         workspace_access=_optional_text(payload.get("workspace_access")),
         read_only=read_only,
         codex_quality_tier=_optional_text(payload.get("codex_quality_tier")),
+        codex_model=_optional_text(payload.get("codex_model")),
+        codex_reasoning_effort=_optional_text(payload.get("codex_reasoning_effort")),
     )
 
 
@@ -1457,6 +1485,8 @@ def _execution_summary(execution: PlanExecutionSpec) -> dict[str, Any]:
         "workspace_access": execution.workspace_access,
         "read_only": execution.read_only,
         "codex_quality_tier": execution.codex_quality_tier,
+        "codex_model": execution.codex_model,
+        "codex_reasoning_effort": execution.codex_reasoning_effort,
         "brief_sha256": hashlib.sha256(brief_bytes).hexdigest(),
         "brief_chars": len(execution.brief),
     }

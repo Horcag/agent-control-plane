@@ -489,6 +489,61 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 "codex/autonomous-supervisor",
             )
 
+    def test_plan_dispatch_preserves_explicit_spark_model_and_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = _config(root, workspace)
+            config = replace(
+                config,
+                defaults=replace(
+                    config.defaults,
+                    codex_model="gpt-5.6-terra",
+                    codex_reasoning_effort="low",
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(control.config.coordination_root, "schema")
+            control.create_plan(
+                plan_id="dispatch-spark",
+                title="Dispatch Spark",
+                tasks=(
+                    PlanTaskDefinition(
+                        "schema",
+                        "Schema",
+                        execution=PlanExecutionSpec(
+                            route="main",
+                            brief="Run with Spark profile.",
+                            backend=CODEX_BACKEND,
+                            codex_model="gpt-5.3-codex-spark",
+                            codex_reasoning_effort="high",
+                        ),
+                    ),
+                ),
+            )
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                dispatched = control.dispatch_plan("dispatch-spark", max_jobs=1)
+
+            job_id = dispatched["dispatched"][0]["job_id"]
+            job = control.store.get_job(job_id)
+            summary = control.summary_job(job_id)
+            snapshot = control.plan_snapshot("dispatch-spark")
+
+            self.assertEqual(job.codex_model, "gpt-5.3-codex-spark")
+            self.assertEqual(job.codex_reasoning_effort, "high")
+            self.assertIsNone(job.codex_quality_tier)
+            self.assertEqual(summary["codex_quota_domain"], "spark")
+            self.assertEqual(
+                snapshot["running"][0]["execution"]["codex_model"],
+                "gpt-5.3-codex-spark",
+            )
+            worker_control = AgentControlPlane(config)
+            worker_job = worker_control.store.get_job(job_id)
+            worker_ladder = worker_control.job_execution._model_ladder_for_job(worker_job)
+            self.assertEqual(worker_ladder[0].model, "gpt-5.3-codex-spark")
+            self.assertEqual(worker_ladder[0].reasoning_effort, "high")
+
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

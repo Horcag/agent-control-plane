@@ -50,6 +50,14 @@ def add_plan_parser(
     plan_add.add_argument("--workspace-access", choices=("ide_mcp", "native"))
     plan_add.add_argument("--read-only", action="store_true")
     plan_add.add_argument("--codex-quality-tier")
+    plan_add.add_argument("--codex-model", help="Model to use when --backend=codex")
+    plan_add.add_argument(
+        "--codex-reasoning-effort",
+        help=(
+            "Codex reasoning effort to use when --backend=codex; managed "
+            "Luna/Terra/Sol profiles accept none, low, medium, high, or xhigh"
+        ),
+    )
 
     plan_bind = plan_subparsers.add_parser(
         "bind", parents=[common], help="Bind an existing job to a logical plan task"
