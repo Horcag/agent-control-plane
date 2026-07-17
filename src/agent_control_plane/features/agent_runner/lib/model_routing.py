@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -7,6 +8,7 @@ from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCat
 
 LEGACY_POLICY_NAMES = ("mechanical", "balanced", "deep")
 _TERMINAL_RESULT_STATUSES = frozenset({"completed", "partial", "blocked", "failed"})
+_AUTOMATIC_SELECTION_SOURCES = frozenset({"configured_fallback", "history"})
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,10 @@ class RoutingHistoryRecord:
     catalog_source: str | None
     catalog_version: str | None = None
     metrics_valid: bool = True
+    route: str | None = None
+    policy_name: str | None = None
+    task_class: str | None = None
+    selection_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -245,6 +251,7 @@ class ModelRoutingPolicy:
         policy_name: str,
         *,
         history: Iterable[RoutingHistoryRecord],
+        route: str | None = None,
     ) -> RoutingDecision:
         policy = self.policy(policy_name)
         candidates = self._resolved_candidates(policy)
@@ -256,7 +263,12 @@ class ModelRoutingPolicy:
                 records,
                 excluded_data_reasons=("adaptive routing is disabled for this policy",),
             )
-        comparable, excluded = self._comparable_history(records, policy.adaptive.history_window)
+        comparable, excluded = self._comparable_history(
+            records,
+            policy=policy,
+            route=route,
+            history_window=policy.adaptive.history_window,
+        )
         scores = tuple(
             self._score_candidate(
                 candidate,
@@ -387,32 +399,78 @@ class ModelRoutingPolicy:
     def _comparable_history(
         self,
         records: tuple[RoutingHistoryRecord, ...],
+        *,
+        policy: RoutingPolicy,
+        route: str | None,
         history_window: int,
     ) -> tuple[tuple[RoutingHistoryRecord, ...], tuple[str, ...]]:
         comparable: list[RoutingHistoryRecord] = []
         excluded: list[str] = []
-        for record in records[:history_window]:
+        for record in records:
             if not record.metrics_valid:
                 excluded.append("invalid attempt metrics")
                 continue
             if record.result_status not in _TERMINAL_RESULT_STATUSES:
                 excluded.append("missing terminal result")
                 continue
+            if not _present(record.route) or not _present(route):
+                excluded.append("missing route")
+                continue
+            if record.route != route:
+                excluded.append("unrelated route")
+                continue
+            if not _present(record.policy_name):
+                excluded.append("missing policy")
+                continue
+            if record.policy_name != policy.name:
+                excluded.append("unrelated policy")
+                continue
+            if not _present(record.task_class):
+                excluded.append("missing task class")
+                continue
+            if record.task_class != policy.task_class:
+                excluded.append("unrelated task class")
+                continue
+            if not _present(record.selection_source):
+                excluded.append("missing selection source")
+                continue
+            if record.selection_source not in _AUTOMATIC_SELECTION_SOURCES:
+                excluded.append("explicit selection")
+                continue
+            if not _present(record.catalog_source) or not _present(self.catalog.source):
+                excluded.append("missing catalog source")
+                continue
             if record.catalog_source != self.catalog.source:
                 excluded.append("incompatible catalog source")
                 continue
-            if (
-                min(
-                    record.input_tokens,
-                    record.cached_input_tokens,
-                    record.output_tokens,
-                    record.duration_sec,
+            if not _present(record.catalog_version) or not _present(self.catalog.version):
+                excluded.append("missing catalog version")
+                continue
+            if record.catalog_version != self.catalog.version:
+                excluded.append("incompatible catalog version")
+                continue
+            try:
+                usage = tuple(
+                    float(value)
+                    for value in (
+                        record.input_tokens,
+                        record.cached_input_tokens,
+                        record.output_tokens,
+                        record.duration_sec,
+                    )
                 )
-                < 0
+            except (TypeError, ValueError):
+                usage = ()
+            if (
+                len(usage) != 4
+                or any(not math.isfinite(value) or value < 0 for value in usage)
+                or usage[1] > usage[0]
             ):
                 excluded.append("invalid raw usage")
                 continue
             comparable.append(record)
+            if len(comparable) >= history_window:
+                break
         return tuple(comparable), tuple(dict.fromkeys(excluded))
 
     def _score_candidate(
@@ -455,6 +513,8 @@ class ModelRoutingPolicy:
         reasons: list[str] = []
         if len(matches) < settings.minimum_samples_per_candidate:
             reasons.append("insufficient comparable samples")
+        if any(record.root_outcome is None for record in matches):
+            reasons.append("missing root review")
         if review_penalties:
             reasons.append("root rejection or defect")
         if quality_score is not None and quality_score < settings.quality_floor:
@@ -513,11 +573,19 @@ def _legacy_candidates(primary: ModelProfile, fallback: ModelProfile) -> tuple[M
 
 
 def _quality_success(record: RoutingHistoryRecord) -> bool:
-    return record.result_status == "completed" and not _has_review_penalty(record)
+    return (
+        record.result_status == "completed"
+        and record.root_outcome == "accepted"
+        and not _has_review_penalty(record)
+    )
 
 
 def _has_review_penalty(record: RoutingHistoryRecord) -> bool:
     return record.root_outcome == "rejected" or record.defects_found > 0
+
+
+def _present(value: str | None) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _profile_payload(profile: ModelProfile) -> dict[str, str]:

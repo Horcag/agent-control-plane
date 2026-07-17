@@ -68,6 +68,11 @@ def _history(
     root_outcome: str | None = "accepted",
     defects_found: int = 0,
     duration_sec: float = 30.0,
+    route: str | None = "main",
+    policy_name: str | None = "code-change",
+    task_class: str | None = "implementation",
+    selection_source: str | None = "configured_fallback",
+    catalog_version: str | None = None,
 ) -> RoutingHistoryRecord:
     return RoutingHistoryRecord(
         model=model,
@@ -81,11 +86,44 @@ def _history(
         root_outcome=root_outcome,
         defects_found=defects_found,
         catalog_source="models_cache.json",
+        catalog_version=catalog_version,
+        route=route,
+        policy_name=policy_name,
+        task_class=task_class,
+        selection_source=selection_source,
+    )
+
+
+def _adaptive_routing(
+    *, minimum_samples_per_candidate: int = 2, history_window: int = 20
+) -> ModelRoutingPolicy:
+    return ModelRoutingPolicy(
+        catalog=_catalog("reliable-model", "economical-model"),
+        policies=(
+            RoutingPolicy(
+                name="code-change",
+                task_class="implementation",
+                tool_call_budget=90,
+                candidates=(
+                    ModelProfile("reliable-model", "medium"),
+                    ModelProfile("economical-model", "medium"),
+                ),
+                adaptive=AdaptiveRoutingSettings(
+                    minimum_samples_per_candidate=minimum_samples_per_candidate,
+                    history_window=history_window,
+                    quality_floor=0.8,
+                    prior_quality=0.75,
+                    prior_weight=2.0,
+                ),
+            ),
+        ),
     )
 
 
 class AdaptiveModelRoutingTest(unittest.TestCase):
-    def test_arbitrary_named_policy_uses_configured_order_when_history_is_insufficient(self) -> None:
+    def test_arbitrary_named_policy_uses_configured_order_when_history_is_insufficient(
+        self,
+    ) -> None:
         routing = ModelRoutingPolicy(
             catalog=_catalog("invented-cached-model", "fallback-model"),
             policies=(
@@ -147,14 +185,101 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
 
         decision = routing.decision_for_policy(
             "code-change",
-            history=tuple(_history("economical-model") for _ in range(3)),
+            route="main",
+            history=tuple(
+                _history(
+                    "economical-model",
+                    catalog_version=routing.catalog.version,
+                )
+                for _ in range(3)
+            ),
         )
 
         self.assertEqual(decision.selection_source, "history")
         self.assertEqual(decision.ladder[0], ModelProfile("economical-model", "medium"))
-        economical = next(score for score in decision.candidate_scores if score.model == "economical-model")
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
         self.assertEqual(economical.sample_count, 3)
         self.assertGreaterEqual(economical.quality_score, 0.8)
+
+    def test_one_comparable_sample_never_promotes_a_candidate(self) -> None:
+        routing = _adaptive_routing()
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(
+                _history(
+                    "economical-model",
+                    catalog_version=routing.catalog.version,
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.selection_source, "configured_fallback")
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertEqual(economical.sample_count, 1)
+        self.assertIn("insufficient comparable samples", economical.exclusion_reasons)
+
+    def test_strict_history_metadata_is_filtered_before_history_window(self) -> None:
+        routing = _adaptive_routing(history_window=2)
+        version = routing.catalog.version
+
+        history = (
+            _history("economical-model", route=None, catalog_version=version),
+            _history("economical-model", policy_name=None, catalog_version=version),
+            _history("economical-model", task_class=None, catalog_version=version),
+            _history("economical-model", selection_source=None, catalog_version=version),
+            _history("economical-model", selection_source="explicit", catalog_version=version),
+            _history("economical-model", route="other", catalog_version=version),
+            _history("economical-model", policy_name="other-policy", catalog_version=version),
+            _history("economical-model", task_class="research", catalog_version=version),
+            _history("economical-model"),
+            _history("economical-model", catalog_version=version),
+            _history("economical-model", catalog_version=version),
+        )
+
+        decision = routing.decision_for_policy("code-change", route="main", history=history)
+
+        self.assertEqual(decision.selection_source, "history")
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertEqual(economical.sample_count, 2)
+        self.assertIn("missing route", decision.excluded_data_reasons)
+        self.assertIn("missing policy", decision.excluded_data_reasons)
+        self.assertIn("missing task class", decision.excluded_data_reasons)
+        self.assertIn("missing selection source", decision.excluded_data_reasons)
+        self.assertIn("explicit selection", decision.excluded_data_reasons)
+        self.assertIn("unrelated route", decision.excluded_data_reasons)
+        self.assertIn("unrelated policy", decision.excluded_data_reasons)
+        self.assertIn("unrelated task class", decision.excluded_data_reasons)
+        self.assertIn("missing catalog version", decision.excluded_data_reasons)
+
+    def test_missing_root_review_never_promotes_a_candidate(self) -> None:
+        routing = _adaptive_routing()
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=tuple(
+                _history(
+                    "economical-model",
+                    root_outcome=None,
+                    catalog_version=routing.catalog.version,
+                )
+                for _ in range(2)
+            ),
+        )
+
+        self.assertEqual(decision.selection_source, "configured_fallback")
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertIn("missing root review", economical.exclusion_reasons)
 
     def test_rejection_or_defect_prevents_a_cheap_candidate_from_promotion(self) -> None:
         routing = ModelRoutingPolicy(
@@ -181,10 +306,24 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
 
         decision = routing.decision_for_policy(
             "reviewed-change",
+            route="main",
             history=(
-                _history("cheap-model"),
-                _history("cheap-model"),
-                _history("cheap-model", defects_found=1),
+                _history(
+                    "cheap-model",
+                    policy_name="reviewed-change",
+                    catalog_version=routing.catalog.version,
+                ),
+                _history(
+                    "cheap-model",
+                    policy_name="reviewed-change",
+                    catalog_version=routing.catalog.version,
+                ),
+                _history(
+                    "cheap-model",
+                    policy_name="reviewed-change",
+                    defects_found=1,
+                    catalog_version=routing.catalog.version,
+                ),
             ),
         )
 
@@ -193,7 +332,9 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
         cheap = next(score for score in decision.candidate_scores if score.model == "cheap-model")
         self.assertIn("root rejection or defect", cheap.exclusion_reasons)
 
-    def test_unpriced_candidate_is_not_promoted_without_an_explicit_missing_price_guardrail(self) -> None:
+    def test_unpriced_candidate_is_not_promoted_without_an_explicit_missing_price_guardrail(
+        self,
+    ) -> None:
         routing = ModelRoutingPolicy(
             catalog=_catalog("reliable-model", "unpriced-model", unpriced=("unpriced-model",)),
             policies=(
@@ -218,11 +359,21 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
 
         decision = routing.decision_for_policy(
             "safe-routing",
-            history=tuple(_history("unpriced-model") for _ in range(3)),
+            route="main",
+            history=tuple(
+                _history(
+                    "unpriced-model",
+                    policy_name="safe-routing",
+                    catalog_version=routing.catalog.version,
+                )
+                for _ in range(3)
+            ),
         )
 
         self.assertEqual(decision.selection_source, "configured_fallback")
-        unpriced = next(score for score in decision.candidate_scores if score.model == "unpriced-model")
+        unpriced = next(
+            score for score in decision.candidate_scores if score.model == "unpriced-model"
+        )
         self.assertIn("missing current price", unpriced.exclusion_reasons)
 
 
