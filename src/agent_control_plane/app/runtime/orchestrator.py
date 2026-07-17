@@ -263,6 +263,9 @@ class AgentControlPlane:
     ) -> AgentControlPlane:
         return cls(load_config(config_path, config_contents=config_contents))
 
+    def model_catalog_inspection(self) -> dict[str, Any]:
+        return self.model_catalog.inspection_payload()
+
     def smoke(self) -> dict[str, Any]:
         self.store.initialize()
         self.plan_store.initialize()

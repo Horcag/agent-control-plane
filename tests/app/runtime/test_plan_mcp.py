@@ -225,6 +225,7 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
         server = build_server()
 
     assert {
+        "agent_model_catalog",
         "agent_plan_create",
         "agent_plan_add_task",
         "agent_plan_bind_job",
@@ -240,6 +241,38 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
         "agent_plan_list",
         "agent_retention_gc",
     }.issubset(server.tools)
+
+
+def test_mcp_model_catalog_refreshes_after_config_change(monkeypatch, tmp_path: Path) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    config_path = tmp_path / "workspaces.toml"
+    config_path.write_text("version = 'old'\n", encoding="utf-8")
+    initial = Mock()
+    initial.config = SimpleNamespace(config_path=config_path.resolve())
+    initial.model_catalog_inspection.return_value = {"version": "old"}
+    refreshed = Mock()
+    refreshed.config = SimpleNamespace(config_path=config_path.resolve())
+    refreshed.model_catalog_inspection.return_value = {"version": "new"}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        side_effect=[initial, refreshed],
+    ) as from_config_path:
+        server = build_server(str(config_path))
+        assert server.tools["agent_model_catalog"]() == {"version": "old"}
+        config_path.write_text("version = 'new'\n", encoding="utf-8")
+        assert server.tools["agent_model_catalog"]() == {"version": "new"}
+
+    assert from_config_path.call_count == 2
+    initial.model_catalog_inspection.assert_called_once_with()
+    refreshed.model_catalog_inspection.assert_called_once_with()
 
 
 def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> None:

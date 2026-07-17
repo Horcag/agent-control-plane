@@ -196,6 +196,11 @@ def build_server(config_path: str | None = None) -> Any:
         return control.smoke()
 
     @mcp.tool()
+    def agent_model_catalog() -> dict[str, Any]:
+        """Return bounded Codex model catalog metadata without cache instruction blobs."""
+        return control.model_catalog_inspection()
+
+    @mcp.tool()
     def agent_start_job(
         task_id: str,
         route: str,

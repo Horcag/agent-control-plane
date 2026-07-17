@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from agent_control_plane.app.runtime.cli import main
 
@@ -62,3 +63,28 @@ def test_demo_show_and_accept_reject_invalid_roots(tmp_path: Path, capsys) -> No
     assert "manifest is invalid" in capsys.readouterr().err
     assert main(["demo", "accept", str(malformed)]) == 2
     assert "manifest is invalid" in capsys.readouterr().err
+
+
+def test_model_catalog_command_prints_payload_from_selected_config(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = tmp_path / "custom-workspaces.toml"
+    payload = {
+        "status": "loaded",
+        "source": "custom-models.json",
+        "version": "cache-v1",
+        "models": [],
+    }
+    control = Mock()
+    control.model_catalog_inspection.return_value = payload
+
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=control,
+    ) as from_config_path:
+        assert main(["model-catalog", "--config", str(config_path)]) == 0
+
+    assert json.loads(capsys.readouterr().out) == payload
+    from_config_path.assert_called_once_with(str(config_path))
+    control.model_catalog_inspection.assert_called_once_with()

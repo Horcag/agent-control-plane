@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "smoke":
             _print_json(control.smoke())
             return 0
+        if args.command == "model-catalog":
+            _print_json(control.model_catalog_inspection())
+            return 0
         if args.command == "reconcile":
             _print_json(
                 control.reconcile_jobs(
@@ -381,6 +384,11 @@ def _build_parser() -> argparse.ArgumentParser:
     add_demo_parser(subparsers)
 
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")
+    subparsers.add_parser(
+        "model-catalog",
+        parents=[common],
+        help="Inspect the bounded Codex model catalog",
+    )
 
     reconcile = subparsers.add_parser(
         "reconcile",
