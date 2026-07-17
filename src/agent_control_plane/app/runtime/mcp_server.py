@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from agent_control_plane.app.runtime.orchestrator import (
@@ -15,6 +17,52 @@ from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS, normal
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
 
 
+class ConfigFreshControl:
+    """Refresh the control plane before each MCP tool invocation when config changes."""
+
+    def __init__(self, config_path: str | None) -> None:
+        self._control = AgentControlPlane.from_config_path(config_path)
+        self._config_path = self._control.config.config_path.resolve(strict=False)
+        self._loaded_fingerprint = _config_fingerprint(self._config_path)
+        self._config_reloaded = False
+        self._lock = RLock()
+
+    def smoke(self) -> dict[str, Any]:
+        control = self._fresh_control()
+        payload = control.smoke()
+        current_fingerprint = _config_fingerprint(self._config_path)
+        payload.update(
+            {
+                "config_fingerprint_loaded": self._loaded_fingerprint,
+                "config_fingerprint_current": current_fingerprint,
+                "reload_required": current_fingerprint != self._loaded_fingerprint,
+                "config_reloaded": self._config_reloaded,
+            }
+        )
+        return payload
+
+    def __getattr__(self, name: str) -> Any:
+        def invoke(*args: Any, **kwargs: Any) -> Any:
+            return getattr(self._fresh_control(), name)(*args, **kwargs)
+
+        return invoke
+
+    def _fresh_control(self) -> AgentControlPlane:
+        with self._lock:
+            current_fingerprint = _config_fingerprint(self._config_path)
+            if current_fingerprint == self._loaded_fingerprint:
+                return self._control
+            refreshed = AgentControlPlane.from_config_path(str(self._config_path))
+            self._control = refreshed
+            self._loaded_fingerprint = current_fingerprint
+            self._config_reloaded = True
+            return refreshed
+
+
+def _config_fingerprint(config_path: Path) -> str:
+    return hashlib.sha256(config_path.read_bytes()).hexdigest()
+
+
 def build_server(config_path: str | None = None) -> Any:
     try:
         fast_mcp = importlib.import_module("mcp.server.fastmcp").FastMCP
@@ -23,7 +71,7 @@ def build_server(config_path: str | None = None) -> Any:
             'The MCP server dependency is missing. Install with: python -m pip install -e ".[mcp]"'
         ) from exc
 
-    control = AgentControlPlane.from_config_path(config_path)
+    control = ConfigFreshControl(config_path)
     mcp = fast_mcp("agent-control-plane")
 
     @mcp.tool()

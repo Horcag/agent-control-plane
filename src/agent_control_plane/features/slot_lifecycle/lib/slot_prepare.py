@@ -59,6 +59,7 @@ def _run_prepare_command(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
             timeout=command.timeout_sec,
         )
     except FileNotFoundError as exc:

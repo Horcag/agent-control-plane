@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -7,6 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent_control_plane.shared.git_tools import (
+    GIT_TIMEOUT_SEC,
+    GitError,
     GitWorkspaceState,
     diff_patch,
     run_git,
@@ -38,7 +41,22 @@ class GitToolsTest(unittest.TestCase):
                 errors="replace",
                 capture_output=True,
                 check=False,
+                stdin=subprocess.DEVNULL,
+                timeout=GIT_TIMEOUT_SEC,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
+
+    def test_run_git_wraps_timeout_with_repository_and_command(self) -> None:
+        repo = Path("repo")
+        timeout = subprocess.TimeoutExpired(["git", "status"], GIT_TIMEOUT_SEC)
+
+        with (
+            patch("agent_control_plane.shared.git_tools.subprocess.run", side_effect=timeout),
+            self.assertRaisesRegex(GitError, r"repo.*git.*status") as error,
+        ):
+            run_git(repo, "status", "--porcelain=v1")
+
+        self.assertIs(error.exception.__cause__, timeout)
 
     def test_workspace_snapshot_marks_head_race_as_unstable(self) -> None:
         state = GitWorkspaceState(branch="main", porcelain=" M tracked.py")

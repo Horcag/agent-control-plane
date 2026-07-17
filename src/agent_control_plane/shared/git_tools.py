@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess  # nosec B404
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,9 @@ from pathlib import Path
 
 class GitError(RuntimeError):
     pass
+
+
+GIT_TIMEOUT_SEC = 30
 
 
 @dataclass(frozen=True)
@@ -37,14 +41,26 @@ def compact_status_preview(porcelain: str, *, limit: int = 8) -> str:
 
 
 def run_git(path: Path, *args: str) -> str:
-    proc = subprocess.run(  # nosec B603 B607
-        ["git", "-C", str(path), *args],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        check=False,
-    )
+    command = ["git", "-C", str(path), *args]
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        proc = subprocess.run(  # nosec B603 B607
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            timeout=GIT_TIMEOUT_SEC,
+            env=environment,
+        )
+    except subprocess.TimeoutExpired as exc:
+        rendered_command = subprocess.list2cmdline(command)
+        raise GitError(
+            f"Git command timed out after {GIT_TIMEOUT_SEC}s in {path}: {rendered_command}"
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or f"git exited {proc.returncode}"
         raise GitError(detail)

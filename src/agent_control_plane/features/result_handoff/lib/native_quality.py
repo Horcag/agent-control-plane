@@ -139,6 +139,7 @@ class NativeQualityGateRunner:
                     cwd=cwd,
                     stdout=output_file,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
                     check=False,
                     timeout=gate.timeout_sec,
                 )

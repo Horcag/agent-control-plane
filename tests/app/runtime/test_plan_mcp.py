@@ -5,7 +5,9 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_control_plane.app.runtime.mcp_server import build_server
+import pytest
+
+from agent_control_plane.app.runtime.mcp_server import ConfigFreshControl, build_server
 
 
 class _FakeFastMCP:
@@ -20,6 +22,59 @@ class _FakeFastMCP:
         return register
 
 
+def test_config_provider_reloads_before_a_tool_call_and_reports_fingerprints(tmp_path) -> None:
+    config_path = tmp_path / "config" / "workspaces.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("[control]\nslot_root = 'slots-old'\n", encoding="utf-8")
+    initial = Mock()
+    initial.config = SimpleNamespace(config_path=config_path.resolve())
+    initial.list_slots.return_value = [{"path": "slots-old/acp-1"}]
+    initial.smoke.return_value = {"ok": True}
+    refreshed = Mock()
+    refreshed.config = SimpleNamespace(config_path=config_path.resolve())
+    refreshed.list_slots.return_value = [{"path": "slots-new/acp-1"}]
+    refreshed.smoke.return_value = {"ok": True}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        side_effect=[initial, refreshed],
+    ) as from_config_path:
+        provider = ConfigFreshControl(str(config_path))
+        assert provider.list_slots() == [{"path": "slots-old/acp-1"}]
+        config_path.write_text("[control]\nslot_root = 'slots-new'\n", encoding="utf-8")
+
+        assert provider.list_slots() == [{"path": "slots-new/acp-1"}]
+        smoke = provider.smoke()
+
+    assert from_config_path.call_args_list == [
+        ((str(config_path),),),
+        ((str(config_path.resolve()),),),
+    ]
+    assert smoke["config_fingerprint_loaded"] == smoke["config_fingerprint_current"]
+    assert smoke["reload_required"] is False
+    assert smoke["config_reloaded"] is True
+
+
+def test_config_provider_does_not_call_stale_control_after_invalid_reload(tmp_path) -> None:
+    config_path = tmp_path / "config" / "workspaces.toml"
+    config_path.parent.mkdir()
+    config_path.write_text("valid = true\n", encoding="utf-8")
+    initial = Mock()
+    initial.config = SimpleNamespace(config_path=config_path.resolve())
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        side_effect=[initial, ValueError("invalid replacement config")],
+    ):
+        provider = ConfigFreshControl(str(config_path))
+        config_path.write_text("invalid = [\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="invalid replacement config"):
+            provider.list_slots()
+
+    initial.list_slots.assert_not_called()
+
+
 def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")
@@ -30,7 +85,7 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
 
     with patch(
-        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
         return_value=object(),
     ):
         server = build_server()
@@ -63,7 +118,7 @@ def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> No
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
 
     with patch(
-        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
         return_value=object(),
     ):
         server = build_server()
@@ -91,7 +146,7 @@ def test_mcp_reconcile_requires_explicit_verified_runner_termination(monkeypatch
     control.reconcile_jobs.return_value = {"terminated_orphan_runners": ["job-1"]}
 
     with patch(
-        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
         return_value=control,
     ):
         server = build_server()
@@ -135,7 +190,7 @@ def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:
     )
 
     with patch(
-        "agent_control_plane.app.runtime.mcp_server.AgentControlPlane.from_config_path",
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
         return_value=control,
     ):
         server = build_server()

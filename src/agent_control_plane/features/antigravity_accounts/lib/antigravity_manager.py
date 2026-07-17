@@ -349,6 +349,7 @@ class AntigravityManagerAdapter:
                 command,
                 text=True,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 timeout=timeout_sec,
                 check=False,
             )
