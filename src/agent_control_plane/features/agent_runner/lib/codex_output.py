@@ -10,6 +10,7 @@ from agent_control_plane.features.agent_runner.lib.codex_telemetry import (
     parse_codex_jsonl,
     render_codex_json_line,
 )
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 
 
 class CodexOutputCapture:
@@ -63,6 +64,7 @@ class CodexOutputCapture:
         model: str,
         duration_sec: float,
         sessions_root: Path | None = None,
+        catalog: ModelCatalog | None = None,
     ) -> AttemptMetrics:
         self.join()
         return parse_codex_jsonl(
@@ -70,6 +72,7 @@ class CodexOutputCapture:
             model=model,
             duration_sec=duration_sec,
             sessions_root=sessions_root,
+            catalog=catalog,
         )
 
     def _pump(self, stream: IO[str]) -> None:

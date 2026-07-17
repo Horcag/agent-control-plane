@@ -2,36 +2,11 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_control_plane.entities.job import AttemptMetrics
-
-CODEX_RATE_CARD_VERSION = "2026-07-09"
-
-
-@dataclass(frozen=True)
-class _RateCard:
-    input: float
-    cached_input: float
-    output: float
-
-
-_CREDIT_RATES = {
-    "gpt-5.6": _RateCard(125.0, 12.5, 750.0),
-    "gpt-5.6-sol": _RateCard(125.0, 12.5, 750.0),
-    "gpt-5.6-terra": _RateCard(62.5, 6.25, 375.0),
-    "gpt-5.6-luna": _RateCard(25.0, 2.5, 150.0),
-    "gpt-5.5": _RateCard(125.0, 12.5, 750.0),
-}
-
-_API_USD_RATES = {
-    "gpt-5.6": _RateCard(5.0, 0.5, 30.0),
-    "gpt-5.6-sol": _RateCard(5.0, 0.5, 30.0),
-    "gpt-5.6-terra": _RateCard(2.5, 0.25, 15.0),
-    "gpt-5.6-luna": _RateCard(1.0, 0.1, 6.0),
-}
+from agent_control_plane.features.agent_runner.lib.model_catalog import CatalogRate, ModelCatalog
 
 _TOOL_ITEM_TYPES = {
     "command_execution",
@@ -47,6 +22,7 @@ def parse_codex_jsonl(
     model: str,
     duration_sec: float,
     sessions_root: Path | None = None,
+    catalog: ModelCatalog | None = None,
 ) -> AttemptMetrics:
     event_count = 0
     thread_id: str | None = None
@@ -108,15 +84,16 @@ def parse_codex_jsonl(
             reasoning_output_tokens = recovered["reasoning_output_tokens"]
 
     uncached_input_tokens = max(0, input_tokens - cached_input_tokens)
+    rate_metadata = catalog.rate_metadata_for(model) if catalog is not None else None
     estimated_credits = _estimate(
-        _CREDIT_RATES.get(model),
+        rate_metadata.credit_rate if rate_metadata is not None else None,
         usage_available=usage_available,
         uncached_input_tokens=uncached_input_tokens,
         cached_input_tokens=cached_input_tokens,
         output_tokens=output_tokens,
     )
     estimated_api_usd = _estimate(
-        _API_USD_RATES.get(model),
+        rate_metadata.api_usd_rate if rate_metadata is not None else None,
         usage_available=usage_available,
         uncached_input_tokens=uncached_input_tokens,
         cached_input_tokens=cached_input_tokens,
@@ -139,7 +116,11 @@ def parse_codex_jsonl(
         tool_counts=tuple(sorted(tool_counts.items())),
         estimated_credits=estimated_credits,
         estimated_api_usd=estimated_api_usd,
-        rate_card_version=CODEX_RATE_CARD_VERSION,
+        rate_card_version=(
+            rate_metadata.rate_card_version
+            if rate_metadata is not None and rate_metadata.rate_card_version is not None
+            else "unknown"
+        ),
         event_log_path=path,
     )
 
@@ -268,7 +249,7 @@ def _integer(value: Any) -> int:
 
 
 def _estimate(
-    rates: _RateCard | None,
+    rates: CatalogRate | None,
     *,
     usage_available: bool,
     uncached_input_tokens: int,

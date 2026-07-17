@@ -506,7 +506,12 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
             PlanTaskDefinition(
                 "task",
                 "Task",
-                execution=PlanExecutionSpec(route="dev", brief="First attempt"),
+                execution=PlanExecutionSpec(
+                    route="dev",
+                    brief="First attempt",
+                    codex_model="retry-model",
+                    codex_reasoning_effort="max",
+                ),
             ),
         ),
     )
@@ -522,6 +527,8 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
     assert retried["state"] == "ready"
     assert claims[0].attempt_no == 1
     assert claims[0].execution.brief == "Second attempt"
+    assert claims[0].execution.codex_model == "retry-model"
+    assert claims[0].execution.codex_reasoning_effort == "max"
 
 
 def test_dispatch_claim_token_is_required_to_bind_created_job(tmp_path: Path) -> None:

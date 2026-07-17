@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -24,6 +25,9 @@ from agent_control_plane.features.agent_runner import (
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.shared.config import (
+    CodexModelCatalogConfig,
+    CodexModelMetadataConfig,
+    CodexQuotaDomainConfig,
     ControlConfig,
     ControlDefaults,
     NativeQualityGateConfig,
@@ -122,6 +126,30 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                             workspace_access="native",
                         )
                     )
+
+            launch.assert_not_called()
+            self.assertEqual(control.store.list_jobs(), [])
+
+    def test_automatic_codex_job_rejects_a_missing_catalog_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = _config(root, workspace)
+            config = replace(
+                config,
+                model_catalog=replace(
+                    config.model_catalog,
+                    cache_path=root / "missing-models_cache.json",
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(control.config.coordination_root, "missing-catalog")
+
+            with (
+                patch.object(control, "_launch_worker", return_value=123) as launch,
+                self.assertRaisesRegex(PolicyError, "catalog is missing"),
+            ):
+                control.start_job(StartOptions(task_id="missing-catalog", route="main"))
 
             launch.assert_not_called()
             self.assertEqual(control.store.list_jobs(), [])
@@ -1287,6 +1315,7 @@ def _create_job(
 
 
 def _config(root: Path, route_path: Path) -> ControlConfig:
+    model_catalog = _model_catalog(root)
     return ControlConfig(
         config_path=root / "workspaces.toml",
         project_root=root,
@@ -1308,7 +1337,12 @@ def _config(root: Path, route_path: Path) -> ControlConfig:
             prepare_slots=False,
             guardrail_poll_sec=2.0,
             forbidden_status_globs=("uv.lock", ".venv/**"),
+            codex_model="gpt-5.6-terra",
+            codex_mechanical_model="gpt-5.6-luna",
+            codex_balanced_model="gpt-5.6-terra",
+            codex_deep_model="gpt-5.6-terra",
         ),
+        model_catalog=model_catalog,
         routes=MappingProxyType(
             {
                 "main": RouteConfig(
@@ -1325,6 +1359,80 @@ def _config(root: Path, route_path: Path) -> ControlConfig:
         ),
         slots=MappingProxyType({}),
         slot_prepare=(),
+    )
+
+
+def _model_catalog(root: Path) -> CodexModelCatalogConfig:
+    cache_path = root / "models_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "gpt-5.6-luna",
+                        "supported_reasoning_levels": [
+                            "none",
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                        ],
+                    },
+                    {
+                        "slug": "gpt-5.6-terra",
+                        "supported_reasoning_levels": [
+                            "none",
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                        ],
+                    },
+                    {
+                        "slug": "gpt-5.3-codex-spark",
+                        "supported_reasoning_levels": ["low", "high"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return CodexModelCatalogConfig(
+        cache_path=cache_path,
+        max_cache_age_sec=60.0,
+        models=(
+            CodexModelMetadataConfig(
+                model="gpt-5.6-luna",
+                quota_domain=None,
+                capacity_units=(("low", 2),),
+                credit_rate=None,
+                api_usd_rate=None,
+                rate_card_version=None,
+                rate_card_source=None,
+            ),
+            CodexModelMetadataConfig(
+                model="gpt-5.6-terra",
+                quota_domain=None,
+                capacity_units=(("medium", 10),),
+                credit_rate=None,
+                api_usd_rate=None,
+                rate_card_version=None,
+                rate_card_source=None,
+            ),
+            CodexModelMetadataConfig(
+                model="gpt-5.3-codex-spark",
+                quota_domain="spark",
+                capacity_units=(),
+                credit_rate=None,
+                api_usd_rate=None,
+                rate_card_version=None,
+                rate_card_source=None,
+            ),
+        ),
+        quota_domains=(
+            CodexQuotaDomainConfig("primary", 2, 8, 75.0),
+            CodexQuotaDomainConfig("spark", 8, 32, 100.0),
+        ),
     )
 
 

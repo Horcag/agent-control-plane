@@ -110,7 +110,7 @@ path = "slots/reports-1"
             self.assertEqual(config.codex_command, "codex")
             self.assertEqual(config.defaults.backend, "codex")
             self.assertEqual(config.defaults.agy_model, "Gemini 3.5 Flash (Medium)")
-            self.assertEqual(config.defaults.codex_model, "gpt-5")
+            self.assertEqual(config.defaults.codex_model, "default")
             self.assertEqual(config.defaults.codex_reasoning_effort, "low")
             self.assertEqual(config.defaults.codex_sandbox_mode, "workspace-write")
             self.assertEqual(config.defaults.codex_disabled_mcp_servers, ())
@@ -130,10 +130,7 @@ path = "slots/reports-1"
             self.assertEqual(config.defaults.codex_global_max_concurrent_jobs, 2)
             self.assertEqual(config.defaults.codex_global_max_burst_jobs, 8)
             self.assertEqual(config.defaults.codex_spark_max_concurrent_jobs, 8)
-            self.assertEqual(
-                config.defaults.codex_spark_models,
-                ("gpt-5.3-codex-spark",),
-            )
+            self.assertEqual(config.defaults.codex_spark_models, ())
             self.assertEqual(config.defaults.codex_five_hour_soft_limit_percent, 75.0)
             self.assertEqual(config.defaults.codex_spark_soft_limit_percent, 88.0)
             self.assertEqual(config.defaults.codex_quota_poll_sec, 30.0)
@@ -240,6 +237,73 @@ backend = "codex"
                 config.defaults.codex_spark_models,
                 ("gpt-5.3-codex-spark", "gpt-5.6-spark"),
             )
+
+    def test_loads_model_catalog_overlay_and_arbitrary_quota_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.model_catalog]
+cache_path = "cache/models_cache.json"
+max_cache_age_sec = 600
+
+[[control.model_catalog.quota_domains]]
+name = "primary"
+max_concurrent_jobs = 1
+max_burst_jobs = 2
+soft_limit_percent = 75
+
+[[control.model_catalog.quota_domains]]
+name = "expedited"
+max_concurrent_jobs = 3
+max_burst_jobs = 6
+soft_limit_percent = 90
+
+[[control.model_catalog.models]]
+model = "future-codex"
+quota_domain = "expedited"
+capacity_units = { low = 4, max = 12, ultra = 18 }
+credit_rate = { input = 2.0, cached_input = 0.2, output = 12.0 }
+api_usd_rate = { input = 1.0, cached_input = 0.1, output = 6.0 }
+rate_card_version = "future-v1"
+rate_card_source = "operator-verified"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(
+                config.model_catalog.cache_path,
+                (root / "cache" / "models_cache.json").resolve(strict=False),
+            )
+            self.assertEqual(config.model_catalog.max_cache_age_sec, 600.0)
+            self.assertEqual(
+                tuple(domain.name for domain in config.model_catalog.quota_domains),
+                ("primary", "expedited"),
+            )
+            model = config.model_catalog.models[0]
+            self.assertEqual(model.model, "future-codex")
+            self.assertEqual(model.quota_domain, "expedited")
+            self.assertEqual(model.capacity_units, (("low", 4), ("max", 12), ("ultra", 18)))
+            self.assertEqual(model.credit_rate.output if model.credit_rate is not None else None, 12.0)
+            self.assertEqual(model.api_usd_rate.output if model.api_usd_rate is not None else None, 6.0)
+            self.assertEqual(model.rate_card_version, "future-v1")
+            self.assertEqual(model.rate_card_source, "operator-verified")
 
     def test_loads_codex_spark_max_concurrent_jobs_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

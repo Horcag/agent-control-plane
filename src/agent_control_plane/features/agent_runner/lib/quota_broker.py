@@ -12,41 +12,28 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 FULL_CODEX_JOB_CAPACITY_UNITS = 30
-_MODEL_CAPACITY_WEIGHTS = {
-    "luna": 2,
-    "terra": 5,
-    "sol": 10,
-}
-_REASONING_CAPACITY_WEIGHTS = {
-    "none": 1,
-    "low": 1,
-    "medium": 2,
-    "high": 3,
-    "xhigh": 3,
-}
-_DEFAULT_SPARK_MODELS = ("gpt-5.3-codex-spark",)
 
 
-def codex_quota_domain(model: str | None, spark_models: tuple[str, ...]) -> str:
-    if not model:
-        return "primary"
-    normalized_model = model.strip().lower()
-    if not normalized_model:
-        return "primary"
-    normalized_spark_models = {candidate.strip().lower() for candidate in spark_models}
-    return "spark" if normalized_model in normalized_spark_models else "primary"
+def codex_quota_domain(model: str | None, catalog: ModelCatalog | None = None) -> str:
+    return catalog.quota_domain_for(model) if catalog is not None else "primary"
 
 
-def codex_job_capacity_units(model: str, reasoning_effort: str) -> int:
-    family = model.strip().lower().rsplit("-", 1)[-1]
-    model_weight = _MODEL_CAPACITY_WEIGHTS.get(family)
-    if model_weight is None:
+def codex_job_capacity_units(
+    model: str,
+    reasoning_effort: str,
+    catalog: ModelCatalog | None = None,
+) -> int:
+    if catalog is None:
         return FULL_CODEX_JOB_CAPACITY_UNITS
-    effort_weight = _REASONING_CAPACITY_WEIGHTS.get(reasoning_effort.strip().lower(), 3)
-    return min(FULL_CODEX_JOB_CAPACITY_UNITS, model_weight * effort_weight)
+    return catalog.capacity_units_for(
+        model,
+        reasoning_effort,
+        full_capacity=FULL_CODEX_JOB_CAPACITY_UNITS,
+    )
 
 
 @dataclass(frozen=True)
@@ -56,6 +43,16 @@ class RateLimitSnapshot:
     observed_at: float
     model: str | None = None
     quota_domain: str = "primary"
+
+
+@dataclass(frozen=True)
+class QuotaDomain:
+    """ACP-owned limits for one configured Codex quota domain."""
+
+    name: str
+    max_concurrent_jobs: int
+    max_burst_jobs: int
+    soft_limit_percent: float
 
 
 @dataclass(frozen=True)
@@ -77,18 +74,16 @@ class CodexRateLimitReader:
         sessions_root: Path,
         *,
         max_files: int = 24,
-        spark_models: tuple[str, ...] = _DEFAULT_SPARK_MODELS,
+        catalog: ModelCatalog | None = None,
     ) -> None:
         self.sessions_root = sessions_root
         self.max_files = max(1, max_files)
-        self.spark_models = tuple(spark_models)
+        self.catalog = catalog
 
     def latest(self, quota_domain: str = "primary") -> RateLimitSnapshot | None:
         if not self.sessions_root.exists():
             return None
-        target_domain = quota_domain.strip().lower()
-        if target_domain not in {"primary", "spark"}:
-            target_domain = "primary"
+        target_domain = quota_domain.strip().lower() or "primary"
         candidates = sorted(
             self.sessions_root.rglob("*.jsonl"),
             key=_safe_mtime,
@@ -120,7 +115,7 @@ class CodexRateLimitReader:
             for snapshot in _extract_rate_limit_snapshots(
                 event,
                 current_model,
-                self.spark_models,
+                self.catalog,
                 path,
             ):
                 if snapshot.quota_domain == target_domain and (
@@ -143,7 +138,8 @@ class GlobalQuotaBroker:
         spark_soft_limit_percent: float = 100.0,
         spark_max_concurrent_jobs: int = 8,
         rate_limit_reader: Callable[[str], RateLimitSnapshot | None] | None = None,
-        spark_models: tuple[str, ...] = _DEFAULT_SPARK_MODELS,
+        catalog: ModelCatalog | None = None,
+        quota_domains: tuple[QuotaDomain, ...] | None = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if max_concurrent_jobs <= 0:
@@ -161,17 +157,29 @@ class GlobalQuotaBroker:
             raise ValueError("soft_limit_percent must be in (0, 100]")
         if not 0 < spark_soft_limit_percent <= 100:
             raise ValueError("spark_soft_limit_percent must be in (0, 100]")
+        configured_domains = quota_domains or (
+            QuotaDomain(
+                "primary",
+                max_concurrent_jobs=max_concurrent_jobs,
+                max_burst_jobs=effective_burst_jobs,
+                soft_limit_percent=soft_limit_percent,
+            ),
+            QuotaDomain(
+                "spark",
+                max_concurrent_jobs=spark_max_concurrent_jobs,
+                max_burst_jobs=spark_max_concurrent_jobs * 4,
+                soft_limit_percent=spark_soft_limit_percent,
+            ),
+        )
+        self._quota_domains = _quota_domains_by_name(configured_domains)
+        primary_domain = self._quota_domains["primary"]
         self.database_path = database_path
-        self.max_concurrent_jobs = max_concurrent_jobs
-        self.max_burst_jobs = effective_burst_jobs
-        self.max_capacity_units = max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
-        self.spark_max_concurrent_jobs = spark_max_concurrent_jobs
-        self.spark_max_burst_jobs = spark_max_concurrent_jobs * 4
-        self.spark_max_capacity_units = spark_max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
-        self.soft_limit_percent = soft_limit_percent
-        self.spark_soft_limit_percent = spark_soft_limit_percent
+        self.max_concurrent_jobs = primary_domain.max_concurrent_jobs
+        self.max_burst_jobs = primary_domain.max_burst_jobs
+        self.max_capacity_units = primary_domain.max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
+        self.soft_limit_percent = primary_domain.soft_limit_percent
         self.rate_limit_reader = rate_limit_reader
-        self.spark_models = tuple(spark_models)
+        self.catalog = catalog
         self.clock = clock
         self._initialize()
 
@@ -183,7 +191,7 @@ class GlobalQuotaBroker:
         capacity_units: int = FULL_CODEX_JOB_CAPACITY_UNITS,
         model: str | None = None,
     ) -> QuotaDecision:
-        quota_domain = codex_quota_domain(model, self.spark_models)
+        quota_domain = self._configured_quota_domain(model)
         if worker_pid <= 0:
             raise ValueError("worker_pid must be positive")
         if not 0 < capacity_units <= FULL_CODEX_JOB_CAPACITY_UNITS:
@@ -194,10 +202,9 @@ class GlobalQuotaBroker:
         )
         if snapshot is not None and snapshot.quota_domain != quota_domain:
             snapshot = None
-        soft_limit_percent = (
-            self.spark_soft_limit_percent if quota_domain == "spark" else self.soft_limit_percent
-        )
-        max_burst_jobs, max_capacity_units = self._domain_limits(quota_domain)
+        domain = self._quota_domains[quota_domain]
+        soft_limit_percent = domain.soft_limit_percent
+        max_burst_jobs, max_capacity_units = self._domain_limits(domain)
 
         with self._connect() as db:
             db.execute("begin immediate")
@@ -364,10 +371,18 @@ class GlobalQuotaBroker:
             migrate=self._migrate_schema_v2,
         )
 
-    def _domain_limits(self, quota_domain: str) -> tuple[int, int]:
-        if quota_domain == "spark":
-            return self.spark_max_burst_jobs, self.spark_max_capacity_units
-        return self.max_burst_jobs, self.max_capacity_units
+    def _configured_quota_domain(self, model: str | None) -> str:
+        requested = codex_quota_domain(model, self.catalog).strip().lower()
+        if requested in self._quota_domains:
+            return requested
+        return "primary"
+
+    @staticmethod
+    def _domain_limits(domain: QuotaDomain) -> tuple[int, int]:
+        return (
+            domain.max_burst_jobs,
+            domain.max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS,
+        )
 
     @staticmethod
     def _migrate_schema_v1(db: sqlite3.Connection) -> None:
@@ -408,10 +423,32 @@ class GlobalQuotaBroker:
             yield db
 
 
+def _quota_domains_by_name(domains: tuple[QuotaDomain, ...]) -> dict[str, QuotaDomain]:
+    configured: dict[str, QuotaDomain] = {}
+    for domain in domains:
+        name = domain.name.strip().lower()
+        if not name:
+            raise ValueError("Quota domain name must not be empty")
+        if name in configured:
+            raise ValueError(f"Duplicate quota domain: {domain.name}")
+        if domain.max_concurrent_jobs <= 0:
+            raise ValueError(f"Quota domain max_concurrent_jobs must be positive: {domain.name}")
+        if domain.max_burst_jobs < domain.max_concurrent_jobs:
+            raise ValueError(
+                f"Quota domain max_burst_jobs must be at least max_concurrent_jobs: {domain.name}"
+            )
+        if not 0 < domain.soft_limit_percent <= 100:
+            raise ValueError(f"Quota domain soft_limit_percent must be in (0, 100]: {domain.name}")
+        configured[name] = domain
+    if "primary" not in configured:
+        raise ValueError("Quota domains must include primary")
+    return configured
+
+
 def _extract_rate_limit_snapshots(
     event: dict[str, Any],
     model: str | None,
-    spark_models: tuple[str, ...],
+    catalog: ModelCatalog | None,
     path: Path,
 ) -> tuple[RateLimitSnapshot, ...]:
     if not _is_token_count_event(event):
@@ -424,7 +461,7 @@ def _extract_rate_limit_snapshots(
         model,
         rate_limits.get("primary"),
         observed_at,
-        spark_models,
+        catalog,
     )
     return (snapshot,) if snapshot is not None else ()
 
@@ -433,7 +470,7 @@ def _rate_limit_with_model(
     model: str | None,
     limit_payload: Any,
     observed_at: float,
-    spark_models: tuple[str, ...],
+    catalog: ModelCatalog | None,
 ) -> RateLimitSnapshot | None:
     if not isinstance(limit_payload, dict):
         return None
@@ -441,9 +478,7 @@ def _rate_limit_with_model(
     resets_at = _number(limit_payload.get("resets_at"))
     if used_percent is None or resets_at is None:
         return None
-    domain = codex_quota_domain(model, spark_models)
-    if domain not in {"primary", "spark"}:
-        domain = "primary"
+    domain = codex_quota_domain(model, catalog)
     return RateLimitSnapshot(
         used_percent=used_percent,
         resets_at=resets_at,

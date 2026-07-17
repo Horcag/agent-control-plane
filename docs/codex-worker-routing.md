@@ -1,34 +1,31 @@
 # Codex Worker Routing
 
-## Default
+## Model catalog
 
-Use `gpt-5.6-terra` with `model_reasoning_effort = "medium"` for delegated coding
-workers. Terra is the balanced capability/cost tier, and OpenAI documents `medium` as
-the balanced starting point for most agents.
+ACP does not embed a current model list, family rule, capacity weight, or token price in
+Python. It loads the live Codex inventory from `~/.codex/models_cache.json` by default;
+`[control.model_catalog].cache_path` and `max_cache_age_sec` make that source explicit
+and configurable. The inventory supplies a model slug, visibility, priority, default
+reasoning effort, and supported reasoning efforts.
 
-Use overrides intentionally:
+`[[control.model_catalog.models]]` is an ACP-owned metadata overlay, not a replacement
+inventory. It may assign a quota domain, effort-specific capacity units, and optional
+credit/API rate cards. Every configured rate is per million tokens and must include a
+rate-card version and source. A newly visible cached model is discoverable without an ACP
+release; it only gains accounting metadata when an operator adds an overlay entry.
 
-- `gpt-5.6-luna` + `low`: strictly mechanical edits, formatting, repetitive test
-  updates, or high-volume extraction with an explicit acceptance test.
-- `gpt-5.6-luna` + `medium`: bounded, repeatable implementation or audit work with
-  exact files and acceptance criteria. This is the Luna default when Luna is selected.
-- `gpt-5.6-terra` + `low`: latency-sensitive, already-specified work where the worker
-  does not need to resolve architectural ambiguity.
-- `gpt-5.6-terra` + `medium`: normal implementation, debugging, and bounded refactors.
-- `gpt-5.6-terra` + `high`: complex edge cases or a second-opinion review when Sol is
-  unnecessary.
-- `gpt-5.6-sol` + `low`: selective high-value second opinion after a Terra pass. It is
-  not a cheaper general worker.
-- `gpt-5.6-sol` + `medium` or higher: ambiguous architecture, security-sensitive work,
-  or recovery after cheaper workers repeatedly fail.
-- `gpt-5.6-sol` + `max`: final quality-first owner review when latency and credits are
-  secondary.
+Automatic quality-tier routing accepts only visible, current-cache candidates. It rejects
+an invalid effort with the catalog's declared choices, including newly declared `max` or
+`ultra`. Missing, invalid, or stale cache input therefore blocks automatic routing rather
+than selecting a phantom model. Explicit `--codex-model` and reasoning-effort choices are
+never silently replaced: known models are validated by the catalog, while unknown explicit
+models remain backend-defined and launchable.
 
-Do not use Luna `high` or `xhigh` as a routine substitute for Terra. Escalate from Luna
-medium to Terra medium when the task needs materially deeper reasoning. Do not use
-`ultra` inside this control plane: Ultra delegates to internal subagents, while this
-runner already owns external slot fan-out. Combining both makes attribution, cost,
-concurrency, and workspace ownership harder to control.
+When metadata is absent, ACP preserves raw usage telemetry but reports null cost estimates
+and applies the conservative full capacity weight. Configure additional quota domains under
+`[[control.model_catalog.quota_domains]]`; their names are arbitrary. The old
+`codex_spark_*` settings remain a compatibility bridge only and should be migrated to the
+catalog schema in `config/workspaces.example.toml`.
 
 ## Workspace Access Modes
 
@@ -155,61 +152,21 @@ more reasoning step.
 
 ## Weighted Global Quota
 
-ACP prices concurrent Codex jobs in deterministic capacity units so cheap workers do
-not consume the same global allowance as expensive workers:
+Each quota domain declares its own concurrent-job ceiling, burst ceiling, and provider
+soft-limit threshold. ACP gives each concurrent slot 30 capacity units, then applies the
+metadata-defined weight for the selected model and effort. All leases in one domain share
+that domain's counters; a configured model in another domain uses its separate pool.
 
-| Effective profile | Low, minimal, or none | Medium | High, xhigh, or max |
-| --- | ---: | ---: | ---: |
-| Luna | 2 | 4 | 6 |
-| Terra | 5 | 10 | 15 |
-| Sol | 10 | 20 | 30 |
+Acquiring or resizing a lease is one SQLite transaction, so simultaneous workers cannot
+oversubscribe a domain. An unknown explicit model uses the full 30-unit cost in `primary`;
+physical route-slot ownership may still be more restrictive. Rate-limit snapshots follow
+the current model recorded in a rollout and are resolved through the same catalog metadata,
+so a future non-primary domain needs no special code path.
 
-`codex_global_max_concurrent_jobs` supplies 30 units per configured concurrency slot.
-`codex_global_max_burst_jobs` separately caps the number of worker processes and
-defaults to four times that value. For example, a capacity of two slots plus a burst
-limit of eight admits up to eight Luna workers when physical route slots are available,
-but the weighted budget still admits only two Sol-high workers.
-Spark can be configured independently with
-`codex_spark_max_concurrent_jobs` (default `8`), which sets a separate local burst
-and weighted capacity pool for `gpt-5.3-codex-spark` jobs. Filling one pool does not
-consume the other.
-In practice, Spark parallelism is also bounded by the number of exclusive route slots,
-and provider-side queuing can reduce effective concurrency further.
-
-The quota broker stores the effective weight in its SQLite lease. Acquiring or resizing
-a lease is one transaction, so simultaneous workers cannot oversubscribe the budget.
-A Luna job that escalates to Terra keeps its original lease and waits until the larger
-weight fits. Unknown model names are charged the full 30 units to fail closed. Physical
-slot ownership remains exclusive and can impose a lower limit than the global quota.
-
-`control.defaults.codex_spark_models` defines a dedicated model list for the "spark"
-domain. If a current model exactly matches any configured value (case-insensitive),
-that job uses a separate spark window with its own soft cap, configured with
-`control.defaults.codex_spark_soft_limit_percent`, while still sharing sessions,
-history, analytics, and weighted concurrency. Usage/reset snapshots and soft-cap decisions
-are applied independently by domain.
-
-The rate-limit soft cap is independent of these concurrency weights and provider-side
-Spark queuing remains possible. The legacy config
-name `codex_five_hour_soft_limit_percent` is applied to the primary reported window;
-that window may be longer than five hours. At or above the threshold, ACP defers all
-primary-domain Codex models, including Luna and Terra. If the usage reaches `100`, the
-primary domain is deferred until its next reset.
-Primary and Spark still share session history and analytics, while weighted capacity and
-burst windows are enforced per-domain. Filling one local pool does not reduce the other.
-Usage and reset snapshots are separate for each domain, and soft-cap decisions are made
-per-domain.
-Spark-domain models use their own threshold (`codex_spark_soft_limit_percent`), with
-explicitly deferred behavior remaining at reported usage `100` when reset time is in the
-future.
-
-Before running the command, create `.agent-work/tasks/spark-example/brief.md` with the task
-instructions.
-Use the following CLI command to select Spark-domain invocation:
-
-```powershell
-agent-control start --config config/workspaces.toml --task-id spark-example --route acp --backend codex --codex-model gpt-5.3-codex-spark --codex-reasoning-effort high --wait
-```
+To add a domain, first define its limits in `control.model_catalog.quota_domains`, then
+assign `quota_domain` on the relevant model overlay. The optional `capacity_units` table
+is keyed by reasoning effort. Omitting an effort is conservative: it receives the full
+capacity weight rather than a heuristic family-derived value.
 
 ## Why Medium
 

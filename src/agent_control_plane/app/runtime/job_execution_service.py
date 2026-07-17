@@ -237,6 +237,7 @@ class JobExecutionService:
         capacity_units = codex_job_capacity_units(
             active_profile.model,
             active_profile.reasoning_effort,
+            self.model_routing.catalog,
         )
         last_reason: str | None = None
         while not self.store.cancel_requested(job.job_id):

@@ -13,12 +13,16 @@ from agent_control_plane.features.agent_runner.lib.codex_process_monitor import 
     CodexProcessMonitor,
     terminate_spawned_process,
 )
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
 
 CODEX_SPARK_DISABLED_FEATURES = ("image_generation",)
 
 
 class CodexExecRunner:
+    def __init__(self, catalog: ModelCatalog | None = None) -> None:
+        self.catalog = catalog
+
     def run(
         self,
         spec: AgentRunSpec,
@@ -96,6 +100,7 @@ class CodexExecRunner:
                 model=spec.codex_model,
                 duration_sec=time.monotonic() - started_mono,
                 sessions_root=spec.codex_sessions_root,
+                catalog=self.catalog,
             )
             return replace(result, metrics=metrics)
 

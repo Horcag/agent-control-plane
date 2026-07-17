@@ -82,6 +82,13 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
     assert results["reloaded_smoke"]["config_reloaded"] is True
     assert results["reloaded_smoke"]["reload_required"] is False
     assert results["slots"]["result"][0]["path"] == str(new_slot.resolve())
+    assert results["smoke"]["codex_model_catalog"]["status"] == "missing"
+    assert set(results["smoke"]["codex_model_catalog"]["profile_resolution_errors"]) == {
+        "mechanical",
+        "balanced",
+        "deep",
+    }
+    assert results["smoke"]["codex_quality_profiles"] == {}
     with sqlite3.connect(tmp_path / "runs" / "jobs.sqlite3") as database:
         stored_path = database.execute("select path from slots where name = 'acp-1'").fetchone()[0]
     assert stored_path == str(new_slot.resolve())
@@ -115,6 +122,9 @@ worktree_root = "slots"
 worktree_base = "repo"
 slot_root = "{slot_root_relative}"
 agy_command = "agy"
+
+[control.model_catalog]
+cache_path = "{(config_path.parent / "missing-models_cache.json").as_posix()}"
 
 [routes.acp]
 path = "repo"

@@ -10,6 +10,29 @@ from agent_control_plane.features.agent_runner.lib.codex_telemetry import (
     parse_codex_jsonl,
     render_codex_json_line,
 )
+from agent_control_plane.features.agent_runner.lib.model_catalog import (
+    CatalogModelMetadata,
+    CatalogRate,
+    ModelCatalog,
+)
+
+
+def _catalog_with_rates(root: Path, model: str) -> ModelCatalog:
+    cache_path = root / "models_cache.json"
+    cache_path.write_text(json.dumps({"models": [{"slug": model}]}), encoding="utf-8")
+    return ModelCatalog.load(
+        cache_path=cache_path,
+        max_cache_age_sec=60.0,
+        metadata=(
+            CatalogModelMetadata(
+                model=model,
+                credit_rate=CatalogRate(62.5, 6.25, 375.0),
+                api_usd_rate=CatalogRate(2.5, 0.25, 15.0),
+                rate_card_version="test-v1",
+                rate_card_source="test",
+            ),
+        ),
+    )
 
 
 class CodexTelemetryTest(unittest.TestCase):
@@ -75,6 +98,7 @@ class CodexTelemetryTest(unittest.TestCase):
                 path,
                 model="gpt-5.6-terra",
                 duration_sec=20.0,
+                catalog=_catalog_with_rates(Path(temp), "gpt-5.6-terra"),
             )
 
             self.assertTrue(codex_turn_completed(path))
@@ -141,6 +165,7 @@ class CodexTelemetryTest(unittest.TestCase):
                 model="gpt-5.6-terra",
                 duration_sec=10.0,
                 sessions_root=root / "sessions",
+                catalog=_catalog_with_rates(root, "gpt-5.6-terra"),
             )
 
             self.assertTrue(metrics.usage_available)
@@ -174,6 +199,54 @@ class CodexTelemetryTest(unittest.TestCase):
             self.assertTrue(metrics.usage_available)
             self.assertIsNone(metrics.estimated_credits)
             self.assertIsNone(metrics.estimated_api_usd)
+
+    def test_uses_catalog_rate_metadata_for_an_invented_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "attempt.events.jsonl"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 1_000,
+                            "cached_input_tokens": 600,
+                            "output_tokens": 200,
+                            "reasoning_output_tokens": 50,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cache_path = root / "models_cache.json"
+            cache_path.write_text(
+                json.dumps({"models": [{"slug": "future-codex"}]}),
+                encoding="utf-8",
+            )
+            catalog = ModelCatalog.load(
+                cache_path=cache_path,
+                max_cache_age_sec=60.0,
+                metadata=(
+                    CatalogModelMetadata(
+                        model="future-codex",
+                        credit_rate=CatalogRate(2.0, 0.2, 12.0),
+                        api_usd_rate=CatalogRate(1.0, 0.1, 6.0),
+                        rate_card_version="future-v1",
+                        rate_card_source="test",
+                    ),
+                ),
+            )
+
+            metrics = parse_codex_jsonl(
+                path,
+                model="future-codex",
+                duration_sec=1.0,
+                catalog=catalog,
+            )
+
+            self.assertAlmostEqual(metrics.estimated_credits or 0.0, 0.00332)
+            self.assertAlmostEqual(metrics.estimated_api_usd or 0.0, 0.00166)
+            self.assertEqual(metrics.rate_card_version, "future-v1")
 
     def test_renders_guardrail_compatible_tool_markers(self) -> None:
         mcp_line = json.dumps(

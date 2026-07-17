@@ -763,6 +763,8 @@ class PlanStore:
                     workspace_access=execution.workspace_access,
                     read_only=execution.read_only,
                     codex_quality_tier=execution.codex_quality_tier,
+                    codex_model=execution.codex_model,
+                    codex_reasoning_effort=execution.codex_reasoning_effort,
                 )
             now = utc_now()
             db.execute(

@@ -5,6 +5,7 @@ from agent_control_plane.features.agent_runner.lib.job_launcher import (
     JobLaunchOptions,
 )
 from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     ModelProfile,
     ModelRoutingPolicy,
@@ -28,6 +29,7 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
     CodexRateLimitReader,
     GlobalQuotaBroker,
     QuotaDecision,
+    QuotaDomain,
     codex_job_capacity_units,
     codex_quota_domain,
 )
@@ -72,6 +74,7 @@ __all__ = [
     "JobLaunchOptions",
     "JobLauncher",
     "JobReconciler",
+    "ModelCatalog",
     "ModelProfile",
     "ModelRoutingPolicy",
     "ProcessIdentity",
@@ -79,6 +82,7 @@ __all__ = [
     "ProcessTerminationState",
     "PtyAgyRunner",
     "QuotaDecision",
+    "QuotaDomain",
     "ResultState",
     "WorkerLease",
     "WorkerLeaseError",

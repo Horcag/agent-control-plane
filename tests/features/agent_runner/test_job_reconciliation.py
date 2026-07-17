@@ -36,6 +36,8 @@ from agent_control_plane.features.result_handoff import (
     create_slot_checkpoint,
 )
 from agent_control_plane.shared.config import (
+    CodexModelCatalogConfig,
+    CodexQuotaDomainConfig,
     ControlConfig,
     ControlDefaults,
     RouteConfig,
@@ -706,6 +708,7 @@ def _wait_for_file(path: Path, process: subprocess.Popen[str]) -> None:
 
 
 def _config(root: Path, route: Path, slot: Path) -> ControlConfig:
+    model_catalog = _model_catalog(root)
     defaults = replace(
         ControlDefaults(
             timeout_sec=10,
@@ -717,6 +720,10 @@ def _config(root: Path, route: Path, slot: Path) -> ControlConfig:
             prepare_slots=False,
             guardrail_poll_sec=1.0,
             forbidden_status_globs=(),
+            codex_model="test-codex",
+            codex_mechanical_model="test-codex",
+            codex_balanced_model="test-codex",
+            codex_deep_model="test-codex",
         ),
         terminal_slot_policy="checkpoint",
     )
@@ -732,6 +739,7 @@ def _config(root: Path, route: Path, slot: Path) -> ControlConfig:
         agy_command="agy",
         codex_command="codex",
         defaults=defaults,
+        model_catalog=model_catalog,
         routes=MappingProxyType(
             {
                 "app": RouteConfig(
@@ -748,6 +756,29 @@ def _config(root: Path, route: Path, slot: Path) -> ControlConfig:
         ),
         slots=MappingProxyType({"app-1": SlotConfig(name="app-1", route="app", path=slot)}),
         slot_prepare=(),
+    )
+
+
+def _model_catalog(root: Path) -> CodexModelCatalogConfig:
+    cache_path = root / "models_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "test-codex",
+                        "supported_reasoning_levels": ["low", "medium"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return CodexModelCatalogConfig(
+        cache_path=cache_path,
+        max_cache_age_sec=60.0,
+        models=(),
+        quota_domains=(CodexQuotaDomainConfig("primary", 2, 8, 75.0),),
     )
 
 

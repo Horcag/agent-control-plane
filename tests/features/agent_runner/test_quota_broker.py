@@ -10,9 +10,14 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from agent_control_plane.features.agent_runner.lib.model_catalog import (
+    CatalogModelMetadata,
+    ModelCatalog,
+)
 from agent_control_plane.features.agent_runner.lib.quota_broker import (
     CodexRateLimitReader,
     GlobalQuotaBroker,
+    QuotaDomain,
     RateLimitSnapshot,
     codex_job_capacity_units,
 )
@@ -58,12 +63,91 @@ def write_jsonl_events(path: Path, *events: dict[str, Any]) -> None:
     )
 
 
+def _catalog(*metadata: CatalogModelMetadata) -> ModelCatalog:
+    return ModelCatalog(
+        models={},
+        metadata={item.model.lower(): item for item in metadata},
+        cache_status="loaded",
+    )
+
+
 class GlobalQuotaBrokerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.catalog = _catalog(
+            CatalogModelMetadata(
+                model="gpt-5.6-luna",
+                capacity_units=(("minimal", 6), ("high", 6)),
+            ),
+            CatalogModelMetadata(
+                model="gpt-5.6-terra",
+                capacity_units=(("medium", 10),),
+            ),
+            CatalogModelMetadata(
+                model="gpt-5.6-sol",
+                capacity_units=(("high", 30),),
+            ),
+            CatalogModelMetadata(
+                model="gpt-5.3-codex-spark",
+                quota_domain="spark",
+            ),
+        )
+
+    def _broker(self, *args: Any, **kwargs: Any) -> GlobalQuotaBroker:
+        kwargs.setdefault("catalog", self.catalog)
+        return GlobalQuotaBroker(*args, **kwargs)
+
+    def test_catalog_metadata_defines_an_arbitrary_quota_domain(self) -> None:
+        catalog = _catalog(
+            CatalogModelMetadata(
+                model="future-codex",
+                quota_domain="expedited",
+                capacity_units=(("max", 12),),
+            )
+        )
+        domains = (
+            QuotaDomain(
+                "primary", max_concurrent_jobs=1, max_burst_jobs=2, soft_limit_percent=75.0
+            ),
+            QuotaDomain(
+                "expedited",
+                max_concurrent_jobs=2,
+                max_burst_jobs=3,
+                soft_limit_percent=90.0,
+            ),
+        )
+        snapshot = RateLimitSnapshot(
+            used_percent=10.0,
+            resets_at=2_000.0,
+            observed_at=1_000.0,
+            quota_domain="expedited",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            broker = GlobalQuotaBroker(
+                Path(temp) / "global-quota.sqlite3",
+                max_concurrent_jobs=1,
+                catalog=catalog,
+                quota_domains=domains,
+                rate_limit_reader=lambda domain: snapshot if domain == "expedited" else None,
+                clock=lambda: 1_100.0,
+            )
+
+            decision = broker.try_acquire(
+                "future-job",
+                worker_pid=os.getpid(),
+                model="future-codex",
+                capacity_units=codex_job_capacity_units("future-codex", "max", catalog),
+            )
+
+        self.assertTrue(decision.acquired)
+        self.assertEqual(decision.quota_domain, "expedited")
+        self.assertEqual(decision.active_capacity_units, 12)
+        self.assertEqual(decision.max_capacity_units, 60)
+
     def test_respects_global_concurrency_across_broker_instances(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            first = GlobalQuotaBroker(database, max_concurrent_jobs=1)
-            second = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            first = self._broker(database, max_concurrent_jobs=1)
+            second = self._broker(database, max_concurrent_jobs=1)
 
             acquired = first.try_acquire("job-1", worker_pid=os.getpid())
             blocked = second.try_acquire("job-2", worker_pid=os.getpid())
@@ -76,7 +160,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_reclaims_a_lease_owned_by_a_dead_worker(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            broker = self._broker(database, max_concurrent_jobs=1)
             live_pid = os.getpid()
             dead_pid = live_pid + 1
 
@@ -98,7 +182,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 resets_at=2_000.0,
                 observed_at=1_000.0,
             )
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=2,
                 soft_limit_percent=75.0,
@@ -121,7 +205,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 resets_at=2_000.0,
                 observed_at=1_000.0,
             )
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=2,
                 soft_limit_percent=75.0,
@@ -170,7 +254,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             def reader(quota_domain: str) -> RateLimitSnapshot:
                 return snapshots[quota_domain]
 
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=2,
                 soft_limit_percent=75.0,
@@ -199,7 +283,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_lease_records_quota_domain(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
             )
@@ -225,7 +309,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_release_makes_capacity_available(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            broker = self._broker(database, max_concurrent_jobs=1)
             worker_pid = os.getpid()
 
             self.assertTrue(broker.try_acquire("job-1", worker_pid=worker_pid).acquired)
@@ -233,18 +317,18 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             self.assertTrue(broker.try_acquire("job-2", worker_pid=worker_pid).acquired)
 
     def test_model_and_effort_map_to_stable_capacity_units(self) -> None:
-        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "high"), 6)
-        self.assertEqual(codex_job_capacity_units("gpt-5.6-terra", "medium"), 10)
-        self.assertEqual(codex_job_capacity_units("gpt-5.6-sol", "high"), 30)
-        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "minimal"), 6)
-        self.assertEqual(codex_job_capacity_units("unknown-model", "low"), 30)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "high", self.catalog), 6)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-terra", "medium", self.catalog), 10)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-sol", "high", self.catalog), 30)
+        self.assertEqual(codex_job_capacity_units("gpt-5.6-luna", "minimal", self.catalog), 6)
+        self.assertEqual(codex_job_capacity_units("unknown-model", "low", self.catalog), 30)
 
     def test_rejects_a_zero_burst_limit(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temp,
             self.assertRaisesRegex(ValueError, "max_burst_jobs must be positive"),
         ):
-            GlobalQuotaBroker(
+            self._broker(
                 Path(temp) / "global-quota.sqlite3",
                 max_concurrent_jobs=1,
                 max_burst_jobs=0,
@@ -252,7 +336,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
 
     def test_default_burst_allows_extra_cheap_jobs_past_four_workers(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 Path(temp) / "global-quota.sqlite3",
                 max_concurrent_jobs=2,
             )
@@ -260,7 +344,11 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 broker.try_acquire(
                     f"luna-{index}",
                     worker_pid=os.getpid(),
-                    capacity_units=codex_job_capacity_units("gpt-5.6-luna", "high"),
+                    capacity_units=codex_job_capacity_units(
+                        "gpt-5.6-luna",
+                        "high",
+                        self.catalog,
+                    ),
                 )
                 for index in range(8)
             ]
@@ -281,7 +369,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
 
     def test_expensive_jobs_fill_weighted_capacity_before_burst_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 Path(temp) / "global-quota.sqlite3",
                 max_concurrent_jobs=2,
                 max_burst_jobs=4,
@@ -302,7 +390,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
 
     def test_existing_lease_resizes_atomically_for_model_escalation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 Path(temp) / "global-quota.sqlite3",
                 max_concurrent_jobs=1,
                 max_burst_jobs=2,
@@ -358,7 +446,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             finally:
                 db.close()
 
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
                 max_burst_jobs=2,
@@ -415,7 +503,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                         "spark": spark_snapshot,
                     }.__getitem__
 
-                    broker = GlobalQuotaBroker(
+                    broker = self._broker(
                         case_database,
                         max_concurrent_jobs=2,
                         soft_limit_percent=75.0,
@@ -448,7 +536,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_full_primary_pool_still_admits_spark_to_local_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
                 max_burst_jobs=4,
@@ -486,7 +574,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_full_spark_pool_still_allows_primary(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
                 spark_max_concurrent_jobs=8,
@@ -512,7 +600,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_ninth_spark_job_is_blocked_by_spark_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=2,
                 spark_max_concurrent_jobs=8,
@@ -540,7 +628,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_primary_burst_count_ignores_spark_leases(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
                 max_burst_jobs=2,
@@ -586,7 +674,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
     def test_existing_lease_domain_switch_does_not_double_count_target_totals(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(
+            broker = self._broker(
                 database,
                 max_concurrent_jobs=1,
                 max_burst_jobs=4,
@@ -665,7 +753,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
             finally:
                 db.close()
 
-            GlobalQuotaBroker(database, max_concurrent_jobs=1, max_burst_jobs=1)
+            self._broker(database, max_concurrent_jobs=1, max_burst_jobs=1)
             db_read = sqlite3.connect(database)
             try:
                 row = db_read.execute(
@@ -684,7 +772,7 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                 self.fail("Schema migration row for version 2 was not added")
             self.assertEqual(row[0], "primary")
             self.assertEqual(count_v2[0], 1)
-            GlobalQuotaBroker(database, max_concurrent_jobs=1, max_burst_jobs=1)
+            self._broker(database, max_concurrent_jobs=1, max_burst_jobs=1)
             db_read = sqlite3.connect(database)
             try:
                 checksum_row = db_read.execute(
@@ -699,6 +787,17 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
 
 
 class CodexRateLimitReaderTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.catalog = _catalog(
+            CatalogModelMetadata(
+                model="gpt-5.3-codex-spark",
+                quota_domain="spark",
+            )
+        )
+
+    def _reader(self, sessions_root: Path) -> CodexRateLimitReader:
+        return CodexRateLimitReader(sessions_root, catalog=self.catalog)
+
     def test_latest_prefers_observed_timestamp(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             sessions = Path(temp) / "sessions" / "2026" / "07" / "11"
@@ -706,7 +805,7 @@ class CodexRateLimitReaderTest(unittest.TestCase):
             newer = sessions / "newer.jsonl"
             older = sessions / "older.jsonl"
             now = time.time()
-            reader = CodexRateLimitReader(Path(temp) / "sessions")
+            reader = self._reader(Path(temp) / "sessions")
 
             with self.subTest("newer_spark_older_terra"):
                 write_jsonl_events(
@@ -772,7 +871,7 @@ class CodexRateLimitReaderTest(unittest.TestCase):
                     build_turn_context_event("gpt-5.6-terra", timestamp="2026-07-12T06:00:10Z"),
                     build_token_count_event(80.0, 2_000.0, timestamp="2026-07-12T06:00:15Z"),
                 )
-                reader = CodexRateLimitReader(Path(temp) / "sessions")
+                reader = self._reader(Path(temp) / "sessions")
                 self.assertEqual(reader.latest("spark").used_percent, 55.0)
                 self.assertEqual(reader.latest("primary").used_percent, 80.0)
 
@@ -787,7 +886,7 @@ class CodexRateLimitReaderTest(unittest.TestCase):
                     ),
                     build_token_count_event(35.0, 2_000.0, timestamp="2026-07-12T06:01:15Z"),
                 )
-                reader = CodexRateLimitReader(Path(temp) / "sessions")
+                reader = self._reader(Path(temp) / "sessions")
                 self.assertEqual(reader.latest("spark").used_percent, 35.0)
                 self.assertEqual(reader.latest("primary").used_percent, 55.0)
 
@@ -871,7 +970,7 @@ class CodexRateLimitReaderTest(unittest.TestCase):
             for description, events, expected_domain in cases:
                 with self.subTest(description=description):
                     write_jsonl_events(rollout, *events)
-                    snapshot = CodexRateLimitReader(Path(temp) / "sessions").latest(expected_domain)
+                    snapshot = self._reader(Path(temp) / "sessions").latest(expected_domain)
                     self.assertIsNotNone(snapshot)
                     if snapshot is None:
                         self.fail("Missing quota-domain snapshot")
@@ -891,7 +990,7 @@ class CodexRateLimitReaderTest(unittest.TestCase):
                 ),
             )
 
-            reader = CodexRateLimitReader(Path(temp) / "sessions")
+            reader = self._reader(Path(temp) / "sessions")
             primary = reader.latest("primary")
             spark = reader.latest("spark")
 

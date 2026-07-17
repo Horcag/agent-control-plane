@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, cast
@@ -27,6 +27,40 @@ class NativeQualityGateConfig:
     def __post_init__(self) -> None:
         if self.run_on not in {"worker", "controller", "both"}:
             raise ValueError("run_on must be worker, controller, or both")
+
+
+@dataclass(frozen=True)
+class CodexTokenRateConfig:
+    input: float
+    cached_input: float
+    output: float
+
+
+@dataclass(frozen=True)
+class CodexModelMetadataConfig:
+    model: str
+    quota_domain: str | None
+    capacity_units: tuple[tuple[str, int], ...]
+    credit_rate: CodexTokenRateConfig | None
+    api_usd_rate: CodexTokenRateConfig | None
+    rate_card_version: str | None
+    rate_card_source: str | None
+
+
+@dataclass(frozen=True)
+class CodexQuotaDomainConfig:
+    name: str
+    max_concurrent_jobs: int
+    max_burst_jobs: int
+    soft_limit_percent: float
+
+
+@dataclass(frozen=True)
+class CodexModelCatalogConfig:
+    cache_path: Path
+    max_cache_age_sec: float
+    models: tuple[CodexModelMetadataConfig, ...]
+    quota_domains: tuple[CodexQuotaDomainConfig, ...]
 
 
 @dataclass(frozen=True)
@@ -89,7 +123,7 @@ class ControlDefaults:
     auto_archive_limit: int = 200
     backend: str = CODEX_BACKEND
     agy_model: str | None = None
-    codex_model: str = "gpt-5"
+    codex_model: str = "default"
     codex_reasoning_effort: str = "low"
     codex_sandbox_mode: str = "workspace-write"
     workspace_access: str = "ide_mcp"
@@ -99,11 +133,11 @@ class ControlDefaults:
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_no_progress_timeout_sec: int = 240
     codex_quality_tier: str = "deep"
-    codex_mechanical_model: str = "gpt-5.6-luna"
+    codex_mechanical_model: str = "default"
     codex_mechanical_reasoning_effort: str = "low"
-    codex_balanced_model: str = "gpt-5.6-terra"
+    codex_balanced_model: str = "default"
     codex_balanced_reasoning_effort: str = "medium"
-    codex_deep_model: str = "gpt-5.6-terra"
+    codex_deep_model: str = "default"
     codex_deep_reasoning_effort: str = "medium"
     codex_mechanical_tool_call_budget: int = 45
     codex_balanced_tool_call_budget: int = 80
@@ -115,7 +149,7 @@ class ControlDefaults:
     codex_five_hour_soft_limit_percent: float = 75.0
     codex_spark_soft_limit_percent: float = 100.0
     codex_quota_poll_sec: float = 30.0
-    codex_spark_models: tuple[str, ...] = ("gpt-5.3-codex-spark",)
+    codex_spark_models: tuple[str, ...] = ()
     codex_sessions_root: Path | None = None
     auto_switch_agy_on_quota: bool = False
     auto_switch_agy_strategy: str = "best"
@@ -128,6 +162,22 @@ class ControlDefaults:
     )
     shared_ide_sdk_name: str | None = None
     shared_ide_sdk_type: str = "Python SDK"
+
+
+def _default_model_catalog_config() -> CodexModelCatalogConfig:
+    return CodexModelCatalogConfig(
+        cache_path=Path.home() / ".codex" / "models_cache.json",
+        max_cache_age_sec=86_400.0,
+        models=(),
+        quota_domains=(
+            CodexQuotaDomainConfig(
+                name="primary",
+                max_concurrent_jobs=2,
+                max_burst_jobs=8,
+                soft_limit_percent=75.0,
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -146,6 +196,7 @@ class ControlConfig:
     routes: Mapping[str, RouteConfig]
     slots: Mapping[str, SlotConfig]
     slot_prepare: tuple[SlotPrepareCommand, ...]
+    model_catalog: CodexModelCatalogConfig = field(default_factory=_default_model_catalog_config)
 
 
 def default_config_path() -> Path:
@@ -229,7 +280,7 @@ def load_config(
         ),
         backend=_backend_value(defaults_raw.get("backend", CODEX_BACKEND)),
         agy_model=_optional_string_value(defaults_raw.get("agy_model")),
-        codex_model=_string_value(defaults_raw.get("codex_model", "gpt-5")),
+        codex_model=_string_value(defaults_raw.get("codex_model", "default")),
         codex_reasoning_effort=_string_value(defaults_raw.get("codex_reasoning_effort", "low")),
         codex_sandbox_mode=_codex_sandbox_mode_value(
             defaults_raw.get("codex_sandbox_mode", "workspace-write")
@@ -252,19 +303,15 @@ def load_config(
             "codex_no_progress_timeout_sec",
         ),
         codex_quality_tier=_quality_tier_value(defaults_raw.get("codex_quality_tier", "deep")),
-        codex_mechanical_model=_string_value(
-            defaults_raw.get("codex_mechanical_model", "gpt-5.6-luna")
-        ),
+        codex_mechanical_model=_string_value(defaults_raw.get("codex_mechanical_model", "default")),
         codex_mechanical_reasoning_effort=_string_value(
             defaults_raw.get("codex_mechanical_reasoning_effort", "low")
         ),
-        codex_balanced_model=_string_value(
-            defaults_raw.get("codex_balanced_model", "gpt-5.6-terra")
-        ),
+        codex_balanced_model=_string_value(defaults_raw.get("codex_balanced_model", "default")),
         codex_balanced_reasoning_effort=_string_value(
             defaults_raw.get("codex_balanced_reasoning_effort", "medium")
         ),
-        codex_deep_model=_string_value(defaults_raw.get("codex_deep_model", "gpt-5.6-terra")),
+        codex_deep_model=_string_value(defaults_raw.get("codex_deep_model", "default")),
         codex_deep_reasoning_effort=_string_value(
             defaults_raw.get("codex_deep_reasoning_effort", "medium")
         ),
@@ -296,9 +343,7 @@ def load_config(
             defaults_raw.get("codex_spark_soft_limit_percent", 100.0),
             "codex_spark_soft_limit_percent",
         ),
-        codex_spark_models=_string_tuple(
-            defaults_raw.get("codex_spark_models", ["gpt-5.3-codex-spark"])
-        ),
+        codex_spark_models=_string_tuple(defaults_raw.get("codex_spark_models", [])),
         codex_quota_poll_sec=_positive_float(
             defaults_raw.get("codex_quota_poll_sec", 30.0),
             "codex_quota_poll_sec",
@@ -318,6 +363,23 @@ def load_config(
                 ["cmd", "/c", "npx", "--no-install", "electron"],
             )
         ),
+    )
+    model_catalog = _model_catalog_config(
+        control.get("model_catalog", {}),
+        project_root=project_root,
+        legacy_primary=CodexQuotaDomainConfig(
+            name="primary",
+            max_concurrent_jobs=codex_global_max_concurrent_jobs,
+            max_burst_jobs=codex_global_max_burst_jobs,
+            soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
+        ),
+        legacy_secondary=CodexQuotaDomainConfig(
+            name="spark",
+            max_concurrent_jobs=codex_spark_max_concurrent_jobs,
+            max_burst_jobs=codex_spark_max_concurrent_jobs * 4,
+            soft_limit_percent=defaults.codex_spark_soft_limit_percent,
+        ),
+        legacy_secondary_models=defaults.codex_spark_models,
     )
 
     global_worktree_root = _path(control, "worktree_root", project_root)
@@ -448,6 +510,7 @@ def load_config(
         agy_command=str(control.get("agy_command", "agy")),
         codex_command=str(control.get("codex_command", "codex")),
         defaults=defaults,
+        model_catalog=model_catalog,
         routes=MappingProxyType(routes),
         slots=MappingProxyType(slots),
         slot_prepare=tuple(slot_prepare),
@@ -459,6 +522,157 @@ def _table(raw: Mapping[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"[{key}] must be a table")
     return value
+
+
+def _model_catalog_config(
+    raw: Any,
+    *,
+    project_root: Path,
+    legacy_primary: CodexQuotaDomainConfig,
+    legacy_secondary: CodexQuotaDomainConfig,
+    legacy_secondary_models: tuple[str, ...],
+) -> CodexModelCatalogConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("[control.model_catalog] must be a table")
+    cache_path = _optional_path(raw, "cache_path", project_root)
+    if cache_path is None:
+        cache_path = Path.home() / ".codex" / "models_cache.json"
+    max_cache_age_sec = _positive_float(
+        raw.get("max_cache_age_sec", 86_400.0),
+        "control.model_catalog.max_cache_age_sec",
+    )
+    configured_domains = raw.get("quota_domains", [])
+    if not isinstance(configured_domains, list):
+        raise ValueError("control.model_catalog.quota_domains must be an array of tables")
+    quota_domains = (
+        tuple(_quota_domain_config(value) for value in configured_domains)
+        if configured_domains
+        else (legacy_primary, legacy_secondary)
+    )
+    domain_names = [domain.name for domain in quota_domains]
+    if len(domain_names) != len(set(domain_names)):
+        raise ValueError("control.model_catalog.quota_domains contains duplicate names")
+    if "primary" not in domain_names:
+        raise ValueError("control.model_catalog.quota_domains must include primary")
+    configured_models = raw.get("models", [])
+    if not isinstance(configured_models, list):
+        raise ValueError("control.model_catalog.models must be an array of tables")
+    models = [_model_metadata_config(value) for value in configured_models]
+    configured_model_ids = {model.model.lower() for model in models}
+    for legacy_model in legacy_secondary_models:
+        if legacy_model.lower() not in configured_model_ids:
+            models.append(
+                CodexModelMetadataConfig(
+                    model=legacy_model,
+                    quota_domain=legacy_secondary.name,
+                    capacity_units=(),
+                    credit_rate=None,
+                    api_usd_rate=None,
+                    rate_card_version=None,
+                    rate_card_source=None,
+                )
+            )
+    model_ids = [model.model.lower() for model in models]
+    if len(model_ids) != len(set(model_ids)):
+        raise ValueError("control.model_catalog.models contains duplicate model IDs")
+    configured_domains_by_name = set(domain_names)
+    for model in models:
+        if model.quota_domain is not None and model.quota_domain not in configured_domains_by_name:
+            raise ValueError(
+                f"Model catalog metadata references unknown quota domain: {model.quota_domain}"
+            )
+    return CodexModelCatalogConfig(
+        cache_path=cache_path,
+        max_cache_age_sec=max_cache_age_sec,
+        models=tuple(models),
+        quota_domains=quota_domains,
+    )
+
+
+def _quota_domain_config(raw: Any) -> CodexQuotaDomainConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("Each model catalog quota domain must be a table")
+    name = _string_value(_required(raw, "name")).lower()
+    max_concurrent_jobs = _positive_int(
+        _required(raw, "max_concurrent_jobs"),
+        f"control.model_catalog.quota_domains.{name}.max_concurrent_jobs",
+    )
+    max_burst_jobs = _positive_int(
+        raw.get("max_burst_jobs", max_concurrent_jobs * 4),
+        f"control.model_catalog.quota_domains.{name}.max_burst_jobs",
+    )
+    if max_burst_jobs < max_concurrent_jobs:
+        raise ValueError(
+            f"Model catalog quota domain {name} max_burst_jobs must be at least max_concurrent_jobs"
+        )
+    return CodexQuotaDomainConfig(
+        name=name,
+        max_concurrent_jobs=max_concurrent_jobs,
+        max_burst_jobs=max_burst_jobs,
+        soft_limit_percent=_percent_value(
+            raw.get("soft_limit_percent", 100.0),
+            f"control.model_catalog.quota_domains.{name}.soft_limit_percent",
+        ),
+    )
+
+
+def _model_metadata_config(raw: Any) -> CodexModelMetadataConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("Each model catalog metadata entry must be a table")
+    model = _string_value(_required(raw, "model"))
+    quota_domain = _optional_string_value(raw.get("quota_domain"))
+    if quota_domain is not None:
+        quota_domain = quota_domain.lower()
+    capacity_raw = raw.get("capacity_units", {})
+    if not isinstance(capacity_raw, dict):
+        raise ValueError(f"Model catalog capacity_units must be a table: {model}")
+    capacity_units = tuple(
+        sorted(
+            (
+                _string_value(effort).lower(),
+                _positive_int(units, f"Model catalog capacity_units.{effort}"),
+            )
+            for effort, units in capacity_raw.items()
+        )
+    )
+    if len({effort for effort, _ in capacity_units}) != len(capacity_units):
+        raise ValueError(f"Model catalog capacity_units contains duplicate efforts: {model}")
+    credit_rate = _catalog_rate(raw, model, "credit")
+    api_usd_rate = _catalog_rate(raw, model, "api_usd")
+    rate_card_version = _optional_string_value(raw.get("rate_card_version"))
+    rate_card_source = _optional_string_value(raw.get("rate_card_source"))
+    if (credit_rate is not None or api_usd_rate is not None) and (
+        rate_card_version is None or rate_card_source is None
+    ):
+        raise ValueError(f"Model catalog rate metadata needs version and source: {model}")
+    return CodexModelMetadataConfig(
+        model=model,
+        quota_domain=quota_domain,
+        capacity_units=capacity_units,
+        credit_rate=credit_rate,
+        api_usd_rate=api_usd_rate,
+        rate_card_version=rate_card_version,
+        rate_card_source=rate_card_source,
+    )
+
+
+def _catalog_rate(
+    raw: Mapping[str, Any],
+    model: str,
+    prefix: str,
+) -> CodexTokenRateConfig | None:
+    rate = raw.get(f"{prefix}_rate")
+    if rate is None:
+        return None
+    if not isinstance(rate, Mapping):
+        raise ValueError(f"Model catalog {prefix} rate must be a table: {model}")
+    values = [rate.get(part) for part in ("input", "cached_input", "output")]
+    if any(value is None for value in values):
+        raise ValueError(f"Model catalog {prefix} rate is incomplete: {model}")
+    rate_values = [float(cast(int | float | str, value)) for value in values]
+    if any(value < 0 for value in rate_values):
+        raise ValueError(f"Model catalog {prefix} rate must not be negative: {model}")
+    return CodexTokenRateConfig(*rate_values)
 
 
 def _required(raw: Mapping[str, Any], key: str) -> Any:

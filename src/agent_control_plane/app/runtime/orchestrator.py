@@ -46,9 +46,11 @@ from agent_control_plane.features.agent_runner import (
     JobLaunchError,
     JobLaunchOptions,
     JobReconciler,
+    ModelCatalog,
     ModelProfile,
     ModelRoutingPolicy,
     PtyAgyRunner,
+    QuotaDomain,
     codex_quota_domain,
     inspect_result,
     normalize_backend,
@@ -111,6 +113,7 @@ class AgentControlPlane:
         self.slots = SlotManager(config, self.slot_store)
         self.policy = WorkspacePolicy(config)
         defaults = config.defaults
+        self.model_catalog = ModelCatalog.from_config(config.model_catalog)
         self.model_routing = ModelRoutingPolicy(
             mechanical=ModelProfile(
                 defaults.codex_mechanical_model,
@@ -124,11 +127,15 @@ class AgentControlPlane:
                 defaults.codex_deep_model,
                 defaults.codex_deep_reasoning_effort,
             ),
+            catalog=self.model_catalog,
         )
         self._quota_broker: GlobalQuotaBroker | None = None
         if defaults.codex_global_quota_database is not None:
             rate_limit_reader = (
-                CodexRateLimitReader(defaults.codex_sessions_root).latest
+                CodexRateLimitReader(
+                    defaults.codex_sessions_root,
+                    catalog=self.model_catalog,
+                ).latest
                 if defaults.codex_sessions_root is not None
                 else None
             )
@@ -139,8 +146,17 @@ class AgentControlPlane:
                 soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
                 spark_soft_limit_percent=defaults.codex_spark_soft_limit_percent,
                 spark_max_concurrent_jobs=defaults.codex_spark_max_concurrent_jobs,
-                spark_models=defaults.codex_spark_models,
                 rate_limit_reader=rate_limit_reader,
+                catalog=self.model_catalog,
+                quota_domains=tuple(
+                    QuotaDomain(
+                        name=domain.name,
+                        max_concurrent_jobs=domain.max_concurrent_jobs,
+                        max_burst_jobs=domain.max_burst_jobs,
+                        soft_limit_percent=domain.soft_limit_percent,
+                    )
+                    for domain in config.model_catalog.quota_domains
+                ),
             )
         self.finalization = FinalizationService(
             config=self.config,
@@ -188,12 +204,11 @@ class AgentControlPlane:
         if hasattr(self, "job_execution"):
             self.job_execution.quota_broker = broker
 
-    @staticmethod
-    def _runner_for_backend(backend: str) -> AgentRunner:
+    def _runner_for_backend(self, backend: str) -> AgentRunner:
         if backend == AGY_BACKEND:
             return PtyAgyRunner()
         if normalize_backend(backend) == CODEX_BACKEND:
-            return CodexExecRunner()
+            return CodexExecRunner(self.model_catalog)
         allowed = ", ".join(SUPPORTED_BACKENDS)
         raise PolicyError(f"Unsupported backend {backend!r}. Expected one of: {allowed}")
 
@@ -210,6 +225,7 @@ class AgentControlPlane:
         self.store.initialize()
         self.plan_store.initialize()
         self.review_inbox.initialize()
+        catalog_diagnostics = self._catalog_diagnostics()
         return {
             "config": str(self.config.config_path),
             "database": str(self.config.database_path),
@@ -229,12 +245,10 @@ class AgentControlPlane:
                 "balanced": self.config.defaults.codex_balanced_tool_call_budget,
                 "deep": self.config.defaults.codex_deep_tool_call_budget,
             },
-            "codex_quality_profiles": {
-                tier: [
-                    {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
-                    for profile in self.model_routing.ladder_for_tier(tier)
-                ]
-                for tier in ("mechanical", "balanced", "deep")
+            "codex_quality_profiles": catalog_diagnostics["profiles"],
+            "codex_model_catalog": {
+                "status": self.model_catalog.cache_status,
+                "profile_resolution_errors": catalog_diagnostics["profile_resolution_errors"],
             },
             "codex_global_quota": {
                 "enabled": self.quota_broker is not None,
@@ -327,6 +341,22 @@ class AgentControlPlane:
                 }
                 for command in self.config.slot_prepare
             ],
+        }
+
+    def _catalog_diagnostics(self) -> dict[str, dict[str, Any]]:
+        profiles: dict[str, list[dict[str, str]]] = {}
+        profile_resolution_errors: dict[str, str] = {}
+        for tier in ("mechanical", "balanced", "deep"):
+            try:
+                profiles[tier] = [
+                    {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
+                    for profile in self.model_routing.ladder_for_tier(tier)
+                ]
+            except ValueError as exc:
+                profile_resolution_errors[tier] = str(exc)
+        return {
+            "profiles": profiles,
+            "profile_resolution_errors": profile_resolution_errors,
         }
 
     def reconcile_jobs(
@@ -792,7 +822,7 @@ class AgentControlPlane:
             return "primary"
         return codex_quota_domain(
             job.codex_model or self.config.defaults.codex_model,
-            self.config.defaults.codex_spark_models,
+            self.model_catalog,
         )
 
     def _native_quality_summary(self, job: JobRecord) -> dict[str, Any]:

@@ -54,8 +54,8 @@ def add_plan_parser(
     plan_add.add_argument(
         "--codex-reasoning-effort",
         help=(
-            "Codex reasoning effort to use when --backend=codex; managed "
-            "Luna/Terra/Sol profiles accept none, low, medium, high, or xhigh"
+            "Codex reasoning effort to use when --backend=codex; known catalog models "
+            "must use an effort declared by the current cache"
         ),
     )
 

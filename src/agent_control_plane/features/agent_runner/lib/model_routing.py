@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
+
 QUALITY_TIERS = ("mechanical", "balanced", "deep")
-_MANAGED_CODEX_MODEL_FAMILIES = frozenset({"luna", "terra", "sol"})
-_MANAGED_CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh")
 
 
 @dataclass(frozen=True)
@@ -13,26 +13,27 @@ class ModelProfile:
     reasoning_effort: str
 
 
-def _validated_profile(profile: ModelProfile) -> ModelProfile:
+def _validated_profile(
+    profile: ModelProfile,
+    *,
+    catalog: ModelCatalog,
+    automatic: bool,
+) -> ModelProfile:
     model = profile.model.strip()
     effort = profile.reasoning_effort.strip().lower()
     if not model:
         raise ValueError("Codex model must not be empty")
-
-    family = model.lower().rsplit("-", maxsplit=1)[-1]
-    if family in _MANAGED_CODEX_MODEL_FAMILIES and effort not in _MANAGED_CODEX_REASONING_EFFORTS:
-        allowed = ", ".join(_MANAGED_CODEX_REASONING_EFFORTS)
-        raise ValueError(
-            f"Codex model {model!r} does not support reasoning effort {effort!r}. "
-            f"Expected one of: {allowed}"
-        )
     if not effort:
         raise ValueError("Codex reasoning effort must not be empty")
+    if automatic or model.lower() == "default":
+        model = catalog.resolve_automatic_profile(model, effort)
+    else:
+        catalog.validate_explicit_profile(model, effort)
     return ModelProfile(model=model, reasoning_effort=effort)
 
 
 class ModelRoutingPolicy:
-    """Conservative model ladder: Luna is opt-in, Terra is the quality fallback."""
+    """Validate catalog-backed quality profiles and their deterministic fallback ladder."""
 
     def __init__(
         self,
@@ -40,12 +41,18 @@ class ModelRoutingPolicy:
         mechanical: ModelProfile,
         balanced: ModelProfile,
         deep: ModelProfile,
+        catalog: ModelCatalog,
     ) -> None:
         self._profiles = {
             "mechanical": mechanical,
             "balanced": balanced,
             "deep": deep,
         }
+        self._catalog = catalog
+
+    @property
+    def catalog(self) -> ModelCatalog:
+        return self._catalog
 
     def ladder_for_tier(self, quality_tier: str) -> tuple[ModelProfile, ...]:
         tier = quality_tier.strip().lower()
@@ -54,18 +61,24 @@ class ModelRoutingPolicy:
             raise ValueError(
                 f"Unsupported quality tier {quality_tier!r}. Expected one of: {allowed}"
             )
-        first = _validated_profile(self._profiles[tier])
-        deep = _validated_profile(self._profiles["deep"])
+        first = _validated_profile(self._profiles[tier], catalog=self._catalog, automatic=True)
+        deep = _validated_profile(self._profiles["deep"], catalog=self._catalog, automatic=True)
         if first == deep:
             return (first,)
         return first, deep
 
-    @staticmethod
     def ladder_for_explicit_model(
+        self,
         model: str,
         reasoning_effort: str,
     ) -> tuple[ModelProfile, ...]:
-        return (_validated_profile(ModelProfile(model, reasoning_effort)),)
+        return (
+            _validated_profile(
+                ModelProfile(model, reasoning_effort),
+                catalog=self._catalog,
+                automatic=False,
+            ),
+        )
 
     @staticmethod
     def should_escalate(

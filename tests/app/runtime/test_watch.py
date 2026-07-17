@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
@@ -12,7 +13,13 @@ from unittest.mock import patch
 
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
 from agent_control_plane.entities.plan import PlanTaskDefinition
-from agent_control_plane.shared.config import ControlConfig, ControlDefaults, RouteConfig
+from agent_control_plane.shared.config import (
+    CodexModelCatalogConfig,
+    CodexQuotaDomainConfig,
+    ControlConfig,
+    ControlDefaults,
+    RouteConfig,
+)
 
 
 class WatchJobTest(unittest.TestCase):
@@ -318,6 +325,7 @@ def _create_job(control: AgentControlPlane, root: Path, job_id: str):
 
 
 def _config(root: Path, *, auto_archive_days: int | None = None) -> ControlConfig:
+    model_catalog = _model_catalog(root)
     return ControlConfig(
         config_path=root / "workspaces.toml",
         project_root=root,
@@ -342,7 +350,12 @@ def _config(root: Path, *, auto_archive_days: int | None = None) -> ControlConfi
             runs_layout="date",
             auto_archive_days=auto_archive_days,
             auto_archive_limit=200,
+            codex_model="test-codex",
+            codex_mechanical_model="test-codex",
+            codex_balanced_model="test-codex",
+            codex_deep_model="test-codex",
         ),
+        model_catalog=model_catalog,
         routes=MappingProxyType(
             {
                 "main": RouteConfig(
@@ -359,6 +372,29 @@ def _config(root: Path, *, auto_archive_days: int | None = None) -> ControlConfi
         ),
         slots=MappingProxyType({}),
         slot_prepare=(),
+    )
+
+
+def _model_catalog(root: Path) -> CodexModelCatalogConfig:
+    cache_path = root / "models_cache.json"
+    cache_path.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "slug": "test-codex",
+                        "supported_reasoning_levels": ["low", "medium"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return CodexModelCatalogConfig(
+        cache_path=cache_path,
+        max_cache_age_sec=60.0,
+        models=(),
+        quota_domains=(CodexQuotaDomainConfig("primary", 2, 8, 75.0),),
     )
 
 
