@@ -4,7 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.entities.job import JobStore
+from agent_control_plane.entities.job import AttemptMetrics, JobStore, ReviewMetricsStore
+from agent_control_plane.shared.codex_session_usage import TokenUsage
 
 
 class JobStoreTest(unittest.TestCase):
@@ -56,6 +57,83 @@ class JobStoreTest(unittest.TestCase):
             store.request_cancel("job-2")
 
             self.assertTrue(store.cancel_requested("job-2"))
+
+    def test_routing_decision_readback_is_deterministic_after_store_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            store = JobStore(database)
+            _create_job(store, root, "job-routing")
+            payload = _routing_payload()
+
+            store.record_routing_decision("job-routing", payload)
+            restarted = JobStore(database)
+
+            self.assertEqual(restarted.routing_decision("job-routing"), payload)
+
+    def test_routing_history_returns_one_valid_reviewed_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            store = JobStore(database)
+            _record_attempt(store, root, "job-history")
+            self.assertIsNone(store.routing_history(limit=1)[0]["root_outcome"])
+
+            reviews = ReviewMetricsStore(database)
+            span_id = reviews.start_span(
+                span_id="review-1",
+                name="Root review",
+                session_path=root / "review.jsonl",
+                usage=TokenUsage(0, 0, 0, 0),
+            )
+            reviews.attach_job(
+                span_id,
+                job_id="job-history",
+                outcome="accepted",
+                root_verified=True,
+                defects_found=1,
+            )
+
+            history = store.routing_history(limit=1)
+            row = history[0]
+            self.assertEqual(
+                (
+                    row["model"],
+                    row["reasoning_effort"],
+                    row["metrics_valid"],
+                    row["root_outcome"],
+                    row["defects_found"],
+                ),
+                ("gpt-5", "low", True, "accepted", 1),
+            )
+            self.assertEqual(
+                (
+                    row["route"],
+                    row["policy_name"],
+                    row["task_class"],
+                    row["selection_source"],
+                    row["catalog_version"],
+                ),
+                ("main", "code-change", "implementation", "configured_fallback", "catalog-v1"),
+            )
+
+    def test_malformed_routing_payload_is_non_comparable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            _record_attempt(store, root, "job-malformed")
+            store.add_event("job-malformed", "routing_decision", "not-json")
+
+            self.assertIsNone(store.routing_decision("job-malformed"))
+            history = store.routing_history()
+            self.assertIsNone(history[0]["policy_name"])
+
+    def test_routing_history_rejects_invalid_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = JobStore(Path(temp) / "jobs.sqlite3")
+
+            with self.assertRaises(ValueError):
+                store.routing_history(limit=0)
 
     def test_workspace_access_default_is_ide_mcp(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -218,6 +296,54 @@ def _create_job(store: JobStore, root: Path, job_id: str):
         agy_model="Gemini 3.5 Flash (High)",
         codex_model="gpt-5",
         codex_reasoning_effort="low",
+    )
+
+
+def _record_attempt(store: JobStore, root: Path, job_id: str) -> None:
+    _create_job(store, root, job_id)
+    store.record_routing_decision(job_id, _routing_payload())
+    store.start_attempt(job_id, 1, root / f"{job_id}.attempt.log")
+    store.finish_attempt(job_id, 1, "completed", result_status="completed", exit_code=0)
+    store.record_attempt_metrics(
+        job_id,
+        1,
+        backend="codex",
+        model="gpt-5",
+        reasoning_effort="low",
+        metrics=_routing_metrics(),
+    )
+
+
+def _routing_payload() -> dict[str, object]:
+    return {
+        "event": "routing_decision",
+        "requested_policy": "code-change",
+        "task_class": "implementation",
+        "selection_source": "configured_fallback",
+        "route": "main",
+        "catalog": {"source": "models_cache.json", "version": "catalog-v1"},
+    }
+
+
+def _routing_metrics() -> AttemptMetrics:
+    return AttemptMetrics(
+        duration_sec=2.0,
+        thread_id=None,
+        event_count=1,
+        turn_completed=True,
+        usage_available=True,
+        input_tokens=100,
+        cached_input_tokens=10,
+        output_tokens=20,
+        reasoning_output_tokens=0,
+        tool_calls=1,
+        failed_tool_calls=0,
+        error_events=0,
+        tool_counts=(),
+        estimated_credits=None,
+        estimated_api_usd=None,
+        rate_card_version="test-card",
+        event_log_path=None,
     )
 
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
 import uuid
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -578,6 +580,72 @@ class JobStore:
             )
         return build_metrics_report(rows)
 
+    def record_routing_decision(self, job_id: str, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Routing decision payload must be a mapping")
+        if payload.get("event") != "routing_decision":
+            raise ValueError("Routing decision payload must have event='routing_decision'")
+        try:
+            message = json.dumps(
+                dict(payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Routing decision payload must be JSON-serializable") from exc
+        self.initialize()
+        self.add_event(job_id, "routing_decision", message)
+
+    def routing_decision(self, job_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as db:
+            row = db.execute(
+                """
+                select message from events
+                where job_id = ? and level = 'routing_decision'
+                order by id desc limit 1
+                """,
+                (job_id,),
+            ).fetchone()
+        return _decode_routing_payload(row["message"] if row is not None else None)
+
+    def routing_history(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+            raise ValueError("routing history limit must be positive")
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                select m.job_id, m.model, m.reasoning_effort, m.duration_sec,
+                       m.input_tokens, m.cached_input_tokens, m.output_tokens,
+                       m.usage_available, m.turn_completed,
+                       a.status as attempt_status, a.result_status, j.route,
+                       e.message as routing_message
+                from attempt_metrics as m
+                join attempts as a
+                  on a.job_id = m.job_id and a.attempt_no = m.attempt_no
+                join jobs as j on j.job_id = m.job_id
+                left join events as e on e.id = (
+                    select max(event.id) from events as event
+                    where event.job_id = m.job_id and event.level = 'routing_decision'
+                )
+                order by m.created_at desc, m.attempt_no desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+            tables = {
+                str(row["name"])
+                for row in db.execute(
+                    "select name from sqlite_master where type = 'table'"
+                ).fetchall()
+            }
+            reviews = _routing_review_outcomes(db) if "review_job_outcomes" in tables else {}
+            plans = _routing_plan_outcomes(db) if "plan_tasks" in tables else {}
+        return [_routing_history_row(row, reviews=reviews, plans=plans) for row in rows]
+
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._connect() as db:
             db.execute(
@@ -727,6 +795,97 @@ def _to_sql(value: Any) -> Any:
 
 def _optional_path(value: str | None) -> Path | None:
     return Path(value) if value else None
+
+
+def _decode_routing_payload(value: Any) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return (
+        payload
+        if isinstance(payload, dict) and payload.get("event") == "routing_decision"
+        else None
+    )
+
+
+def _routing_review_outcomes(db: sqlite3.Connection) -> dict[str, tuple[str, int]]:
+    rows = db.execute(
+        "select job_id, outcome, defects_found from review_job_outcomes "
+        "where root_verified = 1 and outcome in ('accepted', 'rejected') "
+        "order by recorded_at, span_id"
+    ).fetchall()
+    return {
+        str(row["job_id"]): (str(row["outcome"]), max(0, int(row["defects_found"]))) for row in rows
+    }
+
+
+def _routing_plan_outcomes(db: sqlite3.Connection) -> dict[str, str]:
+    rows = db.execute(
+        "select job_id, review_status from plan_tasks "
+        "where job_id is not null and review_status in ('accepted', 'rejected') "
+        "order by updated_at, plan_id, task_id"
+    ).fetchall()
+    return {str(row["job_id"]): str(row["review_status"]) for row in rows}
+
+
+def _routing_history_row(
+    row: sqlite3.Row,
+    *,
+    reviews: dict[str, tuple[str, int]],
+    plans: dict[str, str],
+) -> dict[str, Any]:
+    payload = _decode_routing_payload(row["routing_message"])
+    metadata = payload or {}
+    catalog = metadata.get("catalog")
+    catalog = catalog if isinstance(catalog, dict) else {}
+    review = reviews.get(str(row["job_id"]))
+    root_outcome = review[0] if review is not None else plans.get(str(row["job_id"]))
+    raw_values = tuple(
+        _routing_float(row[field])
+        for field in ("duration_sec", "input_tokens", "cached_input_tokens", "output_tokens")
+    )
+    metrics_valid = bool(row["usage_available"]) and bool(row["turn_completed"])
+    metrics_valid = metrics_valid and all(
+        math.isfinite(value) and value >= 0 for value in raw_values
+    )
+    metrics_valid = metrics_valid and raw_values[2] <= raw_values[1]
+    metrics_valid = metrics_valid and bool(_payload_text(row["model"]))
+    metrics_valid = metrics_valid and bool(_payload_text(row["reasoning_effort"]))
+    policy_name = _payload_text(
+        metadata.get("policy_name") or metadata.get("requested_policy") or metadata.get("policy")
+    )
+    selection_source = _payload_text(metadata.get("selection_source"))
+    return {
+        "model": _payload_text(row["model"]),
+        "reasoning_effort": _payload_text(row["reasoning_effort"]),
+        "attempt_status": row["attempt_status"],
+        "result_status": row["result_status"],
+        "input_tokens": row["input_tokens"],
+        "cached_input_tokens": row["cached_input_tokens"],
+        "output_tokens": row["output_tokens"],
+        "duration_sec": raw_values[0],
+        "metrics_valid": metrics_valid,
+        "route": _payload_text(row["route"]),
+        "policy_name": policy_name,
+        "task_class": _payload_text(metadata.get("task_class")),
+        "selection_source": selection_source,
+        "catalog_source": _payload_text(catalog.get("source")),
+        "catalog_version": _payload_text(catalog.get("version")),
+        "root_outcome": root_outcome,
+        "defects_found": review[1] if review is not None else 0,
+    }
+
+
+def _routing_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _payload_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _job_from_row(row: sqlite3.Row) -> JobRecord:
