@@ -204,6 +204,39 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 1,
             )
 
+    def test_routing_decision_persistence_failure_blocks_created_job_before_worker_launch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "decision-persist-failure")
+
+            with (
+                patch.object(
+                    control.store,
+                    "record_routing_decision",
+                    side_effect=RuntimeError("routing DB unavailable"),
+                ),
+                patch.object(control, "_launch_worker", return_value=123) as launch,
+                self.assertRaisesRegex(PolicyError, "Could not persist routing decision"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="decision-persist-failure",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            launch.assert_not_called()
+            jobs = control.store.list_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0].status, "blocked")
+            self.assertIsNotNone(jobs[0].finished_at)
+            self.assertIn("routing DB unavailable", jobs[0].last_error or "")
+
     def test_automatic_codex_history_can_promote_and_persist_reordered_ladder(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -276,6 +309,42 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                     ModelProfile("gpt-5.6-luna", "low"),
                 ),
             )
+
+    def test_persisted_automatic_decision_requires_exact_job_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "adaptive-contract")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="adaptive-contract",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            expected = (ModelProfile(job.codex_model or "", job.codex_reasoning_effort or ""),)
+            decision = control.store.routing_decision(job.job_id)
+            self.assertIsNotNone(decision)
+            assert decision is not None
+            cases = (
+                {"requested_policy": "another-policy"},
+                {"tool_call_budget": (job.codex_tool_call_budget or 0) + 1},
+                {"catalog": {"source": "", "version": decision["catalog"]["version"]}},
+                {"selection_source": "history", "configured_fallback": True},
+            )
+
+            for changes in cases:
+                payload = json.loads(json.dumps(decision))
+                payload.update(changes)
+                control.store.record_routing_decision(job.job_id, payload)
+                self.assertEqual(
+                    control.job_execution._model_ladder_for_job(control.store.get_job(job.job_id)),
+                    expected,
+                )
 
     def test_automatic_legacy_job_with_missing_or_bad_decision_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -854,6 +923,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 codex_model="gpt-5.6-luna",
                 codex_reasoning_effort="low",
                 codex_quality_tier="mechanical",
+                codex_tool_call_budget=45,
             )
             control.store.record_routing_decision(
                 job.job_id,
@@ -861,7 +931,14 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                     "event": "routing_decision",
                     "route": "main",
                     "requested_policy": "mechanical",
+                    "task_class": "mechanical",
+                    "tool_call_budget": 45,
+                    "catalog": {
+                        "source": control.model_routing.catalog.source,
+                        "version": control.model_routing.catalog.version,
+                    },
                     "selection_source": "configured_fallback",
+                    "configured_fallback": True,
                     "chosen_profile": {
                         "model": "gpt-5.6-luna",
                         "reasoning_effort": "low",
@@ -1544,6 +1621,7 @@ def _create_job(
     codex_model: str | None = None,
     codex_reasoning_effort: str | None = None,
     codex_quality_tier: str | None = None,
+    codex_tool_call_budget: int | None = None,
     workspace_access: str = "ide_mcp",
 ):
     run_dir = root / "runs" / job_id
@@ -1571,6 +1649,7 @@ def _create_job(
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
         codex_quality_tier=codex_quality_tier,
+        codex_tool_call_budget=codex_tool_call_budget,
         workspace_access=workspace_access,
         slot_name=slot_name,
     )

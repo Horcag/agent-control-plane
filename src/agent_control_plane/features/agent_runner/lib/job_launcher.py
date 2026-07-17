@@ -355,14 +355,20 @@ class JobLauncher:
             raise JobLaunchError(str(exc)) from exc
 
         if routing_decision is not None:
-            self.store.record_routing_decision(
-                job.job_id,
-                {
-                    "event": "routing_decision",
-                    "route": options.route,
-                    **routing_decision.as_dict(),
-                },
-            )
+            try:
+                self.store.record_routing_decision(
+                    job.job_id,
+                    {
+                        "event": "routing_decision",
+                        "route": options.route,
+                        **routing_decision.as_dict(),
+                    },
+                )
+            except Exception as exc:
+                message = f"Could not persist routing decision: {exc}"
+                self.store.add_event(job.job_id, "error", message)
+                self.finish_job(job.job_id, "blocked", message)
+                raise JobLaunchError(message) from exc
 
         if options.plan_id:
             try:

@@ -743,6 +743,8 @@ class JobExecutionService:
             self.store.routing_decision(job.job_id),
             route=job.route,
             first_profile=stored_profile,
+            quality_tier=job.codex_quality_tier,
+            tool_call_budget=job.codex_tool_call_budget,
         )
         return persisted_ladder or (stored_profile,)
 
@@ -905,17 +907,52 @@ def _persisted_routing_ladder(
     *,
     route: str,
     first_profile: ModelProfile,
+    quality_tier: str | None,
+    tool_call_budget: int | None,
 ) -> tuple[ModelProfile, ...] | None:
     if not isinstance(payload, Mapping):
         return None
     if payload.get("event") != "routing_decision" or payload.get("route") != route:
         return None
+    if not isinstance(quality_tier, str) or not quality_tier.strip():
+        return None
     if (
         not isinstance(payload.get("requested_policy"), str)
-        or not payload["requested_policy"].strip()
+        or payload["requested_policy"].strip().casefold() != quality_tier.strip().casefold()
     ):
         return None
-    if payload.get("selection_source") not in {"configured_fallback", "history"}:
+    if (
+        not isinstance(tool_call_budget, int)
+        or isinstance(tool_call_budget, bool)
+        or tool_call_budget <= 0
+    ):
+        return None
+    if (
+        not isinstance(payload.get("tool_call_budget"), int)
+        or isinstance(payload["tool_call_budget"], bool)
+        or payload["tool_call_budget"] <= 0
+        or payload["tool_call_budget"] != tool_call_budget
+    ):
+        return None
+    if not isinstance(payload.get("task_class"), str) or not payload["task_class"].strip():
+        return None
+    catalog = payload.get("catalog")
+    if not isinstance(catalog, Mapping):
+        return None
+    if not isinstance(catalog.get("source"), str) or not catalog["source"].strip():
+        return None
+    catalog_version = catalog.get("version")
+    if catalog_version is not None and (
+        not isinstance(catalog_version, str) or not catalog_version.strip()
+    ):
+        return None
+    selection_source = payload.get("selection_source")
+    if selection_source not in {"configured_fallback", "history"}:
+        return None
+    configured_fallback = payload.get("configured_fallback")
+    if not isinstance(configured_fallback, bool) or configured_fallback != (
+        selection_source == "configured_fallback"
+    ):
         return None
     raw_ladder = payload.get("ladder")
     if not isinstance(raw_ladder, list) or not raw_ladder:
