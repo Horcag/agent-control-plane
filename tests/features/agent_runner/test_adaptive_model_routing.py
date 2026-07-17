@@ -158,7 +158,23 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
                 ModelProfile("fallback-model", "medium"),
             ),
         )
-        self.assertIn("insufficient comparable history", decision.excluded_data_reasons)
+        self.assertIn(
+            "insufficient comparative samples for every candidate", decision.excluded_data_reasons
+        )
+
+    def test_zero_comparable_samples_defaults_to_configured_fallback(self) -> None:
+        routing = _adaptive_routing()
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(),
+        )
+
+        self.assertEqual(decision.selection_source, "configured_fallback")
+        self.assertIn(
+            "insufficient comparative samples for every candidate", decision.excluded_data_reasons
+        )
 
     def test_enough_comparable_successes_can_promote_a_qualified_lower_cost_candidate(self) -> None:
         routing = ModelRoutingPolicy(
@@ -188,8 +204,16 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
             route="main",
             history=tuple(
                 _history(
+                    "reliable-model",
+                    catalog_version=routing.catalog.version,
+                )
+                for _ in range(3)
+            )
+            + tuple(
+                _history(
                     "economical-model",
                     catalog_version=routing.catalog.version,
+                    duration_sec=10.0,
                 )
                 for _ in range(3)
             ),
@@ -224,6 +248,106 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
         self.assertEqual(economical.sample_count, 1)
         self.assertIn("insufficient comparable samples", economical.exclusion_reasons)
 
+    def test_two_accepted_samples_for_only_non_fallback_candidate_keep_configured_fallback(
+        self,
+    ) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=tuple(
+                _history(
+                    "economical-model",
+                    policy_name="code-change",
+                    catalog_version=version,
+                )
+                for _ in range(2)
+            ),
+        )
+
+        self.assertEqual(decision.selection_source, "configured_fallback")
+        self.assertIn(
+            "insufficient comparative samples for every candidate",
+            decision.excluded_data_reasons,
+        )
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertEqual(economical.sample_count, 2)
+
+    def test_one_sample_for_every_candidate_keeps_configured_fallback(self) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(
+                _history(
+                    "reliable-model",
+                    policy_name="code-change",
+                    catalog_version=version,
+                ),
+                _history(
+                    "economical-model",
+                    policy_name="code-change",
+                    catalog_version=version,
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.selection_source, "configured_fallback")
+        reliable = next(
+            score for score in decision.candidate_scores if score.model == "reliable-model"
+        )
+        economical = next(
+            score for score in decision.candidate_scores if score.model == "economical-model"
+        )
+        self.assertEqual(reliable.sample_count, 1)
+        self.assertEqual(economical.sample_count, 1)
+        self.assertIn(
+            "insufficient comparative samples for every candidate",
+            decision.excluded_data_reasons,
+        )
+
+    def test_minimum_samples_for_every_candidate_enables_adaptive_selection(self) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+
+        history = (
+            _history(
+                "reliable-model",
+                policy_name="code-change",
+                catalog_version=version,
+            ),
+            _history(
+                "reliable-model",
+                policy_name="code-change",
+                catalog_version=version,
+            ),
+            _history(
+                "economical-model",
+                policy_name="code-change",
+                catalog_version=version,
+                duration_sec=10.0,
+            ),
+            _history(
+                "economical-model",
+                policy_name="code-change",
+                catalog_version=version,
+                duration_sec=10.0,
+            ),
+        )
+        decision = routing.decision_for_policy("code-change", route="main", history=history)
+
+        self.assertEqual(decision.selection_source, "history")
+        self.assertEqual(
+            decision.ladder[0],
+            ModelProfile("economical-model", "medium"),
+        )
+
     def test_adaptive_settings_reject_too_few_samples(self) -> None:
         with self.assertRaisesRegex(
             ValueError,
@@ -257,11 +381,14 @@ class AdaptiveModelRoutingTest(unittest.TestCase):
 
         decision = routing.decision_for_policy("code-change", route="main", history=history)
 
-        self.assertEqual(decision.selection_source, "history")
+        self.assertEqual(decision.selection_source, "configured_fallback")
         economical = next(
             score for score in decision.candidate_scores if score.model == "economical-model"
         )
         self.assertEqual(economical.sample_count, 2)
+        self.assertIn(
+            "insufficient comparative samples for every candidate", decision.excluded_data_reasons
+        )
         self.assertIn("missing route", decision.excluded_data_reasons)
         self.assertIn("missing policy", decision.excluded_data_reasons)
         self.assertIn("missing task class", decision.excluded_data_reasons)

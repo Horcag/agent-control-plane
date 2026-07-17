@@ -281,6 +281,24 @@ class ModelRoutingPolicy:
             )
             for index, candidate in enumerate(candidates)
         )
+        if any(
+            score.sample_count < policy.adaptive.minimum_samples_per_candidate for score in scores
+        ):
+            reasons = tuple(
+                dict.fromkeys(
+                    (
+                        *excluded,
+                        "insufficient comparative samples for every candidate",
+                    )
+                )
+            )
+            return self._configured_decision(
+                policy,
+                candidates,
+                records,
+                candidate_scores=scores,
+                excluded_data_reasons=reasons,
+            )
         eligible = tuple(score for score in scores if score.eligible)
         if not eligible:
             reasons = tuple(dict.fromkeys((*excluded, "insufficient comparable history")))

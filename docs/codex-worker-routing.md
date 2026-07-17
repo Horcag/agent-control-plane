@@ -172,21 +172,27 @@ capacity weight rather than a heuristic family-derived value.
 
 Public coding benchmarks compare model tiers, not this repository's exact prompts and
 effort settings. They do not establish this repository's routing order. LUNA-001 and the
-local tables below contain one run per variant; they are diagnostic anecdotes, not
-comparative evidence, and must never seed, train, promote, or order routing candidates.
+local tables below are single-run diagnostic anecdotes; they are not comparative evidence
+and are entirely excluded from model-ordering decisions.
 
 Routing order is operator configuration. ACP does not import candidate order from
 LUNA-001 or from any external single-run benchmark.
 
 Adaptive routing is fail-closed for each named policy:
 
-- `n=0` and `n=1` comparable runs per candidate always retain the configured fallback,
+- `n=0`, `n=1`, and any under-sampled candidate retain the configured fallback,
   which is the first candidate in the operator-supplied ladder.
-- Promotion requires the configured `minimum_samples_per_candidate` repeated comparable
-  accepted runs. Set that minimum to at least `3` for a conservative policy.
-- A run is comparable only when its prompt, context, build mode, tooling, workspace,
-  route, policy, task class, and model catalog version are identical. Any mismatch or
-  missing value excludes the run.
+  - Promotion requires the configured `minimum_samples_per_candidate` repeated comparable
+  accepted runs.
+- A run is comparable only when route, policy, `task_class` (cohort boundary),
+  catalog source/version, automatic selection source, and valid terminal result status
+  match exactly. Durable root review (`accepted`/`rejected`/`defects` outcome) must be
+  present. Any mismatch or missing value excludes the run.
+- This heuristic is not a formal confidence interval or statistical significance test.
+  Use conservative settings: `minimum_samples_per_candidate >= 3` and narrow
+  task classes for high-risk routing decisions.
+- `task_class` groups comparable routes; it is a cohort boundary, not proof of identical
+  prompt, context, build mode, tooling, or workspace state.
 - Quality evidence requires a completed result plus durable root acceptance/review.
   Missing review fails closed; partial, blocked, or unreviewed results cannot promote a
   candidate.
