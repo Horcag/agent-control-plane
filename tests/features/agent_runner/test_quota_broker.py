@@ -445,10 +445,15 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                         self.assertEqual(spark.reason, "rate_limit_soft_cap")
                         self.assertTrue(primary.acquired)
 
-    def test_primary_and_spark_share_weighted_capacity(self) -> None:
+    def test_full_primary_pool_still_admits_spark_to_local_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             database = Path(temp) / "global-quota.sqlite3"
-            broker = GlobalQuotaBroker(database, max_concurrent_jobs=1)
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+                max_burst_jobs=4,
+                spark_max_concurrent_jobs=8,
+            )
             self.assertTrue(
                 broker.try_acquire(
                     "primary",
@@ -456,13 +461,164 @@ class GlobalQuotaBrokerTest(unittest.TestCase):
                     model="gpt-5.6-terra",
                 ).acquired
             )
-            spark = broker.try_acquire(
-                "spark",
+            spark_decisions = [
+                broker.try_acquire(
+                    f"spark-{index}",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.3-codex-spark",
+                )
+                for index in range(8)
+            ]
+
+            self.assertTrue(all(decision.acquired for decision in spark_decisions))
+            self.assertEqual(spark_decisions[-1].active_jobs, 8)
+            self.assertEqual(spark_decisions[-1].max_capacity_units, 240)
+
+            blocked = broker.try_acquire(
+                "spark-8",
                 worker_pid=os.getpid(),
                 model="gpt-5.3-codex-spark",
             )
-            self.assertFalse(spark.acquired)
-            self.assertEqual(spark.reason, "weighted_capacity_limit")
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
+            self.assertEqual(blocked.active_jobs, 8)
+
+    def test_full_spark_pool_still_allows_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+                spark_max_concurrent_jobs=8,
+            )
+            spark_decisions = [
+                broker.try_acquire(
+                    f"spark-{index}",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.3-codex-spark",
+                )
+                for index in range(8)
+            ]
+            self.assertTrue(all(decision.acquired for decision in spark_decisions))
+
+            primary = broker.try_acquire(
+                "primary",
+                worker_pid=os.getpid(),
+                model="gpt-5.6-terra",
+            )
+            self.assertTrue(primary.acquired)
+            self.assertEqual(primary.quota_domain, "primary")
+
+    def test_ninth_spark_job_is_blocked_by_spark_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=2,
+                spark_max_concurrent_jobs=8,
+            )
+            first_spark = [
+                broker.try_acquire(
+                    f"spark-{index}",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.3-codex-spark",
+                )
+                for index in range(8)
+            ]
+            self.assertTrue(all(decision.acquired for decision in first_spark))
+
+            blocked = broker.try_acquire(
+                "spark-8",
+                worker_pid=os.getpid(),
+                model="gpt-5.3-codex-spark",
+            )
+            self.assertFalse(blocked.acquired)
+            self.assertEqual(blocked.reason, "weighted_capacity_limit")
+            self.assertEqual(blocked.active_jobs, 8)
+            self.assertEqual(blocked.max_capacity_units, 240)
+
+    def test_primary_burst_count_ignores_spark_leases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+                max_burst_jobs=2,
+                spark_max_concurrent_jobs=8,
+            )
+            self.assertTrue(
+                broker.try_acquire(
+                    "primary-1",
+                    worker_pid=os.getpid(),
+                    capacity_units=6,
+                    model="gpt-5.6-luna",
+                ).acquired
+            )
+            self.assertTrue(
+                broker.try_acquire(
+                    "primary-2",
+                    worker_pid=os.getpid(),
+                    capacity_units=6,
+                    model="gpt-5.6-luna",
+                ).acquired
+            )
+
+            burst_blocked = broker.try_acquire(
+                "primary-3",
+                worker_pid=os.getpid(),
+                capacity_units=6,
+                model="gpt-5.6-luna",
+            )
+            self.assertFalse(burst_blocked.acquired)
+            self.assertEqual(burst_blocked.reason, "burst_job_limit")
+
+            spark_decisions = [
+                broker.try_acquire(
+                    f"spark-{index}",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.3-codex-spark",
+                    capacity_units=6,
+                )
+                for index in range(8)
+            ]
+            self.assertTrue(all(decision.acquired for decision in spark_decisions))
+
+    def test_existing_lease_domain_switch_does_not_double_count_target_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "global-quota.sqlite3"
+            broker = GlobalQuotaBroker(
+                database,
+                max_concurrent_jobs=1,
+                max_burst_jobs=4,
+                spark_max_concurrent_jobs=8,
+            )
+            self.assertTrue(
+                broker.try_acquire(
+                    "spark-existing",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.3-codex-spark",
+                    capacity_units=6,
+                ).acquired
+            )
+            self.assertTrue(
+                broker.try_acquire(
+                    "primary-switching",
+                    worker_pid=os.getpid(),
+                    model="gpt-5.6-terra",
+                    capacity_units=6,
+                ).acquired
+            )
+
+            switched = broker.try_acquire(
+                "primary-switching",
+                worker_pid=os.getpid(),
+                model="gpt-5.3-codex-spark",
+                capacity_units=6,
+            )
+            self.assertTrue(switched.acquired)
+            self.assertEqual(switched.quota_domain, "spark")
+            self.assertEqual(switched.active_jobs, 2)
+            self.assertEqual(switched.active_capacity_units, 12)
 
     def test_migrates_v1_db_and_records_v2_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

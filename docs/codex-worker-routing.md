@@ -169,6 +169,12 @@ not consume the same global allowance as expensive workers:
 defaults to four times that value. For example, a capacity of two slots plus a burst
 limit of eight admits up to eight Luna workers when physical route slots are available,
 but the weighted budget still admits only two Sol-high workers.
+Spark can be configured independently with
+`codex_spark_max_concurrent_jobs` (default `8`), which sets a separate local burst
+and weighted capacity pool for `gpt-5.3-codex-spark` jobs. Filling one pool does not
+consume the other.
+In practice, Spark parallelism is also bounded by the number of exclusive route slots,
+and provider-side queuing can reduce effective concurrency further.
 
 The quota broker stores the effective weight in its SQLite lease. Acquiring or resizing
 a lease is one transaction, so simultaneous workers cannot oversubscribe the budget.
@@ -183,12 +189,14 @@ that job uses a separate spark window with its own soft cap, configured with
 history, analytics, and weighted concurrency. Usage/reset snapshots and soft-cap decisions
 are applied independently by domain.
 
-The rate-limit soft cap is independent of these concurrency weights. The legacy config
+The rate-limit soft cap is independent of these concurrency weights and provider-side
+Spark queuing remains possible. The legacy config
 name `codex_five_hour_soft_limit_percent` is applied to the primary reported window;
 that window may be longer than five hours. At or above the threshold, ACP defers all
 primary-domain Codex models, including Luna and Terra. If the usage reaches `100`, the
 primary domain is deferred until its next reset.
-Primary and Spark still share session history, analytics, and local weighted capacity.
+Primary and Spark still share session history and analytics, while weighted capacity and
+burst windows are enforced per-domain. Filling one local pool does not reduce the other.
 Usage and reset snapshots are separate for each domain, and soft-cap decisions are made
 per-domain.
 Spark-domain models use their own threshold (`codex_spark_soft_limit_percent`), with

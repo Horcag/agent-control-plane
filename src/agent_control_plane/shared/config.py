@@ -111,6 +111,7 @@ class ControlDefaults:
     codex_global_quota_database: Path | None = None
     codex_global_max_concurrent_jobs: int = 2
     codex_global_max_burst_jobs: int = 8
+    codex_spark_max_concurrent_jobs: int = 8
     codex_five_hour_soft_limit_percent: float = 75.0
     codex_spark_soft_limit_percent: float = 100.0
     codex_quota_poll_sec: float = 30.0
@@ -178,6 +179,10 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
             codex_global_max_concurrent_jobs * 4,
         ),
         "codex_global_max_burst_jobs",
+    )
+    codex_spark_max_concurrent_jobs = _positive_int(
+        defaults_raw.get("codex_spark_max_concurrent_jobs", 8),
+        "codex_spark_max_concurrent_jobs",
     )
     if codex_global_max_burst_jobs < codex_global_max_concurrent_jobs:
         raise ValueError(
@@ -275,6 +280,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> ControlConfig:
         ),
         codex_global_max_concurrent_jobs=codex_global_max_concurrent_jobs,
         codex_global_max_burst_jobs=codex_global_max_burst_jobs,
+        codex_spark_max_concurrent_jobs=codex_spark_max_concurrent_jobs,
         codex_five_hour_soft_limit_percent=_percent_value(
             defaults_raw.get("codex_five_hour_soft_limit_percent", 75.0),
             "codex_five_hour_soft_limit_percent",

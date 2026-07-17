@@ -141,12 +141,15 @@ class GlobalQuotaBroker:
         max_burst_jobs: int | None = None,
         soft_limit_percent: float = 100.0,
         spark_soft_limit_percent: float = 100.0,
+        spark_max_concurrent_jobs: int = 8,
         rate_limit_reader: Callable[[str], RateLimitSnapshot | None] | None = None,
         spark_models: tuple[str, ...] = _DEFAULT_SPARK_MODELS,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if max_concurrent_jobs <= 0:
             raise ValueError("max_concurrent_jobs must be positive")
+        if spark_max_concurrent_jobs <= 0:
+            raise ValueError("spark_max_concurrent_jobs must be positive")
         effective_burst_jobs = (
             max_burst_jobs if max_burst_jobs is not None else max_concurrent_jobs * 4
         )
@@ -162,6 +165,9 @@ class GlobalQuotaBroker:
         self.max_concurrent_jobs = max_concurrent_jobs
         self.max_burst_jobs = effective_burst_jobs
         self.max_capacity_units = max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
+        self.spark_max_concurrent_jobs = spark_max_concurrent_jobs
+        self.spark_max_burst_jobs = spark_max_concurrent_jobs * 4
+        self.spark_max_capacity_units = spark_max_concurrent_jobs * FULL_CODEX_JOB_CAPACITY_UNITS
         self.soft_limit_percent = soft_limit_percent
         self.spark_soft_limit_percent = spark_soft_limit_percent
         self.rate_limit_reader = rate_limit_reader
@@ -191,6 +197,7 @@ class GlobalQuotaBroker:
         soft_limit_percent = (
             self.spark_soft_limit_percent if quota_domain == "spark" else self.soft_limit_percent
         )
+        max_burst_jobs, max_capacity_units = self._domain_limits(quota_domain)
 
         with self._connect() as db:
             db.execute("begin immediate")
@@ -200,7 +207,9 @@ class GlobalQuotaBroker:
                 select count(*)                         as active_jobs,
                        coalesce(sum(capacity_units), 0) as active_capacity_units
                 from leases
-                """
+                where quota_domain = ?
+                """,
+                (quota_domain,),
             ).fetchone()
             active_jobs = int(totals["active_jobs"])
             active_capacity_units = int(totals["active_capacity_units"])
@@ -216,7 +225,7 @@ class GlobalQuotaBroker:
                     active_jobs=active_jobs,
                     retry_after_sec=max(0.0, snapshot.resets_at - now),
                     active_capacity_units=active_capacity_units,
-                    max_capacity_units=self.max_capacity_units,
+                    max_capacity_units=max_capacity_units,
                     quota_domain=quota_domain,
                 )
 
@@ -225,18 +234,52 @@ class GlobalQuotaBroker:
                 (job_id,),
             ).fetchone()
             if existing is not None:
+                existing_domain = (
+                    existing["quota_domain"] if existing["quota_domain"] is not None else "primary"
+                )
                 resized_capacity_units = (
                     active_capacity_units - int(existing["capacity_units"]) + capacity_units
                 )
-                if resized_capacity_units > self.max_capacity_units:
+                if existing_domain == quota_domain and resized_capacity_units > max_capacity_units:
                     return QuotaDecision(
                         acquired=False,
                         reason="weighted_capacity_limit",
                         active_jobs=active_jobs,
                         active_capacity_units=active_capacity_units,
-                        max_capacity_units=self.max_capacity_units,
+                        max_capacity_units=max_capacity_units,
                         quota_domain=quota_domain,
                     )
+                if existing_domain != quota_domain:
+                    if capacity_units > max_capacity_units:
+                        return QuotaDecision(
+                            acquired=False,
+                            reason="weighted_capacity_limit",
+                            active_jobs=active_jobs,
+                            active_capacity_units=active_capacity_units,
+                            max_capacity_units=max_capacity_units,
+                            quota_domain=quota_domain,
+                        )
+                    if active_jobs >= max_burst_jobs:
+                        return QuotaDecision(
+                            acquired=False,
+                            reason="burst_job_limit",
+                            active_jobs=active_jobs,
+                            active_capacity_units=active_capacity_units,
+                            max_capacity_units=max_capacity_units,
+                            quota_domain=quota_domain,
+                        )
+                    if active_capacity_units + capacity_units > max_capacity_units:
+                        return QuotaDecision(
+                            acquired=False,
+                            reason="weighted_capacity_limit",
+                            active_jobs=active_jobs,
+                            active_capacity_units=active_capacity_units,
+                            max_capacity_units=max_capacity_units,
+                            quota_domain=quota_domain,
+                        )
+                    active_jobs += 1
+                    active_capacity_units += capacity_units
+                    resized_capacity_units = capacity_units
                 db.execute(
                     """
                     update leases
@@ -252,27 +295,31 @@ class GlobalQuotaBroker:
                     acquired=True,
                     reason=None,
                     active_jobs=active_jobs,
-                    active_capacity_units=resized_capacity_units,
-                    max_capacity_units=self.max_capacity_units,
+                    active_capacity_units=(
+                        active_capacity_units
+                        if existing_domain != quota_domain
+                        else resized_capacity_units
+                    ),
+                    max_capacity_units=max_capacity_units,
                     quota_domain=quota_domain,
                 )
 
-            if active_jobs >= self.max_burst_jobs:
+            if active_jobs >= max_burst_jobs:
                 return QuotaDecision(
                     acquired=False,
                     reason="burst_job_limit",
                     active_jobs=active_jobs,
                     active_capacity_units=active_capacity_units,
-                    max_capacity_units=self.max_capacity_units,
+                    max_capacity_units=max_capacity_units,
                     quota_domain=quota_domain,
                 )
-            if active_capacity_units + capacity_units > self.max_capacity_units:
+            if active_capacity_units + capacity_units > max_capacity_units:
                 return QuotaDecision(
                     acquired=False,
                     reason="weighted_capacity_limit",
                     active_jobs=active_jobs,
                     active_capacity_units=active_capacity_units,
-                    max_capacity_units=self.max_capacity_units,
+                    max_capacity_units=max_capacity_units,
                     quota_domain=quota_domain,
                 )
 
@@ -293,7 +340,7 @@ class GlobalQuotaBroker:
                 reason=None,
                 active_jobs=active_jobs + 1,
                 active_capacity_units=active_capacity_units + capacity_units,
-                max_capacity_units=self.max_capacity_units,
+                max_capacity_units=max_capacity_units,
                 quota_domain=quota_domain,
             )
 
@@ -316,6 +363,11 @@ class GlobalQuotaBroker:
             checksum="global-quota-broker-v2-20260716",
             migrate=self._migrate_schema_v2,
         )
+
+    def _domain_limits(self, quota_domain: str) -> tuple[int, int]:
+        if quota_domain == "spark":
+            return self.spark_max_burst_jobs, self.spark_max_capacity_units
+        return self.max_burst_jobs, self.max_capacity_units
 
     @staticmethod
     def _migrate_schema_v1(db: sqlite3.Connection) -> None:

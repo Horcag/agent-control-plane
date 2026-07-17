@@ -138,6 +138,7 @@ class AgentControlPlane:
                 max_burst_jobs=defaults.codex_global_max_burst_jobs,
                 soft_limit_percent=defaults.codex_five_hour_soft_limit_percent,
                 spark_soft_limit_percent=defaults.codex_spark_soft_limit_percent,
+                spark_max_concurrent_jobs=defaults.codex_spark_max_concurrent_jobs,
                 spark_models=defaults.codex_spark_models,
                 rate_limit_reader=rate_limit_reader,
             )
@@ -242,6 +243,7 @@ class AgentControlPlane:
                 ),
                 "max_concurrent_jobs": self.config.defaults.codex_global_max_concurrent_jobs,
                 "max_burst_jobs": self.config.defaults.codex_global_max_burst_jobs,
+                "spark_max_concurrent_jobs": self.config.defaults.codex_spark_max_concurrent_jobs,
                 "primary_window_soft_limit_percent": (
                     self.config.defaults.codex_five_hour_soft_limit_percent
                 ),

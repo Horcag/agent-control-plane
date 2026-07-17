@@ -47,6 +47,7 @@ codex_deep_model = "gpt-5.6-terra"
 codex_deep_reasoning_effort = "medium"
 codex_global_quota_database = "global/quota.sqlite3"
 codex_global_max_concurrent_jobs = 2
+codex_spark_max_concurrent_jobs = 8
 codex_five_hour_soft_limit_percent = 75
 codex_spark_soft_limit_percent = 88
 codex_quota_poll_sec = 30
@@ -128,6 +129,7 @@ path = "slots/reports-1"
             )
             self.assertEqual(config.defaults.codex_global_max_concurrent_jobs, 2)
             self.assertEqual(config.defaults.codex_global_max_burst_jobs, 8)
+            self.assertEqual(config.defaults.codex_spark_max_concurrent_jobs, 8)
             self.assertEqual(
                 config.defaults.codex_spark_models,
                 ("gpt-5.3-codex-spark",),
@@ -238,6 +240,68 @@ backend = "codex"
                 config.defaults.codex_spark_models,
                 ("gpt-5.3-codex-spark", "gpt-5.6-spark"),
             )
+
+    def test_loads_codex_spark_max_concurrent_jobs_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+codex_spark_max_concurrent_jobs = 9
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+backend = "codex"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.defaults.codex_spark_max_concurrent_jobs, 9)
+
+    def test_rejects_non_positive_spark_max_concurrent_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+codex_spark_max_concurrent_jobs = 0
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+backend = "codex"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "codex_spark_max_concurrent_jobs must be positive",
+            ):
+                load_config(config_path)
 
     def test_native_quality_contract_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -53,6 +53,7 @@ codex_deep_tool_call_budget = 120
 codex_global_quota_database = "${USERPROFILE}/.codex/agent-control-plane/global-quota.sqlite3"
 codex_global_max_concurrent_jobs = 2
 codex_global_max_burst_jobs = 8
+codex_spark_max_concurrent_jobs = 8
 # Legacy option name for the primary-domain reported rate-limit window.
 # The primary-domain window may be longer than five hours.
 codex_five_hour_soft_limit_percent = 75
