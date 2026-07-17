@@ -57,6 +57,10 @@ from agent_control_plane.features.agent_runner import (
     process_is_alive,
     terminate_verified_process,
 )
+from agent_control_plane.features.agent_runner.lib.model_routing import (
+    AdaptiveRoutingSettings,
+    RoutingPolicy,
+)
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
 from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
 from agent_control_plane.features.plan_supervision import PlanService
@@ -88,6 +92,38 @@ class PolicyError(RuntimeError):
 StartOptions = JobLaunchOptions
 
 
+def _configured_routing_policies(config: ControlConfig) -> tuple[RoutingPolicy, ...] | None:
+    if not config.routing_policies:
+        return None
+    policies: list[RoutingPolicy] = []
+    for configured in config.routing_policies:
+        adaptive = configured.adaptive
+        policies.append(
+            RoutingPolicy(
+                name=configured.name,
+                task_class=configured.task_class,
+                tool_call_budget=configured.tool_call_budget,
+                candidates=tuple(
+                    ModelProfile(candidate.model, candidate.reasoning_effort)
+                    for candidate in configured.candidates
+                ),
+                adaptive=(
+                    AdaptiveRoutingSettings(
+                        minimum_samples_per_candidate=adaptive.minimum_samples_per_candidate,
+                        history_window=adaptive.history_window,
+                        quality_floor=adaptive.quality_floor,
+                        prior_quality=adaptive.prior_quality,
+                        prior_weight=adaptive.prior_weight,
+                        allow_missing_price=adaptive.allow_missing_price,
+                    )
+                    if adaptive is not None
+                    else None
+                ),
+            )
+        )
+    return tuple(policies)
+
+
 TERMINAL_STATUSES = frozenset(
     {
         "completed",
@@ -115,6 +151,7 @@ class AgentControlPlane:
         defaults = config.defaults
         self.model_catalog = ModelCatalog.from_config(config.model_catalog)
         self.model_routing = ModelRoutingPolicy(
+            policies=_configured_routing_policies(config),
             mechanical=ModelProfile(
                 defaults.codex_mechanical_model,
                 defaults.codex_mechanical_reasoning_effort,
@@ -127,8 +164,13 @@ class AgentControlPlane:
                 defaults.codex_deep_model,
                 defaults.codex_deep_reasoning_effort,
             ),
+            mechanical_tool_call_budget=defaults.codex_mechanical_tool_call_budget,
+            balanced_tool_call_budget=defaults.codex_balanced_tool_call_budget,
+            deep_tool_call_budget=defaults.codex_deep_tool_call_budget,
             catalog=self.model_catalog,
         )
+        self.model_routing.validate_configured_candidates()
+        self.model_routing.policy(defaults.codex_quality_tier)
         self._quota_broker: GlobalQuotaBroker | None = None
         if defaults.codex_global_quota_database is not None:
             rate_limit_reader = (
@@ -241,9 +283,10 @@ class AgentControlPlane:
             "native_quality_policy": self.config.defaults.native_quality_policy,
             "terminal_slot_policy": self.config.defaults.terminal_slot_policy,
             "codex_tool_call_budgets": {
-                "mechanical": self.config.defaults.codex_mechanical_tool_call_budget,
-                "balanced": self.config.defaults.codex_balanced_tool_call_budget,
-                "deep": self.config.defaults.codex_deep_tool_call_budget,
+                policy.name: policy.tool_call_budget
+                for policy in (
+                    self.model_routing.policy(name) for name in self.model_routing.policy_names
+                )
             },
             "codex_quality_profiles": catalog_diagnostics["profiles"],
             "codex_model_catalog": {
@@ -346,14 +389,14 @@ class AgentControlPlane:
     def _catalog_diagnostics(self) -> dict[str, dict[str, Any]]:
         profiles: dict[str, list[dict[str, str]]] = {}
         profile_resolution_errors: dict[str, str] = {}
-        for tier in ("mechanical", "balanced", "deep"):
+        for policy_name in self.model_routing.policy_names:
             try:
-                profiles[tier] = [
+                profiles[policy_name] = [
                     {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
-                    for profile in self.model_routing.ladder_for_tier(tier)
+                    for profile in self.model_routing.ladder_for_policy(policy_name)
                 ]
             except ValueError as exc:
-                profile_resolution_errors[tier] = str(exc)
+                profile_resolution_errors[policy_name] = str(exc)
         return {
             "profiles": profiles,
             "profile_resolution_errors": profile_resolution_errors,

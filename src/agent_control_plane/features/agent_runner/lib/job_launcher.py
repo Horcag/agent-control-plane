@@ -238,17 +238,22 @@ class JobLauncher:
             )
         )
         codex_quality_tier: str | None = None
+        codex_policy_name: str | None = None
         codex_model: str | None = None
         codex_reasoning_effort: str | None = None
         if normalized_backend == CODEX_BACKEND:
+            codex_policy_name = (
+                options.codex_quality_tier or self.config.defaults.codex_quality_tier
+            )
             if not explicit_codex_profile:
-                codex_quality_tier = (
-                    options.codex_quality_tier or self.config.defaults.codex_quality_tier
-                )
                 try:
-                    initial_profile = self.model_routing.ladder_for_tier(codex_quality_tier)[0]
+                    configured_policy = self.model_routing.policy(codex_policy_name)
+                    initial_profile = self.model_routing.ladder_for_policy(configured_policy.name)[
+                        0
+                    ]
                 except ValueError as exc:
                     raise JobLaunchError(str(exc)) from exc
+                codex_quality_tier = configured_policy.name
                 codex_model = initial_profile.model
                 codex_reasoning_effort = initial_profile.reasoning_effort
             else:
@@ -261,6 +266,7 @@ class JobLauncher:
                     self.config.defaults.codex_reasoning_effort,
                 )
                 try:
+                    self.model_routing.policy(codex_policy_name)
                     explicit_profile = self.model_routing.ladder_for_explicit_model(
                         codex_model,
                         codex_reasoning_effort,
@@ -272,15 +278,12 @@ class JobLauncher:
 
         codex_tool_call_budget: int | None = None
         if normalized_backend == CODEX_BACKEND:
-            budget_tier = (
-                options.codex_quality_tier
-                or codex_quality_tier
-                or self.config.defaults.codex_quality_tier
-            )
+            if codex_policy_name is None:
+                raise JobLaunchError("Codex routing policy was not selected")
             codex_tool_call_budget = (
                 options.codex_tool_call_budget
                 if options.codex_tool_call_budget is not None
-                else _tool_call_budget_for_tier(self.config, budget_tier)
+                else self.model_routing.tool_call_budget_for_policy(codex_policy_name)
             )
             if codex_tool_call_budget <= 0:
                 raise JobLaunchError("Codex tool-call budget must be positive")
@@ -436,18 +439,6 @@ def _backend_option(*values: str | None) -> str:
             raise JobLaunchError(f"Unsupported backend {value!r}. Expected one of: {allowed}")
         return backend
     raise JobLaunchError("No backend configured")
-
-
-def _tool_call_budget_for_tier(config: ControlConfig, tier: str) -> int:
-    budgets = {
-        "mechanical": config.defaults.codex_mechanical_tool_call_budget,
-        "balanced": config.defaults.codex_balanced_tool_call_budget,
-        "deep": config.defaults.codex_deep_tool_call_budget,
-    }
-    try:
-        return budgets[tier]
-    except KeyError as exc:
-        raise JobLaunchError(f"Unsupported Codex quality tier for tool budget: {tier}") from exc
 
 
 def _initialize_task_artifacts(

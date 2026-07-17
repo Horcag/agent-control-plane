@@ -64,6 +64,31 @@ class CodexModelCatalogConfig:
 
 
 @dataclass(frozen=True)
+class CodexRoutingCandidateConfig:
+    model: str
+    reasoning_effort: str
+
+
+@dataclass(frozen=True)
+class CodexAdaptiveRoutingConfig:
+    minimum_samples_per_candidate: int
+    history_window: int
+    quality_floor: float
+    prior_quality: float
+    prior_weight: float
+    allow_missing_price: bool = False
+
+
+@dataclass(frozen=True)
+class CodexRoutingPolicyConfig:
+    name: str
+    task_class: str
+    tool_call_budget: int
+    candidates: tuple[CodexRoutingCandidateConfig, ...]
+    adaptive: CodexAdaptiveRoutingConfig | None = None
+
+
+@dataclass(frozen=True)
 class RouteConfig:
     name: str
     path: Path
@@ -197,6 +222,7 @@ class ControlConfig:
     slots: Mapping[str, SlotConfig]
     slot_prepare: tuple[SlotPrepareCommand, ...]
     model_catalog: CodexModelCatalogConfig = field(default_factory=_default_model_catalog_config)
+    routing_policies: tuple[CodexRoutingPolicyConfig, ...] = ()
 
 
 def default_config_path() -> Path:
@@ -302,7 +328,9 @@ def load_config(
             defaults_raw.get("codex_no_progress_timeout_sec", 240),
             "codex_no_progress_timeout_sec",
         ),
-        codex_quality_tier=_quality_tier_value(defaults_raw.get("codex_quality_tier", "deep")),
+        codex_quality_tier=_routing_policy_name_value(
+            defaults_raw.get("codex_quality_tier", "deep")
+        ),
         codex_mechanical_model=_string_value(defaults_raw.get("codex_mechanical_model", "default")),
         codex_mechanical_reasoning_effort=_string_value(
             defaults_raw.get("codex_mechanical_reasoning_effort", "low")
@@ -381,6 +409,7 @@ def load_config(
         ),
         legacy_secondary_models=defaults.codex_spark_models,
     )
+    routing_policies = _routing_policy_configs(control.get("model_routing", {}))
 
     global_worktree_root = _path(control, "worktree_root", project_root)
     worktree_base: Path | None = _optional_path(control, "worktree_base", project_root)
@@ -511,6 +540,7 @@ def load_config(
         codex_command=str(control.get("codex_command", "codex")),
         defaults=defaults,
         model_catalog=model_catalog,
+        routing_policies=routing_policies,
         routes=MappingProxyType(routes),
         slots=MappingProxyType(slots),
         slot_prepare=tuple(slot_prepare),
@@ -587,6 +617,96 @@ def _model_catalog_config(
         models=tuple(models),
         quota_domains=quota_domains,
     )
+
+
+def _routing_policy_configs(raw: Any) -> tuple[CodexRoutingPolicyConfig, ...]:
+    if not isinstance(raw, Mapping):
+        raise ValueError("[control.model_routing] must be a table")
+    policies_raw = raw.get("policies", [])
+    if not isinstance(policies_raw, list):
+        raise ValueError("control.model_routing.policies must be an array of tables")
+    policies = tuple(
+        _routing_policy_config(item, index=index)
+        for index, item in enumerate(policies_raw, start=1)
+    )
+    names = [policy.name.lower() for policy in policies]
+    if len(names) != len(set(names)):
+        raise ValueError("control.model_routing.policies contains duplicate names")
+    return policies
+
+
+def _routing_policy_config(raw: Any, *, index: int) -> CodexRoutingPolicyConfig:
+    location = f"control.model_routing.policies[{index}]"
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{location} must be a table")
+    candidates_raw = raw.get("candidates")
+    if not isinstance(candidates_raw, list) or not candidates_raw:
+        raise ValueError(f"{location}.candidates must be a non-empty array of tables")
+    candidates = tuple(
+        _routing_candidate_config(candidate, location=f"{location}.candidates[{candidate_index}]")
+        for candidate_index, candidate in enumerate(candidates_raw, start=1)
+    )
+    candidate_keys = [
+        (candidate.model.lower(), candidate.reasoning_effort.lower()) for candidate in candidates
+    ]
+    if len(candidate_keys) != len(set(candidate_keys)):
+        raise ValueError(f"{location}.candidates contains duplicate model and effort pairs")
+    return CodexRoutingPolicyConfig(
+        name=_configured_text(raw, "name", location),
+        task_class=_configured_text(raw, "task_class", location),
+        tool_call_budget=_positive_int(
+            _required(raw, "tool_call_budget"),
+            f"{location}.tool_call_budget",
+        ),
+        candidates=candidates,
+        adaptive=_adaptive_routing_config(raw.get("adaptive"), location=location),
+    )
+
+
+def _routing_candidate_config(raw: Any, *, location: str) -> CodexRoutingCandidateConfig:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{location} must be a table")
+    return CodexRoutingCandidateConfig(
+        model=_configured_text(raw, "model", location),
+        reasoning_effort=_configured_text(raw, "reasoning_effort", location).lower(),
+    )
+
+
+def _adaptive_routing_config(raw: Any, *, location: str) -> CodexAdaptiveRoutingConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{location}.adaptive must be a table")
+    return CodexAdaptiveRoutingConfig(
+        minimum_samples_per_candidate=_positive_int(
+            _required(raw, "minimum_samples_per_candidate"),
+            f"{location}.adaptive.minimum_samples_per_candidate",
+        ),
+        history_window=_positive_int(
+            _required(raw, "history_window"),
+            f"{location}.adaptive.history_window",
+        ),
+        quality_floor=_unit_interval_value(
+            _required(raw, "quality_floor"),
+            f"{location}.adaptive.quality_floor",
+        ),
+        prior_quality=_unit_interval_value(
+            _required(raw, "prior_quality"),
+            f"{location}.adaptive.prior_quality",
+        ),
+        prior_weight=_positive_float(
+            _required(raw, "prior_weight"),
+            f"{location}.adaptive.prior_weight",
+        ),
+        allow_missing_price=bool(raw.get("allow_missing_price", False)),
+    )
+
+
+def _configured_text(raw: Mapping[str, Any], key: str, location: str) -> str:
+    text = _optional_string_value(_required(raw, key))
+    if text is None:
+        raise ValueError(f"{location}.{key} must not be empty")
+    return text
 
 
 def _quota_domain_config(raw: Any) -> CodexQuotaDomainConfig:
@@ -966,13 +1086,18 @@ def _percent_value(value: Any, key: str) -> float:
     return parsed
 
 
-def _quality_tier_value(value: Any) -> str:
-    tier = _string_value(value).strip().lower()
-    if tier not in {"mechanical", "balanced", "deep"}:
-        raise ValueError(
-            "control.defaults.codex_quality_tier must be mechanical, balanced, or deep"
-        )
-    return tier
+def _unit_interval_value(value: Any, key: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise ValueError(f"{key} must be between 0 and 1")
+    return parsed
+
+
+def _routing_policy_name_value(value: Any) -> str:
+    policy_name = _string_value(value).strip()
+    if not policy_name:
+        raise ValueError("control.defaults.codex_quality_tier must not be empty")
+    return policy_name
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

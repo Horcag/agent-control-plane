@@ -736,7 +736,7 @@ class JobExecutionService:
         effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
         if normalize_backend(job.backend) != CODEX_BACKEND or job.codex_quality_tier is None:
             return self.model_routing.ladder_for_explicit_model(model, effort)
-        return self.model_routing.ladder_for_tier(job.codex_quality_tier)
+        return self.model_routing.ladder_for_policy(job.codex_quality_tier)
 
     def _record_quota_acquired(
         self,

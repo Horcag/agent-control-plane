@@ -182,9 +182,19 @@ class ModelRoutingPolicy:
         mechanical: ModelProfile | None = None,
         balanced: ModelProfile | None = None,
         deep: ModelProfile | None = None,
+        mechanical_tool_call_budget: int = 45,
+        balanced_tool_call_budget: int = 80,
+        deep_tool_call_budget: int = 120,
     ) -> None:
         self._catalog = catalog
-        definitions = policies or _legacy_policy_definitions(mechanical, balanced, deep)
+        definitions = policies or _legacy_policy_definitions(
+            mechanical,
+            balanced,
+            deep,
+            mechanical_tool_call_budget=mechanical_tool_call_budget,
+            balanced_tool_call_budget=balanced_tool_call_budget,
+            deep_tool_call_budget=deep_tool_call_budget,
+        )
         normalized: dict[str, RoutingPolicy] = {}
         for definition in definitions:
             key = definition.name.strip().lower()
@@ -223,6 +233,8 @@ class ModelRoutingPolicy:
 
     def ladder_for_tier(self, quality_tier: str) -> tuple[ModelProfile, ...]:
         """Compatibility adapter for legacy mechanical/balanced/deep callers."""
+        if quality_tier.strip().lower() not in self._policies:
+            raise ValueError(f"Unsupported Codex quality tier {quality_tier!r}")
         return self.ladder_for_policy(quality_tier)
 
     def tool_call_budget_for_policy(self, policy_name: str) -> int:
@@ -389,12 +401,15 @@ class ModelRoutingPolicy:
             if record.catalog_source != self.catalog.source:
                 excluded.append("incompatible catalog source")
                 continue
-            if min(
-                record.input_tokens,
-                record.cached_input_tokens,
-                record.output_tokens,
-                record.duration_sec,
-            ) < 0:
+            if (
+                min(
+                    record.input_tokens,
+                    record.cached_input_tokens,
+                    record.output_tokens,
+                    record.duration_sec,
+                )
+                < 0
+            ):
                 excluded.append("invalid raw usage")
                 continue
             comparable.append(record)
@@ -432,7 +447,9 @@ class ModelRoutingPolicy:
             for record in matches
         ]
         priced = [price for price in prices if price is not None]
-        expected_api_usd = sum(priced) / len(priced) if len(priced) == len(matches) and priced else None
+        expected_api_usd = (
+            sum(priced) / len(priced) if len(priced) == len(matches) and priced else None
+        )
         durations = [record.duration_sec for record in matches]
         expected_duration = sum(durations) / len(durations) if durations else None
         reasons: list[str] = []
@@ -464,14 +481,35 @@ def _legacy_policy_definitions(
     mechanical: ModelProfile | None,
     balanced: ModelProfile | None,
     deep: ModelProfile | None,
+    *,
+    mechanical_tool_call_budget: int,
+    balanced_tool_call_budget: int,
+    deep_tool_call_budget: int,
 ) -> tuple[RoutingPolicy, ...]:
+    """Adapt the pre-named-policy mechanical/balanced/deep configuration."""
     if mechanical is None or balanced is None or deep is None:
-        raise ValueError("Named policies or all legacy mechanical/balanced/deep profiles are required")
+        raise ValueError(
+            "Named policies or all legacy mechanical/balanced/deep profiles are required"
+        )
     return (
-        RoutingPolicy("mechanical", "mechanical", 45, (mechanical, deep)),
-        RoutingPolicy("balanced", "balanced", 80, (balanced, deep)),
-        RoutingPolicy("deep", "deep", 120, (deep,)),
+        RoutingPolicy(
+            "mechanical",
+            "mechanical",
+            mechanical_tool_call_budget,
+            _legacy_candidates(mechanical, deep),
+        ),
+        RoutingPolicy(
+            "balanced",
+            "balanced",
+            balanced_tool_call_budget,
+            _legacy_candidates(balanced, deep),
+        ),
+        RoutingPolicy("deep", "deep", deep_tool_call_budget, (deep,)),
     )
+
+
+def _legacy_candidates(primary: ModelProfile, fallback: ModelProfile) -> tuple[ModelProfile, ...]:
+    return (primary,) if primary == fallback else (primary, fallback)
 
 
 def _quality_success(record: RoutingHistoryRecord) -> bool:

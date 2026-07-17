@@ -20,6 +20,7 @@ from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinit
 from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
     CODEX_BACKEND,
+    ModelProfile,
     QuotaDecision,
 )
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
@@ -28,6 +29,8 @@ from agent_control_plane.shared.config import (
     CodexModelCatalogConfig,
     CodexModelMetadataConfig,
     CodexQuotaDomainConfig,
+    CodexRoutingCandidateConfig,
+    CodexRoutingPolicyConfig,
     ControlConfig,
     ControlDefaults,
     NativeQualityGateConfig,
@@ -569,14 +572,76 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             worker_control = AgentControlPlane(config)
             worker_job = worker_control.store.get_job(job_id)
             worker_ladder = worker_control.job_execution._model_ladder_for_job(worker_job)
-            self.assertEqual(worker_ladder[0].model, "gpt-5.3-codex-spark")
-            self.assertEqual(worker_ladder[0].reasoning_effort, "high")
+            self.assertEqual(
+                worker_ladder,
+                (ModelProfile("gpt-5.3-codex-spark", "high"),),
+            )
+
+    def test_named_policy_validates_cached_candidates_and_uses_its_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base_config = _config(root, workspace)
+            base_config.model_catalog.cache_path.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "invented-cached-model",
+                                "supported_reasoning_levels": ["low", "ultra"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = CodexRoutingPolicyConfig(
+                name="implementation-fast-path",
+                task_class="implementation",
+                tool_call_budget=77,
+                candidates=(CodexRoutingCandidateConfig("invented-cached-model", "ultra"),),
+            )
+            defaults = replace(
+                base_config.defaults,
+                codex_quality_tier="implementation-fast-path",
+            )
+
+            with self.assertRaisesRegex(ValueError, "not a visible candidate"):
+                AgentControlPlane(
+                    replace(
+                        base_config,
+                        defaults=defaults,
+                        routing_policies=(
+                            replace(
+                                policy,
+                                candidates=(CodexRoutingCandidateConfig("missing-model", "ultra"),),
+                            ),
+                        ),
+                    )
+                )
+
+            config = replace(base_config, defaults=defaults, routing_policies=(policy,))
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "named-policy")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(StartOptions(task_id="named-policy", route="main"))
+
+            self.assertEqual(job.codex_quality_tier, "implementation-fast-path")
+            self.assertEqual(job.codex_model, "invented-cached-model")
+            self.assertEqual(job.codex_reasoning_effort, "ultra")
+            self.assertEqual(job.codex_tool_call_budget, 77)
 
     def test_mechanical_quality_tier_starts_on_luna_without_changing_deep_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
-            control = AgentControlPlane(_config(root, workspace))
+            config = _config(root, workspace)
+            config = replace(
+                config,
+                defaults=replace(config.defaults, codex_mechanical_tool_call_budget=57),
+            )
+            control = AgentControlPlane(config)
             _brief(control.config.coordination_root, "task-mechanical")
 
             with patch.object(control, "_launch_worker", return_value=123):
@@ -592,7 +657,9 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(job.codex_quality_tier, "mechanical")
             self.assertEqual(job.codex_model, "gpt-5.6-luna")
             self.assertEqual(job.codex_reasoning_effort, "low")
+            self.assertEqual(job.codex_tool_call_budget, 57)
             self.assertEqual(control.config.defaults.codex_quality_tier, "deep")
+            self.assertEqual(control.model_routing.policy_names, ("mechanical", "balanced", "deep"))
 
     def test_capacity_escalates_mechanical_job_to_terra_on_same_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

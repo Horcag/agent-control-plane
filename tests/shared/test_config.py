@@ -202,6 +202,72 @@ path = "slots/reports-1"
                 ("dist", "frontend/build"),
             )
 
+    def test_loads_named_routing_policies(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+codex_quality_tier = "implementation-fast-path"
+
+[control.model_routing]
+[[control.model_routing.policies]]
+name = "implementation-fast-path"
+task_class = "implementation"
+tool_call_budget = 77
+candidates = [
+  { model = "invented-cached-model", reasoning_effort = "ultra" },
+  { model = "fallback-model", reasoning_effort = "medium" },
+]
+adaptive = { minimum_samples_per_candidate = 3, history_window = 20, quality_floor = 0.8, prior_quality = 0.75, prior_weight = 2.0, allow_missing_price = true }
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.defaults.codex_quality_tier, "implementation-fast-path")
+            self.assertEqual(len(config.routing_policies), 1)
+            policy = config.routing_policies[0]
+            self.assertEqual(policy.name, "implementation-fast-path")
+            self.assertEqual(policy.task_class, "implementation")
+            self.assertEqual(policy.tool_call_budget, 77)
+            self.assertEqual(
+                [(candidate.model, candidate.reasoning_effort) for candidate in policy.candidates],
+                [("invented-cached-model", "ultra"), ("fallback-model", "medium")],
+            )
+            self.assertTrue(policy.adaptive is not None and policy.adaptive.allow_missing_price)
+
+            payload = config_path.read_text(encoding="utf-8")
+            invalid_cases = (
+                ("nonpositive budget", "tool_call_budget = 77", "tool_call_budget = 0", "positive"),
+                (
+                    "duplicate candidates",
+                    '{ model = "invented-cached-model", reasoning_effort = "ultra" }',
+                    '{ model = "fallback-model", reasoning_effort = "medium" }',
+                    "duplicate model and effort pairs",
+                ),
+            )
+            for label, old, new, message in invalid_cases:
+                with self.subTest(label=label):
+                    config_path.write_text(payload.replace(old, new), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_config(config_path)
+
     def test_loads_codex_spark_models_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -300,8 +366,12 @@ required_branch = "main"
             self.assertEqual(model.model, "future-codex")
             self.assertEqual(model.quota_domain, "expedited")
             self.assertEqual(model.capacity_units, (("low", 4), ("max", 12), ("ultra", 18)))
-            self.assertEqual(model.credit_rate.output if model.credit_rate is not None else None, 12.0)
-            self.assertEqual(model.api_usd_rate.output if model.api_usd_rate is not None else None, 6.0)
+            self.assertEqual(
+                model.credit_rate.output if model.credit_rate is not None else None, 12.0
+            )
+            self.assertEqual(
+                model.api_usd_rate.output if model.api_usd_rate is not None else None, 6.0
+            )
             self.assertEqual(model.rate_card_version, "future-v1")
             self.assertEqual(model.rate_card_source, "operator-verified")
 

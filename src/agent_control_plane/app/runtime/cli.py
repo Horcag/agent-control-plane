@@ -409,13 +409,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument(
         "--codex-quality-tier",
-        choices=("mechanical", "balanced", "deep"),
-        help="Opt into a quality tier; deep remains the safe default",
+        help="Configured Codex routing policy name (compatibility option name)",
     )
     start.add_argument(
         "--codex-tool-call-budget",
         type=int,
-        help="Hard per-attempt Codex tool-call budget; overrides the quality-tier default",
+        help="Hard per-attempt Codex tool-call budget; overrides the routing-policy default",
     )
     start.add_argument("--slot", help="Use a managed IDE-indexed slot by name")
     start.add_argument(
