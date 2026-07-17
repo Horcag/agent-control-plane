@@ -168,14 +168,31 @@ assign `quota_domain` on the relevant model overlay. The optional `capacity_unit
 is keyed by reasoning effort. Omitting an effort is conservative: it receives the full
 capacity weight rather than a heuristic family-derived value.
 
-## Why Medium
+## Evidence policy for adaptive routing
 
 Public coding benchmarks compare model tiers, not this repository's exact prompts and
-effort settings. They justify Terra as the worker tier, but they do not prove that
-`medium` beats `low` for every task. OpenAI's migration guidance explicitly recommends
-testing the current effort and one level lower on representative tasks. The control
-plane therefore records enough data for a local decision instead of treating a public
-benchmark as an effort benchmark.
+effort settings. They do not establish this repository's routing order. LUNA-001 and the
+local tables below contain one run per variant; they are diagnostic anecdotes, not
+comparative evidence, and must never seed, train, promote, or order routing candidates.
+
+Routing order is operator configuration. ACP does not import candidate order from
+LUNA-001 or from any external single-run benchmark.
+
+Adaptive routing is fail-closed for each named policy:
+
+- `n=0` and `n=1` comparable runs per candidate always retain the configured fallback,
+  which is the first candidate in the operator-supplied ladder.
+- Promotion requires the configured `minimum_samples_per_candidate` repeated comparable
+  accepted runs. Set that minimum to at least `3` for a conservative policy.
+- A run is comparable only when its prompt, context, build mode, tooling, workspace,
+  route, policy, task class, and model catalog version are identical. Any mismatch or
+  missing value excludes the run.
+- Quality evidence requires a completed result plus durable root acceptance/review.
+  Missing review fails closed; partial, blocked, or unreviewed results cannot promote a
+  candidate.
+- Unknown price remains `null`. With `allow_missing_price = false`, a candidate with
+  missing price is ineligible; only a policy that explicitly allows missing price may
+  use it.
 
 Compare identical tasks on clean slots at the same commit. Keep the prompt, timeout,
 tools, acceptance criteria, and target files fixed. Evaluate:
@@ -188,13 +205,19 @@ tools, acceptance criteria, and target files fixed. Evaluate:
 6. Tool calls, failed tool calls, and error events.
 7. Estimated Codex credits and API-equivalent cost.
 
-Do not select `low` only because it is faster. Promote it for a task class only when it
-matches `medium` on the acceptance rubric over multiple representative runs.
+Do not reorder or promote candidates from a single run. Use the configured ladder until
+the policy's repeated, comparable, accepted evidence satisfies every fail-closed rule
+above.
 
-## Local Canaries (2026-07-10)
+## Diagnostic anecdotes only (2026-07-10)
 
-Read-only HH vacancy-state audits ran on commit `38639981` with identical acceptance
-criteria and clean AgentBridge slots.
+> **Diagnostic-only data, not comparative evidence.** Each row below is one run per
+> variant. These raw tables describe observed telemetry and must not seed, train, promote,
+> or order routing candidates.
+
+Read-only HH vacancy-state audits ran on commit `38639981` with identical stated
+acceptance criteria and clean AgentBridge slots. Identical stated setup does not turn
+one run per variant into statistically valid evidence.
 
 ### Terra
 
@@ -205,9 +228,8 @@ criteria and clean AgentBridge slots.
 | high | completed | 309.8 s | 900,926 / 725,504 | 8,692 / 4,851 | 21 / 0 failed | 18.76 |
 | xhigh | completed | 346.9 s | 1,103,937 / 843,008 | 11,748 / 7,062 | 22 / 0 failed | 25.98 |
 
-Terra medium traced the full pipeline and found the same material risk classes as high.
-Low was not faster in this sample, while high and xhigh took substantially longer without
-changing the routing decision.
+The recorded Terra rows describe pipeline coverage and observed duration/token values for
+this sample. They do not establish a Terra effort default or a candidate promotion.
 
 ### Luna, Strict Path Protocol
 
@@ -218,13 +240,8 @@ changing the routing decision.
 | high | completed | 222.5 s | 877,465 / 742,912 | 9,189 / 4,129 | 26 / 1 failed | 6.60 |
 | xhigh | partial | 342.5 s | 1,216,448 / 1,000,704 | 14,455 / 7,947 | 28 / 0 failed | 10.06 |
 
-Luna medium found the core application-state and employer-matching risks and completed
-without tool failures. High was 22% slower and added a useful stale-report boundary.
-Extra High was 88% slower than medium, did not add another material risk class, and
-finished partial after unnecessary verification commands failed. Low was faster but also
-partial. Luna medium is therefore the best current Luna setting for bounded work; collect
-three to five clean implementation canaries before making Luna the implementation
-default.
+The recorded Luna rows describe result status, duration, token, and tool-call values for
+this sample. They do not establish a Luna effort default or a candidate promotion.
 
 The first Luna medium and xhigh attempts were excluded: project-wide IDE discovery read
 files from another indexed checkout. That failure produced the strict physical-path
@@ -245,15 +262,14 @@ commit, and read-only sandbox:
 | Sol low | completed | 179.1 s | 574,675 / 507,904 | 4,560 / 668 | 19 / 0 failed | 18.12 |
 | Sol medium | partial | 251.0 s | 776,079 / 711,168 | 7,043 / 1,705 | 24 / 0 failed | 22.29 |
 
-Against the strict Terra medium run, Sol low was 18% slower and used 44% more credits.
-It did surface a distinct detail-budget starvation risk, so it remains useful as a
-selective second opinion. Sol medium was 65% slower, used 77% more credits, and finished
-partial after unnecessary test-runner attempts. This canary supports Terra medium as the
-general worker default and rejects lower-effort Sol as a cost-saving default.
+The recorded Sol/Terra rows describe observed duration, token, tool-call, and credit
+values for this sample. They do not establish a Terra or Sol default, reject a candidate,
+or determine candidate order.
 
-The current Codex rate card explains the result: Sol input and cached input cost twice
-Terra, while Sol output costs twelve times Terra. A lower Sol effort can reduce reasoning
-tokens, but it does not change the model's token rates.
+The checked-in credit and API rates are operator-supplied example values, not official or
+guaranteed-current prices. Raw input, cached-input, output, and reasoning token counts
+remain authoritative; unknown price remains `null` and is ineligible unless the policy
+explicitly allows missing price.
 
 ## Telemetry
 
@@ -271,8 +287,8 @@ that a worker read the assigned checkout or produced a semantically comparable r
 For routing decisions, also verify the result's exact physical workspace, branch, HEAD,
 result status, and reviewer rubric.
 
-Credit estimates use the Codex per-million-token rate card dated 2026-07-09. API cost
-estimates use the GPT-5.6 API prices and the documented 90% cached-input discount. Raw
+Credit and API estimates use the checked-in operator-supplied example rates (version
+`2026-07-09` is provenance, not a claim that the rate card is official or current). Raw
 token counts remain authoritative if pricing changes.
 
 ## Sources
