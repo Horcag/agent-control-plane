@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -732,11 +732,19 @@ class JobExecutionService:
         return False
 
     def _model_ladder_for_job(self, job: JobRecord) -> tuple[ModelProfile, ...]:
-        model = job.codex_model or self.config.defaults.codex_model
-        effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
         if normalize_backend(job.backend) != CODEX_BACKEND or job.codex_quality_tier is None:
+            model = job.codex_model or self.config.defaults.codex_model
+            effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort
             return self.model_routing.ladder_for_explicit_model(model, effort)
-        return self.model_routing.ladder_for_policy(job.codex_quality_tier)
+        stored_profile = _stored_codex_profile(job)
+        if stored_profile is None:
+            raise ValueError(f"Automatic Codex job {job.job_id} is missing its stored profile")
+        persisted_ladder = _persisted_routing_ladder(
+            self.store.routing_decision(job.job_id),
+            route=job.route,
+            first_profile=stored_profile,
+        )
+        return persisted_ladder or (stored_profile,)
 
     def _record_quota_acquired(
         self,
@@ -882,3 +890,62 @@ class JobExecutionService:
         if patch_file.exists():
             artifact_note = f"{artifact_note}; patch: {patch_file}"
         return compact_status_preview(status_text), artifact_note
+
+
+def _stored_codex_profile(job: JobRecord) -> ModelProfile | None:
+    if not isinstance(job.codex_model, str) or not job.codex_model.strip():
+        return None
+    if not isinstance(job.codex_reasoning_effort, str) or not job.codex_reasoning_effort.strip():
+        return None
+    return ModelProfile(job.codex_model.strip(), job.codex_reasoning_effort.strip().lower())
+
+
+def _persisted_routing_ladder(
+    payload: Any,
+    *,
+    route: str,
+    first_profile: ModelProfile,
+) -> tuple[ModelProfile, ...] | None:
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("event") != "routing_decision" or payload.get("route") != route:
+        return None
+    if (
+        not isinstance(payload.get("requested_policy"), str)
+        or not payload["requested_policy"].strip()
+    ):
+        return None
+    if payload.get("selection_source") not in {"configured_fallback", "history"}:
+        return None
+    raw_ladder = payload.get("ladder")
+    if not isinstance(raw_ladder, list) or not raw_ladder:
+        return None
+    chosen_profile = _profile_from_payload(payload.get("chosen_profile"))
+    if chosen_profile is None:
+        return None
+    ladder: list[ModelProfile] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_profile in raw_ladder:
+        profile = _profile_from_payload(raw_profile)
+        if profile is None:
+            return None
+        key = (profile.model.casefold(), profile.reasoning_effort)
+        if key in seen:
+            return None
+        seen.add(key)
+        ladder.append(profile)
+    if ladder[0] != first_profile or chosen_profile != ladder[0]:
+        return None
+    return tuple(ladder)
+
+
+def _profile_from_payload(value: Any) -> ModelProfile | None:
+    if not isinstance(value, Mapping):
+        return None
+    model = value.get("model")
+    effort = value.get("reasoning_effort")
+    if not isinstance(model, str) or not model.strip():
+        return None
+    if not isinstance(effort, str) or not effort.strip():
+        return None
+    return ModelProfile(model.strip(), effort.strip().lower())

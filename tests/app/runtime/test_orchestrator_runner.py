@@ -26,6 +26,7 @@ from agent_control_plane.features.agent_runner import (
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.shared.config import (
+    CodexAdaptiveRoutingConfig,
     CodexModelCatalogConfig,
     CodexModelMetadataConfig,
     CodexQuotaDomainConfig,
@@ -156,6 +157,183 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             launch.assert_not_called()
             self.assertEqual(control.store.list_jobs(), [])
+
+    def test_automatic_codex_one_sample_stays_on_fallback_and_records_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "adaptive-fallback")
+            history = [
+                _routing_history_mapping(control, "gpt-5.6-luna"),
+                {"model": None, "reasoning_effort": "low"},
+            ]
+
+            with (
+                patch.object(
+                    control.store, "routing_history", return_value=history
+                ) as history_read,
+                patch.object(control, "_launch_worker", return_value=123),
+            ):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="adaptive-fallback",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            history_read.assert_called_once_with()
+            self.assertEqual(
+                (job.codex_model, job.codex_reasoning_effort, job.codex_tool_call_budget),
+                ("gpt-5.6-terra", "low", 91),
+            )
+            decision = control.store.routing_decision(job.job_id)
+            self.assertIsNotNone(decision)
+            assert decision is not None
+            self.assertEqual(decision["selection_source"], "configured_fallback")
+            self.assertEqual(
+                decision["ladder"][0],
+                {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
+            )
+            self.assertEqual(
+                sum(
+                    level == "routing_decision"
+                    for _, level, _ in control.store.recent_events(job.job_id)
+                ),
+                1,
+            )
+
+    def test_automatic_codex_history_can_promote_and_persist_reordered_ladder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "adaptive-history")
+            history = [
+                _routing_history_mapping(control, "gpt-5.6-luna"),
+                _routing_history_mapping(control, "gpt-5.6-luna"),
+            ]
+
+            with (
+                patch.object(control.store, "routing_history", return_value=history),
+                patch.object(control, "_launch_worker", return_value=123),
+            ):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="adaptive-history",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            decision = control.store.routing_decision(job.job_id)
+            self.assertIsNotNone(decision)
+            assert decision is not None
+            self.assertEqual(job.codex_model, "gpt-5.6-luna")
+            self.assertEqual(decision["selection_source"], "history")
+            self.assertEqual(
+                decision["ladder"],
+                [
+                    {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+                    {"model": "gpt-5.6-terra", "reasoning_effort": "low"},
+                ],
+            )
+
+    def test_restarted_control_plane_uses_persisted_ladder_after_policy_reorder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = _adaptive_config(root, workspace)
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "adaptive-restart")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="adaptive-restart",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            reordered_policy = replace(
+                config.routing_policies[0],
+                candidates=(
+                    CodexRoutingCandidateConfig("gpt-5.6-luna", "low"),
+                    CodexRoutingCandidateConfig("gpt-5.6-terra", "low"),
+                ),
+            )
+            restarted = AgentControlPlane(replace(config, routing_policies=(reordered_policy,)))
+            worker_ladder = restarted.job_execution._model_ladder_for_job(
+                restarted.store.get_job(job.job_id)
+            )
+
+            self.assertEqual(
+                worker_ladder,
+                (
+                    ModelProfile("gpt-5.6-terra", "low"),
+                    ModelProfile("gpt-5.6-luna", "low"),
+                ),
+            )
+
+    def test_automatic_legacy_job_with_missing_or_bad_decision_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "legacy-routing",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-luna",
+                codex_reasoning_effort="low",
+                codex_quality_tier="mechanical",
+            )
+            expected = (ModelProfile("gpt-5.6-luna", "low"),)
+
+            self.assertEqual(control.job_execution._model_ladder_for_job(job), expected)
+            control.store.record_routing_decision(
+                job.job_id,
+                {
+                    "event": "routing_decision",
+                    "route": "main",
+                    "ladder": [{"model": "gpt-5.6-terra", "reasoning_effort": "medium"}],
+                },
+            )
+            self.assertEqual(
+                control.job_execution._model_ladder_for_job(control.store.get_job(job.job_id)),
+                expected,
+            )
+
+    def test_explicit_codex_profile_bypasses_adaptive_selection_and_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_adaptive_config(root, workspace))
+            _brief(control.config.coordination_root, "explicit-profile")
+
+            with (
+                patch.object(control.store, "routing_history") as history_read,
+                patch.object(control, "_launch_worker", return_value=123),
+            ):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="explicit-profile",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        codex_model="gpt-5.6-terra",
+                        codex_reasoning_effort="high",
+                    )
+                )
+
+            history_read.assert_not_called()
+            self.assertEqual(job.codex_model, "gpt-5.6-terra")
+            self.assertEqual(job.codex_reasoning_effort, "high")
+            self.assertIsNone(job.codex_quality_tier)
+            self.assertIsNone(control.store.routing_decision(job.job_id))
 
     def test_controller_native_quality_requires_checkpointed_slot_and_persists_contract(
         self,
@@ -676,6 +854,23 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 codex_model="gpt-5.6-luna",
                 codex_reasoning_effort="low",
                 codex_quality_tier="mechanical",
+            )
+            control.store.record_routing_decision(
+                job.job_id,
+                {
+                    "event": "routing_decision",
+                    "route": "main",
+                    "requested_policy": "mechanical",
+                    "selection_source": "configured_fallback",
+                    "chosen_profile": {
+                        "model": "gpt-5.6-luna",
+                        "reasoning_effort": "low",
+                    },
+                    "ladder": [
+                        {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+                        {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+                    ],
+                },
             )
             runner = _CapacityThenCompletedRunner()
             broker = _RecordingQuotaBroker()
@@ -1427,6 +1622,57 @@ def _config(root: Path, route_path: Path) -> ControlConfig:
         slots=MappingProxyType({}),
         slot_prepare=(),
     )
+
+
+def _adaptive_config(root: Path, route_path: Path) -> ControlConfig:
+    base = _config(root, route_path)
+    policy = CodexRoutingPolicyConfig(
+        name="adaptive-routing",
+        task_class="implementation",
+        tool_call_budget=91,
+        candidates=(
+            CodexRoutingCandidateConfig("gpt-5.6-terra", "low"),
+            CodexRoutingCandidateConfig("gpt-5.6-luna", "low"),
+        ),
+        adaptive=CodexAdaptiveRoutingConfig(
+            minimum_samples_per_candidate=2,
+            history_window=20,
+            quality_floor=0.8,
+            prior_quality=0.75,
+            prior_weight=2.0,
+            allow_missing_price=True,
+        ),
+    )
+    return replace(
+        base,
+        defaults=replace(base.defaults, codex_quality_tier=policy.name),
+        routing_policies=(policy,),
+    )
+
+
+def _routing_history_mapping(
+    control: AgentControlPlane,
+    model: str,
+) -> dict[str, object]:
+    return {
+        "model": model,
+        "reasoning_effort": "low",
+        "attempt_status": "completed",
+        "result_status": "completed",
+        "input_tokens": 1_000,
+        "cached_input_tokens": 0,
+        "output_tokens": 100,
+        "duration_sec": 1.0,
+        "root_outcome": "accepted",
+        "defects_found": 0,
+        "catalog_source": control.model_routing.catalog.source,
+        "catalog_version": control.model_routing.catalog.version,
+        "metrics_valid": True,
+        "route": "main",
+        "policy_name": "adaptive-routing",
+        "task_class": "implementation",
+        "selection_source": "configured_fallback",
+    }
 
 
 def _model_catalog(root: Path) -> CodexModelCatalogConfig:

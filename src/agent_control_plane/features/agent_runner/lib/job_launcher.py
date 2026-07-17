@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -9,7 +10,11 @@ from typing import Any, Protocol, TypeVar
 from agent_control_plane.entities.job import JobRecord, JobStore, new_job_id
 from agent_control_plane.entities.plan import PlanStore
 from agent_control_plane.entities.workspace import StartRequest, WorkspacePolicy
-from agent_control_plane.features.agent_runner.lib.model_routing import ModelRoutingPolicy
+from agent_control_plane.features.agent_runner.lib.model_routing import (
+    ModelRoutingPolicy,
+    RoutingDecision,
+    RoutingHistoryRecord,
+)
 from agent_control_plane.features.agent_runner.lib.prompt_builder import build_task_prompt
 from agent_control_plane.features.agent_runner.lib.runner import (
     AGY_BACKEND,
@@ -239,6 +244,7 @@ class JobLauncher:
         )
         codex_quality_tier: str | None = None
         codex_policy_name: str | None = None
+        routing_decision: RoutingDecision | None = None
         codex_model: str | None = None
         codex_reasoning_effort: str | None = None
         if normalized_backend == CODEX_BACKEND:
@@ -248,9 +254,12 @@ class JobLauncher:
             if not explicit_codex_profile:
                 try:
                     configured_policy = self.model_routing.policy(codex_policy_name)
-                    initial_profile = self.model_routing.ladder_for_policy(configured_policy.name)[
-                        0
-                    ]
+                    routing_decision = self.model_routing.decision_for_policy(
+                        configured_policy.name,
+                        history=_routing_history_records(self.store.routing_history()),
+                        route=options.route,
+                    )
+                    initial_profile = routing_decision.chosen_profile
                 except ValueError as exc:
                     raise JobLaunchError(str(exc)) from exc
                 codex_quality_tier = configured_policy.name
@@ -283,7 +292,11 @@ class JobLauncher:
             codex_tool_call_budget = (
                 options.codex_tool_call_budget
                 if options.codex_tool_call_budget is not None
-                else self.model_routing.tool_call_budget_for_policy(codex_policy_name)
+                else (
+                    routing_decision.tool_call_budget
+                    if routing_decision is not None
+                    else self.model_routing.tool_call_budget_for_policy(codex_policy_name)
+                )
             )
             if codex_tool_call_budget <= 0:
                 raise JobLaunchError("Codex tool-call budget must be positive")
@@ -340,6 +353,16 @@ class JobLauncher:
             )
         except ValueError as exc:
             raise JobLaunchError(str(exc)) from exc
+
+        if routing_decision is not None:
+            self.store.record_routing_decision(
+                job.job_id,
+                {
+                    "event": "routing_decision",
+                    "route": options.route,
+                    **routing_decision.as_dict(),
+                },
+            )
 
         if options.plan_id:
             try:
@@ -427,6 +450,65 @@ T = TypeVar("T")
 
 def _option(value: T | None, default: T) -> T:
     return default if value is None else value
+
+
+def _routing_history_records(raw_history: Any) -> tuple[RoutingHistoryRecord, ...]:
+    if not isinstance(raw_history, (list, tuple)):
+        return ()
+    records: list[RoutingHistoryRecord] = []
+    for raw_record in raw_history:
+        if not isinstance(raw_record, Mapping):
+            continue
+        try:
+            model = raw_record["model"].strip()
+            reasoning_effort = raw_record["reasoning_effort"].strip().lower()
+            attempt_status = raw_record["attempt_status"].strip()
+            input_tokens = raw_record["input_tokens"]
+            cached_input_tokens = raw_record["cached_input_tokens"]
+            output_tokens = raw_record["output_tokens"]
+            duration_sec = float(raw_record["duration_sec"])
+            defects_found = raw_record["defects_found"]
+            if (
+                not model
+                or not reasoning_effort
+                or not attempt_status
+                or any(
+                    not isinstance(value, int) or isinstance(value, bool) or value < 0
+                    for value in (input_tokens, cached_input_tokens, output_tokens, defects_found)
+                )
+                or not math.isfinite(duration_sec)
+                or duration_sec < 0
+            ):
+                continue
+        except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
+            continue
+        metrics_valid = raw_record.get("metrics_valid")
+        records.append(
+            RoutingHistoryRecord(
+                model=model,
+                reasoning_effort=reasoning_effort,
+                attempt_status=attempt_status,
+                result_status=_history_text(raw_record.get("result_status")),
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                output_tokens=output_tokens,
+                duration_sec=duration_sec,
+                root_outcome=_history_text(raw_record.get("root_outcome")),
+                defects_found=defects_found,
+                catalog_source=_history_text(raw_record.get("catalog_source")),
+                catalog_version=_history_text(raw_record.get("catalog_version")),
+                metrics_valid=metrics_valid if isinstance(metrics_valid, bool) else False,
+                route=_history_text(raw_record.get("route")),
+                policy_name=_history_text(raw_record.get("policy_name")),
+                task_class=_history_text(raw_record.get("task_class")),
+                selection_source=_history_text(raw_record.get("selection_source")),
+            )
+        )
+    return tuple(records)
+
+
+def _history_text(value: Any) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _backend_option(*values: str | None) -> str:
