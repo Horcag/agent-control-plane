@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_control_plane.shared.git_tools import GitError, head_commit, workspace_state
+from agent_control_plane.shared.git_tools import (
+    GIT_TIMEOUT_SEC,
+    GitError,
+    head_commit,
+    workspace_state,
+)
 from agent_control_plane.shared.path_rules import is_same_or_child
 
 
@@ -272,19 +277,33 @@ def _git(
     input_text: str | None = None,
     extra_env: dict[str, str] | None = None,
 ) -> str:
+    command = ["git", "-C", str(workspace), *args]
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    proc = subprocess.run(  # nosec B603 B607
-        ["git", "-C", str(workspace), *args],
-        input=input_text,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        check=False,
-        env=env,
-    )
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    run_kwargs: dict[str, Any] = {
+        "input": input_text,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "capture_output": True,
+        "check": False,
+        "timeout": GIT_TIMEOUT_SEC,
+        "env": env,
+    }
+    if input_text is None:
+        run_kwargs["stdin"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.run(  # nosec B603 B607
+            command,
+            **run_kwargs,
+        )
+    except subprocess.TimeoutExpired as exc:
+        rendered_command = subprocess.list2cmdline(command)
+        raise SlotCheckpointError(
+            f"Git command timed out after {GIT_TIMEOUT_SEC}s in {workspace}: {rendered_command}"
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or f"git exited {proc.returncode}"
         raise SlotCheckpointError(detail)

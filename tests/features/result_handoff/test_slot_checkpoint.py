@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -13,7 +14,71 @@ from agent_control_plane.features.result_handoff import (
     clean_checkpointed_workspace,
     create_slot_checkpoint,
 )
-from agent_control_plane.shared.git_tools import run_git, workspace_state
+from agent_control_plane.features.result_handoff.lib import slot_checkpoint
+from agent_control_plane.shared.git_tools import GIT_TIMEOUT_SEC, run_git, workspace_state
+
+
+def test_git_without_input_disables_stdin_and_prompts(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    completed = subprocess.CompletedProcess(args=["git"], returncode=0, stdout="ok\n", stderr="")
+
+    with patch(
+        "agent_control_plane.features.result_handoff.lib.slot_checkpoint.subprocess.run",
+        return_value=completed,
+    ) as run:
+        output = slot_checkpoint._git(
+            workspace,
+            "status",
+            extra_env={"ACP_TEST_VARIABLE": "kept", "GIT_TERMINAL_PROMPT": "1"},
+        )
+
+    assert output == "ok"
+    run.assert_called_once()
+    command, kwargs = run.call_args
+    assert command == (["git", "-C", str(workspace), "status"],)
+    assert kwargs["input"] is None
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["timeout"] == GIT_TIMEOUT_SEC
+    assert kwargs["env"]["ACP_TEST_VARIABLE"] == "kept"
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_with_input_preserves_commit_message_stdin(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    completed = subprocess.CompletedProcess(
+        args=["git"], returncode=0, stdout="commit\n", stderr=""
+    )
+
+    with patch(
+        "agent_control_plane.features.result_handoff.lib.slot_checkpoint.subprocess.run",
+        return_value=completed,
+    ) as run:
+        output = slot_checkpoint._git(workspace, "commit-tree", "tree", input_text="message\n")
+
+    assert output == "commit"
+    run.assert_called_once()
+    command, kwargs = run.call_args
+    assert command == (["git", "-C", str(workspace), "commit-tree", "tree"],)
+    assert kwargs["input"] == "message\n"
+    assert "stdin" not in kwargs
+    assert kwargs["timeout"] == GIT_TIMEOUT_SEC
+    assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_git_timeout_reports_workspace_and_command(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    timeout = subprocess.TimeoutExpired(["git", "status"], GIT_TIMEOUT_SEC)
+
+    with (
+        patch(
+            "agent_control_plane.features.result_handoff.lib.slot_checkpoint.subprocess.run",
+            side_effect=timeout,
+        ),
+        pytest.raises(SlotCheckpointError, match=r"repo.*git.*status") as error,
+    ):
+        slot_checkpoint._git(workspace, "status")
+
+    assert error.value.__cause__ is timeout
 
 
 def test_checkpoint_captures_all_non_ignored_changes_without_moving_head(tmp_path: Path) -> None:
