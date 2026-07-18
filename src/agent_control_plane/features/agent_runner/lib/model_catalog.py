@@ -231,7 +231,8 @@ class ModelCatalog:
                     "default_reasoning_effort": model.default_reasoning_effort,
                     "supported_reasoning_efforts": list(model.supported_reasoning_efforts),
                     "quota_domain": metadata.quota_domain if metadata is not None else None,
-                    "premium": metadata.premium if metadata is not None else False,
+                    "premium": metadata.premium if metadata is not None else None,
+                    "premium_state": "known" if metadata is not None else "unknown",
                     "rate_card_version": (
                         metadata.rate_card_version if metadata is not None else None
                     ),

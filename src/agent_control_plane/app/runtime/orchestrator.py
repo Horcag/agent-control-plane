@@ -437,12 +437,21 @@ class AgentControlPlane:
         }
 
     def _catalog_diagnostics(self) -> dict[str, dict[str, Any]]:
-        profiles: dict[str, list[dict[str, str]]] = {}
+        profiles: dict[str, list[dict[str, Any]]] = {}
         profile_resolution_errors: dict[str, str] = {}
         for policy_name in self.model_routing.policy_names:
             try:
                 profiles[policy_name] = [
-                    {"model": profile.model, "reasoning_effort": profile.reasoning_effort}
+                    {
+                        "model": profile.model,
+                        "reasoning_effort": profile.reasoning_effort,
+                        "premium": (
+                            metadata.premium
+                            if (metadata := self.model_catalog.rate_metadata_for(profile.model))
+                            is not None
+                            else None
+                        ),
+                    }
                     for profile in self.model_routing.ladder_for_policy(policy_name)
                 ]
             except ValueError as exc:
@@ -490,19 +499,26 @@ class AgentControlPlane:
                     ],
                 }
             )
-        premium_initials: dict[str, bool] = {}
+        premium_initials: dict[str, bool | None] = {}
+        initial_models: dict[str, str] = {}
         if not catalog_diagnostics["profile_resolution_errors"]:
             for policy_name in self.model_routing.policy_names:
                 policy_ladder = self.model_routing.ladder_for_policy(policy_name)
                 if policy_ladder:
                     metadata = self.model_catalog.rate_metadata_for(policy_ladder[0].model)
-                    premium_initials[policy_name] = bool(metadata and metadata.premium)
-            if premium_initials and all(premium_initials.values()):
+                    initial_models[policy_name] = policy_ladder[0].model
+                    premium_initials[policy_name] = metadata.premium if metadata else None
+            if (
+                premium_initials
+                and len(set(initial_models.values())) == 1
+                and all(value is True for value in premium_initials.values())
+            ):
                 failures.append(
                     {
                         "code": "all_policy_initial_profiles_premium",
                         "message": "Every configured policy starts on a premium catalog model; configure an intentional cheap-first policy.",
                         "premium_initial_profiles": premium_initials,
+                        "initial_models": initial_models,
                         "config_keys": [
                             "control.model_routing.policies",
                             "control.model_catalog.models",
@@ -514,6 +530,8 @@ class AgentControlPlane:
             "effective_default_policy": default_policy,
             "effective_default_initial_profile": effective_default,
             "premium_initial_profiles": premium_initials,
+            "initial_models": initial_models,
+            "coordinator_scope": COORDINATOR_SCOPE,
             "failures": failures,
         }
 
