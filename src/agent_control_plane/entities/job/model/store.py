@@ -627,6 +627,45 @@ class JobStore:
             ).fetchone()
         return _decode_routing_payload(row["message"] if row is not None else None)
 
+    def record_explicit_premium_launch(self, job_id: str, payload: Mapping[str, Any]) -> None:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Explicit premium launch payload must be a mapping")
+        if payload.get("event") != "explicit_premium_launch":
+            raise ValueError(
+                "Explicit premium launch payload must have event='explicit_premium_launch'"
+            )
+        try:
+            message = json.dumps(
+                dict(payload),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Explicit premium launch payload must be JSON-serializable") from exc
+        self.initialize()
+        self.add_event(job_id, "explicit_premium_launch", message)
+
+    def explicit_premium_launch(self, job_id: str) -> dict[str, Any] | None:
+        self.initialize()
+        with self._connect() as db:
+            row = db.execute(
+                """
+                select message from events
+                where job_id = ? and level = 'explicit_premium_launch'
+                order by id desc limit 1
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["message"])
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def routing_history(self, *, limit: int = 200) -> list[dict[str, Any]]:
         if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
             raise ValueError("routing history limit must be positive")

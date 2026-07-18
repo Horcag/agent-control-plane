@@ -1175,6 +1175,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
             control = AgentControlPlane(_config(root, workspace))
+            self.assertTrue(control.model_routing.catalog.rate_metadata_for("gpt-5.6-sol").premium)
             _brief(control.config.coordination_root, "premium-missing")
             _brief(control.config.coordination_root, "premium-explicit")
 
@@ -1209,6 +1210,17 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 control.summary_job(job.job_id)["codex_premium_override_reason"],
                 "approved benchmark run",
             )
+            self.assertEqual(
+                control.store.explicit_premium_launch(job.job_id),
+                {
+                    "codex_model": "gpt-5.6-sol",
+                    "codex_premium_override_reason": "approved benchmark run",
+                    "codex_reasoning_effort": "medium",
+                    "event": "explicit_premium_launch",
+                    "route": "main",
+                },
+            )
+            self.assertIsNone(control.store.routing_decision(job.job_id))
 
     def test_explicit_profile_cannot_combine_with_quality_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

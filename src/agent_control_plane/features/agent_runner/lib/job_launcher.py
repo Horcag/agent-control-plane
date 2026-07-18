@@ -267,6 +267,7 @@ class JobLauncher:
         codex_quality_tier: str | None = None
         codex_policy_name: str | None = None
         routing_decision: RoutingDecision | None = None
+        explicit_premium_launch = False
         codex_model: str | None = None
         codex_reasoning_effort: str | None = None
         if normalized_backend == CODEX_BACKEND:
@@ -312,6 +313,7 @@ class JobLauncher:
                         "Explicit launch of premium Codex model requires a nonblank "
                         "codex_premium_override_reason"
                     )
+                explicit_premium_launch = metadata is not None and metadata.premium
 
         codex_tool_call_budget: int | None = None
         if normalized_backend == CODEX_BACKEND:
@@ -396,6 +398,29 @@ class JobLauncher:
                 )
             except Exception as exc:
                 message = f"Could not persist routing decision: {exc}"
+                self.store.add_event(job.job_id, "error", message)
+                self.finish_job(job.job_id, "blocked", message)
+                raise JobLaunchError(message) from exc
+        explicit_premium_launch = explicit_premium_launch or (
+            codex_model is not None
+            and (catalog_metadata := self.model_routing.catalog.rate_metadata_for(codex_model))
+            is not None
+            and catalog_metadata.premium
+        )
+        if explicit_premium_launch:
+            try:
+                self.store.record_explicit_premium_launch(
+                    job.job_id,
+                    {
+                        "event": "explicit_premium_launch",
+                        "route": options.route,
+                        "codex_model": codex_model,
+                        "codex_reasoning_effort": codex_reasoning_effort,
+                        "codex_premium_override_reason": override_reason,
+                    },
+                )
+            except Exception as exc:
+                message = f"Could not persist explicit premium launch audit: {exc}"
                 self.store.add_event(job.job_id, "error", message)
                 self.finish_job(job.job_id, "blocked", message)
                 raise JobLaunchError(message) from exc
