@@ -97,6 +97,9 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
         "deep",
     }
     assert results["smoke"]["codex_quality_profiles"] == {}
+    assert "status" in results["smoke"]
+    assert "failures" in results["smoke"]
+    assert "model_control_scope" in results["smoke"]
     with sqlite3.connect(tmp_path / "runs" / "jobs.sqlite3") as database:
         slot_count = database.execute("select count(*) from slots").fetchone()[0]
     assert slot_count == 0

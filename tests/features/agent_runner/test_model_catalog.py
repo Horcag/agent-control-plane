@@ -95,7 +95,7 @@ class ModelCatalogTest(unittest.TestCase):
 
             self.assertTrue(payload["models"][0]["premium"])
 
-    def test_missing_metadata_defaults_premium_to_false_in_inspection(self) -> None:
+    def test_missing_metadata_is_unknown_in_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             cache_path = Path(temp) / "models_cache.json"
             cache_path.write_text(
@@ -106,7 +106,9 @@ class ModelCatalogTest(unittest.TestCase):
             )
             catalog = ModelCatalog.load(cache_path=cache_path, max_cache_age_sec=60.0)
 
-            self.assertFalse(catalog.inspection_payload()["models"][0]["premium"])
+            model = catalog.inspection_payload()["models"][0]
+            self.assertIsNone(model["premium"])
+            self.assertEqual(model["premium_state"], "unknown")
 
     def test_malformed_reasoning_entries_invalidate_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

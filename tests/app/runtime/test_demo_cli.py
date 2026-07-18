@@ -139,3 +139,20 @@ def test_model_routing_explain_command_prints_json_and_reports_unknown_policy(
             == 2
         )
     assert "Unsupported Codex routing policy 'missing'" in capsys.readouterr().err
+
+
+def test_smoke_cli_preserves_structured_payload_and_exit_status(tmp_path: Path, capsys) -> None:
+    control = Mock()
+    control.smoke.side_effect = [
+        {"status": "failed", "failures": [{"code": "smoke_failure"}]},
+        {"status": "passed", "failures": []},
+    ]
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=control,
+    ):
+        assert main(["smoke", "--config", str(tmp_path / "config.toml")]) == 1
+        failed_payload = json.loads(capsys.readouterr().out)
+        assert failed_payload["failures"][0]["code"] == "smoke_failure"
+        assert main(["smoke", "--config", str(tmp_path / "config.toml")]) == 0
+        assert json.loads(capsys.readouterr().out)["status"] == "passed"

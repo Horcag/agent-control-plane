@@ -41,6 +41,91 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_smoke_reports_advertised_default_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = _config(root, workspace)
+            control = AgentControlPlane(config)
+
+            smoke = control.smoke()
+
+            self.assertEqual(smoke["status"], "failed")
+            failure = next(
+                item for item in smoke["failures"] if item["code"] == "advertised_default_mismatch"
+            )
+            self.assertEqual(failure["effective_initial_profile"]["model"], "gpt-5.6-terra")
+
+    def test_smoke_premium_collapse_is_exact_and_diagnostics_are_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            premium_catalog = replace(
+                base.model_catalog,
+                models=tuple(replace(model, premium=True) for model in base.model_catalog.models),
+            )
+            defaults = replace(
+                base.defaults,
+                codex_model="gpt-5.6-terra",
+                codex_mechanical_model="gpt-5.6-terra",
+                codex_balanced_model="gpt-5.6-terra",
+                codex_deep_model="gpt-5.6-terra",
+            )
+            collapsed = AgentControlPlane(
+                replace(base, defaults=defaults, model_catalog=premium_catalog)
+            )
+
+            smoke = collapsed.smoke()
+            self.assertEqual(smoke["status"], "failed")
+            self.assertIn(
+                "all_policy_initial_profiles_premium",
+                {item["code"] for item in smoke["failures"]},
+            )
+            self.assertEqual(
+                set(smoke["codex_quality_profiles"]), {"mechanical", "balanced", "deep"}
+            )
+            for profiles in smoke["codex_quality_profiles"].values():
+                self.assertTrue(profiles)
+                self.assertEqual(set(profiles[0]), {"model", "reasoning_effort", "premium"})
+
+            different = AgentControlPlane(replace(base, model_catalog=premium_catalog))
+            self.assertNotIn(
+                "all_policy_initial_profiles_premium",
+                {item["code"] for item in different.smoke()["failures"]},
+            )
+
+    def test_smoke_unknown_catalog_metadata_is_never_nonpremium(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            control = AgentControlPlane(
+                replace(base, model_catalog=replace(base.model_catalog, models=()))
+            )
+
+            smoke = control.smoke()
+
+            inspection = {model["model"]: model for model in smoke["codex_model_catalog"]["models"]}
+            self.assertIsNone(inspection["gpt-5.6-luna"]["premium"])
+            self.assertEqual(inspection["gpt-5.6-luna"]["premium_state"], "unknown")
+            self.assertIsNone(smoke["codex_quality_profiles"]["mechanical"][0]["premium"])
+            self.assertNotIn(
+                "all_policy_initial_profiles_premium", {item["code"] for item in smoke["failures"]}
+            )
+
+    def test_model_routing_explain_states_coordinator_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+
+            payload = control.model_routing_explain("deep", "main")
+
+            self.assertIn("model_control_scope", payload)
+            self.assertIn("coordinating", payload["model_control_scope"].lower())
+            self.assertNotIn("parent_model", payload)
+
     def test_run_job_delegates_to_the_execution_service(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
