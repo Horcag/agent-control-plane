@@ -1495,7 +1495,6 @@ def _execution_summary(execution: PlanExecutionSpec) -> dict[str, Any]:
         "codex_premium_override_reason": execution.codex_premium_override_reason,
         "codex_model": execution.codex_model,
         "codex_reasoning_effort": execution.codex_reasoning_effort,
-        "codex_premium_override_reason": execution.codex_premium_override_reason,
         "brief_sha256": hashlib.sha256(brief_bytes).hexdigest(),
         "brief_chars": len(execution.brief),
     }
