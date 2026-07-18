@@ -392,7 +392,6 @@ class JobLauncher:
                     {
                         "event": "routing_decision",
                         "route": options.route,
-                        "codex_premium_override_reason": override_reason,
                         **routing_decision.as_dict(),
                     },
                 )
@@ -401,12 +400,6 @@ class JobLauncher:
                 self.store.add_event(job.job_id, "error", message)
                 self.finish_job(job.job_id, "blocked", message)
                 raise JobLaunchError(message) from exc
-        explicit_premium_launch = explicit_premium_launch or (
-            codex_model is not None
-            and (catalog_metadata := self.model_routing.catalog.rate_metadata_for(codex_model))
-            is not None
-            and catalog_metadata.premium
-        )
         if explicit_premium_launch:
             try:
                 self.store.record_explicit_premium_launch(

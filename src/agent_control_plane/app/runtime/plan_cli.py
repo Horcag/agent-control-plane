@@ -145,6 +145,7 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         args.codex_quality_tier,
         args.codex_model,
         args.codex_reasoning_effort,
+        args.codex_premium_override_reason,
     )
     if not any(value is not None for value in values) and not args.read_only:
         return None
