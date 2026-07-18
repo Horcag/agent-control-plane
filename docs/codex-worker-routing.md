@@ -16,8 +16,11 @@ reasoning effort, and supported reasoning efforts.
 inventory. It may assign a quota domain, effort-specific capacity units, and optional
 credit/API rate cards. Every configured rate is per million tokens and must include a
 rate-card version and source. Set `premium = true` for configuration-owned high-cost
-models; omitted metadata safely defaults to `false` and inspection exposes the flag. A newly visible cached model is discoverable without an ACP
-release; it only gains accounting metadata when an operator adds an overlay entry.
+models; omitted metadata safely defaults to `false` and inspection exposes the flag. This
+default applies to an existing overlay entry that omits `premium`. A newly visible cached
+model with no ACP overlay entry is discoverable without an ACP release, but its ACP
+premium metadata is unknown and is reported as `premium = null` /
+`premium_state = "unknown"` until an operator adds and configures an overlay entry.
 
 Automatic quality-tier routing accepts only visible, current-cache candidates. It rejects
 an invalid effort with the catalog's declared choices, including newly declared `max` or
