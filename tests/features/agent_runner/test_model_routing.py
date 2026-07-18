@@ -94,15 +94,26 @@ class ModelRoutingPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not support reasoning effort 'minimal'"):
             policy.ladder_for_tier("mechanical")
 
-    def test_nonfinal_result_and_capacity_escalate_but_completed_does_not(self) -> None:
+    def test_only_classified_model_capability_partial_escalates(self) -> None:
         self.assertTrue(
             self.policy.should_escalate(
                 runner_status="completed",
                 result_status="partial",
                 has_next=True,
+                escalation_classification="model_capability",
             )
         )
-        self.assertTrue(
+        for classification in (None, "infrastructure", "quota", "spawn", "tooling"):
+            with self.subTest(classification=classification):
+                self.assertFalse(
+                    self.policy.should_escalate(
+                        runner_status="completed",
+                        result_status="partial",
+                        has_next=True,
+                        escalation_classification=classification,
+                    )
+                )
+        self.assertFalse(
             self.policy.should_escalate(
                 runner_status="capacity",
                 result_status=None,

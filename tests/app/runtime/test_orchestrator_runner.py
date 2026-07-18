@@ -1085,7 +1085,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(control.config.defaults.codex_quality_tier, "deep")
             self.assertEqual(control.model_routing.policy_names, ("mechanical", "balanced", "deep"))
 
-    def test_capacity_escalates_mechanical_job_to_terra_on_same_thread(self) -> None:
+    def test_capacity_does_not_escalate_mechanical_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -1137,18 +1137,14 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 finished = control.run_job(job.job_id)
 
             self.assertEqual(finished.status, "completed")
-            self.assertEqual(finished.codex_model, "gpt-5.6-terra")
-            self.assertEqual(finished.codex_reasoning_effort, "medium")
+            self.assertEqual(finished.codex_model, "gpt-5.6-luna")
+            self.assertEqual(finished.codex_reasoning_effort, "low")
             self.assertEqual(
                 [spec.codex_model for spec in runner.specs],
-                [
-                    "gpt-5.6-luna",
-                    "gpt-5.6-terra",
-                ],
+                ["gpt-5.6-luna", "gpt-5.6-luna"],
             )
             self.assertIsNone(runner.specs[0].codex_resume_thread_id)
-            self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-capacity")
-            self.assertEqual(broker.capacity_units, [2, 10])
+            self.assertEqual(broker.capacity_units, [2])
             self.assertEqual(broker.released_jobs, [job.job_id])
 
     def test_partial_deep_job_continues_same_model_on_same_thread(self) -> None:

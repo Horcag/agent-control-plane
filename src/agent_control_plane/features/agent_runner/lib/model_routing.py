@@ -447,19 +447,14 @@ class ModelRoutingPolicy:
         runner_status: str,
         result_status: str | None,
         has_next: bool,
+        escalation_classification: str | None = None,
     ) -> bool:
-        if not has_next:
-            return False
-        if result_status in {"partial", "blocked"}:
-            return True
-        return runner_status in {
-            "capacity",
-            "exited_without_result",
-            "timeout",
-            "idle_timeout",
-            "no_progress_timeout",
-            "tool_timeout",
-        }
+        del runner_status
+        return (
+            has_next
+            and result_status == "partial"
+            and escalation_classification == "model_capability"
+        )
 
     def _resolved_candidates(self, policy: RoutingPolicy) -> tuple[ModelProfile, ...]:
         return tuple(

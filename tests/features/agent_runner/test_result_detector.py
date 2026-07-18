@@ -8,11 +8,24 @@ from pathlib import Path
 from agent_control_plane.features.agent_runner.lib.result_detector import (
     contains_capacity_marker,
     inspect_result,
+    parse_escalation_classification,
     recover_result_from_last_message,
 )
 
 
 class ResultDetectorTest(unittest.TestCase):
+    def test_classification_is_closed_and_fail_closed(self) -> None:
+        self.assertEqual(
+            parse_escalation_classification("Escalation-Classification: model_capability\n"),
+            "model_capability",
+        )
+        self.assertIsNone(parse_escalation_classification("Escalation-Classification: nope\n"))
+        self.assertIsNone(
+            parse_escalation_classification(
+                "Escalation-Classification: model_capability\nEscalation-Classification: quota\n"
+            )
+        )
+
     def test_detects_colon_status(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.md"

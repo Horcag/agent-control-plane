@@ -47,6 +47,7 @@ def build_task_prompt(
             coordination_rules = f"""- This is a READ-ONLY job.
 - You are FORBIDDEN from editing any files in the workspace or updating the progress file.
 - You MUST write your final response beginning with exactly one of: Status: completed, Status: partial, Status: blocked.
+- For Status: partial, emit exactly one machine-readable line `Escalation-Classification: model_capability` only when the remaining issue is a model capability or task-reasoning limitation likely to benefit from the next configured model. Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or `guardrail` for other blockers. Omit the line for unclassified results. Never classify an environment blocker as model_capability. Status: blocked never escalates.
 - The response itself will be recovered and written to: {result_path}"""
         else:
             coordination_rules = f"""- Maintain live progress/state in: {progress_path}
@@ -83,6 +84,7 @@ Mandatory execution rules:
 - You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
 - You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID.
 - Write the final result in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
+- For Status: partial, emit exactly one machine-readable line `Escalation-Classification: model_capability` only when the remaining issue is a model capability or task-reasoning limitation likely to benefit from the next configured model. Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or `guardrail` for other blockers. Omit the line for unclassified results. Never classify an environment blocker as model_capability. Status: blocked never escalates.
 """
     protocol_path = _protocol_path(config.coordination_root)
     routing_path = _required_file(config.coordination_root / "workspace-routing.md")

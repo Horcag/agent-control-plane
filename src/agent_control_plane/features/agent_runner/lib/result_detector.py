@@ -22,6 +22,19 @@ STATUS_ALIASES = {
     "частично": "partial",
     "заблокировано": "blocked",
 }
+ESCALATION_CLASSIFICATIONS = frozenset(
+    {
+        "model_capability",
+        "infrastructure",
+        "workspace",
+        "dependency",
+        "quota",
+        "spawn",
+        "tooling",
+        "guardrail",
+    }
+)
+ESCALATION_PATTERN = re.compile(r"(?im)^\s*Escalation-Classification\s*:\s*(\S+)\s*$")
 
 CAPACITY_PATTERNS = (
     re.compile(r"(?i)you(?:'|\u2019)ve hit (?:your )?(?:usage|rate) limit"),
@@ -39,6 +52,7 @@ class ResultState:
     verification_state: str | None = None
     verification_error: str | None = None
     verification_sha256: str | None = None
+    escalation_classification: str | None = None
 
 
 def inspect_result(path: Path, started_at: float) -> ResultState:
@@ -72,8 +86,16 @@ def inspect_result(path: Path, started_at: float) -> ResultState:
                 verification_state=verification.state,
                 verification_error=verification.error,
                 verification_sha256=verification.sha256,
+                escalation_classification=parse_escalation_classification(text),
             )
     return ResultState(done=False, status=None, reason="result status marker is missing")
+
+
+def parse_escalation_classification(text: str) -> str | None:
+    matches = [match.group(1).strip().lower() for match in ESCALATION_PATTERN.finditer(text)]
+    if len(matches) != 1 or matches[0] not in ESCALATION_CLASSIFICATIONS:
+        return None
+    return matches[0]
 
 
 def recover_result_from_last_message(
