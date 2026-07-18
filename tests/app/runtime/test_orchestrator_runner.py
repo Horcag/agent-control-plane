@@ -1147,6 +1147,126 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(broker.capacity_units, [2])
             self.assertEqual(broker.released_jobs, [job.job_id])
 
+    def test_model_capability_partial_escalates_and_resizes_quota_on_same_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-capability-escalation",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-luna",
+                codex_reasoning_effort="low",
+                codex_quality_tier="mechanical",
+                codex_tool_call_budget=45,
+            )
+            _record_mechanical_ladder(control, job.job_id)
+            runner = _ClassifiedPartialThenCompletedRunner("model_capability")
+            broker = _RecordingQuotaBroker()
+            control.quota_broker = broker  # type: ignore[assignment]
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(
+                [spec.codex_model for spec in runner.specs], ["gpt-5.6-luna", "gpt-5.6-terra"]
+            )
+            self.assertEqual(
+                [spec.codex_resume_thread_id for spec in runner.specs], [None, "thread-classified"]
+            )
+            self.assertEqual(broker.capacity_units, [2, 10])
+            self.assertTrue(
+                any(
+                    "Model escalation accepted; classification=model_capability" in event[2]
+                    for event in control.store.recent_events(job.job_id)
+                )
+            )
+
+    def test_infrastructure_partial_stays_on_luna_and_refuses_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-infrastructure-partial",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-luna",
+                codex_reasoning_effort="low",
+                codex_quality_tier="mechanical",
+                codex_tool_call_budget=45,
+            )
+            _record_mechanical_ladder(control, job.job_id)
+            runner = _ClassifiedPartialThenCompletedRunner("infrastructure")
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(
+                [spec.codex_model for spec in runner.specs], ["gpt-5.6-luna", "gpt-5.6-luna"]
+            )
+            self.assertEqual(
+                [spec.codex_resume_thread_id for spec in runner.specs], [None, "thread-classified"]
+            )
+            self.assertTrue(
+                any(
+                    "Model escalation refused; classification=infrastructure" in event[2]
+                    for event in control.store.recent_events(job.job_id)
+                )
+            )
+
+    def test_malformed_partial_stays_on_luna_as_unclassified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-malformed-partial",
+                backend=CODEX_BACKEND,
+                codex_model="gpt-5.6-luna",
+                codex_reasoning_effort="low",
+                codex_quality_tier="mechanical",
+                codex_tool_call_budget=45,
+            )
+            _record_mechanical_ladder(control, job.job_id)
+            runner = _ClassifiedPartialThenCompletedRunner("not-a-classification")
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=runner,
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "completed")
+            self.assertEqual(
+                [spec.codex_model for spec in runner.specs], ["gpt-5.6-luna", "gpt-5.6-luna"]
+            )
+            self.assertTrue(
+                any(
+                    "Model escalation refused; classification=unclassified" in event[2]
+                    for event in control.store.recent_events(job.job_id)
+                )
+            )
+
     def test_partial_deep_job_continues_same_model_on_same_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1588,6 +1708,41 @@ class _PartialThenCompletedRunner:
         )
 
 
+class _ClassifiedPartialThenCompletedRunner:
+    def __init__(self, classification: str) -> None:
+        self.classification = classification
+        self.specs: list[Any] = []
+
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        self.specs.append(spec)
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        if len(self.specs) == 1:
+            spec.result_path.write_text(
+                f"Status: partial\nEscalation-Classification: {self.classification}\n",
+                encoding="utf-8",
+            )
+            return AgyRunResult(
+                status="completed",
+                completed=True,
+                exit_code=1,
+                result_status="partial",
+                message="classified partial checkpoint",
+                metrics=_attempt_metrics(thread_id="thread-classified"),
+                escalation_classification=inspect_result(
+                    spec.result_path, 0.0
+                ).escalation_classification,
+            )
+        spec.result_path.write_text("Status: completed\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="completed",
+            message="completed after classified continuation",
+            metrics=_attempt_metrics(thread_id="thread-classified"),
+        )
+
+
 class _RecordingQuotaBroker:
     def __init__(self) -> None:
         self.capacity_units: list[int] = []
@@ -1875,6 +2030,30 @@ def _create_job(
         codex_tool_call_budget=codex_tool_call_budget,
         workspace_access=workspace_access,
         slot_name=slot_name,
+    )
+
+
+def _record_mechanical_ladder(control: AgentControlPlane, job_id: str) -> None:
+    control.store.record_routing_decision(
+        job_id,
+        {
+            "event": "routing_decision",
+            "route": "main",
+            "requested_policy": "mechanical",
+            "task_class": "mechanical",
+            "tool_call_budget": 45,
+            "catalog": {
+                "source": control.model_routing.catalog.source,
+                "version": control.model_routing.catalog.version,
+            },
+            "selection_source": "configured_fallback",
+            "configured_fallback": True,
+            "chosen_profile": {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+            "ladder": [
+                {"model": "gpt-5.6-luna", "reasoning_effort": "low"},
+                {"model": "gpt-5.6-terra", "reasoning_effort": "medium"},
+            ],
+        },
     )
 
 
