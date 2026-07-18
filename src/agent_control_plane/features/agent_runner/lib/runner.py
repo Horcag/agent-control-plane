@@ -62,6 +62,7 @@ class AgentRunResult:
     result_status: str | None
     message: str
     metrics: AttemptMetrics | None = None
+    escalation_classification: str | None = None
 
 
 class AgentRunner(Protocol):

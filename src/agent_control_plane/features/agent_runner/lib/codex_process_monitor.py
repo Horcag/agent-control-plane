@@ -275,7 +275,9 @@ class CodexProcessMonitor:
             return None
         if terminate:
             self._await_completed_process(proc, spec)
-        return self._completed_result(proc, result_state.status)
+        return self._completed_result(
+            proc, result_state.status, result_state.escalation_classification
+        )
 
     @staticmethod
     def _exited_result_if_dead(
@@ -293,7 +295,9 @@ class CodexProcessMonitor:
             started_wall,
         )
         if result_state.done:
-            return CodexProcessMonitor._completed_result(proc, result_state.status)
+            return CodexProcessMonitor._completed_result(
+                proc, result_state.status, result_state.escalation_classification
+            )
         if contains_capacity_marker(spec.log_path, last_message_path):
             return AgentRunResult(
                 status="capacity",
@@ -349,6 +353,7 @@ class CodexProcessMonitor:
     def _completed_result(
         proc: TerminableProcess,
         result_status: str | None,
+        escalation_classification: str | None = None,
     ) -> AgentRunResult:
         return AgentRunResult(
             status="completed",
@@ -356,6 +361,7 @@ class CodexProcessMonitor:
             exit_code=proc.poll(),
             result_status=result_status,
             message=f"Result file completed with status {result_status}",
+            escalation_classification=escalation_classification,
         )
 
     @staticmethod

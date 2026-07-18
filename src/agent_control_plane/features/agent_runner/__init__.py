@@ -43,6 +43,7 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
 from agent_control_plane.features.agent_runner.lib.result_detector import (
     ResultState,
     inspect_result,
+    parse_escalation_classification,
 )
 from agent_control_plane.features.agent_runner.lib.runner import (
     AGY_BACKEND,
@@ -106,6 +107,7 @@ __all__ = [
     "codex_quota_domain",
     "inspect_result",
     "normalize_backend",
+    "parse_escalation_classification",
     "parse_routing_history_record",
     "parse_routing_history_records",
     "probe_worker_lease",

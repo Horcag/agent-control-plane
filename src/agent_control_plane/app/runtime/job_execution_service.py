@@ -33,9 +33,6 @@ from agent_control_plane.features.agent_runner import (
     codex_job_capacity_units,
     normalize_backend,
 )
-from agent_control_plane.features.agent_runner.lib.result_detector import (
-    parse_escalation_classification,
-)
 from agent_control_plane.features.antigravity_accounts import (
     AntigravityManagerAdapter,
     AntigravityManagerError,
@@ -620,12 +617,7 @@ class JobExecutionService:
         state: ExecutionState,
         result: AgentRunResult,
     ) -> bool:
-        try:
-            classification = parse_escalation_classification(
-                job.result_path.read_text(encoding="utf-8", errors="replace")
-            )
-        except OSError:
-            classification = None
+        classification = result.escalation_classification
         accepted = normalize_backend(
             job.backend
         ) == CODEX_BACKEND and self.model_routing.should_escalate(
