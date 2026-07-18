@@ -4,10 +4,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.shared.config import load_config
+from agent_control_plane.shared.config import CodexModelMetadataConfig, load_config
 
 
 class ConfigTest(unittest.TestCase):
+    def test_direct_model_metadata_defaults_premium_to_false(self) -> None:
+        metadata = CodexModelMetadataConfig(
+            model="legacy-codex",
+            quota_domain=None,
+            capacity_units=(),
+            credit_rate=None,
+            api_usd_rate=None,
+            rate_card_version=None,
+            rate_card_source=None,
+        )
+
+        self.assertFalse(metadata.premium)
+
     def test_loads_slot_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

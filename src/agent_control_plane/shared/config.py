@@ -39,13 +39,13 @@ class CodexTokenRateConfig:
 @dataclass(frozen=True)
 class CodexModelMetadataConfig:
     model: str
-    premium: bool
     quota_domain: str | None
     capacity_units: tuple[tuple[str, int], ...]
     credit_rate: CodexTokenRateConfig | None
     api_usd_rate: CodexTokenRateConfig | None
     rate_card_version: str | None
     rate_card_source: str | None
+    premium: bool = False
 
 
 @dataclass(frozen=True)
