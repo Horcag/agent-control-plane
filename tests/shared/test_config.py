@@ -8,6 +8,26 @@ from agent_control_plane.shared.config import CodexModelMetadataConfig, load_con
 
 
 class ConfigTest(unittest.TestCase):
+    def test_loads_example_config_cheap_first_policy(self) -> None:
+        config = load_config(
+            Path(__file__).resolve().parents[2] / "config" / "workspaces.example.toml"
+        )
+
+        self.assertEqual(config.defaults.codex_quality_tier, "cheap-first")
+        policy = next(policy for policy in config.routing_policies if policy.name == "cheap-first")
+        self.assertEqual(
+            [(candidate.model, candidate.reasoning_effort) for candidate in policy.candidates],
+            [
+                ("gpt-5.6-luna", "low"),
+                ("gpt-5.6-terra", "medium"),
+                ("gpt-5.6-sol", "medium"),
+            ],
+        )
+        metadata = {model.model: model for model in config.model_catalog.models}
+        self.assertTrue(metadata["gpt-5.6-sol"].premium)
+        self.assertFalse(metadata["gpt-5.6-luna"].premium)
+        self.assertFalse(metadata["gpt-5.6-terra"].premium)
+
     def test_direct_model_metadata_defaults_premium_to_false(self) -> None:
         metadata = CodexModelMetadataConfig(
             model="legacy-codex",
