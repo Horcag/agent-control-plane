@@ -124,6 +124,10 @@ def _configured_routing_policies(config: ControlConfig) -> tuple[RoutingPolicy, 
 
 
 _ROUTING_HISTORY_LIMIT = 200
+COORDINATOR_SCOPE = (
+    "ACP controls delegated worker profiles only; the parent/coordinating Codex thread is "
+    "external and cannot be selected, downgraded, or escalated by ACP."
+)
 
 
 TERMINAL_STATUSES = frozenset(
@@ -298,6 +302,7 @@ class AgentControlPlane:
                 ),
                 "catalog_source": decision.catalog_source,
                 "catalog_version": decision.catalog_version,
+                "model_control_scope": COORDINATOR_SCOPE,
             }
         )
         return payload
@@ -307,7 +312,11 @@ class AgentControlPlane:
         self.plan_store.initialize()
         self.review_inbox.initialize()
         catalog_diagnostics = self._catalog_diagnostics()
+        smoke_diagnostics = self._smoke_routing_diagnostics(catalog_diagnostics)
         return {
+            "status": "failed" if smoke_diagnostics["failures"] else "passed",
+            "failures": smoke_diagnostics["failures"],
+            "model_control_scope": COORDINATOR_SCOPE,
             "config": str(self.config.config_path),
             "database": str(self.config.database_path),
             "runs_root": str(self.config.runs_root),
@@ -331,7 +340,9 @@ class AgentControlPlane:
             "codex_model_catalog": {
                 "status": self.model_catalog.cache_status,
                 "profile_resolution_errors": catalog_diagnostics["profile_resolution_errors"],
+                "models": self.model_catalog.inspection_payload()["models"],
             },
+            "codex_routing_invariants": smoke_diagnostics,
             "codex_global_quota": {
                 "enabled": self.quota_broker is not None,
                 "database": (
@@ -439,6 +450,71 @@ class AgentControlPlane:
         return {
             "profiles": profiles,
             "profile_resolution_errors": profile_resolution_errors,
+        }
+
+    def _smoke_routing_diagnostics(
+        self, catalog_diagnostics: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        failures: list[dict[str, Any]] = []
+        default_policy = self.config.defaults.codex_quality_tier
+        effective_default: dict[str, str] | None = None
+        try:
+            ladder = self.model_routing.ladder_for_policy(default_policy)
+            if ladder:
+                initial = ladder[0]
+                effective_default = {
+                    "model": initial.model,
+                    "reasoning_effort": initial.reasoning_effort,
+                }
+        except ValueError:
+            ladder = ()
+        advertised = {
+            "model": self.config.defaults.codex_model,
+            "reasoning_effort": self.config.defaults.codex_reasoning_effort,
+        }
+        if (
+            effective_default is not None
+            and advertised["model"].strip().lower() != "default"
+            and advertised != effective_default
+        ):
+            failures.append(
+                {
+                    "code": "advertised_default_mismatch",
+                    "message": "Advertised explicit Codex default differs from the configured default policy initial profile.",
+                    "advertised_default": advertised,
+                    "effective_default_policy": default_policy,
+                    "effective_initial_profile": effective_default,
+                    "config_keys": [
+                        "control.defaults.codex_model",
+                        "control.defaults.codex_quality_tier",
+                    ],
+                }
+            )
+        premium_initials: dict[str, bool] = {}
+        if not catalog_diagnostics["profile_resolution_errors"]:
+            for policy_name in self.model_routing.policy_names:
+                policy_ladder = self.model_routing.ladder_for_policy(policy_name)
+                if policy_ladder:
+                    metadata = self.model_catalog.rate_metadata_for(policy_ladder[0].model)
+                    premium_initials[policy_name] = bool(metadata and metadata.premium)
+            if premium_initials and all(premium_initials.values()):
+                failures.append(
+                    {
+                        "code": "all_policy_initial_profiles_premium",
+                        "message": "Every configured policy starts on a premium catalog model; configure an intentional cheap-first policy.",
+                        "premium_initial_profiles": premium_initials,
+                        "config_keys": [
+                            "control.model_routing.policies",
+                            "control.model_catalog.models",
+                        ],
+                    }
+                )
+        return {
+            "advertised_default": advertised,
+            "effective_default_policy": default_policy,
+            "effective_default_initial_profile": effective_default,
+            "premium_initial_profiles": premium_initials,
+            "failures": failures,
         }
 
     def reconcile_jobs(

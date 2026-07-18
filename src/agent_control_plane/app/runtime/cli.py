@@ -51,8 +51,9 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "smoke":
-            _print_json(control.smoke())
-            return 0
+            payload = control.smoke()
+            _print_json(payload)
+            return 1 if payload.get("status") == "failed" else 0
         if args.command == "model-catalog":
             _print_json(control.model_catalog_inspection())
             return 0

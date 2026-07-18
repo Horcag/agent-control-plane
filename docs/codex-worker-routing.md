@@ -1,5 +1,9 @@
 # Codex Worker Routing
 
+ACP controls delegated worker profiles only; the parent/coordinating Codex thread is
+external and cannot be selected, downgraded, or escalated by ACP. Routing diagnostics
+must not claim knowledge of the actual parent model.
+
 ## Model catalog
 
 ACP does not embed a current model list, family rule, capacity weight, or token price in
