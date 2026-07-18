@@ -16,6 +16,10 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.defaults.codex_quality_tier, "cheap-first")
         policy = next(policy for policy in config.routing_policies if policy.name == "cheap-first")
         self.assertEqual(
+            (config.defaults.codex_model, config.defaults.codex_reasoning_effort),
+            (policy.candidates[0].model, policy.candidates[0].reasoning_effort),
+        )
+        self.assertEqual(
             [(candidate.model, candidate.reasoning_effort) for candidate in policy.candidates],
             [
                 ("gpt-5.6-luna", "low"),

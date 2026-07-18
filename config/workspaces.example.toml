@@ -25,8 +25,8 @@ auto_archive_limit = 200
 backend = "codex"
 # Optional default Antigravity model. Override per route or with --agy-model.
 agy_model = "Gemini 3.5 Flash (High)"
-codex_model = "gpt-5.6-terra"
-codex_reasoning_effort = "medium"
+codex_model = "gpt-5.6-luna"
+codex_reasoning_effort = "low"
 codex_sandbox_mode = "workspace-write"
 # Backward-compatible default. Use "native" to run Codex without AgentBridge/IDEA.
 workspace_access = "ide_mcp"
