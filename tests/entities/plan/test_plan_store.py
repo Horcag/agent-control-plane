@@ -347,12 +347,41 @@ def test_executable_task_spec_round_trips_without_returning_full_brief() -> None
             "workspace_access": "native",
             "read_only": False,
             "codex_quality_tier": "mechanical",
+            "codex_premium_override_reason": None,
             "codex_model": None,
             "codex_reasoning_effort": None,
             "brief_sha256": "2d3f668e501d9979fac44adb78c7cf3b970a83cba93a0d62d0a769caf31b884d",
             "brief_chars": 27,
         }
         assert "secret implementation brief" not in str(task)
+
+
+def test_executable_task_snapshot_retains_premium_override_reason_without_brief(
+    tmp_path: Path,
+) -> None:
+    plans = _plan_store(tmp_path)
+    plans.create_plan(
+        plan_id="premium",
+        title="Premium",
+        tasks=(
+            PlanTaskDefinition(
+                "schema",
+                "Schema",
+                execution=PlanExecutionSpec(
+                    route="dev",
+                    brief="secret premium brief",
+                    backend="codex",
+                    codex_model="gpt-5.6-sol",
+                    codex_premium_override_reason="approved benchmark",
+                ),
+            ),
+        ),
+    )
+
+    execution = plans.snapshot("premium")["ready_next"][0]["execution"]
+
+    assert execution["codex_premium_override_reason"] == "approved benchmark"
+    assert "secret premium brief" not in str(execution)
 
 
 def test_legacy_execution_json_without_plan_contract_fields_loads_as_none(tmp_path: Path) -> None:

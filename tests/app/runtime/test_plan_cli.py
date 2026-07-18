@@ -91,6 +91,25 @@ def test_start_parser_accepts_native_workspace_access() -> None:
     assert args.workspace_access == "native"
 
 
+def test_start_parser_accepts_premium_override_reason() -> None:
+    args = _build_parser().parse_args(
+        [
+            "start",
+            "--task-id",
+            "premium-task",
+            "--route",
+            "dev",
+            "--codex-model",
+            "gpt-5.6-sol",
+            "--codex-premium-override-reason",
+            "approved benchmark",
+        ]
+    )
+
+    assert args.codex_model == "gpt-5.6-sol"
+    assert args.codex_premium_override_reason == "approved benchmark"
+
+
 def test_list_reports_persisted_workspace_access(capsys) -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -174,6 +193,21 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
     assert add.backend == "codex"
     assert add.codex_model == "gpt-5.3-codex-spark"
     assert add.codex_reasoning_effort == "high"
+
+
+def test_plan_manifest_preserves_premium_override_reason() -> None:
+    spec = plan_execution_spec(
+        {
+            "route": "dev",
+            "brief": "private brief",
+            "backend": "codex",
+            "codex_model": "gpt-5.6-sol",
+            "codex_premium_override_reason": "approved benchmark",
+        }
+    )
+
+    assert spec is not None
+    assert spec.codex_premium_override_reason == "approved benchmark"
 
 
 def test_cli_restart_requires_explicit_retry_after_failed_dispatch(tmp_path: Path) -> None:

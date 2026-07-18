@@ -403,3 +403,50 @@ def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:
 
     assert options.workspace_access == "native"
     assert response["workspace_access"] == "native"
+
+
+def test_mcp_start_forwards_premium_override_reason(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+    control = Mock()
+    control.start_job.return_value = SimpleNamespace(
+        job_id="job-premium",
+        status="queued",
+        run_dir=Path("runs/job-premium"),
+        result_path=Path("tasks/premium/result.md"),
+        backend="codex",
+        agy_model=None,
+        codex_model="gpt-5.6-sol",
+        codex_reasoning_effort="medium",
+        codex_quality_tier=None,
+        codex_premium_override_reason="approved benchmark",
+        workspace_access="native",
+        worker_pid=123,
+        runner_pid=None,
+        read_only=False,
+        slot_name="app-1",
+    )
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+
+    response = server.tools["agent_start_job"](
+        task_id="premium",
+        route="app",
+        backend="codex",
+        codex_model="gpt-5.6-sol",
+        codex_premium_override_reason="approved benchmark",
+        workspace_access="native",
+    )
+
+    options = control.start_job.call_args.args[0]
+    assert options.codex_premium_override_reason == "approved benchmark"
+    assert response["codex_premium_override_reason"] == "approved benchmark"
