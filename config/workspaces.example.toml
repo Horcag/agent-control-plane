@@ -40,7 +40,7 @@ codex_disabled_mcp_servers = []
 codex_no_progress_timeout_sec = 600
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
-codex_quality_tier = "deep"
+codex_quality_tier = "cheap-first"
 codex_mechanical_model = "gpt-5.6-luna"
 codex_mechanical_reasoning_effort = "low"
 codex_balanced_model = "gpt-5.6-terra"
@@ -130,6 +130,7 @@ rate_card_source = "operator-supplied example rates; verify before use"
 
 [[control.model_catalog.models]]
 model = "gpt-5.6-sol"
+premium = true
 quota_domain = "primary"
 capacity_units = { none = 10, low = 10, medium = 20, high = 30, xhigh = 30, max = 30 }
 credit_rate = { input = 125.0, cached_input = 12.5, output = 750.0 }
@@ -141,17 +142,18 @@ rate_card_source = "operator-supplied example rates; verify before use"
 model = "gpt-5.3-codex-spark"
 quota_domain = "spark"
 
-# Preferred named-policy form. Replace these arbitrary model IDs with slugs from the
-# operator's model cache. The policy name "deep" preserves the selector above; policy
-# order is configuration, not an imported benchmark ranking.
+# Preferred named-policy form. The first configured candidate is the initial worker
+# profile; later candidates form the escalation ladder. Replace model IDs with slugs
+# from the operator's model cache as needed.
 [control.model_routing]
 [[control.model_routing.policies]]
-name = "deep"
+name = "cheap-first"
 task_class = "implementation"
 tool_call_budget = 120
 candidates = [
-  { model = "example-primary-model", reasoning_effort = "medium" },
-  { model = "example-fallback-model", reasoning_effort = "low" },
+  { model = "gpt-5.6-luna", reasoning_effort = "low" },
+  { model = "gpt-5.6-terra", reasoning_effort = "medium" },
+  { model = "gpt-5.6-sol", reasoning_effort = "medium" },
 ]
 adaptive = { minimum_samples_per_candidate = 3, history_window = 20, quality_floor = 0.8, prior_quality = 0.75, prior_weight = 2.0, allow_missing_price = false }
 

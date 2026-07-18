@@ -386,6 +386,7 @@ required_branch = "main"
             )
             self.assertEqual(model.rate_card_version, "future-v1")
             self.assertEqual(model.rate_card_source, "operator-verified")
+            self.assertFalse(model.premium)
 
     def test_loads_codex_spark_max_concurrent_jobs_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

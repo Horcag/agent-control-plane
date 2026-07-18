@@ -39,6 +39,7 @@ class CodexTokenRateConfig:
 @dataclass(frozen=True)
 class CodexModelMetadataConfig:
     model: str
+    premium: bool
     quota_domain: str | None
     capacity_units: tuple[tuple[str, int], ...]
     credit_rate: CodexTokenRateConfig | None
@@ -594,6 +595,7 @@ def _model_catalog_config(
             models.append(
                 CodexModelMetadataConfig(
                     model=legacy_model,
+                    premium=False,
                     quota_domain=legacy_secondary.name,
                     capacity_units=(),
                     credit_rate=None,
@@ -777,6 +779,7 @@ def _model_metadata_config(raw: Any) -> CodexModelMetadataConfig:
         raise ValueError(f"Model catalog rate metadata needs version and source: {model}")
     return CodexModelMetadataConfig(
         model=model,
+        premium=_boolean_value(raw.get("premium", False), f"Model catalog premium: {model}"),
         quota_domain=quota_domain,
         capacity_units=capacity_units,
         credit_rate=credit_rate,
@@ -1087,6 +1090,12 @@ def _positive_float(value: Any, key: str) -> float:
     if parsed <= 0:
         raise ValueError(f"control.defaults.{key} must be positive")
     return parsed
+
+
+def _boolean_value(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
 
 
 def _percent_value(value: Any, key: str) -> float:

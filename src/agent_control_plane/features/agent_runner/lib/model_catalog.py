@@ -24,6 +24,7 @@ class CatalogModelMetadata:
     """Explicit ACP policy and accounting metadata for one model."""
 
     model: str
+    premium: bool = False
     quota_domain: str | None = None
     capacity_units: tuple[tuple[str, int], ...] = ()
     credit_rate: CatalogRate | None = None
@@ -100,6 +101,7 @@ class ModelCatalog:
             metadata=tuple(
                 CatalogModelMetadata(
                     model=item.model,
+                    premium=item.premium,
                     quota_domain=item.quota_domain,
                     capacity_units=item.capacity_units,
                     credit_rate=(
@@ -229,6 +231,7 @@ class ModelCatalog:
                     "default_reasoning_effort": model.default_reasoning_effort,
                     "supported_reasoning_efforts": list(model.supported_reasoning_efforts),
                     "quota_domain": metadata.quota_domain if metadata is not None else None,
+                    "premium": metadata.premium if metadata is not None else False,
                     "rate_card_version": (
                         metadata.rate_card_version if metadata is not None else None
                     ),

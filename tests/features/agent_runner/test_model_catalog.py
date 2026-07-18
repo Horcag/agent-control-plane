@@ -70,6 +70,43 @@ class ModelCatalogTest(unittest.TestCase):
                 catalog.capacity_units_for("future-codex", "ultra", full_capacity=30), 18
             )
             self.assertEqual(catalog.rate_metadata_for("future-codex"), metadata)
+            self.assertFalse(metadata.premium)
+
+    def test_premium_metadata_is_optional_and_visible_in_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_path = Path(temp) / "models_cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"slug": "expensive-future", "supported_reasoning_levels": ["medium"]}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalog = ModelCatalog.load(
+                cache_path=cache_path,
+                max_cache_age_sec=60.0,
+                metadata=(CatalogModelMetadata(model="expensive-future", premium=True),),
+            )
+
+            payload = catalog.inspection_payload()
+
+            self.assertTrue(payload["models"][0]["premium"])
+
+    def test_missing_metadata_defaults_premium_to_false_in_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            cache_path = Path(temp) / "models_cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {"models": [{"slug": "ordinary-future", "supported_reasoning_levels": ["low"]}]}
+                ),
+                encoding="utf-8",
+            )
+            catalog = ModelCatalog.load(cache_path=cache_path, max_cache_age_sec=60.0)
+
+            self.assertFalse(catalog.inspection_payload()["models"][0]["premium"])
 
     def test_malformed_reasoning_entries_invalidate_the_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -11,7 +11,8 @@ reasoning effort, and supported reasoning efforts.
 `[[control.model_catalog.models]]` is an ACP-owned metadata overlay, not a replacement
 inventory. It may assign a quota domain, effort-specific capacity units, and optional
 credit/API rate cards. Every configured rate is per million tokens and must include a
-rate-card version and source. A newly visible cached model is discoverable without an ACP
+rate-card version and source. Set `premium = true` for configuration-owned high-cost
+models; omitted metadata safely defaults to `false` and inspection exposes the flag. A newly visible cached model is discoverable without an ACP
 release; it only gains accounting metadata when an operator adds an overlay entry.
 
 Automatic quality-tier routing accepts only visible, current-cache candidates. It rejects
@@ -169,6 +170,10 @@ is keyed by reasoning effort. Omitting an effort is conservative: it receives th
 capacity weight rather than a heuristic family-derived value.
 
 ## Evidence policy for adaptive routing
+
+Named policies are ordered configuration ladders. The first configured candidate is the
+initial worker profile; later candidates form the escalation ladder. Adaptive evidence may
+change selection only after its fail-closed evidence requirements are met.
 
 Public coding benchmarks and ad-hoc runs compare sample outcomes, not this repository's
 exact prompts and effort settings. They do not determine routing decisions here. Only
