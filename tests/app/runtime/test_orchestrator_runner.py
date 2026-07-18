@@ -1170,6 +1170,65 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(control.config.defaults.codex_quality_tier, "deep")
             self.assertEqual(control.model_routing.policy_names, ("mechanical", "balanced", "deep"))
 
+    def test_explicit_premium_model_requires_override_reason_and_persists_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "premium-missing")
+            _brief(control.config.coordination_root, "premium-explicit")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                with self.assertRaisesRegex(PolicyError, "nonblank"):
+                    control.start_job(
+                        StartOptions(
+                            task_id="premium-missing",
+                            route="main",
+                            backend=CODEX_BACKEND,
+                            codex_model="gpt-5.6-sol",
+                            codex_reasoning_effort="medium",
+                        )
+                    )
+                job = control.start_job(
+                    StartOptions(
+                        task_id="premium-explicit",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        codex_model="gpt-5.6-sol",
+                        codex_reasoning_effort="medium",
+                        codex_premium_override_reason="approved benchmark run",
+                    )
+                )
+
+            self.assertEqual(job.codex_premium_override_reason, "approved benchmark run")
+            self.assertEqual(
+                control.status_job(job.job_id)["codex_premium_override_reason"],
+                "approved benchmark run",
+            )
+            self.assertEqual(
+                control.summary_job(job.job_id)["codex_premium_override_reason"],
+                "approved benchmark run",
+            )
+
+    def test_explicit_profile_cannot_combine_with_quality_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "profile-policy-conflict")
+
+            with self.assertRaisesRegex(PolicyError, "either automatic policy routing"):
+                control.start_job(
+                    StartOptions(
+                        task_id="profile-policy-conflict",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        codex_model="gpt-5.6-luna",
+                        codex_reasoning_effort="low",
+                        codex_quality_tier="mechanical",
+                    )
+                )
+
     def test_capacity_does_not_escalate_mechanical_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -2271,6 +2330,10 @@ def _model_catalog(root: Path) -> CodexModelCatalogConfig:
                         "slug": "gpt-5.3-codex-spark",
                         "supported_reasoning_levels": ["low", "high"],
                     },
+                    {
+                        "slug": "gpt-5.6-sol",
+                        "supported_reasoning_levels": ["medium", "high"],
+                    },
                 ]
             }
         ),
@@ -2302,6 +2365,16 @@ def _model_catalog(root: Path) -> CodexModelCatalogConfig:
                 model="gpt-5.3-codex-spark",
                 quota_domain="spark",
                 capacity_units=(),
+                credit_rate=None,
+                api_usd_rate=None,
+                rate_card_version=None,
+                rate_card_source=None,
+            ),
+            CodexModelMetadataConfig(
+                model="gpt-5.6-sol",
+                premium=True,
+                quota_domain="primary",
+                capacity_units=(("medium", 20),),
                 credit_rate=None,
                 api_usd_rate=None,
                 rate_card_version=None,

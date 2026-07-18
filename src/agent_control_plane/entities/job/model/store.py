@@ -72,6 +72,7 @@ class JobRecord:
     codex_model: str | None
     codex_reasoning_effort: str | None
     codex_quality_tier: str | None
+    codex_premium_override_reason: str | None
     codex_tool_call_budget: int | None
     workspace_access: str
     archived_at: str | None
@@ -115,6 +116,19 @@ class JobStore:
             checksum="job-store-runner-process-identity-v2-20260715",
             migrate=self._migrate_runner_process_identity,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=3,
+            checksum="job-store-premium-override-reason-v3-20260718",
+            migrate=self._migrate_premium_override_reason,
+        )
+
+    @staticmethod
+    def _migrate_premium_override_reason(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        if "codex_premium_override_reason" not in columns:
+            db.execute("alter table jobs add column codex_premium_override_reason text")
 
     @staticmethod
     def _migrate_runner_process_identity(db: sqlite3.Connection) -> None:
@@ -241,6 +255,7 @@ class JobStore:
         codex_model: str | None = None,
         codex_reasoning_effort: str | None = None,
         codex_quality_tier: str | None = None,
+        codex_premium_override_reason: str | None = None,
         codex_tool_call_budget: int | None = None,
         workspace_access: str = "ide_mcp",
         slot_name: str | None = None,
@@ -263,12 +278,12 @@ class JobStore:
                     job_id, task_id, route, workspace_path, expected_branch, status,
                     config_path, run_dir, prompt_path, result_path,
                     backend, agy_model, codex_model, codex_reasoning_effort,
-                    codex_quality_tier,
+                    codex_quality_tier, codex_premium_override_reason,
                     codex_tool_call_budget, workspace_access,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
                     print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -286,6 +301,7 @@ class JobStore:
                     codex_model,
                     codex_reasoning_effort,
                     codex_quality_tier,
+                    codex_premium_override_reason,
                     codex_tool_call_budget,
                     workspace_access,
                     now,
@@ -910,6 +926,7 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         codex_model=row["codex_model"],
         codex_reasoning_effort=row["codex_reasoning_effort"],
         codex_quality_tier=row["codex_quality_tier"],
+        codex_premium_override_reason=row["codex_premium_override_reason"],
         codex_tool_call_budget=row["codex_tool_call_budget"],
         workspace_access=row["workspace_access"],
         archived_at=row["archived_at"],

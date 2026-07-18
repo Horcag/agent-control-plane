@@ -379,6 +379,7 @@ def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:
         codex_model="gpt-5",
         codex_reasoning_effort="low",
         codex_quality_tier="mechanical",
+        codex_premium_override_reason=None,
         workspace_access="native",
         worker_pid=123,
         runner_pid=None,

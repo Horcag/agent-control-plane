@@ -90,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
                     codex_model=args.codex_model,
                     codex_reasoning_effort=args.codex_reasoning_effort,
                     codex_quality_tier=args.codex_quality_tier,
+                    codex_premium_override_reason=args.codex_premium_override_reason,
                     codex_tool_call_budget=args.codex_tool_call_budget,
                     slot=args.slot,
                     workspace_path=Path(args.workspace_path) if args.workspace_path else None,
@@ -428,6 +429,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--backend", choices=SUPPORTED_BACKENDS)
     start.add_argument("--agy-model", help="Antigravity model to use when --backend=agy")
     start.add_argument("--codex-model", help="Model to use when --backend=codex")
+    start.add_argument("--codex-premium-override-reason")
     start.add_argument(
         "--codex-reasoning-effort",
         help=(
@@ -914,6 +916,7 @@ def _job_payload(job: Any) -> dict[str, Any]:
         "codex_model": job.codex_model,
         "codex_reasoning_effort": job.codex_reasoning_effort,
         "codex_quality_tier": job.codex_quality_tier,
+        "codex_premium_override_reason": job.codex_premium_override_reason,
         "workspace_access": job.workspace_access,
         "worker_pid": job.worker_pid,
         "worker_instance_id": job.worker_instance_id,

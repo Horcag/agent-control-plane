@@ -42,6 +42,7 @@ class JobLaunchOptions:
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
     codex_quality_tier: str | None = None
+    codex_premium_override_reason: str | None = None
     codex_tool_call_budget: int | None = None
     slot: str | None = None
     workspace_path: Path | None = None
@@ -127,6 +128,11 @@ class JobLauncher:
         self.slot_error_type = slot_error_type
 
     def start(self, options: JobLaunchOptions) -> JobRecord:
+        override_reason = (
+            options.codex_premium_override_reason.strip()
+            if options.codex_premium_override_reason is not None
+            else None
+        )
         if options.plan_task_id and not options.plan_id:
             raise JobLaunchError("plan_task_id requires plan_id")
         if options.plan_dispatch_token and not options.plan_id:
@@ -241,6 +247,23 @@ class JobLauncher:
                 route_config.codex_reasoning_effort,
             )
         )
+        if explicit_codex_profile and options.codex_quality_tier is not None:
+            raise JobLaunchError(
+                "Callers must choose either automatic policy routing or one fixed explicit profile; "
+                "codex_quality_tier cannot be combined with codex_model or codex_reasoning_effort"
+            )
+        if options.codex_premium_override_reason is not None and not explicit_codex_profile:
+            raise JobLaunchError(
+                "codex_premium_override_reason requires an explicit Codex model profile"
+            )
+        if (
+            explicit_codex_profile
+            and options.codex_premium_override_reason is not None
+            and not override_reason
+        ):
+            raise JobLaunchError(
+                "Explicit premium Codex launches require a nonblank codex_premium_override_reason"
+            )
         codex_quality_tier: str | None = None
         codex_policy_name: str | None = None
         routing_decision: RoutingDecision | None = None
@@ -283,6 +306,12 @@ class JobLauncher:
                     raise JobLaunchError(str(exc)) from exc
                 codex_model = explicit_profile.model
                 codex_reasoning_effort = explicit_profile.reasoning_effort
+                metadata = self.model_routing.catalog.rate_metadata_for(codex_model)
+                if metadata is not None and metadata.premium and not override_reason:
+                    raise JobLaunchError(
+                        "Explicit launch of premium Codex model requires a nonblank "
+                        "codex_premium_override_reason"
+                    )
 
         codex_tool_call_budget: int | None = None
         if normalized_backend == CODEX_BACKEND:
@@ -346,6 +375,7 @@ class JobLauncher:
                 codex_model=codex_model,
                 codex_reasoning_effort=codex_reasoning_effort,
                 codex_quality_tier=codex_quality_tier,
+                codex_premium_override_reason=override_reason,
                 codex_tool_call_budget=codex_tool_call_budget,
                 workspace_access=workspace_access,
                 slot_name=options.slot,
@@ -360,6 +390,7 @@ class JobLauncher:
                     {
                         "event": "routing_decision",
                         "route": options.route,
+                        "codex_premium_override_reason": override_reason,
                         **routing_decision.as_dict(),
                     },
                 )

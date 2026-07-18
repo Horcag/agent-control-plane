@@ -50,6 +50,7 @@ def add_plan_parser(
     plan_add.add_argument("--workspace-access", choices=("ide_mcp", "native"))
     plan_add.add_argument("--read-only", action="store_true")
     plan_add.add_argument("--codex-quality-tier")
+    plan_add.add_argument("--codex-premium-override-reason")
     plan_add.add_argument("--codex-model", help="Model to use when --backend=codex")
     plan_add.add_argument(
         "--codex-reasoning-effort",

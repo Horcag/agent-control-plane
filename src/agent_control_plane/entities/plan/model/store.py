@@ -65,6 +65,7 @@ class PlanExecutionSpec:
     codex_quality_tier: str | None = None
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
+    codex_premium_override_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "route", _required("execution route", self.route))
@@ -76,6 +77,7 @@ class PlanExecutionSpec:
             "codex_quality_tier",
             "codex_model",
             "codex_reasoning_effort",
+            "codex_premium_override_reason",
         ):
             value = getattr(self, field_name)
             object.__setattr__(self, field_name, value.strip() if value and value.strip() else None)
@@ -765,6 +767,7 @@ class PlanStore:
                     codex_quality_tier=execution.codex_quality_tier,
                     codex_model=execution.codex_model,
                     codex_reasoning_effort=execution.codex_reasoning_effort,
+                    codex_premium_override_reason=execution.codex_premium_override_reason,
                 )
             now = utc_now()
             db.execute(
@@ -1445,6 +1448,7 @@ def _execution_json(execution: PlanExecutionSpec) -> str:
             "codex_quality_tier": execution.codex_quality_tier,
             "codex_model": execution.codex_model,
             "codex_reasoning_effort": execution.codex_reasoning_effort,
+            "codex_premium_override_reason": execution.codex_premium_override_reason,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1470,6 +1474,7 @@ def _execution_from_json(value: str | None) -> PlanExecutionSpec | None:
         codex_quality_tier=_optional_text(payload.get("codex_quality_tier")),
         codex_model=_optional_text(payload.get("codex_model")),
         codex_reasoning_effort=_optional_text(payload.get("codex_reasoning_effort")),
+        codex_premium_override_reason=_optional_text(payload.get("codex_premium_override_reason")),
     )
 
 

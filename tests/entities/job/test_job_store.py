@@ -205,6 +205,40 @@ class JobStoreTest(unittest.TestCase):
                 ("job-store-runner-process-identity-v2-20260715",),
             )
 
+    def test_premium_override_reason_v3_migrates_older_jobs_database(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "jobs.sqlite3"
+            store = JobStore(database)
+            store.initialize()
+            db = sqlite3.connect(database)
+            try:
+                db.execute("alter table jobs drop column codex_premium_override_reason")
+                db.execute(
+                    "delete from schema_migrations where component = 'job_store' and version = 3"
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            store.initialize()
+
+            db = sqlite3.connect(database)
+            try:
+                columns = {row[1] for row in db.execute("pragma table_info(jobs)")}
+                migration = db.execute(
+                    "select checksum from schema_migrations "
+                    "where component = 'job_store' and version = 3"
+                ).fetchone()
+            finally:
+                db.close()
+            self.assertIn("codex_premium_override_reason", columns)
+            self.assertEqual(
+                migration,
+                ("job-store-premium-override-reason-v3-20260718",),
+            )
+
     def test_old_jobs_table_migration(self) -> None:
         import sqlite3
 
