@@ -239,6 +239,144 @@ path = "slots/reports-1"
                 ("dist", "frontend/build"),
             )
 
+    def test_loads_claude_backend_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+claude_command = "claude-nightly"
+
+[control.defaults]
+claude_model = "claude-sonnet-5"
+claude_reasoning_effort = "xhigh"
+claude_permission_mode = "dontAsk"
+claude_allowed_tools = ["Read", "Bash"]
+claude_sessions_root = "claude-sessions"
+claude_max_turns = 40
+
+[[control.claude_model_catalog.models]]
+model = "claude-opus-4-8"
+premium = true
+rate_card_version = "2026-07"
+rate_card_source = "operator"
+
+[control.claude_model_catalog.models.api_usd_rate]
+input = 5.0
+cached_input = 0.5
+output = 25.0
+
+[[control.claude_model_catalog.inventory]]
+model = "claude-nova-7"
+priority = 0
+default_reasoning_effort = "high"
+supported_reasoning_efforts = ["low", "high"]
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+backend = "claude-code"
+claude_model = "claude-haiku-4-5"
+claude_reasoning_effort = "low"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.claude_command, "claude-nightly")
+            self.assertEqual(config.defaults.claude_model, "claude-sonnet-5")
+            self.assertEqual(config.defaults.claude_reasoning_effort, "xhigh")
+            self.assertEqual(config.defaults.claude_permission_mode, "dontAsk")
+            self.assertEqual(config.defaults.claude_allowed_tools, ("Read", "Bash"))
+            self.assertEqual(
+                config.defaults.claude_sessions_root,
+                (root / "claude-sessions").resolve(strict=False),
+            )
+            self.assertEqual(config.defaults.claude_max_turns, 40)
+            metadata = {model.model: model for model in config.claude_model_catalog.models}
+            self.assertTrue(metadata["claude-opus-4-8"].premium)
+            self.assertEqual(metadata["claude-opus-4-8"].api_usd_rate.input, 5.0)
+            inventory = config.claude_model_catalog.inventory[0]
+            self.assertEqual(inventory.model, "claude-nova-7")
+            self.assertEqual(inventory.supported_reasoning_efforts, ("low", "high"))
+            self.assertEqual(config.routes["main"].backend, "claude")
+            self.assertEqual(config.routes["main"].claude_model, "claude-haiku-4-5")
+            self.assertEqual(config.routes["main"].claude_reasoning_effort, "low")
+
+    def test_claude_defaults_are_safe_when_unconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+            self.assertEqual(config.claude_command, "claude")
+            self.assertEqual(config.defaults.claude_model, "default")
+            self.assertEqual(config.defaults.claude_reasoning_effort, "medium")
+            self.assertEqual(config.defaults.claude_permission_mode, "acceptEdits")
+            self.assertEqual(
+                config.defaults.claude_allowed_tools,
+                ("Read", "Edit", "Write", "Glob", "Grep", "Bash"),
+            )
+            self.assertIsNone(config.defaults.claude_sessions_root)
+            self.assertEqual(config.defaults.claude_max_turns, 0)
+            self.assertEqual(config.claude_model_catalog.models, ())
+            self.assertEqual(config.claude_model_catalog.inventory, ())
+
+    def test_invalid_claude_permission_mode_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+claude_permission_mode = "bypassPermissions"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "claude_permission_mode"):
+                load_config(config_path)
+
     def test_loads_named_routing_policies(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

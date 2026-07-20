@@ -59,6 +59,14 @@ def add_plan_parser(
             "must use an effort declared by the current cache"
         ),
     )
+    plan_add.add_argument("--claude-model", help="Model to use when --backend=claude")
+    plan_add.add_argument(
+        "--claude-reasoning-effort",
+        help=(
+            "Claude reasoning effort to use when --backend=claude; known catalog models "
+            "must use an effort declared by the builtin Claude inventory"
+        ),
+    )
 
     plan_bind = plan_subparsers.add_parser(
         "bind", parents=[common], help="Bind an existing job to a logical plan task"

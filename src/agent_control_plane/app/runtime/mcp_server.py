@@ -216,6 +216,8 @@ def build_server(config_path: str | None = None) -> Any:
         agy_model: str | None = None,
         codex_model: str | None = None,
         codex_reasoning_effort: str | None = None,
+        claude_model: str | None = None,
+        claude_reasoning_effort: str | None = None,
         codex_quality_tier: str | None = None,
         codex_premium_override_reason: str | None = None,
         slot: str | None = None,
@@ -255,6 +257,8 @@ def build_server(config_path: str | None = None) -> Any:
                     agy_model=agy_model,
                     codex_model=codex_model,
                     codex_reasoning_effort=codex_reasoning_effort,
+                    claude_model=claude_model,
+                    claude_reasoning_effort=claude_reasoning_effort,
                     codex_quality_tier=codex_quality_tier,
                     codex_premium_override_reason=codex_premium_override_reason,
                     slot=slot,
@@ -910,6 +914,8 @@ def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         codex_premium_override_reason=_optional_text(payload.get("codex_premium_override_reason")),
         codex_model=_optional_text(payload.get("codex_model")),
         codex_reasoning_effort=_optional_text(payload.get("codex_reasoning_effort")),
+        claude_model=_optional_text(payload.get("claude_model")),
+        claude_reasoning_effort=_optional_text(payload.get("claude_reasoning_effort")),
     )
 
 

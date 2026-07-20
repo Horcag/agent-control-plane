@@ -36,10 +36,12 @@ from agent_control_plane.entities.slot import SlotStore
 from agent_control_plane.entities.workspace import WorkspacePolicy, find_forbidden_status_entries
 from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     SUPPORTED_BACKENDS,
     AdaptiveRoutingSettings,
     AgentRunner,
+    ClaudeExecRunner,
     CodexExecRunner,
     CodexRateLimitReader,
     GlobalQuotaBroker,
@@ -53,6 +55,7 @@ from agent_control_plane.features.agent_runner import (
     PtyAgyRunner,
     QuotaDomain,
     RoutingPolicy,
+    build_claude_model_catalog,
     codex_quota_domain,
     inspect_result,
     normalize_backend,
@@ -156,6 +159,7 @@ class AgentControlPlane:
         self.policy = WorkspacePolicy(config)
         defaults = config.defaults
         self.model_catalog = ModelCatalog.from_config(config.model_catalog)
+        self.claude_model_catalog = build_claude_model_catalog(config.claude_model_catalog)
         self.model_routing = ModelRoutingPolicy(
             policies=_configured_routing_policies(config),
             mechanical=ModelProfile(
@@ -226,6 +230,7 @@ class AgentControlPlane:
             finalizer=self.finalization,
             runner_factory=lambda backend: self._runner_for_backend(backend),
             quota_broker=self._quota_broker,
+            claude_catalog=self.claude_model_catalog,
         )
         self.plan_service = PlanService(
             coordination_root=config.coordination_root,
@@ -257,6 +262,8 @@ class AgentControlPlane:
             return PtyAgyRunner()
         if normalize_backend(backend) == CODEX_BACKEND:
             return CodexExecRunner(self.model_catalog)
+        if normalize_backend(backend) == CLAUDE_BACKEND:
+            return ClaudeExecRunner(self.claude_model_catalog)
         allowed = ", ".join(SUPPORTED_BACKENDS)
         raise PolicyError(f"Unsupported backend {backend!r}. Expected one of: {allowed}")
 
@@ -322,10 +329,18 @@ class AgentControlPlane:
             "runs_root": str(self.config.runs_root),
             "agy_on_path": shutil.which(self.config.agy_command),
             "codex_on_path": shutil.which(self.config.codex_command),
+            "claude_on_path": shutil.which(self.config.claude_command),
             "default_backend": self.config.defaults.backend,
             "agy_model": self.config.defaults.agy_model,
             "codex_model": self.config.defaults.codex_model,
             "codex_reasoning_effort": self.config.defaults.codex_reasoning_effort,
+            "claude_model": self.config.defaults.claude_model,
+            "claude_reasoning_effort": self.config.defaults.claude_reasoning_effort,
+            "claude_model_catalog": {
+                "status": self.claude_model_catalog.cache_status,
+                "source": self.claude_model_catalog.source,
+                "version": self.claude_model_catalog.version,
+            },
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
             "workspace_access": self.config.defaults.workspace_access,
             "native_quality_policy": self.config.defaults.native_quality_policy,
@@ -635,6 +650,8 @@ class AgentControlPlane:
                 codex_premium_override_reason=claim.execution.codex_premium_override_reason,
                 codex_model=claim.execution.codex_model,
                 codex_reasoning_effort=claim.execution.codex_reasoning_effort,
+                claude_model=claim.execution.claude_model,
+                claude_reasoning_effort=claim.execution.claude_reasoning_effort,
                 slot=claim.execution.slot,
                 read_only=claim.execution.read_only,
                 plan_id=claim.plan_id,
@@ -730,6 +747,7 @@ class AgentControlPlane:
                 slots=self.slots,
                 policy=self.policy,
                 model_routing=self.model_routing,
+                claude_catalog=self.claude_model_catalog,
                 reconcile_jobs=self.reconcile_jobs,
                 finish_job=self._finish_job,
                 launch_worker=self._launch_worker,

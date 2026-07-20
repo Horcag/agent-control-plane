@@ -350,6 +350,8 @@ def test_executable_task_spec_round_trips_without_returning_full_brief() -> None
             "codex_premium_override_reason": None,
             "codex_model": None,
             "codex_reasoning_effort": None,
+            "claude_model": None,
+            "claude_reasoning_effort": None,
             "brief_sha256": "2d3f668e501d9979fac44adb78c7cf3b970a83cba93a0d62d0a769caf31b884d",
             "brief_chars": 27,
         }

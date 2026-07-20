@@ -10,6 +10,7 @@ from agent_control_plane.entities.job import (
     REVIEW_PHASES,
     ReviewMetricsStore,
 )
+from agent_control_plane.shared.claude_session_usage import latest_claude_session_usage
 from agent_control_plane.shared.codex_session_usage import (
     SessionUsageSnapshot,
     TokenUsage,
@@ -131,9 +132,17 @@ def _live_report(store: ReviewMetricsStore, span_id: str) -> dict[str, Any]:
     span = store.get_span(span_id)
     live_usage = None
     if span["status"] == "active":
-        snapshot = latest_session_usage(Path(span["session_path"]))
+        snapshot = _session_snapshot(Path(span["session_path"]))
         live_usage = snapshot.usage if snapshot is not None else None
     return store.report(span_id, live_usage=live_usage)
+
+
+def _session_snapshot(path: Path) -> SessionUsageSnapshot | None:
+    """Read a cumulative usage snapshot from a Codex rollout or Claude transcript."""
+    snapshot = latest_session_usage(path)
+    if snapshot is not None:
+        return snapshot
+    return latest_claude_session_usage(path)
 
 
 def _load_marker(path: Path) -> dict[str, Any]:
@@ -164,9 +173,9 @@ def _marker_snapshot(marker: dict[str, Any]) -> SessionUsageSnapshot:
 
 
 def _required_snapshot(path: Path) -> SessionUsageSnapshot:
-    snapshot = latest_session_usage(path)
+    snapshot = _session_snapshot(path)
     if snapshot is None:
-        raise ValueError(f"No Codex token_count snapshot found in {path}")
+        raise ValueError(f"No Codex token_count or Claude usage snapshot found in {path}")
     return snapshot
 
 

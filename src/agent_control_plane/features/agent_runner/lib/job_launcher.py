@@ -9,6 +9,10 @@ from typing import Any, Protocol, TypeVar
 from agent_control_plane.entities.job import JobRecord, JobStore, new_job_id
 from agent_control_plane.entities.plan import PlanStore
 from agent_control_plane.entities.workspace import StartRequest, WorkspacePolicy
+from agent_control_plane.features.agent_runner.lib.claude_model_catalog import (
+    claude_ladder_for_explicit_model,
+)
+from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
 from agent_control_plane.features.agent_runner.lib.model_routing import (
     ModelRoutingPolicy,
     RoutingDecision,
@@ -17,6 +21,7 @@ from agent_control_plane.features.agent_runner.lib.model_routing import (
 from agent_control_plane.features.agent_runner.lib.prompt_builder import build_task_prompt
 from agent_control_plane.features.agent_runner.lib.runner import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     SUPPORTED_BACKENDS,
     normalize_backend,
@@ -41,6 +46,8 @@ class JobLaunchOptions:
     agy_model: str | None = None
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
+    claude_model: str | None = None
+    claude_reasoning_effort: str | None = None
     codex_quality_tier: str | None = None
     codex_premium_override_reason: str | None = None
     codex_tool_call_budget: int | None = None
@@ -109,6 +116,7 @@ class JobLauncher:
         slots: SlotLifecycleGateway,
         policy: WorkspacePolicy,
         model_routing: ModelRoutingPolicy,
+        claude_catalog: ModelCatalog,
         reconcile_jobs: Callable[[], object],
         finish_job: Callable[[str, str, str | None], JobRecord],
         launch_worker: Callable[[str, str], int],
@@ -121,6 +129,7 @@ class JobLauncher:
         self.slots = slots
         self.policy = policy
         self.model_routing = model_routing
+        self.claude_catalog = claude_catalog
         self.reconcile_jobs = reconcile_jobs
         self.finish_job = finish_job
         self.launch_worker = launch_worker
@@ -231,8 +240,19 @@ class JobLauncher:
         normalized_backend = normalize_backend(backend)
         if normalized_backend == AGY_BACKEND and workspace_access == "native":
             raise JobLaunchError("workspace_access=native is not supported with the agy backend")
+        if normalized_backend == CLAUDE_BACKEND and workspace_access != "native":
+            raise JobLaunchError(
+                "The claude backend requires workspace_access=native; "
+                "ide_mcp workers are Codex/agy only"
+            )
         if options.agy_model is not None and normalized_backend != AGY_BACKEND:
             raise JobLaunchError("--agy-model can only be used with the agy backend")
+        if options.claude_model is not None and normalized_backend != CLAUDE_BACKEND:
+            raise JobLaunchError("--claude-model can only be used with the claude backend")
+        if options.claude_reasoning_effort is not None and normalized_backend != CLAUDE_BACKEND:
+            raise JobLaunchError(
+                "--claude-reasoning-effort can only be used with the claude backend"
+            )
         agy_model = (
             options.agy_model or route_config.agy_model or self.config.defaults.agy_model
             if normalized_backend == AGY_BACKEND
@@ -252,7 +272,11 @@ class JobLauncher:
                 "Callers must choose either automatic policy routing or one fixed explicit profile; "
                 "codex_quality_tier cannot be combined with codex_model or codex_reasoning_effort"
             )
-        if options.codex_premium_override_reason is not None and not explicit_codex_profile:
+        if (
+            options.codex_premium_override_reason is not None
+            and normalized_backend == CODEX_BACKEND
+            and not explicit_codex_profile
+        ):
             raise JobLaunchError(
                 "codex_premium_override_reason requires an explicit Codex model profile"
             )
@@ -315,7 +339,40 @@ class JobLauncher:
                     )
                 explicit_premium_launch = metadata is not None and metadata.premium
 
+        if normalized_backend == CLAUDE_BACKEND:
+            claude_model = _option(
+                options.claude_model or route_config.claude_model,
+                self.config.defaults.claude_model,
+            )
+            claude_reasoning_effort = _option(
+                options.claude_reasoning_effort or route_config.claude_reasoning_effort,
+                self.config.defaults.claude_reasoning_effort,
+            )
+            try:
+                claude_profile = claude_ladder_for_explicit_model(
+                    self.claude_catalog,
+                    claude_model,
+                    claude_reasoning_effort,
+                )[0]
+            except ValueError as exc:
+                raise JobLaunchError(str(exc)) from exc
+            # The resolved Claude profile rides the shared profile columns so the
+            # existing escalation, metrics, and status plumbing stay schema-stable.
+            codex_model = claude_profile.model
+            codex_reasoning_effort = claude_profile.reasoning_effort
+            metadata = self.claude_catalog.rate_metadata_for(claude_profile.model)
+            if metadata is not None and metadata.premium and not override_reason:
+                raise JobLaunchError(
+                    "Explicit launch of premium Claude model requires a nonblank "
+                    "codex_premium_override_reason"
+                )
+            explicit_premium_launch = metadata is not None and metadata.premium
+
         codex_tool_call_budget: int | None = None
+        if normalized_backend == CLAUDE_BACKEND and options.codex_tool_call_budget is not None:
+            codex_tool_call_budget = options.codex_tool_call_budget
+            if codex_tool_call_budget <= 0:
+                raise JobLaunchError("Claude tool-call budget must be positive")
         if normalized_backend == CODEX_BACKEND:
             if codex_policy_name is None:
                 raise JobLaunchError("Codex routing policy was not selected")

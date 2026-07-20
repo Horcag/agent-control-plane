@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from types import TracebackType
 from typing import IO, TextIO
@@ -14,12 +15,18 @@ from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCat
 
 
 class CodexOutputCapture:
-    def __init__(self, log_path: Path) -> None:
+    def __init__(
+        self,
+        log_path: Path,
+        *,
+        render_line: Callable[[str], str] = render_codex_json_line,
+    ) -> None:
         self.log_path = log_path
         self.event_log_path = log_path.with_suffix(".events.jsonl")
         self.log: TextIO | None = None
         self._events: TextIO | None = None
         self._thread: threading.Thread | None = None
+        self._render_line = render_line
 
     def __enter__(self) -> CodexOutputCapture:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,7 +91,7 @@ class CodexOutputCapture:
             for line in stream:
                 events.write(line.rstrip("\r\n") + "\n")
                 events.flush()
-                log.write(render_codex_json_line(line))
+                log.write(self._render_line(line))
                 log.flush()
         except OSError as exc:
             log.write(f"\n[codex output pump failed: {exc}]\n")

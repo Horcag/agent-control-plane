@@ -1,3 +1,8 @@
+from agent_control_plane.features.agent_runner.lib.claude_model_catalog import (
+    build_claude_model_catalog,
+    claude_ladder_for_explicit_model,
+)
+from agent_control_plane.features.agent_runner.lib.claude_runner import ClaudeExecRunner
 from agent_control_plane.features.agent_runner.lib.codex_runner import CodexExecRunner
 from agent_control_plane.features.agent_runner.lib.job_launcher import (
     JobLauncher,
@@ -47,6 +52,7 @@ from agent_control_plane.features.agent_runner.lib.result_detector import (
 )
 from agent_control_plane.features.agent_runner.lib.runner import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     CODEX_SPARK_BACKEND,
     SUPPORTED_BACKENDS,
@@ -66,6 +72,7 @@ from agent_control_plane.features.agent_runner.lib.worker_lease import (
 
 __all__ = [
     "AGY_BACKEND",
+    "CLAUDE_BACKEND",
     "CODEX_BACKEND",
     "CODEX_SPARK_BACKEND",
     "SUPPORTED_BACKENDS",
@@ -76,6 +83,7 @@ __all__ = [
     "AgyRunResult",
     "AgyRunSpec",
     "CandidateScore",
+    "ClaudeExecRunner",
     "CodexExecRunner",
     "CodexRateLimitReader",
     "FinalizationLease",
@@ -101,8 +109,10 @@ __all__ = [
     "WorkerLeaseError",
     "WorkerLeaseProbe",
     "WorkerLeaseState",
+    "build_claude_model_catalog",
     "build_task_prompt",
     "capture_process_identity",
+    "claude_ladder_for_explicit_model",
     "codex_job_capacity_units",
     "codex_quota_domain",
     "inspect_result",

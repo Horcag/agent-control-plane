@@ -19,17 +19,20 @@ from agent_control_plane.entities.job import JobRecord, JobStore
 from agent_control_plane.entities.workspace import StartRequest, WorkspacePolicy
 from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     AgentRunner,
     AgentRunResult,
     AgentRunSpec,
     GlobalQuotaBroker,
+    ModelCatalog,
     ModelProfile,
     ModelRoutingPolicy,
     QuotaDecision,
     WorkerLease,
     WorkerLeaseError,
     capture_process_identity,
+    claude_ladder_for_explicit_model,
     codex_job_capacity_units,
     normalize_backend,
 )
@@ -159,6 +162,7 @@ class JobExecutionService:
         finalizer: JobFinalizer,
         runner_factory: Callable[[str], AgentRunner],
         quota_broker: GlobalQuotaBroker | None,
+        claude_catalog: ModelCatalog | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -168,6 +172,7 @@ class JobExecutionService:
         self.finalizer = finalizer
         self.runner_factory = runner_factory
         self.quota_broker = quota_broker
+        self.claude_catalog = claude_catalog
         self._active_worker_instance_id: str | None = None
         self._worker_ownership_lost: threading.Event | None = None
 
@@ -525,6 +530,19 @@ class JobExecutionService:
             codex_resume_thread_id=state.resume_thread_id,
             codex_sessions_root=self.config.defaults.codex_sessions_root,
             workspace_access=job.workspace_access,
+            claude_command=self.config.claude_command,
+            claude_model=(
+                profile.model if normalize_backend(job.backend) == CLAUDE_BACKEND else None
+            ),
+            claude_reasoning_effort=(
+                profile.reasoning_effort
+                if normalize_backend(job.backend) == CLAUDE_BACKEND
+                else None
+            ),
+            claude_permission_mode=self.config.defaults.claude_permission_mode,
+            claude_allowed_tools=self.config.defaults.claude_allowed_tools,
+            claude_sessions_root=self.config.defaults.claude_sessions_root,
+            claude_max_turns=self.config.defaults.claude_max_turns,
         )
 
     def _disabled_mcp_servers(self, job: JobRecord) -> tuple[str, ...]:
@@ -677,7 +695,7 @@ class JobExecutionService:
         result: AgentRunResult,
     ) -> bool:
         return (
-            normalize_backend(job.backend) == CODEX_BACKEND
+            normalize_backend(job.backend) in {CODEX_BACKEND, CLAUDE_BACKEND}
             and result.result_status == "partial"
             and attempt_no < state.max_attempts
         )
@@ -703,7 +721,7 @@ class JobExecutionService:
         self.store.add_event(
             job.job_id,
             "warning",
-            "Continuing partial Codex result with the same model; "
+            f"Continuing partial {normalize_backend(job.backend)} result with the same model; "
             f"resume_thread={state.resume_thread_id or 'unavailable'}",
         )
 
@@ -740,6 +758,12 @@ class JobExecutionService:
         return False
 
     def _model_ladder_for_job(self, job: JobRecord) -> tuple[ModelProfile, ...]:
+        if normalize_backend(job.backend) == CLAUDE_BACKEND:
+            if self.claude_catalog is None:
+                raise ValueError(f"Claude job {job.job_id} requires a Claude model catalog")
+            model = job.codex_model or self.config.defaults.claude_model
+            effort = job.codex_reasoning_effort or self.config.defaults.claude_reasoning_effort
+            return claude_ladder_for_explicit_model(self.claude_catalog, model, effort)
         if normalize_backend(job.backend) != CODEX_BACKEND or job.codex_quality_tier is None:
             model = job.codex_model or self.config.defaults.codex_model
             effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort

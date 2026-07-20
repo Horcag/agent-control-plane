@@ -129,6 +129,8 @@ def plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         codex_quality_tier=optional_manifest_text(payload.get("codex_quality_tier")),
         codex_model=optional_manifest_text(payload.get("codex_model")),
         codex_reasoning_effort=optional_manifest_text(payload.get("codex_reasoning_effort")),
+        claude_model=optional_manifest_text(payload.get("claude_model")),
+        claude_reasoning_effort=optional_manifest_text(payload.get("claude_reasoning_effort")),
         codex_premium_override_reason=optional_manifest_text(
             payload.get("codex_premium_override_reason")
         ),
@@ -145,6 +147,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         args.codex_quality_tier,
         args.codex_model,
         args.codex_reasoning_effort,
+        args.claude_model,
+        args.claude_reasoning_effort,
         args.codex_premium_override_reason,
     )
     if not any(value is not None for value in values) and not args.read_only:
@@ -165,6 +169,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         codex_quality_tier=args.codex_quality_tier,
         codex_model=args.codex_model,
         codex_reasoning_effort=args.codex_reasoning_effort,
+        claude_model=args.claude_model,
+        claude_reasoning_effort=args.claude_reasoning_effort,
         codex_premium_override_reason=args.codex_premium_override_reason,
     )
 

@@ -63,12 +63,14 @@ class ModelCatalog:
         cache_status: str,
         source: str,
         version: str | None,
+        label: str = "Codex",
     ) -> None:
         self._models = models
         self._metadata = metadata
         self.cache_status = cache_status
         self.source = source
         self.version = version
+        self.label = label
 
     @classmethod
     def load(
@@ -150,19 +152,22 @@ class ModelCatalog:
         if candidate is None:
             if self.cache_status != "loaded":
                 raise ValueError(
-                    "Codex model catalog is "
+                    f"{self.label} model catalog is "
                     f"{self.cache_status}; automatic routing needs a current cache inventory"
                 )
             if normalized_model == "default":
                 raise ValueError(
-                    "Codex model selector 'default' could not resolve to a visible candidate "
-                    "in the current model catalog"
+                    f"{self.label} model selector 'default' could not resolve to a visible "
+                    "candidate in the current model catalog"
                 )
             raise ValueError(
-                f"Codex model {model!r} is not a visible candidate in the current model catalog"
+                f"{self.label} model {model!r} is not a visible candidate "
+                "in the current model catalog"
             )
         if not candidate.visible:
-            raise ValueError(f"Codex model {model!r} is not visible in the current model catalog")
+            raise ValueError(
+                f"{self.label} model {model!r} is not visible in the current model catalog"
+            )
         return candidate
 
     def _default_visible_candidate(self) -> CatalogModel | None:
@@ -269,18 +274,17 @@ class ModelCatalog:
                 return min(full_capacity, units)
         return full_capacity
 
-    @staticmethod
-    def _validate_known_effort(candidate: CatalogModel, reasoning_effort: str) -> None:
+    def _validate_known_effort(self, candidate: CatalogModel, reasoning_effort: str) -> None:
         effort = reasoning_effort.strip().lower()
         if not effort:
-            raise ValueError("Codex reasoning effort must not be empty")
+            raise ValueError(f"{self.label} reasoning effort must not be empty")
         supported = candidate.supported_reasoning_efforts
         if effort in supported:
             return
         allowed = ", ".join(supported) or "none declared by the catalog"
         raise ValueError(
-            f"Codex model {candidate.model!r} does not support reasoning effort {effort!r}. "
-            f"Expected one of: {allowed}"
+            f"{self.label} model {candidate.model!r} does not support reasoning effort "
+            f"{effort!r}. Expected one of: {allowed}"
         )
 
 

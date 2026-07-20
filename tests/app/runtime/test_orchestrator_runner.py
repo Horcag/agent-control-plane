@@ -19,7 +19,9 @@ from agent_control_plane.entities.job import AttemptMetrics
 from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
+    ClaudeExecRunner,
     ModelProfile,
     QuotaDecision,
 )
@@ -2211,6 +2213,135 @@ def _record_mechanical_ladder(control: AgentControlPlane, job_id: str) -> None:
             ],
         },
     )
+
+
+class OrchestratorClaudeBackendTest(unittest.TestCase):
+    def test_runner_selection_returns_claude_exec_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+
+            runner = control._runner_for_backend(CLAUDE_BACKEND)
+
+            self.assertIsInstance(runner, ClaudeExecRunner)
+            self.assertIs(runner.catalog, control.claude_model_catalog)
+
+    def test_claude_start_persists_resolved_profile_in_shared_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-claude")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-claude",
+                        route="main",
+                        backend=CLAUDE_BACKEND,
+                        claude_model="claude-sonnet-5",
+                        claude_reasoning_effort="XHigh",
+                        workspace_access="native",
+                    )
+                )
+
+            self.assertEqual(job.backend, CLAUDE_BACKEND)
+            self.assertEqual(job.codex_model, "claude-sonnet-5")
+            self.assertEqual(job.codex_reasoning_effort, "xhigh")
+            self.assertIsNone(job.codex_quality_tier)
+
+    def test_claude_default_selector_resolves_via_builtin_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-claude-default")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-claude-default",
+                        route="main",
+                        backend=CLAUDE_BACKEND,
+                        workspace_access="native",
+                    )
+                )
+
+            self.assertEqual(job.codex_model, "claude-opus-4-8")
+            self.assertEqual(job.codex_reasoning_effort, "medium")
+
+    def test_claude_backend_requires_native_workspace_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-claude-idemcp")
+
+            with self.assertRaisesRegex(PolicyError, "requires workspace_access=native"):
+                control.start_job(
+                    StartOptions(
+                        task_id="task-claude-idemcp",
+                        route="main",
+                        backend=CLAUDE_BACKEND,
+                    )
+                )
+
+    def test_claude_model_override_is_rejected_for_codex_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-wrong-claude-option")
+
+            with self.assertRaisesRegex(PolicyError, "claude-model"):
+                control.start_job(
+                    StartOptions(
+                        task_id="task-wrong-claude-option",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                        claude_model="claude-sonnet-5",
+                    )
+                )
+
+    def test_unsupported_claude_effort_is_rejected_before_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-claude-effort")
+
+            with (
+                patch.object(control, "_launch_worker", return_value=123) as launch,
+                self.assertRaisesRegex(PolicyError, "does not support reasoning effort 'ultra'"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="task-claude-effort",
+                        route="main",
+                        backend=CLAUDE_BACKEND,
+                        claude_model="claude-opus-4-8",
+                        claude_reasoning_effort="ultra",
+                        workspace_access="native",
+                    )
+                )
+
+            launch.assert_not_called()
+            self.assertEqual(control.store.list_jobs(), [])
+
+    def test_smoke_reports_claude_backend_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+
+            smoke = control.smoke()
+
+            self.assertIn("claude_on_path", smoke)
+            self.assertEqual(smoke["claude_model"], "default")
+            self.assertEqual(smoke["claude_reasoning_effort"], "medium")
+            self.assertEqual(smoke["claude_model_catalog"]["status"], "loaded")
+            self.assertEqual(smoke["claude_model_catalog"]["source"], "claude-builtin")
 
 
 def _config(root: Path, route_path: Path) -> ControlConfig:

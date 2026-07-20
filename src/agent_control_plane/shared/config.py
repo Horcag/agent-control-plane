@@ -65,6 +65,25 @@ class CodexModelCatalogConfig:
 
 
 @dataclass(frozen=True)
+class ClaudeModelInventoryConfig:
+    """Operator override or extension of the builtin Claude model inventory."""
+
+    model: str
+    visible: bool = True
+    priority: int | None = None
+    default_reasoning_effort: str | None = None
+    supported_reasoning_efforts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ClaudeModelCatalogConfig:
+    """Claude Code has no CLI-owned cache file, so the inventory is builtin plus overrides."""
+
+    models: tuple[CodexModelMetadataConfig, ...] = ()
+    inventory: tuple[ClaudeModelInventoryConfig, ...] = ()
+
+
+@dataclass(frozen=True)
 class CodexRoutingCandidateConfig:
     model: str
     reasoning_effort: str
@@ -108,6 +127,8 @@ class RouteConfig:
     backend: str | None = None
     codex_model: str | None = None
     codex_reasoning_effort: str | None = None
+    claude_model: str | None = None
+    claude_reasoning_effort: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] | None = None
     workspace_access: str | None = None
     native_quality_policy: str | None = None
@@ -177,6 +198,19 @@ class ControlDefaults:
     codex_quota_poll_sec: float = 30.0
     codex_spark_models: tuple[str, ...] = ()
     codex_sessions_root: Path | None = None
+    claude_model: str = "default"
+    claude_reasoning_effort: str = "medium"
+    claude_permission_mode: str = "acceptEdits"
+    claude_allowed_tools: tuple[str, ...] = (
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+        "Bash",
+    )
+    claude_sessions_root: Path | None = None
+    claude_max_turns: int = 0
     auto_switch_agy_on_quota: bool = False
     auto_switch_agy_strategy: str = "best"
     auto_switch_agy_electron_command: tuple[str, ...] = (
@@ -224,6 +258,8 @@ class ControlConfig:
     slot_prepare: tuple[SlotPrepareCommand, ...]
     model_catalog: CodexModelCatalogConfig = field(default_factory=_default_model_catalog_config)
     routing_policies: tuple[CodexRoutingPolicyConfig, ...] = ()
+    claude_command: str = "claude"
+    claude_model_catalog: ClaudeModelCatalogConfig = field(default_factory=ClaudeModelCatalogConfig)
 
 
 def default_config_path() -> Path:
@@ -382,6 +418,28 @@ def load_config(
             "codex_sessions_root",
             project_root,
         ),
+        claude_model=_string_value(defaults_raw.get("claude_model", "default")),
+        claude_reasoning_effort=_string_value(
+            defaults_raw.get("claude_reasoning_effort", "medium")
+        ),
+        claude_permission_mode=_claude_permission_mode_value(
+            defaults_raw.get("claude_permission_mode", "acceptEdits")
+        ),
+        claude_allowed_tools=_string_tuple(
+            defaults_raw.get(
+                "claude_allowed_tools",
+                ["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+            )
+        ),
+        claude_sessions_root=_optional_path(
+            defaults_raw,
+            "claude_sessions_root",
+            project_root,
+        ),
+        claude_max_turns=_non_negative_int(
+            defaults_raw.get("claude_max_turns", 0),
+            "claude_max_turns",
+        ),
         auto_switch_agy_on_quota=bool(defaults_raw.get("auto_switch_agy_on_quota", False)),
         auto_switch_agy_strategy=_string_value(
             defaults_raw.get("auto_switch_agy_strategy", "best")
@@ -411,6 +469,7 @@ def load_config(
         legacy_secondary_models=defaults.codex_spark_models,
     )
     routing_policies = _routing_policy_configs(control.get("model_routing", {}))
+    claude_model_catalog = _claude_model_catalog_config(control.get("claude_model_catalog", {}))
 
     global_worktree_root = _path(control, "worktree_root", project_root)
     worktree_base: Path | None = _optional_path(control, "worktree_base", project_root)
@@ -466,6 +525,8 @@ def load_config(
             backend=_optional_backend_value(value.get("backend")),
             codex_model=_optional_string_value(value.get("codex_model")),
             codex_reasoning_effort=_optional_string_value(value.get("codex_reasoning_effort")),
+            claude_model=_optional_string_value(value.get("claude_model")),
+            claude_reasoning_effort=_optional_string_value(value.get("claude_reasoning_effort")),
             codex_forbidden_tool_markers=_optional_string_tuple(
                 value.get("codex_forbidden_tool_markers")
             ),
@@ -539,9 +600,11 @@ def load_config(
         slot_root=slot_root,
         agy_command=str(control.get("agy_command", "agy")),
         codex_command=str(control.get("codex_command", "codex")),
+        claude_command=str(control.get("claude_command", "claude")),
         defaults=defaults,
         model_catalog=model_catalog,
         routing_policies=routing_policies,
+        claude_model_catalog=claude_model_catalog,
         routes=MappingProxyType(routes),
         slots=MappingProxyType(slots),
         slot_prepare=tuple(slot_prepare),
@@ -619,6 +682,60 @@ def _model_catalog_config(
         models=tuple(models),
         quota_domains=quota_domains,
     )
+
+
+def _claude_model_catalog_config(raw: Any) -> ClaudeModelCatalogConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("[control.claude_model_catalog] must be a table")
+    configured_models = raw.get("models", [])
+    if not isinstance(configured_models, list):
+        raise ValueError("control.claude_model_catalog.models must be an array of tables")
+    models = tuple(_model_metadata_config(value) for value in configured_models)
+    model_ids = [model.model.lower() for model in models]
+    if len(model_ids) != len(set(model_ids)):
+        raise ValueError("control.claude_model_catalog.models contains duplicate model IDs")
+    configured_inventory = raw.get("inventory", [])
+    if not isinstance(configured_inventory, list):
+        raise ValueError("control.claude_model_catalog.inventory must be an array of tables")
+    inventory = tuple(_claude_inventory_config(value) for value in configured_inventory)
+    inventory_ids = [entry.model.lower() for entry in inventory]
+    if len(inventory_ids) != len(set(inventory_ids)):
+        raise ValueError("control.claude_model_catalog.inventory contains duplicate model IDs")
+    return ClaudeModelCatalogConfig(models=models, inventory=inventory)
+
+
+def _claude_inventory_config(raw: Any) -> ClaudeModelInventoryConfig:
+    if not isinstance(raw, Mapping):
+        raise ValueError("control.claude_model_catalog.inventory entries must be tables")
+    model = _string_value(_required(raw, "model")).strip()
+    if not model:
+        raise ValueError("control.claude_model_catalog.inventory model must not be empty")
+    efforts = raw.get("supported_reasoning_efforts")
+    if not isinstance(efforts, list) or not efforts:
+        raise ValueError(
+            "control.claude_model_catalog.inventory supported_reasoning_efforts "
+            f"must be a non-empty array: {model}"
+        )
+    priority = raw.get("priority")
+    if priority is not None and not isinstance(priority, int):
+        raise ValueError(f"control.claude_model_catalog.inventory priority must be int: {model}")
+    return ClaudeModelInventoryConfig(
+        model=model,
+        visible=bool(raw.get("visible", True)),
+        priority=priority,
+        default_reasoning_effort=_optional_string_value(raw.get("default_reasoning_effort")),
+        supported_reasoning_efforts=_string_tuple(efforts),
+    )
+
+
+def _claude_permission_mode_value(value: Any) -> str:
+    mode = _string_value(value).strip()
+    allowed = ("default", "acceptEdits", "plan", "dontAsk")
+    if mode not in allowed:
+        raise ValueError(
+            f"Unsupported claude_permission_mode {mode!r}. Expected one of: {', '.join(allowed)}"
+        )
+    return mode
 
 
 def _routing_policy_configs(raw: Any) -> tuple[CodexRoutingPolicyConfig, ...]:

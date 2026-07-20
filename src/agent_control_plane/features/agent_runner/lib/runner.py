@@ -8,6 +8,7 @@ from typing import Protocol
 from agent_control_plane.entities.job import AttemptMetrics
 from agent_control_plane.shared.agent_backends import (
     AGY_BACKEND,
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     CODEX_SPARK_BACKEND,
     SUPPORTED_BACKENDS,
@@ -16,6 +17,7 @@ from agent_control_plane.shared.agent_backends import (
 
 __all__ = [
     "AGY_BACKEND",
+    "CLAUDE_BACKEND",
     "CODEX_BACKEND",
     "CODEX_SPARK_BACKEND",
     "SUPPORTED_BACKENDS",
@@ -52,6 +54,13 @@ class AgentRunSpec:
     codex_resume_thread_id: str | None = None
     codex_sessions_root: Path | None = None
     workspace_access: str = "ide_mcp"
+    claude_command: str = "claude"
+    claude_model: str | None = None
+    claude_reasoning_effort: str | None = None
+    claude_permission_mode: str = "acceptEdits"
+    claude_allowed_tools: tuple[str, ...] = ()
+    claude_sessions_root: Path | None = None
+    claude_max_turns: int = 0
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@ from agent_control_plane.entities.workspace import (
     find_new_forbidden_status_entries,
 )
 from agent_control_plane.features.agent_runner import (
+    CLAUDE_BACKEND,
     CODEX_BACKEND,
     inspect_result,
     normalize_backend,
@@ -182,7 +183,7 @@ class JobGuardrails:
         job: JobRecord,
         baseline: GuardrailBaseline,
     ) -> str | None:
-        if normalize_backend(job.backend) != CODEX_BACKEND:
+        if normalize_backend(job.backend) not in {CODEX_BACKEND, CLAUDE_BACKEND}:
             return None
         if inspect_result(job.result_path, 0.0).done:
             return None

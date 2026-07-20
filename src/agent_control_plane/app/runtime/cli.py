@@ -89,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
                     agy_model=args.agy_model,
                     codex_model=args.codex_model,
                     codex_reasoning_effort=args.codex_reasoning_effort,
+                    claude_model=args.claude_model,
+                    claude_reasoning_effort=args.claude_reasoning_effort,
                     codex_quality_tier=args.codex_quality_tier,
                     codex_premium_override_reason=args.codex_premium_override_reason,
                     codex_tool_call_budget=args.codex_tool_call_budget,
@@ -435,6 +437,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Codex reasoning effort to use when --backend=codex; known catalog models "
             "must use an effort declared by the current cache"
+        ),
+    )
+    start.add_argument("--claude-model", help="Model to use when --backend=claude")
+    start.add_argument(
+        "--claude-reasoning-effort",
+        help=(
+            "Claude reasoning effort to use when --backend=claude; known catalog models "
+            "must use an effort declared by the builtin Claude inventory"
         ),
     )
     start.add_argument(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol, TextIO
 
 from agent_control_plane.features.agent_runner.lib.codex_telemetry import codex_turn_completed
@@ -36,6 +37,23 @@ class TerminableProcess(Protocol):
 
 
 class CodexProcessMonitor:
+    def _turn_completed(self, event_log_path: Path) -> bool:
+        return codex_turn_completed(event_log_path)
+
+    def _scan_tool_constraints(
+        self,
+        spec: AgentRunSpec,
+        scan_size: int,
+        tool_call_count: int,
+    ) -> tuple[str | None, int, int]:
+        return scan_codex_tool_constraints(
+            spec.log_path.with_suffix(".events.jsonl"),
+            scan_size,
+            tool_call_count,
+            tool_call_budget=spec.codex_tool_call_budget,
+            terminal_tab_name=spec.codex_terminal_tab_name,
+        )
+
     def monitor(
         self,
         proc: subprocess.Popen[str],
@@ -80,12 +98,10 @@ class CodexProcessMonitor:
                     last_productive_mono = now
 
             constraint_violation, last_constraint_scan_size, tool_call_count = (
-                scan_codex_tool_constraints(
-                    spec.log_path.with_suffix(".events.jsonl"),
+                self._scan_tool_constraints(
+                    spec,
                     last_constraint_scan_size,
                     tool_call_count,
-                    tool_call_budget=spec.codex_tool_call_budget,
-                    terminal_tab_name=spec.codex_terminal_tab_name,
                 )
             )
             if constraint_violation is not None:
@@ -378,15 +394,15 @@ class CodexProcessMonitor:
             message=message,
         )
 
-    @staticmethod
     def _await_completed_process(
+        self,
         proc: TerminableProcess,
         spec: AgentRunSpec,
     ) -> None:
         deadline = time.monotonic() + CODEX_COMPLETION_GRACE_SEC
         event_log_path = spec.log_path.with_suffix(".events.jsonl")
         while proc.poll() is None:
-            if codex_turn_completed(event_log_path):
+            if self._turn_completed(event_log_path):
                 try:
                     proc.wait(timeout=1.0)
                 except (OSError, subprocess.TimeoutExpired):
