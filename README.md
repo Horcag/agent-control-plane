@@ -22,7 +22,7 @@ cloud scheduler, or unattended merge service.
 flowchart LR
     C[Coordinator] --> CLI[agent-control CLI]
     CLI --> DB[(SQLite job state)]
-    CLI --> R[Runner: Codex or AGY]
+    CLI --> R[Runner: Codex, AGY, or Claude Code]
     R --> S[Isolated route slot]
     R --> A[Run artifacts]
     A --> I[Review inbox]
@@ -32,7 +32,8 @@ flowchart LR
 ## Requirements
 
 - Python 3.11 or newer and Git on `PATH`.
-- Codex CLI or Google Antigravity CLI (`agy`) only for the backend you choose.
+- Codex CLI, Google Antigravity CLI (`agy`), or the Claude Code CLI (`claude`) — only
+  for the backend you choose.
 - No agent CLI, IDEA, or network access is needed for the offline demo below.
 
 ## Install
@@ -150,10 +151,13 @@ groups logical tasks into a dependency graph so ready work can be dispatched and
 The review inbox is the handoff point for results and verification; delivery is not
 acceptance.
 
-The backend selects the runner (`codex` or `agy`). Workspace access is separate: `ide_mcp`
-uses the configured IDE integration, while `native` uses Codex-native shell and file tools
-in the assigned workspace. Set it globally, per route, or per job; the most specific
-setting wins. Native mode is Codex-only and does not provide IDEA diagnostics/refactors.
+The backend selects the runner (`codex`, `agy`, or `claude`; `claude-code` is a legacy
+alias for `claude`). Workspace access is separate: `ide_mcp` uses the configured IDE
+integration, while `native` uses native shell and file tools in the assigned workspace.
+Set it globally, per route, or per job; the most specific setting wins. `ide_mcp` is
+Codex/AGY-only and does not apply to Claude Code — the claude backend requires
+`workspace_access = "native"` and does not provide IDEA diagnostics/refactors. Claude
+Code jobs also do not draw from the global Codex quota broker.
 
 For operational procedures and failure handling, see [Operations](docs/operations.md) and
 the [Recovery matrix](docs/recovery-matrix.md). Quality gates run only when configured;

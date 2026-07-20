@@ -11,6 +11,8 @@ worktree_base = "../my-project"
 slot_root = "../agent-control-plane-slots"
 agy_command = "agy"
 codex_command = "codex"
+# Optional override for the Claude Code CLI executable. Defaults to "claude" on PATH.
+# claude_command = "claude"
 
 [control.defaults]
 timeout_sec = 3600
@@ -66,6 +68,16 @@ codex_spark_soft_limit_percent = 100
 codex_spark_models = ["gpt-5.3-codex-spark"]
 codex_quota_poll_sec = 30
 codex_sessions_root = "${USERPROFILE}/.codex/sessions"
+# Claude Code backend defaults. The claude backend requires
+# workspace_access = "native" (no ide_mcp/IDEA support) and does not draw from
+# the codex_global_quota_database broker above.
+claude_model = "default"
+claude_reasoning_effort = "medium"
+# One of: default, acceptEdits, plan, dontAsk.
+claude_permission_mode = "acceptEdits"
+claude_allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
+claude_sessions_root = "${USERPROFILE}/.claude/agent-control-plane/sessions"
+claude_max_turns = 0
 guardrail_poll_sec = 2
 prepare_slots = true
 auto_switch_agy_on_quota = false
@@ -157,11 +169,38 @@ candidates = [
 ]
 adaptive = { minimum_samples_per_candidate = 3, history_window = 20, quality_floor = 0.8, prior_quality = 0.75, prior_weight = 2.0, allow_missing_price = false }
 
+# Claude Code model catalog. Same shape as [[control.model_catalog.models]] above:
+# metadata overlays supplement the builtin catalog in
+# src/agent_control_plane/features/agent_runner/lib/claude_model_catalog.py
+# (claude-opus-4-8, claude-sonnet-5, claude-fable-5, claude-opus-4-7, claude-opus-4-6,
+# claude-sonnet-4-6, claude-haiku-4-5; efforts low/medium/high, plus xhigh/max where
+# supported). The rate below is an operator-supplied example, not an official or
+# guaranteed current rate; raw token counts remain authoritative when a rate card is
+# missing or changes.
+[[control.claude_model_catalog.models]]
+model = "claude-sonnet-5"
+api_usd_rate = { input = 3.0, cached_input = 0.3, output = 15.0 }
+rate_card_version = "2026-07-09"
+rate_card_source = "operator-supplied example rates; verify before use"
+
+# Inventory overrides adjust visibility, priority, and supported reasoning efforts
+# for a catalog entry without redefining its rate metadata.
+# [[control.claude_model_catalog.inventory]]
+# model = "claude-opus-4-8"
+# visible = true
+# priority = 0
+# default_reasoning_effort = "high"
+# supported_reasoning_efforts = ["low", "medium", "high", "xhigh", "max"]
+
 [routes.app]
 path = "../my-project"
 required_branch = "main"
 # Optional route override: "ide_mcp" or "native". A per-job override has priority.
+# The claude backend requires "native" (no ide_mcp/IDEA support).
 # workspace_access = "native"
+# Optional route-specific Claude Code model and reasoning effort.
+# claude_model = "claude-opus-4-8"
+# claude_reasoning_effort = "high"
 # Use a stable AgentBridge IDE/port ID from ~/.codex/config.toml.
 ide_mcp_server = "agentbridge_idea_8644"
 # Optional: MCP server name from Antigravity User/mcp.json. Configure an

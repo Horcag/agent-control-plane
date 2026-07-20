@@ -19,10 +19,13 @@ Within 0.1.x, maintainers should preserve documented CLI command names, options,
 keys, and accepted-value meanings. Additive changes are preferred. Invalid
 configuration must fail closed.
 
-The promise covers the codex and agy backends, subject to the installed external CLI.
-ide_mcp remains the legacy IDEA/AgentBridge access mode; native is Codex-only and uses
-native shell/search/edit tools. Agents stay inside the declared route and slot
-workspace. ACP does not promise arbitrary IDE modules or external workspace paths.
+The promise covers the codex, agy, and claude (Claude Code CLI; `claude-code` is a
+legacy alias) backends, subject to the installed external CLI. ide_mcp remains the
+legacy IDEA/AgentBridge access mode and does not apply to the claude backend; native
+uses native shell/search/edit tools. The claude backend is native-only: it requires
+`workspace_access = "native"` and does not use ide_mcp/IDEA diagnostics. Agents stay
+inside the declared route and slot workspace. ACP does not promise arbitrary IDE
+modules or external workspace paths.
 
 The alpha line does not promise a stable plugin API, database schema for direct
 third-party writes, log text format, internal Python imports, or automatic downgrades.
