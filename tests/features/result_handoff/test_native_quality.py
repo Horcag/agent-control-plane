@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
 from agent_control_plane.features.result_handoff import (
     NativeQualityGateRunner,
     inspect_native_quality_report,
+)
+from agent_control_plane.features.result_handoff.lib.native_quality import (
+    _resolve_gate_executable,
 )
 from agent_control_plane.shared.config import NativeQualityGateConfig
 from agent_control_plane.shared.native_quality import (
@@ -366,3 +370,81 @@ def test_controller_quality_inspection_rejects_boolean_parallelism(tmp_path: Pat
 
     assert inspection["state"] == "invalid"
     assert "parallelism" in (inspection["error"] or "")
+
+
+def test_resolve_gate_executable_absolutizes_relative_path_with_directory(
+    tmp_path: Path,
+) -> None:
+    tool_dir = tmp_path / ".venv" / "Scripts"
+    tool_dir.mkdir(parents=True)
+    executable = tool_dir / "python.exe"
+    executable.write_text("", encoding="utf-8")
+
+    resolved = _resolve_gate_executable(tmp_path, (".venv/Scripts/python.exe", "-c", "print('ok')"))
+
+    assert resolved[0] == str(executable.resolve(strict=False))
+    assert resolved[1:] == ("-c", "print('ok')")
+
+
+def test_resolve_gate_executable_leaves_bare_names_and_absolute_paths_unchanged(
+    tmp_path: Path,
+) -> None:
+    absolute = tmp_path / "tool.exe"
+    absolute.write_text("", encoding="utf-8")
+
+    assert _resolve_gate_executable(tmp_path, ("git", "status")) == ("git", "status")
+    assert _resolve_gate_executable(tmp_path, (str(absolute), "--flag")) == (
+        str(absolute),
+        "--flag",
+    )
+
+
+def test_resolve_gate_executable_leaves_missing_relative_path_unchanged(
+    tmp_path: Path,
+) -> None:
+    command = (".venv/Scripts/python.exe", "-c", "print('ok')")
+
+    assert _resolve_gate_executable(tmp_path, command) == command
+
+
+def test_controller_quality_runs_workspace_relative_executable_gate(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    tools_dir = workspace / "tools"
+    tools_dir.mkdir()
+    relative_python = "tools/py" + (".exe" if sys.platform == "win32" else "")
+    copied_python = workspace / relative_python
+    base_executable = Path(getattr(sys, "_base_executable", sys.executable))
+    shutil.copy2(base_executable, copied_python)
+    if sys.platform == "win32":
+        # The interpreter dynamically loads its runtime DLLs from its own
+        # directory, so those need to sit next to the copied executable too.
+        for dll in base_executable.parent.glob("*.dll"):
+            shutil.copy2(dll, tools_dir / dll.name)
+        # A venv-style pyvenv.cfg above the executable's directory lets it
+        # locate the real stdlib without copying the whole interpreter home.
+        (workspace / "pyvenv.cfg").write_text(
+            f"home = {base_executable.parent}\n", encoding="utf-8"
+        )
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(
+            NativeQualityGateConfig(
+                name="relative-python",
+                command=(relative_python, "-c", "print('ok')"),
+                working_dir=Path("."),
+                timeout_sec=10,
+            ),
+        ),
+    )
+
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "relative-exe",
+        checkpoint_tree_sha="tree-relative",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+
+    assert report["checks"][0]["outcome"] == "passed"
+    assert report["status"] == "passed"

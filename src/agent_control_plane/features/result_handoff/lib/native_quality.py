@@ -23,6 +23,29 @@ from agent_control_plane.shared.path_rules import is_same_or_child
 MAX_QUALITY_OUTPUT_CHARS = 8_000
 
 
+def _resolve_gate_executable(cwd: Path, command: tuple[str, ...]) -> tuple[str, ...]:
+    """Resolve a workspace-relative executable path against ``cwd``.
+
+    ``CreateProcess`` on some hosts refuses to resolve a relative path even
+    when the process cwd is correct, so gates that name their executable as a
+    workspace-relative path (e.g. ``.venv/Scripts/python.exe``) need it
+    resolved to an absolute path before ``subprocess.run``. Bare program
+    names (no directory separator) and already-absolute paths are left
+    untouched so PATH lookup keeps working.
+    """
+    if not command:
+        return command
+    executable = command[0]
+    if os.path.isabs(executable):
+        return command
+    if not (os.sep in executable or (os.altsep and os.altsep in executable)):
+        return command
+    candidate = cwd / executable
+    if not candidate.exists():
+        return command
+    return (str(candidate.resolve(strict=False)), *command[1:])
+
+
 class _BinaryOutput(Protocol):
     def flush(self) -> None: ...
 
@@ -133,9 +156,10 @@ class NativeQualityGateRunner:
                 command=command,
             )
         with tempfile.TemporaryFile() as output_file:
+            spawn_command = _resolve_gate_executable(cwd, command)
             try:
                 completed = subprocess.run(  # nosec B603
-                    list(command),
+                    list(spawn_command),
                     cwd=cwd,
                     stdout=output_file,
                     stderr=subprocess.STDOUT,
