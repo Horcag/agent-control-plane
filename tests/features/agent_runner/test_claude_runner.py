@@ -11,6 +11,7 @@ def _spec(
     claude_permission_mode: str = "acceptEdits",
     claude_allowed_tools: tuple[str, ...] = (),
     claude_max_turns: int = 0,
+    claude_bare: bool = True,
     codex_resume_thread_id: str | None = None,
     workspace_access: str = "native",
 ) -> AgentRunSpec:
@@ -39,6 +40,7 @@ def _spec(
         claude_permission_mode=claude_permission_mode,
         claude_allowed_tools=claude_allowed_tools,
         claude_max_turns=claude_max_turns,
+        claude_bare=claude_bare,
     )
 
 
@@ -101,3 +103,15 @@ def test_allowed_tools_and_max_turns_are_forwarded() -> None:
 def test_ide_mcp_access_does_not_expose_the_result_dir() -> None:
     command = _command(_spec(workspace_access="ide_mcp"))
     assert "--add-dir" not in command
+
+
+def test_bare_isolation_flags_are_on_by_default() -> None:
+    command = _command(_spec())
+    assert "--bare" in command
+    assert "--strict-mcp-config" in command
+
+
+def test_bare_isolation_can_be_disabled() -> None:
+    command = _command(_spec(claude_bare=False))
+    assert "--bare" not in command
+    assert "--strict-mcp-config" not in command

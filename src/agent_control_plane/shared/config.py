@@ -211,6 +211,7 @@ class ControlDefaults:
     )
     claude_sessions_root: Path | None = None
     claude_max_turns: int = 0
+    claude_bare: bool = True
     auto_switch_agy_on_quota: bool = False
     auto_switch_agy_strategy: str = "best"
     auto_switch_agy_electron_command: tuple[str, ...] = (
@@ -440,6 +441,7 @@ def load_config(
             defaults_raw.get("claude_max_turns", 0),
             "claude_max_turns",
         ),
+        claude_bare=bool(defaults_raw.get("claude_bare", True)),
         auto_switch_agy_on_quota=bool(defaults_raw.get("auto_switch_agy_on_quota", False)),
         auto_switch_agy_strategy=_string_value(
             defaults_raw.get("auto_switch_agy_strategy", "best")
