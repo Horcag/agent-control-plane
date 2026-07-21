@@ -794,6 +794,7 @@ import sys
 import time
 from pathlib import Path
 
+from agent_control_plane.entities.job import JobStore
 from agent_control_plane.entities.plan import PlanStore
 from agent_control_plane.features.plan_supervision import PlanDispatcher
 
@@ -808,6 +809,7 @@ def launch(_claim):
 
 PlanDispatcher(
     plan_store=PlanStore(database),
+    job_store=JobStore(database),
     coordination_root=coordination_root,
     launch=launch,
     process_is_alive=lambda _pid: False,
@@ -845,6 +847,7 @@ PlanDispatcher(
         assert terminated.state.value == "terminated"
         recovered = PlanDispatcher(
             plan_store=PlanStore(database),
+            job_store=JobStore(database),
             coordination_root=tmp_path / ".agent-work",
             launch=lambda _claim: pytest.fail("recovery must not relaunch an abandoned claim"),
             process_is_alive=process_is_alive,

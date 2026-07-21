@@ -717,8 +717,14 @@ class AgentControlPlane:
         task_id: str,
         *,
         brief_override: str | None = None,
+        retry_override_reason: str | None = None,
     ) -> dict[str, Any]:
-        return self.plan_service.retry_plan_task(plan_id, task_id, brief_override=brief_override)
+        return self.plan_service.retry_plan_task(
+            plan_id,
+            task_id,
+            brief_override=brief_override,
+            retry_override_reason=retry_override_reason,
+        )
 
     def cancel_plan(self, plan_id: str) -> dict[str, Any]:
         return self.plan_service.cancel_plan(plan_id)

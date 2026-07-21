@@ -14,11 +14,22 @@ from agent_control_plane.entities.plan import (
 )
 from agent_control_plane.entities.review_inbox import ReviewInboxStore
 from agent_control_plane.features.plan_supervision.lib.dispatcher import PlanDispatcher
+from agent_control_plane.features.plan_supervision.lib.retry_fingerprint import (
+    circuit_breaker_state,
+    fingerprint_from_job,
+    fingerprint_from_spec,
+    is_circuit_breaking_failure,
+    retry_fingerprint,
+)
 from agent_control_plane.features.plan_supervision.lib.supervisor import (
     PlanRunOptions,
     PlanSupervisor,
 )
 from agent_control_plane.shared.verification_report import inspect_verification_report
+
+
+class PlanRetryError(ValueError):
+    """A retry would re-run an attempt the circuit breaker has already refused."""
 
 
 class PlanService:
@@ -108,16 +119,64 @@ class PlanService:
     def dispatch_plan(self, plan_id: str, *, max_jobs: int = 1) -> dict[str, Any]:
         return PlanDispatcher(
             plan_store=self._plan_store,
+            job_store=self._job_store,
             coordination_root=self._coordination_root,
             launch=self._launch,
             process_is_alive=self._process_is_alive,
         ).dispatch(plan_id, max_jobs=max_jobs)
 
     def retry_plan_task(
-        self, plan_id: str, task_id: str, *, brief_override: str | None = None
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        brief_override: str | None = None,
+        retry_override_reason: str | None = None,
     ) -> dict[str, Any]:
-        retried = self._plan_store.retry_task(plan_id, task_id, brief_override=brief_override)
+        task = self._plan_store.get_task(plan_id, task_id)
+        execution = task["execution"]
+        if execution is None:
+            raise ValueError(f"Plan task has no execution specification: {plan_id}/{task_id}")
+        would_be_fingerprint = fingerprint_from_spec(execution, brief_override=brief_override)
+        needs_revision, escalated_fingerprint = circuit_breaker_state(
+            self._plan_store, self._job_store, plan_id, task_id
+        )
+        if needs_revision and would_be_fingerprint == escalated_fingerprint:
+            raise PlanRetryError(
+                f"Plan task {plan_id}/{task_id} needs a strategy revision after repeated "
+                "identical failures: change brief/scope/budget to retry"
+            )
+        if not needs_revision:
+            current_job = self._current_attempt_job(task["job_id"])
+            has_override = bool(retry_override_reason and retry_override_reason.strip())
+            if (
+                current_job is not None
+                and is_circuit_breaking_failure(
+                    runner_failure=current_job.runner_failure, status=current_job.status
+                )
+                and would_be_fingerprint == fingerprint_from_job(current_job)
+                and not has_override
+            ):
+                kind = current_job.runner_failure or current_job.status
+                raise PlanRetryError(
+                    f"identical retry after {kind}: change brief/scope/budget or set "
+                    "retry_override_reason"
+                )
+        retried = self._plan_store.retry_task(
+            plan_id,
+            task_id,
+            brief_override=brief_override,
+            retry_override_reason=retry_override_reason,
+        )
         return {"task": retried, "snapshot": self._plan_store.snapshot(plan_id)}
+
+    def _current_attempt_job(self, job_id: str | None) -> JobRecord | None:
+        if not job_id:
+            return None
+        try:
+            return self._job_store.get_job(job_id)
+        except KeyError:
+            return None
 
     def cancel_plan(self, plan_id: str) -> dict[str, Any]:
         cancellation = self._plan_store.request_cancel(plan_id)
@@ -149,12 +208,29 @@ class PlanService:
         event_limit: int = 100,
         item_limit: int = 20,
     ) -> dict[str, Any]:
-        return self._plan_store.snapshot(
+        snapshot = self._plan_store.snapshot(
             plan_id,
             since=since,
             event_limit=event_limit,
             item_limit=item_limit,
         )
+        self._annotate_circuit_breaker(plan_id, snapshot["requires_root_decision"])
+        return snapshot
+
+    def _annotate_circuit_breaker(self, plan_id: str, tasks: list[dict[str, Any]]) -> None:
+        for task in tasks:
+            execution = task.get("execution")
+            if not execution:
+                continue
+            needs_revision, escalated_fingerprint = circuit_breaker_state(
+                self._plan_store, self._job_store, plan_id, task["task_id"]
+            )
+            task["needs_strategy_revision"] = needs_revision
+            task["retry_fingerprint"] = escalated_fingerprint or retry_fingerprint(
+                brief_sha256=execution["brief_sha256"],
+                effective_scope_sha256=execution["effective_scope_sha256"],
+                tool_call_budget=execution["codex_tool_call_budget"],
+            )
 
     def watch_plan(
         self,

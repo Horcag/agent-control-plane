@@ -146,6 +146,10 @@ def add_plan_parser(
     plan_retry.add_argument("plan_id")
     plan_retry.add_argument("task_id")
     plan_retry.add_argument("--brief-file")
+    plan_retry.add_argument(
+        "--retry-override-reason",
+        help="Escape hatch for one identical retry after a circuit-breaking failure",
+    )
 
     plan_cancel = plan_subparsers.add_parser(
         "cancel",

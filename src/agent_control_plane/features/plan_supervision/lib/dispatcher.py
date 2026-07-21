@@ -5,7 +5,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent_control_plane.entities.job import JobStore
 from agent_control_plane.entities.plan import PlanDispatchClaim, PlanStore
+from agent_control_plane.features.plan_supervision.lib.retry_fingerprint import (
+    circuit_breaker_state,
+    fingerprint_from_spec,
+)
 
 
 class DispatchedPlanJob(Protocol):
@@ -23,11 +28,13 @@ class PlanDispatcher:
         self,
         *,
         plan_store: PlanStore,
+        job_store: JobStore,
         coordination_root: Path,
         launch: Callable[[PlanDispatchClaim], DispatchedPlanJob],
         process_is_alive: Callable[[int], bool],
     ) -> None:
         self.plan_store = plan_store
+        self.job_store = job_store
         self.coordination_root = coordination_root
         self.launch = launch
         self.process_is_alive = process_is_alive
@@ -47,6 +54,29 @@ class PlanDispatcher:
         dispatched: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         for claim in claims:
+            needs_revision, escalated_fingerprint = circuit_breaker_state(
+                self.plan_store, self.job_store, plan_id, claim.task_id
+            )
+            if needs_revision and fingerprint_from_spec(claim.execution) == escalated_fingerprint:
+                message = (
+                    f"Plan task {plan_id}/{claim.task_id} needs a strategy revision after "
+                    "repeated identical failures; auto-dispatch is blocked"
+                )
+                self.plan_store.mark_dispatch_failed(
+                    plan_id,
+                    claim.task_id,
+                    dispatch_token=claim.dispatch_token,
+                    error=message,
+                )
+                failures.append(
+                    {
+                        "task_id": claim.task_id,
+                        "dispatch_task_id": claim.dispatch_task_id,
+                        "attempt_no": claim.attempt_no,
+                        "error": message,
+                    }
+                )
+                continue
             try:
                 self._materialize_brief(claim.dispatch_task_id, claim.execution.brief)
                 job = self.launch(claim)

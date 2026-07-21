@@ -525,6 +525,7 @@ def build_server(config_path: str | None = None) -> Any:
         plan_id: str,
         task_id: str,
         brief_override: str | None = None,
+        retry_override_reason: str | None = None,
     ) -> dict[str, Any]:
         """Explicitly make a failed task eligible for a new dispatch attempt."""
         try:
@@ -532,6 +533,7 @@ def build_server(config_path: str | None = None) -> Any:
                 plan_id,
                 task_id,
                 brief_override=brief_override,
+                retry_override_reason=retry_override_reason,
             )
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

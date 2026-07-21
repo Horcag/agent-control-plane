@@ -792,6 +792,7 @@ class PlanStore:
         task_id: str,
         *,
         brief_override: str | None = None,
+        retry_override_reason: str | None = None,
     ) -> dict[str, Any]:
         """Explicitly clear a failed/rejected attempt so it may be dispatched again."""
         self.initialize()
@@ -808,10 +809,14 @@ class PlanStore:
             execution = _execution_from_json(task["execution_json"])
             if execution is None:
                 raise ValueError(f"Plan task has no execution specification: {plan_id}/{task_id}")
-            if brief_override is not None:
+            if brief_override is not None or retry_override_reason is not None:
                 execution = PlanExecutionSpec(
                     route=execution.route,
-                    brief=_required("brief_override", brief_override),
+                    brief=(
+                        _required("brief_override", brief_override)
+                        if brief_override is not None
+                        else execution.brief
+                    ),
                     slot=execution.slot,
                     backend=execution.backend,
                     workspace_access=execution.workspace_access,
@@ -827,7 +832,11 @@ class PlanStore:
                     expected_base_sha=execution.expected_base_sha,
                     effective_scope=execution.effective_scope,
                     codex_tool_call_budget=execution.codex_tool_call_budget,
-                    retry_override_reason=execution.retry_override_reason,
+                    retry_override_reason=(
+                        retry_override_reason
+                        if retry_override_reason is not None
+                        else execution.retry_override_reason
+                    ),
                 )
             now = utc_now()
             db.execute(
@@ -858,6 +867,40 @@ class PlanStore:
                 "attempt_no": int(updated["attempt_no"]),
                 "execution": _execution_summary(execution),
             }
+
+    def get_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
+        """Return the raw task row plus its parsed execution spec (plan-only, no job join)."""
+        self.initialize()
+        with self._connect() as db:
+            row = self._require_task(db, plan_id, task_id)
+            return {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "state": row["state"],
+                "job_id": row["job_id"],
+                "attempt_no": int(row["attempt_no"]),
+                "execution": _execution_from_json(row["execution_json"]),
+            }
+
+    def job_ids_for_task(self, plan_id: str, task_id: str) -> list[str]:
+        """Chronological job ids ever bound to a task, from the durable plan event log."""
+        self.initialize()
+        with self._connect() as db:
+            self._require_task(db, plan_id, task_id)
+            rows = db.execute(
+                """
+                select payload_json from plan_events
+                where plan_id = ? and task_id = ? and event_type in ('job_bound', 'job_dispatched')
+                order by id
+                """,
+                (plan_id, task_id),
+            ).fetchall()
+        job_ids: list[str] = []
+        for row in rows:
+            job_id = json.loads(row["payload_json"]).get("job_id")
+            if isinstance(job_id, str) and job_id:
+                job_ids.append(job_id)
+        return job_ids
 
     def accept_task(self, plan_id: str, task_id: str, *, accepted_sha: str | None = None) -> None:
         self._record_decision(plan_id, task_id, "accepted", accepted_sha=accepted_sha)
