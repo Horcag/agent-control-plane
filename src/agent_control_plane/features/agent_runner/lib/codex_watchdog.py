@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
+from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec, BudgetLifecycleEvent
 from agent_control_plane.shared.git_tools import GitError, workspace_state
+from agent_control_plane.shared.path_rules import is_known_temporary_patch_artifact
 
 CODEX_TOOL_TIMEOUT_LIMIT = 2
+CODEX_INEFFICIENT_TOOL_USAGE_LIMIT = 16
 CODEX_TOOL_TIMEOUT_MARKER = "Exit code: 124"
 CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "web_search": "\nweb search:",
@@ -32,6 +35,43 @@ CODEX_TERMINAL_TOOLS = frozenset(
         "close_terminal",
     }
 )
+CODEX_DISCOVERY_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_text",
+        "search_symbols",
+        "list_project_files",
+        "list_directory_tree",
+        "get_problems",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ToolBudgetPolicy:
+    hard_limit: int
+    reserved_calls: int
+    discretionary_calls: int
+    warning_threshold: int
+    handoff_threshold: int
+
+
+@dataclass(frozen=True)
+class BudgetLifecycleScan:
+    scan_size: int
+    tool_call_count: int
+    events: tuple[BudgetLifecycleEvent, ...]
+    violation: str | None
+
+
+def tool_budget_policy(tool_call_budget: int) -> ToolBudgetPolicy | None:
+    if tool_call_budget <= 0:
+        return None
+    reserved = min(16, max(0, tool_call_budget - 1))
+    discretionary = max(1, tool_call_budget - reserved)
+    warning = _ceil_fraction(discretionary, 80)
+    handoff = max(warning, _ceil_fraction(discretionary, 90))
+    return ToolBudgetPolicy(tool_call_budget, reserved, discretionary, warning, handoff)
 
 
 def refresh_log_activity(
@@ -143,11 +183,88 @@ def scan_codex_tool_constraints(
     return None, next_scan_size, tool_call_count
 
 
+def scan_budget_lifecycle(
+    event_log_path: Path,
+    scan_size: int,
+    tool_call_count: int,
+    *,
+    policy: ToolBudgetPolicy | None,
+    warning_emitted: bool,
+    handoff_emitted: bool,
+) -> BudgetLifecycleScan:
+    """Emit phase transitions once and reject clearly-discovery work after handoff."""
+    text, next_scan_size = _read_new_log_text(event_log_path, scan_size)
+    events: list[BudgetLifecycleEvent] = []
+    for line in text.splitlines():
+        item = _started_tool_item(line)
+        if item is None:
+            continue
+        tool_call_count += 1
+        if policy is None:
+            continue
+        already_in_handoff = handoff_emitted
+        if not warning_emitted and tool_call_count >= policy.warning_threshold:
+            warning_emitted = True
+            events.append(
+                BudgetLifecycleEvent(
+                    "budget_warning",
+                    tool_call_count,
+                    f"Tool budget warning at call {tool_call_count}; reserve {policy.reserved_calls} calls",
+                )
+            )
+        if not handoff_emitted and tool_call_count >= policy.handoff_threshold:
+            handoff_emitted = True
+            events.append(
+                BudgetLifecycleEvent(
+                    "budget_handoff",
+                    tool_call_count,
+                    f"Tool budget handoff at call {tool_call_count}; finalize with reserve",
+                )
+            )
+        if already_in_handoff and _is_discovery_item(item):
+            return BudgetLifecycleScan(
+                next_scan_size,
+                tool_call_count,
+                tuple(events),
+                f"Codex started new discovery after budget handoff at call {tool_call_count}",
+            )
+    return BudgetLifecycleScan(next_scan_size, tool_call_count, tuple(events), None)
+
+
+def _started_tool_item(line: str) -> dict[str, Any] | None:
+    event = _json_object(line)
+    if event is None or event.get("type") != "item.started":
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict):
+        return None
+    if item.get("type") not in {"mcp_tool_call", "command_execution", "file_change"}:
+        return None
+    return item
+
+
+def _is_discovery_item(item: dict[str, Any]) -> bool:
+    tool = str(item.get("tool") or "")
+    if tool in CODEX_DISCOVERY_TOOLS:
+        return True
+    arguments = item.get("arguments")
+    command = arguments.get("command") if isinstance(arguments, dict) else None
+    if not isinstance(command, str):
+        return False
+    normalized = command.lstrip().lower()
+    return normalized.startswith(("rg ", "rg.exe ", "get-content "))
+
+
+def _ceil_fraction(value: int, percentage: int) -> int:
+    return (value * percentage + 99) // 100
+
+
 def progress_signature(spec: AgentRunSpec) -> tuple[tuple[str, ...] | None, bool]:
     """Return durable progress markers and whether target workspace is dirty."""
     progress_path = spec.result_path.parent / "agent-progress.md"
     markers: list[str] = []
-    for path in (progress_path, spec.result_path):
+    verification_path = spec.result_path.with_name("verification.json")
+    for path in (progress_path, spec.result_path, verification_path):
         try:
             stat = path.stat()
         except OSError:
@@ -159,7 +276,6 @@ def progress_signature(spec: AgentRunSpec) -> tuple[tuple[str, ...] | None, bool
         state = workspace_state(spec.workspace_path)
         workspace_dirty = state.dirty
         if state.porcelain.strip():
-            markers.append(f"git-status:{state.porcelain}")
             markers.extend(dirty_file_markers_from_porcelain(spec.workspace_path, state.porcelain))
     except GitError as exc:
         markers.append(f"git-error:{type(exc).__name__}:{exc}")
@@ -172,15 +288,27 @@ def dirty_file_markers_from_porcelain(workspace_path: Path, porcelain: str) -> l
     markers: list[str] = []
     for line in porcelain.splitlines():
         path_text = porcelain_changed_path(line)
-        if not path_text:
+        if not path_text or is_known_temporary_patch_artifact(path_text):
             continue
         path = workspace_path / path_text
         try:
             stat = path.stat()
         except OSError:
+            markers.append(f"dirty-file:{path_text}:missing")
             continue
         markers.append(f"dirty-file:{path_text}:{stat.st_mtime_ns}:{stat.st_size}")
     return markers
+
+
+def updated_calls_without_durable_progress(
+    previous_signature: tuple[str, ...] | None,
+    current_signature: tuple[str, ...] | None,
+    consecutive_calls: int,
+    new_calls: int,
+) -> int:
+    if current_signature != previous_signature:
+        return 0
+    return consecutive_calls + new_calls
 
 
 def porcelain_changed_path(line: str) -> str | None:

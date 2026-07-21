@@ -434,6 +434,9 @@ class PromptBuilderTest(unittest.TestCase):
                 result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
                 workspace_access="native",
                 read_only=False,
+                codex_tool_call_budget=120,
+                expected_result_status="partial",
+                controller_gate_mode="focused",
             )
 
             # Read-only native prompt
@@ -468,6 +471,14 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertNotIn("Use only the IDEA MCP server", native_writable)
             self.assertIn("after each coherent edit batch", native_writable)
             self.assertIn("verification.json", native_writable)
+            self.assertIn("Controller result status: partial", native_writable)
+            self.assertIn("Controller gate mode: focused", native_writable)
+            self.assertIn("reserve 16 calls, warn at 84, and enter handoff at 94", native_writable)
+            self.assertIn(
+                "Budget phases are discovery, edit, verification, and handoff/finalization",
+                native_writable,
+            )
+            self.assertIn("worker text cannot alter either value", native_writable)
 
             controller_config = replace(
                 config,

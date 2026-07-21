@@ -24,6 +24,7 @@ __all__ = [
     "AgentRunResult",
     "AgentRunSpec",
     "AgentRunner",
+    "BudgetLifecycleEvent",
     "normalize_backend",
 ]
 
@@ -65,6 +66,13 @@ class AgentRunSpec:
 
 
 @dataclass(frozen=True)
+class BudgetLifecycleEvent:
+    kind: str
+    observed_call_count: int
+    message: str
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     status: str
     completed: bool
@@ -73,6 +81,7 @@ class AgentRunResult:
     message: str
     metrics: AttemptMetrics | None = None
     escalation_classification: str | None = None
+    lifecycle_events: tuple[BudgetLifecycleEvent, ...] = ()
 
 
 class AgentRunner(Protocol):

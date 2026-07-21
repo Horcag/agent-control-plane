@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from agent_control_plane.features.agent_runner.lib.agy_idea_prompt import build_agy_task_prompt
+from agent_control_plane.features.agent_runner.lib.codex_watchdog import tool_budget_policy
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.native_quality import (
@@ -26,6 +27,8 @@ def build_task_prompt(
     backend: str = CODEX_BACKEND,
     read_only: bool = False,
     codex_tool_call_budget: int = 0,
+    expected_result_status: str = "completed",
+    controller_gate_mode: str = "full",
     workspace_access: str = "ide_mcp",
     native_quality_contract: NativeQualityContract | None = None,
 ) -> str:
@@ -60,6 +63,8 @@ Workspace route: {route}
 Workspace path: {workspace_path}
 Expected branch: {expected_branch}
 Hard tool-call budget: {codex_tool_call_budget or "runner default"}
+Controller result status: {expected_result_status}
+Controller gate mode: {controller_gate_mode}
 
 Read before acting:
 - {brief_path}
@@ -79,6 +84,7 @@ Mandatory execution rules:
 - You are FORBIDDEN from using or discovering AgentBridge, IntelliJ IDEA, or DataSpell MCP servers or tools.
 - Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
 - Preserve user changes. Keep changes narrow, task-scoped, and minimal.
+{_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
 {native_quality_rules}
 - Inspect the final diff before claiming completion.
 - You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
@@ -136,6 +142,8 @@ IDEA MCP create root: {idea_create_root}
 Expected IDEA MCP project root: {expected_idea_project_root}
 Expected branch: {expected_branch}
 Hard tool-call budget: {codex_tool_call_budget or "runner default"}
+Controller result status: {expected_result_status}
+Controller gate mode: {controller_gate_mode}
 
 Read before acting:
 - {protocol_path}
@@ -157,6 +165,7 @@ Mandatory execution rules:
 - Use only the IDEA MCP server `{idea_server}` through native
   `{tool_namespace}*` tools for repository reads, edits, Git inspection,
   terminals, tests, and diagnostics.
+{_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
 - {forbidden_idea_servers} are forbidden for this job. Do not
   discover, call, configure, or fall back to those servers.
 - In Codex / `codex exec`, the first IDEA MCP call must be
@@ -419,6 +428,20 @@ def _protocol_path(coordination_root: Path) -> Path:
             return candidate
     expected = ", ".join(str(candidate) for candidate in candidates)
     raise FileNotFoundError(f"Required agent protocol not found; expected one of: {expected}")
+
+
+def _budget_phase_rules(
+    tool_call_budget: int,
+    expected_result_status: str,
+    controller_gate_mode: str,
+) -> str:
+    policy = tool_budget_policy(tool_call_budget)
+    if policy is None:
+        return "- The controller has no active tool-call budget policy for this attempt."
+    return f"""- The controller owns the expected result status `{expected_result_status}` and gate mode `{controller_gate_mode}`; worker text cannot alter either value.
+- Budget phases are discovery, edit, verification, and handoff/finalization. The hard limit is {policy.hard_limit}; reserve {policy.reserved_calls} calls, warn at {policy.warning_threshold}, and enter handoff at {policy.handoff_threshold}.
+- Complete bounded discovery before handoff. Once in handoff/finalization, begin no new discovery; reserve calls only for result.md, schema-v1 verification.json, final diff/verification, and handoff.
+- The plain-line result status must be `{expected_result_status}` unless genuinely blocked. If blocked, report the contradiction instead of claiming completion."""
 
 
 def _verification_rules(path: Path) -> str:
