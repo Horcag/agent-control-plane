@@ -12,7 +12,7 @@ from typing import Any
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
-REVIEW_DECISIONS = frozenset({"accepted", "rejected"})
+REVIEW_DECISIONS = frozenset({"accepted", "rejected", "continuation_verified"})
 REVIEW_STATUSES = frozenset({"pending", *REVIEW_DECISIONS})
 
 
@@ -423,7 +423,8 @@ class ReviewInboxStore:
         now = utc_now()
         existing = db.execute(
             """
-            select i.verification_bundle_json, p.verification_state
+            select i.verification_bundle_json, i.checkpoint_sha, i.checkpoint_error,
+                i.delivery_status, i.slot_released, p.verification_state
             from review_inbox_items i
             left join review_inbox_payloads p on p.item_id = i.item_id
             where i.item_id = ?
@@ -439,6 +440,10 @@ class ReviewInboxStore:
                 raise ValueError(
                     "Review item cannot be accepted until verification is valid and review-ready"
                 )
+        if decision == "continuation_verified" and not _is_continuation_checkpoint(existing):
+            raise ValueError(
+                "Review item cannot verify continuation without valid verification and checkpoint"
+            )
         cursor = db.execute(
             """
             update review_inbox_items
@@ -543,6 +548,27 @@ def _json_object(value: str | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         raise ValueError("verification_bundle_json must contain a JSON object")
     return payload
+
+
+def _is_continuation_checkpoint(item: sqlite3.Row) -> bool:
+    try:
+        bundle = _json_object(item["verification_bundle_json"])
+    except (TypeError, ValueError):
+        return False
+    artifact = bundle.get("artifact") if bundle is not None else None
+    return (
+        item["verification_state"] == "valid"
+        and isinstance(item["checkpoint_sha"], str)
+        and bool(item["checkpoint_sha"].strip())
+        and item["checkpoint_error"] is None
+        and item["delivery_status"] in {"checkpointed", "salvage_checkpointed"}
+        and bool(item["slot_released"])
+        and isinstance(artifact, dict)
+        and artifact.get("checkpoint_verified") is True
+        and artifact.get("disposition") == "normal"
+        and artifact.get("error") is None
+        and artifact.get("matched_paths") == []
+    )
 
 
 def _verification_payload(bundle: dict[str, Any] | None) -> dict[str, Any]:

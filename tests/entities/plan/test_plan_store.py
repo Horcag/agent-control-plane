@@ -270,6 +270,49 @@ def test_active_root_verified_outcome_does_not_unlock_dependants() -> None:
         assert snapshot["running"][0]["task_id"] == "schema"
 
 
+def test_continuation_verified_keeps_dependents_locked_and_is_retryable() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        plans = _plan_store(root)
+        jobs = JobStore(root / "jobs.sqlite3")
+        jobs.initialize()
+        reviews = ReviewMetricsStore(root / "jobs.sqlite3")
+        plans.create_plan(
+            plan_id="transfer",
+            title="Transfer",
+            tasks=(
+                PlanTaskDefinition(
+                    "schema",
+                    "Schema",
+                    execution=PlanExecutionSpec(route="dev", brief="Retry the schema task"),
+                ),
+                PlanTaskDefinition("api", "API", depends_on=("schema",)),
+            ),
+        )
+        _create_job(jobs, root, job_id="schema-job", task_id="schema-run")
+        plans.bind_job("transfer", "schema", "schema-job")
+        jobs.mark_finished("schema-job", "completed")
+        jobs.mark_finalization_completed("schema-job")
+        span_id = reviews.start_span(
+            name="Continuation", session_path=root / "rollout.jsonl", usage=TokenUsage(0, 0, 0, 0)
+        )
+        reviews.attach_job(
+            span_id,
+            job_id="schema-job",
+            outcome="continuation_verified",
+            root_verified=True,
+            checkpoint_sha="checkpoint",
+        )
+
+        snapshot = plans.snapshot("transfer")
+
+        assert snapshot["status"] == "active"
+        assert snapshot["requires_root_decision"][0]["task_id"] == "schema"
+        assert snapshot["requires_root_decision"][0]["state"] == "partial"
+        assert snapshot["ready_next"] == []
+        assert plans.retry_task("transfer", "schema")["state"] == "ready"
+
+
 def test_snapshot_exposes_completed_task_identity_and_truncation() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -333,6 +376,10 @@ def test_executable_task_spec_round_trips_without_returning_full_brief() -> None
                         backend="codex",
                         workspace_access="native",
                         codex_quality_tier="mechanical",
+                        expected_base_sha="A" * 40,
+                        effective_scope=(" tests/api.py ", "src/api.py", "src/api.py"),
+                        codex_tool_call_budget=47,
+                        retry_override_reason=" approved retry ",
                     ),
                 ),
             ),
@@ -352,6 +399,13 @@ def test_executable_task_spec_round_trips_without_returning_full_brief() -> None
             "codex_reasoning_effort": None,
             "claude_model": None,
             "claude_reasoning_effort": None,
+            "expected_result_status": "completed",
+            "controller_gate_mode": "full",
+            "expected_base_sha": "a" * 40,
+            "effective_scope": ["src/api.py", "tests/api.py"],
+            "effective_scope_sha256": "1ccf7bddcd58584eb1450b2315be9f3a9f5765f526bf975abff4ed8a43891831",
+            "codex_tool_call_budget": 47,
+            "retry_override_reason": "approved retry",
             "brief_sha256": "2d3f668e501d9979fac44adb78c7cf3b970a83cba93a0d62d0a769caf31b884d",
             "brief_chars": 27,
         }
@@ -415,6 +469,12 @@ def test_legacy_execution_json_without_plan_contract_fields_loads_as_none(tmp_pa
     task = plans.snapshot("legacy")["ready_next"][0]
     assert task["execution"]["codex_model"] is None
     assert task["execution"]["codex_reasoning_effort"] is None
+    assert task["execution"]["expected_result_status"] == "completed"
+    assert task["execution"]["controller_gate_mode"] == "full"
+    assert task["execution"]["expected_base_sha"] is None
+    assert task["execution"]["effective_scope"] == []
+    assert task["execution"]["codex_tool_call_budget"] is None
+    assert task["execution"]["retry_override_reason"] is None
 
 
 def test_ready_task_claim_is_atomic_across_two_plan_store_instances(tmp_path: Path) -> None:
@@ -542,6 +602,12 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
                     brief="First attempt",
                     codex_model="retry-model",
                     codex_reasoning_effort="max",
+                    expected_result_status="partial",
+                    controller_gate_mode="focused",
+                    expected_base_sha="B" * 40,
+                    effective_scope=("tests/retry.py", "src/retry.py"),
+                    codex_tool_call_budget=31,
+                    retry_override_reason="transient infrastructure failure",
                 ),
             ),
         ),
@@ -560,6 +626,43 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
     assert claims[0].execution.brief == "Second attempt"
     assert claims[0].execution.codex_model == "retry-model"
     assert claims[0].execution.codex_reasoning_effort == "max"
+    assert claims[0].execution.expected_result_status == "partial"
+    assert claims[0].execution.controller_gate_mode == "focused"
+    assert claims[0].execution.expected_base_sha == "b" * 40
+    assert claims[0].execution.effective_scope == ("src/retry.py", "tests/retry.py")
+    assert claims[0].execution.codex_tool_call_budget == 31
+    assert claims[0].execution.retry_override_reason == "transient infrastructure failure"
+
+
+@pytest.mark.parametrize("terminal_status", ("contract_mismatch", "inefficient_tool_usage"))
+def test_terminal_failure_is_retryable_and_does_not_unlock_dependents(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="contract",
+        title="Contract",
+        tasks=(
+            PlanTaskDefinition(
+                "first", "First", execution=PlanExecutionSpec(route="dev", brief="Do it")
+            ),
+            PlanTaskDefinition("next", "Next", depends_on=("first",)),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="mismatch-job", task_id="first-run")
+    plans.bind_job("contract", "first", "mismatch-job")
+    jobs.mark_finished("mismatch-job", terminal_status)
+    jobs.mark_finalization_completed("mismatch-job")
+
+    snapshot = plans.snapshot("contract")
+
+    assert snapshot["blocked"][0]["state"] == terminal_status
+    assert snapshot["ready_next"] == []
+    assert plans.retry_task("contract", "first")["state"] == "ready"
 
 
 def test_dispatch_claim_token_is_required_to_bind_created_job(tmp_path: Path) -> None:
@@ -784,6 +887,7 @@ def test_plan_store_initialization_preserves_legacy_v4_and_registers_v5(tmp_path
 
     assert migration_checksums[4] == "plan-slot-allocation-v4-20260716"
     assert migration_checksums[5] == "plan-execution-contract-v5-20260717"
+    assert migration_checksums[6] == "plan-controller-contract-v6-20260719"
 
 
 def _plan_store(root: Path) -> PlanStore:

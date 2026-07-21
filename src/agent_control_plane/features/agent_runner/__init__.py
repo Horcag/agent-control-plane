@@ -46,7 +46,9 @@ from agent_control_plane.features.agent_runner.lib.quota_broker import (
     codex_quota_domain,
 )
 from agent_control_plane.features.agent_runner.lib.result_detector import (
+    ResultContractAssessment,
     ResultState,
+    assess_result_contract,
     inspect_result,
     parse_escalation_classification,
 )
@@ -101,6 +103,7 @@ __all__ = [
     "PtyAgyRunner",
     "QuotaDecision",
     "QuotaDomain",
+    "ResultContractAssessment",
     "ResultState",
     "RoutingDecision",
     "RoutingHistoryRecord",
@@ -109,6 +112,7 @@ __all__ = [
     "WorkerLeaseError",
     "WorkerLeaseProbe",
     "WorkerLeaseState",
+    "assess_result_contract",
     "build_claude_model_catalog",
     "build_task_prompt",
     "capture_process_identity",

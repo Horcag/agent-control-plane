@@ -15,3 +15,11 @@ def is_child(path: Path, parent: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def is_known_temporary_patch_artifact(path_text: str) -> bool:
+    """Return whether a path names a proven throwaway patch artifact."""
+    name = Path(path_text).name.lower()
+    return name.endswith((".rej", ".orig")) or (
+        name.endswith(".patch") and name.startswith(("tmp_", "single_"))
+    )

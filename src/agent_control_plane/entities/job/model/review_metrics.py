@@ -18,7 +18,13 @@ REVIEW_PHASES = (
     "repair",
     "integration",
 )
-REVIEW_OUTCOMES = ("accepted", "rejected", "infra_failed", "false_positive")
+REVIEW_OUTCOMES = (
+    "accepted",
+    "rejected",
+    "infra_failed",
+    "false_positive",
+    "continuation_verified",
+)
 
 
 class ReviewMetricsStore:
@@ -35,6 +41,19 @@ class ReviewMetricsStore:
             checksum="review-metrics-store-v1-20260715",
             migrate=self._migrate_schema,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="review_metrics_store",
+            version=2,
+            checksum="review-metrics-store-checkpoint-sha-v2-20260719",
+            migrate=self._migrate_checkpoint_sha,
+        )
+
+    @staticmethod
+    def _migrate_checkpoint_sha(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(review_job_outcomes)")}
+        if "checkpoint_sha" not in columns:
+            db.execute("alter table review_job_outcomes add column checkpoint_sha text")
 
     @staticmethod
     def _migrate_schema(db: sqlite3.Connection) -> None:
@@ -175,6 +194,7 @@ class ReviewMetricsStore:
         outcome: str,
         attempt_no: int | None = None,
         root_verified: bool = False,
+        checkpoint_sha: str | None = None,
         accepted_sha: str | None = None,
         defects_found: int = 0,
         false_positives: int = 0,
@@ -193,6 +213,7 @@ class ReviewMetricsStore:
                 outcome=outcome,
                 attempt_no=attempt_no,
                 root_verified=root_verified,
+                checkpoint_sha=checkpoint_sha,
                 accepted_sha=accepted_sha,
                 defects_found=defects_found,
                 false_positives=false_positives,
@@ -208,6 +229,7 @@ class ReviewMetricsStore:
         outcome: str,
         attempt_no: int | None = None,
         root_verified: bool = False,
+        checkpoint_sha: str | None = None,
         accepted_sha: str | None = None,
         defects_found: int = 0,
         false_positives: int = 0,
@@ -216,6 +238,17 @@ class ReviewMetricsStore:
         _validate_choice("outcome", outcome, REVIEW_OUTCOMES)
         if defects_found < 0 or false_positives < 0:
             raise ValueError("Review counters must be non-negative")
+        if outcome == "continuation_verified":
+            if (
+                not root_verified
+                or not isinstance(checkpoint_sha, str)
+                or not checkpoint_sha.strip()
+            ):
+                raise ValueError(
+                    "Continuation verification requires a root-verified checkpoint SHA"
+                )
+            if accepted_sha is not None:
+                raise ValueError("Continuation verification cannot set accepted_sha")
         if (
             db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone()
             is None
@@ -236,12 +269,13 @@ class ReviewMetricsStore:
             """
             insert into review_job_outcomes (
                 span_id, job_id, attempt_no, outcome, root_verified,
-                accepted_sha, defects_found, false_positives, notes, recorded_at
-            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                checkpoint_sha, accepted_sha, defects_found, false_positives, notes, recorded_at
+            ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(span_id, job_id) do update set
                 attempt_no = excluded.attempt_no,
                 outcome = excluded.outcome,
                 root_verified = excluded.root_verified,
+                checkpoint_sha = excluded.checkpoint_sha,
                 accepted_sha = excluded.accepted_sha,
                 defects_found = excluded.defects_found,
                 false_positives = excluded.false_positives,
@@ -254,6 +288,7 @@ class ReviewMetricsStore:
                 attempt_no,
                 outcome,
                 int(root_verified),
+                checkpoint_sha,
                 accepted_sha,
                 defects_found,
                 false_positives,

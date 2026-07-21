@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
@@ -49,6 +50,12 @@ JOB_COLUMNS = {
     "finalized_at",
 }
 
+WORKSPACE_DISPOSITIONS = frozenset({"unknown", "clean", "dirty_after_failure", "dirty_after_job"})
+CHECKPOINT_DISPOSITIONS = frozenset(
+    ["none", "salvage", "contaminated", "continuation_verified", "final_accepted"]
+)
+ROOT_ACCEPTANCES = frozenset({"pending", "accepted", "rejected", "infra_failed", "false_positive"})
+
 
 @dataclass(frozen=True)
 class JobRecord:
@@ -57,6 +64,8 @@ class JobRecord:
     route: str
     workspace_path: Path
     expected_branch: str
+    expected_result_status: str
+    controller_gate_mode: str
     status: str
     config_path: Path
     run_dir: Path
@@ -75,6 +84,14 @@ class JobRecord:
     codex_premium_override_reason: str | None
     codex_tool_call_budget: int | None
     workspace_access: str
+    launch_base_sha: str | None
+    brief_sha256: str | None
+    effective_scope_json: str
+    retry_override_reason: str | None
+    runner_failure: str | None
+    workspace_disposition: str
+    checkpoint_disposition: str
+    root_acceptance: str
     archived_at: str | None
     created_at: str
     updated_at: str
@@ -123,6 +140,27 @@ class JobStore:
             checksum="job-store-premium-override-reason-v3-20260718",
             migrate=self._migrate_premium_override_reason,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=4,
+            checksum="job-store-controller-contract-v4-20260719",
+            migrate=self._migrate_controller_contract,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=5,
+            checksum="job-store-causal-outcomes-v5-20260719",
+            migrate=self._migrate_causal_outcomes,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=6,
+            checksum="job-store-launch-provenance-v6-20260719",
+            migrate=self._migrate_launch_provenance,
+        )
         # create_attempt_metrics_table is idempotent (CREATE TABLE IF NOT EXISTS +
         # pragma-guarded ALTERs), so calling it here unconditionally on every
         # initialize() is the only mechanism by which its guarded column adds
@@ -130,6 +168,42 @@ class JobStore:
         # migration above was already recorded and therefore never re-runs.
         with self._connect() as db:
             create_attempt_metrics_table(db)
+
+    @staticmethod
+    def _migrate_launch_provenance(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        for column, definition in {
+            "launch_base_sha": "text",
+            "brief_sha256": "text",
+            "effective_scope_json": "text not null default '[]'",
+            "retry_override_reason": "text",
+        }.items():
+            if column not in columns:
+                db.execute(f"alter table jobs add column {column} {definition}")  # nosec
+
+    @staticmethod
+    def _migrate_causal_outcomes(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        for column, definition in {
+            "runner_failure": "text",
+            "workspace_disposition": "text not null default 'unknown'",
+            "checkpoint_disposition": "text not null default 'none'",
+            "root_acceptance": "text not null default 'pending'",
+        }.items():
+            if column not in columns:
+                db.execute(f"alter table jobs add column {column} {definition}")  # nosec
+
+    @staticmethod
+    def _migrate_controller_contract(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        if "expected_result_status" not in columns:
+            db.execute(
+                "alter table jobs add column expected_result_status text not null default 'completed'"
+            )
+        if "controller_gate_mode" not in columns:
+            db.execute(
+                "alter table jobs add column controller_gate_mode text not null default 'full'"
+            )
 
     @staticmethod
     def _migrate_premium_override_reason(db: sqlite3.Connection) -> None:
@@ -266,9 +340,16 @@ class JobStore:
         codex_tool_call_budget: int | None = None,
         workspace_access: str = "ide_mcp",
         slot_name: str | None = None,
+        expected_result_status: str = "completed",
+        controller_gate_mode: str = "full",
+        launch_base_sha: str | None = None,
+        brief_sha256: str | None = None,
+        effective_scope_json: str = "[]",
+        retry_override_reason: str | None = None,
     ) -> JobRecord:
         self.initialize()
         backend = normalize_backend(backend)
+        _validate_controller_contract(expected_result_status, controller_gate_mode)
         job_id = job_id or new_job_id(task_id)
         now = utc_now()
         with self._connect() as db:
@@ -282,15 +363,17 @@ class JobStore:
             db.execute(
                 """
                 insert into jobs (
-                    job_id, task_id, route, workspace_path, expected_branch, status,
+                    job_id, task_id, route, workspace_path, expected_branch,
+                    expected_result_status, controller_gate_mode, status,
                     config_path, run_dir, prompt_path, result_path,
                     backend, agy_model, codex_model, codex_reasoning_effort,
                     codex_quality_tier, codex_premium_override_reason,
                     codex_tool_call_budget, workspace_access,
+                    launch_base_sha, brief_sha256, effective_scope_json, retry_override_reason,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
                     print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -298,6 +381,8 @@ class JobStore:
                     route,
                     str(workspace_path),
                     expected_branch,
+                    expected_result_status,
+                    controller_gate_mode,
                     "created",
                     str(config_path),
                     str(run_dir),
@@ -311,6 +396,10 @@ class JobStore:
                     codex_premium_override_reason,
                     codex_tool_call_budget,
                     workspace_access,
+                    launch_base_sha,
+                    brief_sha256,
+                    effective_scope_json,
+                    retry_override_reason,
                     now,
                     now,
                     timeout_sec,
@@ -334,9 +423,55 @@ class JobStore:
         return _job_from_row(row)
 
     def update_job(self, job_id: str, **values: Any) -> JobRecord:
+        immutable = {
+            "expected_result_status",
+            "controller_gate_mode",
+            "runner_failure",
+            "workspace_disposition",
+            "checkpoint_disposition",
+            "root_acceptance",
+            "launch_base_sha",
+            "brief_sha256",
+            "effective_scope_json",
+            "retry_override_reason",
+        } & set(values)
+        if immutable:
+            names = ", ".join(sorted(immutable))
+            raise ValueError(f"Controller contract fields are immutable: {names}")
         invalid = sorted(set(values) - JOB_COLUMNS)
         if invalid:
             raise ValueError(f"Unsupported job columns: {', '.join(invalid)}")
+        values["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = ?" for key in values)
+        params = [_to_sql(value) for value in values.values()]
+        params.append(job_id)
+        with self._connect() as db:
+            db.execute(f"update jobs set {assignments} where job_id = ?", params)  # nosec
+        return self.get_job(job_id)
+
+    def set_runner_failure(self, job_id: str, runner_failure: str | None) -> JobRecord:
+        if runner_failure is not None:
+            _validate_runner_failure(runner_failure)
+        return self._set_causal_outcome(job_id, runner_failure=runner_failure)
+
+    def set_workspace_disposition(self, job_id: str, workspace_disposition: str) -> JobRecord:
+        _validate_causal_value(
+            "workspace disposition", workspace_disposition, WORKSPACE_DISPOSITIONS
+        )
+        return self._set_causal_outcome(job_id, workspace_disposition=workspace_disposition)
+
+    def set_checkpoint_disposition(self, job_id: str, checkpoint_disposition: str) -> JobRecord:
+        _validate_causal_value(
+            "checkpoint disposition", checkpoint_disposition, CHECKPOINT_DISPOSITIONS
+        )
+        return self._set_causal_outcome(job_id, checkpoint_disposition=checkpoint_disposition)
+
+    def set_root_acceptance(self, job_id: str, root_acceptance: str) -> JobRecord:
+        _validate_causal_value("root acceptance", root_acceptance, ROOT_ACCEPTANCES)
+        return self._set_causal_outcome(job_id, root_acceptance=root_acceptance)
+
+    def _set_causal_outcome(self, job_id: str, **values: Any) -> JobRecord:
+        self.initialize()
         values["updated_at"] = utc_now()
         assignments = ", ".join(f"{key} = ?" for key in values)
         params = [_to_sql(value) for value in values.values()]
@@ -875,6 +1010,23 @@ def _to_sql(value: Any) -> Any:
     return value
 
 
+def _validate_causal_value(name: str, value: str, allowed: frozenset[str]) -> None:
+    if value not in allowed:
+        raise ValueError(f"Unsupported {name}: {value}")
+
+
+def _validate_runner_failure(value: str) -> None:
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value):
+        raise ValueError(f"Invalid runner failure: {value}")
+
+
+def _validate_controller_contract(expected_result_status: str, controller_gate_mode: str) -> None:
+    if expected_result_status not in {"partial", "completed", "blocked"}:
+        raise ValueError("expected_result_status must be partial, completed, or blocked")
+    if controller_gate_mode not in {"focused", "full", "none"}:
+        raise ValueError("controller_gate_mode must be focused, full, or none")
+
+
 def _optional_path(value: str | None) -> Path | None:
     return Path(value) if value else None
 
@@ -977,6 +1129,8 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         route=row["route"],
         workspace_path=Path(row["workspace_path"]),
         expected_branch=row["expected_branch"],
+        expected_result_status=row["expected_result_status"],
+        controller_gate_mode=row["controller_gate_mode"],
         status=row["status"],
         config_path=Path(row["config_path"]),
         run_dir=Path(row["run_dir"]),
@@ -995,6 +1149,14 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         codex_premium_override_reason=row["codex_premium_override_reason"],
         codex_tool_call_budget=row["codex_tool_call_budget"],
         workspace_access=row["workspace_access"],
+        launch_base_sha=row["launch_base_sha"],
+        brief_sha256=row["brief_sha256"],
+        effective_scope_json=row["effective_scope_json"],
+        retry_override_reason=row["retry_override_reason"],
+        runner_failure=row["runner_failure"],
+        workspace_disposition=row["workspace_disposition"],
+        checkpoint_disposition=row["checkpoint_disposition"],
+        root_acceptance=row["root_acceptance"],
         archived_at=row["archived_at"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
