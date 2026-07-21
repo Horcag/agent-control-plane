@@ -596,8 +596,98 @@ def test_shared_gate_uses_expanded_changed_python_files_for_both_stages(
     bundle = item.verification_bundle
     assert bundle is not None
     assert bundle["review_ready"] is True
-    assert bundle["worker_quality"]["required_gates"] == ["python-files"]
+    assert bundle["worker_quality"]["required_gates"] == []
     assert bundle["controller_quality"]["payload"]["checks"][0]["command"] == list(expanded_command)
+
+
+def test_shared_gate_absent_from_worker_report_does_not_block_review(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    shared_command = (sys.executable, "-c", "print('shared-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(name="shared", command=shared_command, run_on="both"),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-shared-not-recorded",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(
+        job.result_path,
+        command=f"{shlex.quote(sys.executable)} -c \"print('worker-ran-shared-tool-differently')\"",
+    )
+    (slot / "worker.txt").write_text("worker ran the shared tool\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["worker_quality"]["required_gates"] == []
+    assert bundle["worker_quality"]["status"] == "passed"
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    assert [check["name"] for check in bundle["controller_quality"]["payload"]["checks"]] == [
+        "shared"
+    ]
+    assert bundle["review_ready"] is True
+
+
+def test_worker_only_gate_missing_from_worker_verification_fails_review(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    controller_command = (sys.executable, "-c", "print('controller-ok')")
+    worker_only_command = (sys.executable, "-c", "print('worker-only-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(
+                name="controller", command=controller_command, run_on="controller"
+            ),
+            NativeQualityGateConfig(
+                name="worker-only", command=worker_only_command, run_on="worker"
+            ),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-worker-only-missing",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(
+        job.result_path,
+        command=f"{shlex.quote(sys.executable)} -c \"print('worker-did-something-else')\"",
+    )
+    (slot / "worker.txt").write_text("worker only gate missing\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    assert bundle["worker_quality"]["required_gates"] == ["worker-only"]
+    assert bundle["worker_quality"]["missing_gates"] == ["worker-only"]
+    assert bundle["worker_quality"]["status"] == "failed"
+    assert bundle["review_ready"] is False
 
 
 def test_deleted_python_file_skips_file_placeholder_but_keeps_controller_coverage(

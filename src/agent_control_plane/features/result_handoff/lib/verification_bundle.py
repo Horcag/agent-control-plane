@@ -339,7 +339,8 @@ def _assess_worker_quality(
         stage="worker",
         command_files=command_paths,
     )
-    if not selected:
+    mandatory = tuple(gate for gate in selected if gate.run_on == "worker")
+    if not mandatory:
         passed = bool(checks) and all(
             check.get("outcome") == "passed" and check.get("exit_code") in {None, 0}
             for check in checks
@@ -355,7 +356,7 @@ def _assess_worker_quality(
             "claims_trust": "worker_reported",
         }
     missing: list[str] = []
-    for gate in selected:
+    for gate in mandatory:
         expected_command = format_gate_command(gate, command_paths)
         if not any(
             _reported_gate_matches(
@@ -373,8 +374,8 @@ def _assess_worker_quality(
         reason = None
     return {
         "required": True,
-        "status": "passed" if selected and not missing else "failed",
-        "required_gates": [gate.name for gate in selected],
+        "status": "passed" if mandatory and not missing else "failed",
+        "required_gates": [gate.name for gate in mandatory],
         "missing_gates": missing,
         "changed_files_missing": [],
         "changed_files_unobserved": [],
