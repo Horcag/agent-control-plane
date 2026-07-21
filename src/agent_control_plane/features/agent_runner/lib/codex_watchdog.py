@@ -13,9 +13,12 @@ from agent_control_plane.shared.path_rules import is_known_temporary_patch_artif
 CODEX_TOOL_TIMEOUT_LIMIT = 2
 # Consecutive tool calls without any durable-progress signature change before the worker is
 # stopped. Resets to 0 on any progress (repo tree dirtied, agent-progress.md/result.md/
-# verification.json touched). Read-heavy orientation on an unfamiliar codebase routinely
-# spends 15-20 calls, so 16 was too aggressive and killed legitimate workers mid-orientation.
-CODEX_INEFFICIENT_TOOL_USAGE_LIMIT = 50
+# verification.json touched). A reference-heavy task on an unfamiliar codebase (build a full
+# new slice: read the ingest/HTTP/reused-feature APIs + a reference slice, then implement)
+# routinely reads 30-50 files before its first write; 16 and even 50 killed legitimate workers
+# mid-exploration. 200 leaves ample room while still catching a genuinely stuck/looping worker
+# (200 CONSECUTIVE no-progress calls — real work interleaves writes and resets the counter).
+CODEX_INEFFICIENT_TOOL_USAGE_LIMIT = 200
 CODEX_TOOL_TIMEOUT_MARKER = "Exit code: 124"
 CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "web_search": "\nweb search:",
