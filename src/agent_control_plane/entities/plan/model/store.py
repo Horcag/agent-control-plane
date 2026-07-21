@@ -378,11 +378,18 @@ class PlanStore:
                 )
             active = db.execute(
                 """
-                select task_id from plan_tasks
-                where plan_id = ? and state in (
+                select t.task_id from plan_tasks t
+                left join jobs j on j.job_id = t.job_id
+                where t.plan_id = ? and t.state in (
                     'dispatching', 'created', 'queued', 'running', 'waiting_quota',
                     'cancel_requested', 'finalizing'
-                ) order by task_id
+                )
+                and (
+                    t.job_id is null
+                    or j.finished_at is null
+                    or j.finalization_status != 'completed'
+                )
+                order by t.task_id
                 """,
                 (plan_id,),
             ).fetchall()

@@ -109,6 +109,45 @@ def test_plan_archive_is_explicit_terminal_state_and_hidden_by_default(tmp_path:
     assert plans.list_plans(include_archived=True)[0]["archived_at"] == archived.archived_at
 
 
+def test_plan_archive_ignores_a_finished_and_finalized_stranded_cancel_task(
+    tmp_path: Path,
+) -> None:
+    """Regression: a cancel that raced a finishing worker leaves a task at
+    ``cancel_requested`` with ``finished_at``/finalization set. The plan
+    self-heals to ``cancelled`` (see the cancelling regression above), but
+    ``archive_plan`` must apply the same finished-and-finalized exclusion or it
+    wrongly reports the stranded task as active and can never be archived.
+    """
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    job = _create_job(jobs, tmp_path, "job-raced")
+    plans.create_plan(
+        plan_id="wave",
+        title="Wave",
+        tasks=(PlanTaskDefinition("task", "Task"),),
+    )
+    plans.bind_job("wave", "task", job.job_id)
+    plans.request_cancel("wave")
+
+    # The stranded row: finished + finalized, yet the status string was clobbered
+    # back to cancel_requested by the racing cancel.
+    jobs.update_job(
+        job.job_id,
+        status="cancel_requested",
+        cancel_requested=True,
+        finished_at=OLD_TIMESTAMP,
+        finalization_status="completed",
+    )
+    assert plans.snapshot("wave")["status"] == "cancelled"
+
+    archived = plans.archive_plan("wave")
+
+    assert archived.archived_at is not None
+    assert plans.list_plans() == []
+
+
 def test_plan_cancel_fences_a_dispatch_claim_that_already_passed_validation(
     tmp_path: Path,
 ) -> None:
