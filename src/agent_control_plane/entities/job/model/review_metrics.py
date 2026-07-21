@@ -4,6 +4,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,10 @@ REVIEW_OUTCOMES = (
     "false_positive",
     "continuation_verified",
 )
+
+# How long an active span may go without a fresh segment before it is considered
+# stale (an agent/process disappeared without finishing the span).
+REVIEW_SPAN_STALE_AFTER_SEC = 6 * 60 * 60
 
 
 class ReviewMetricsStore:
@@ -48,6 +53,64 @@ class ReviewMetricsStore:
             checksum="review-metrics-store-checkpoint-sha-v2-20260719",
             migrate=self._migrate_checkpoint_sha,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="review_metrics_store",
+            version=3,
+            checksum="review-metrics-store-span-segments-v3-20260721",
+            migrate=self._migrate_span_segments,
+        )
+
+    @staticmethod
+    def _migrate_span_segments(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            create table if not exists review_span_segments (
+                    span_id text not null references review_spans(span_id),
+                    seq integer not null,
+                    session_path text not null,
+                    started_at text not null,
+                    finished_at text,
+                    start_input_tokens integer not null,
+                    start_cached_input_tokens integer not null,
+                    start_output_tokens integer not null,
+                    start_reasoning_output_tokens integer not null,
+                    end_input_tokens integer,
+                    end_cached_input_tokens integer,
+                    end_output_tokens integer,
+                    end_reasoning_output_tokens integer,
+                    primary key(span_id, seq)
+                )
+            """
+        )
+        existing_spans = db.execute("select * from review_spans").fetchall()
+        for span in existing_spans:
+            db.execute(
+                """
+                insert into review_span_segments (
+                    span_id, seq, session_path, started_at, finished_at,
+                    start_input_tokens, start_cached_input_tokens,
+                    start_output_tokens, start_reasoning_output_tokens,
+                    end_input_tokens, end_cached_input_tokens,
+                    end_output_tokens, end_reasoning_output_tokens
+                ) values (?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(span_id, seq) do nothing
+                """,
+                (
+                    span["span_id"],
+                    span["session_path"],
+                    span["started_at"],
+                    span["finished_at"],
+                    span["start_input_tokens"],
+                    span["start_cached_input_tokens"],
+                    span["start_output_tokens"],
+                    span["start_reasoning_output_tokens"],
+                    span["end_input_tokens"],
+                    span["end_cached_input_tokens"],
+                    span["end_output_tokens"],
+                    span["end_reasoning_output_tokens"],
+                ),
+            )
 
     @staticmethod
     def _migrate_checkpoint_sha(db: sqlite3.Connection) -> None:
@@ -125,6 +188,7 @@ class ReviewMetricsStore:
         self.initialize()
         now = utc_now()
         span_id = span_id or _new_span_id(name)
+        span_started_at = started_at or now
         with self._connect() as db:
             db.execute(
                 """
@@ -139,7 +203,7 @@ class ReviewMetricsStore:
                     span_id,
                     name,
                     str(session_path),
-                    started_at or now,
+                    span_started_at,
                     usage.input_tokens,
                     usage.cached_input_tokens,
                     usage.output_tokens,
@@ -147,6 +211,24 @@ class ReviewMetricsStore:
                     notes,
                     now,
                     now,
+                ),
+            )
+            db.execute(
+                """
+                insert into review_span_segments (
+                    span_id, seq, session_path, started_at,
+                    start_input_tokens, start_cached_input_tokens,
+                    start_output_tokens, start_reasoning_output_tokens
+                ) values (?, 0, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    span_id,
+                    str(session_path),
+                    span_started_at,
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_output_tokens,
                 ),
             )
         return span_id
@@ -160,7 +242,9 @@ class ReviewMetricsStore:
         recorded_at: str | None = None,
     ) -> None:
         _validate_choice("phase", phase, REVIEW_PHASES)
-        self.get_span(span_id)
+        span = self.get_span(span_id)
+        if span["stale"]:
+            raise ValueError(_stale_message(span_id))
         with self._connect() as db:
             db.execute(
                 """
@@ -185,6 +269,72 @@ class ReviewMetricsStore:
                     usage.reasoning_output_tokens,
                 ),
             )
+
+    def open_segment(
+        self,
+        span_id: str,
+        *,
+        session_path: Path,
+        usage: TokenUsage,
+        started_at: str | None = None,
+    ) -> int:
+        self.initialize()
+        now = utc_now()
+        with self._connect() as db:
+            db.execute("begin immediate")
+            span_row = db.execute(
+                "select * from review_spans where span_id = ?", (span_id,)
+            ).fetchone()
+            if span_row is None:
+                raise KeyError(f"Review span not found: {span_id}")
+            latest = _latest_segment(db, span_id)
+            if span_row["status"] != "active" or _is_stale(
+                span_row["status"],
+                latest["started_at"] if latest is not None else None,
+                latest["finished_at"] if latest is not None else None,
+            ):
+                raise ValueError(_stale_message(span_id))
+            segment_at = started_at or now
+            next_seq = (int(latest["seq"]) + 1) if latest is not None else 0
+            if latest is not None and latest["finished_at"] is None:
+                db.execute(
+                    """
+                    update review_span_segments set
+                        finished_at = ?,
+                        end_input_tokens = ?, end_cached_input_tokens = ?,
+                        end_output_tokens = ?, end_reasoning_output_tokens = ?
+                    where span_id = ? and seq = ?
+                    """,
+                    (
+                        segment_at,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.reasoning_output_tokens,
+                        span_id,
+                        latest["seq"],
+                    ),
+                )
+            db.execute(
+                """
+                insert into review_span_segments (
+                    span_id, seq, session_path, started_at,
+                    start_input_tokens, start_cached_input_tokens,
+                    start_output_tokens, start_reasoning_output_tokens
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    span_id,
+                    next_seq,
+                    str(session_path),
+                    segment_at,
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.output_tokens,
+                    usage.reasoning_output_tokens,
+                ),
+            )
+        return next_seq
 
     def attach_job(
         self,
@@ -249,11 +399,16 @@ class ReviewMetricsStore:
                 )
             if accepted_sha is not None:
                 raise ValueError("Continuation verification cannot set accepted_sha")
-        if (
-            db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone()
-            is None
-        ):
+        span_row = db.execute("select * from review_spans where span_id = ?", (span_id,)).fetchone()
+        if span_row is None:
             raise KeyError(f"Review span not found: {span_id}")
+        latest = _latest_segment(db, span_id)
+        if _is_stale(
+            span_row["status"],
+            latest["started_at"] if latest is not None else None,
+            latest["finished_at"] if latest is not None else None,
+        ):
+            raise ValueError(_stale_message(span_id))
         if db.execute("select 1 from jobs where job_id = ?", (job_id,)).fetchone() is None:
             raise KeyError(f"Job not found: {job_id}")
         if (
@@ -304,8 +459,14 @@ class ReviewMetricsStore:
         usage: TokenUsage,
         finished_at: str | None = None,
     ) -> None:
-        self.get_span(span_id)
         with self._connect() as db:
+            db.execute("begin immediate")
+            if (
+                db.execute("select 1 from review_spans where span_id = ?", (span_id,)).fetchone()
+                is None
+            ):
+                raise KeyError(f"Review span not found: {span_id}")
+            finished = finished_at or utc_now()
             db.execute(
                 """
                 update review_spans set
@@ -316,7 +477,7 @@ class ReviewMetricsStore:
                 where span_id = ?
                 """,
                 (
-                    finished_at or utc_now(),
+                    finished,
                     usage.input_tokens,
                     usage.cached_input_tokens,
                     usage.output_tokens,
@@ -325,6 +486,26 @@ class ReviewMetricsStore:
                     span_id,
                 ),
             )
+            latest = _latest_segment(db, span_id)
+            if latest is not None and latest["finished_at"] is None:
+                db.execute(
+                    """
+                    update review_span_segments set
+                        finished_at = ?,
+                        end_input_tokens = ?, end_cached_input_tokens = ?,
+                        end_output_tokens = ?, end_reasoning_output_tokens = ?
+                    where span_id = ? and seq = ?
+                    """,
+                    (
+                        finished,
+                        usage.input_tokens,
+                        usage.cached_input_tokens,
+                        usage.output_tokens,
+                        usage.reasoning_output_tokens,
+                        span_id,
+                        latest["seq"],
+                    ),
+                )
 
     def get_span(self, span_id: str) -> dict[str, Any]:
         self.initialize()
@@ -333,9 +514,28 @@ class ReviewMetricsStore:
                 "select * from review_spans where span_id = ?",
                 (span_id,),
             ).fetchone()
-        if row is None:
-            raise KeyError(f"Review span not found: {span_id}")
-        return dict(row)
+            if row is None:
+                raise KeyError(f"Review span not found: {span_id}")
+            latest = _latest_segment(db, span_id)
+        span = dict(row)
+        span["stale"] = _is_stale(
+            span["status"],
+            latest["started_at"] if latest is not None else None,
+            latest["finished_at"] if latest is not None else None,
+        )
+        return span
+
+    def list_segments(self, span_id: str) -> list[dict[str, Any]]:
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                select * from review_span_segments
+                where span_id = ? order by seq
+                """,
+                (span_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_spans(self, *, limit: int = 20) -> list[dict[str, Any]]:
         self.initialize()
@@ -351,12 +551,11 @@ class ReviewMetricsStore:
         span_id: str,
         *,
         live_usage: TokenUsage | None = None,
+        since: str | None = None,
     ) -> dict[str, Any]:
         span = self.get_span(span_id)
-        start = _usage_from_row(span, "start")
-        end = _optional_usage_from_row(span, "end") or live_usage or start
-        root_delta = end.delta(start)
         with self._connect() as db:
+            segments = [dict(row) for row in _segment_rows(db, span_id)]
             checkpoints = [
                 dict(row)
                 for row in db.execute(
@@ -378,6 +577,8 @@ class ReviewMetricsStore:
                 ).fetchall()
             ]
 
+        root_delta = _segments_delta(segments, live_usage)
+
         accepted_comparable = sum(
             int(item["agent_comparable_tokens"] or 0)
             for item in outcomes
@@ -395,6 +596,13 @@ class ReviewMetricsStore:
         review_tax = (
             root_delta.comparable_tokens / accepted_comparable if accepted_comparable > 0 else None
         )
+        observations = _build_observations(segments, checkpoints, outcomes)
+        max_cursor = observations[-1]["cursor"] if observations else None
+        visible_observations = (
+            observations
+            if since is None
+            else [obs for obs in observations if _cursor_key(obs["cursor"]) > _cursor_key(since)]
+        )
         return {
             "span": span,
             "root_usage": root_delta.as_dict(),
@@ -408,8 +616,55 @@ class ReviewMetricsStore:
             "total_comparable_tokens": root_delta.comparable_tokens + agent_comparable,
             "defects_found": sum(int(item["defects_found"]) for item in outcomes),
             "false_positives": sum(int(item["false_positives"]) for item in outcomes),
+            "segments": segments,
             "checkpoints": checkpoints,
             "job_outcomes": outcomes,
+            "observations": visible_observations,
+            "cursor": max_cursor,
+            "since": since,
+        }
+
+    def observations_since(
+        self,
+        span_id: str,
+        *,
+        since: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_span(span_id)
+        with self._connect() as db:
+            segments = [dict(row) for row in _segment_rows(db, span_id)]
+            checkpoints = [
+                dict(row)
+                for row in db.execute(
+                    """
+                    select * from review_checkpoints
+                    where span_id = ? order by recorded_at
+                    """,
+                    (span_id,),
+                ).fetchall()
+            ]
+            outcomes = [
+                self._outcome_payload(db, row)
+                for row in db.execute(
+                    """
+                    select * from review_job_outcomes
+                    where span_id = ? order by recorded_at
+                    """,
+                    (span_id,),
+                ).fetchall()
+            ]
+        observations = _build_observations(segments, checkpoints, outcomes)
+        max_cursor = observations[-1]["cursor"] if observations else None
+        visible_observations = (
+            observations
+            if since is None
+            else [obs for obs in observations if _cursor_key(obs["cursor"]) > _cursor_key(since)]
+        )
+        return {
+            "span_id": span_id,
+            "observations": visible_observations,
+            "cursor": max_cursor,
+            "since": since,
         }
 
     @staticmethod
@@ -473,3 +728,114 @@ def _new_span_id(name: str) -> str:
 def _validate_choice(name: str, value: str, choices: tuple[str, ...]) -> None:
     if value not in choices:
         raise ValueError(f"Unsupported {name} {value!r}; expected one of: {', '.join(choices)}")
+
+
+def _segment_rows(db: sqlite3.Connection, span_id: str) -> list[sqlite3.Row]:
+    return list(
+        db.execute(
+            "select * from review_span_segments where span_id = ? order by seq",
+            (span_id,),
+        ).fetchall()
+    )
+
+
+def _latest_segment(db: sqlite3.Connection, span_id: str) -> sqlite3.Row | None:
+    return db.execute(
+        "select * from review_span_segments where span_id = ? order by seq desc limit 1",
+        (span_id,),
+    ).fetchone()
+
+
+def _segments_delta(
+    segments: list[dict[str, Any]],
+    live_usage: TokenUsage | None,
+) -> TokenUsage:
+    total_input = total_cached = total_output = total_reasoning = 0
+    for segment in segments:
+        start = _usage_from_row(segment, "start")
+        end = _optional_usage_from_row(segment, "end") or live_usage or start
+        delta = end.delta(start)
+        total_input += delta.input_tokens
+        total_cached += delta.cached_input_tokens
+        total_output += delta.output_tokens
+        total_reasoning += delta.reasoning_output_tokens
+    return TokenUsage(total_input, total_cached, total_output, total_reasoning)
+
+
+def _is_stale(
+    status: str,
+    latest_segment_started_at: str | None,
+    latest_segment_finished_at: str | None,
+) -> bool:
+    if status != "active" or latest_segment_finished_at is not None:
+        return False
+    if latest_segment_started_at is None:
+        return False
+    started = datetime.fromisoformat(latest_segment_started_at)
+    now = datetime.fromisoformat(utc_now())
+    elapsed = (now - started).total_seconds()
+    return elapsed > REVIEW_SPAN_STALE_AFTER_SEC
+
+
+def _stale_message(span_id: str) -> str:
+    return f"review span {span_id} is stale; start a new span or resume with open_segment"
+
+
+def _build_observations(
+    segments: list[dict[str, Any]],
+    checkpoints: list[dict[str, Any]],
+    outcomes: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for segment in segments:
+        seq = int(segment["seq"])
+        observations.append(
+            {
+                "kind": "segment_opened",
+                "recorded_at": segment["started_at"],
+                "seq": seq,
+                "session_path": segment["session_path"],
+            }
+        )
+        if segment["finished_at"] is not None:
+            observations.append(
+                {
+                    "kind": "segment_closed",
+                    "recorded_at": segment["finished_at"],
+                    "seq": seq,
+                    "session_path": segment["session_path"],
+                }
+            )
+    for index, checkpoint in enumerate(checkpoints):
+        observations.append(
+            {
+                "kind": "checkpoint",
+                "recorded_at": checkpoint["recorded_at"],
+                "seq": index,
+                "phase": checkpoint["phase"],
+            }
+        )
+    for index, outcome in enumerate(outcomes):
+        observations.append(
+            {
+                "kind": "job_outcome",
+                "recorded_at": outcome["recorded_at"],
+                "seq": index,
+                "job_id": outcome["job_id"],
+                "outcome": outcome["outcome"],
+            }
+        )
+    observations.sort(key=lambda obs: (obs["recorded_at"], obs["kind"], obs["seq"]))
+    for observation in observations:
+        observation["cursor"] = (
+            f"{observation['recorded_at']}|{observation['kind']}|{observation['seq']:010d}"
+        )
+    return observations
+
+
+def _cursor_key(cursor: str) -> tuple[str, str, int]:
+    try:
+        recorded_at, kind, seq = cursor.split("|")
+        return (recorded_at, kind, int(seq))
+    except ValueError as exc:
+        raise ValueError(f"Malformed review observation cursor: {cursor!r}") from exc

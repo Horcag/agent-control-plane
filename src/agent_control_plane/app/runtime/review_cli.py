@@ -63,6 +63,10 @@ def add_review_parser(
 
     show = commands.add_parser("show", parents=[common], help="Show review cost and outcomes")
     show.add_argument("span_id")
+    show.add_argument(
+        "--since",
+        help="Only return observations recorded after this cursor (from a prior show)",
+    )
 
     list_spans = commands.add_parser("list", parents=[common], help="List recent review spans")
     list_spans.add_argument("--limit", type=int, default=20)
@@ -122,19 +126,21 @@ def handle_review_command(args: argparse.Namespace, *, database_path: Path) -> A
         )
         return store.report(args.span_id)
     if command == "show":
-        return _live_report(store, args.span_id)
+        return _live_report(store, args.span_id, since=args.since)
     if command == "list":
         return store.list_spans(limit=args.limit)
     raise ValueError(f"Unknown review command: {command}")
 
 
-def _live_report(store: ReviewMetricsStore, span_id: str) -> dict[str, Any]:
+def _live_report(
+    store: ReviewMetricsStore, span_id: str, *, since: str | None = None
+) -> dict[str, Any]:
     span = store.get_span(span_id)
     live_usage = None
     if span["status"] == "active":
         snapshot = _session_snapshot(Path(span["session_path"]))
         live_usage = snapshot.usage if snapshot is not None else None
-    return store.report(span_id, live_usage=live_usage)
+    return store.report(span_id, live_usage=live_usage, since=since)
 
 
 def _session_snapshot(path: Path) -> SessionUsageSnapshot | None:
