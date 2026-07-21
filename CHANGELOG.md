@@ -30,9 +30,10 @@ All notable changes are recorded here. This project follows Keep a Changelog.
   and does not draw from the global Codex quota broker. CLI/MCP/plan surfaces accept
   `--claude-model`/`--claude-reasoning-effort` (`claude_model`/`claude_reasoning_effort`
   keys in plan manifests and `agent_start_job`).
-- Added `[control.defaults] claude_bare` (default `true`), which appends `--bare
-  --strict-mcp-config` to the claude runner command so workers never load the
-  operator's user-scope MCP servers, plugins, skills, or `CLAUDE.md`.
+- Added `[control.defaults] claude_bare` (default `true`), which appends
+  `--strict-mcp-config --setting-sources project` to the claude runner command
+  so workers never load the operator's user-scope MCP servers, plugins,
+  skills, or `CLAUDE.md`, while keeping the CLI's subscription login intact.
 
 ## [0.1.0] - 2026-07-16
 

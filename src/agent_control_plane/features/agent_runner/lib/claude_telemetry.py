@@ -54,7 +54,7 @@ def parse_claude_jsonl(
             thread_id = event["session_id"]
         if event_type == "result":
             subtype = str(event.get("subtype") or "")
-            if subtype == "success":
+            if subtype == "success" and event.get("is_error") is not True:
                 turn_completed = True
             else:
                 error_events += 1

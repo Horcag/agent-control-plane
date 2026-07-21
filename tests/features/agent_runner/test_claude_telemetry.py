@@ -73,6 +73,13 @@ def test_result_event_provides_usage_cost_and_session_identity(tmp_path) -> None
     assert metrics.rate_card_version == "claude-code-cli"
 
 
+def test_success_subtype_with_is_error_true_does_not_complete_the_turn(tmp_path) -> None:
+    path = _events_file(tmp_path, [_init_event(), _result_event(is_error=True)])
+    metrics = parse_claude_jsonl(path, model="claude-opus-4-8", duration_sec=1.0)
+    assert metrics.turn_completed is False
+    assert metrics.error_events == 1
+
+
 def test_assistant_usage_sum_is_the_fallback_when_result_missing(tmp_path) -> None:
     path = _events_file(
         tmp_path,

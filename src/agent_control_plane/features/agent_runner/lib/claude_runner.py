@@ -157,7 +157,7 @@ class ClaudeExecRunner:
             "--verbose",
         ]
         if spec.claude_bare:
-            command.extend(["--bare", "--strict-mcp-config"])
+            command.extend(["--strict-mcp-config", "--setting-sources", "project"])
         if spec.codex_resume_thread_id is not None:
             command.extend(["--resume", spec.codex_resume_thread_id])
         else:
