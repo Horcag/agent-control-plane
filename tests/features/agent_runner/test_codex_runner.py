@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,10 +18,12 @@ from agent_control_plane.features.agent_runner.lib.codex_runner import (
 )
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     dirty_file_markers_from_porcelain,
+    is_known_temporary_patch_artifact,
     porcelain_changed_path,
     productive_log_activity_if_needed,
+    updated_calls_without_durable_progress,
 )
-from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
+from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
 
 
 class CodexRunnerCommandTest(unittest.TestCase):
@@ -189,10 +194,225 @@ class CodexRunnerCommandTest(unittest.TestCase):
             proc = _FakeProc()
             spec = _spec(read_only=True, yolo=False, log_path=log_path)
 
-            CodexProcessMonitor()._await_completed_process(proc, spec)
+            CodexProcessMonitor()._await_completed_process(proc, spec, cancel_requested=None)
 
             self.assertEqual(proc.wait_timeout, 1.0)
             self.assertFalse(proc.terminated)
+
+    def test_writable_handoff_budget_boundary_requires_valid_pair(self) -> None:
+        for verified, expected_status in ((True, "completed"), (False, "tool_call_budget")):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                log_path = root / "attempt-001.log"
+                _write_budget_events(log_path, count=2)
+                result_path = root / "result.md"
+                result_path.write_text("Status: partial\n", encoding="utf-8")
+                if verified:
+                    _write_verification(root, status="partial")
+                proc = _FakeProc()
+                result = CodexProcessMonitor().monitor(
+                    proc,
+                    _spec(
+                        read_only=False,
+                        yolo=False,
+                        log_path=log_path,
+                        result_path=result_path,
+                        codex_tool_call_budget=1,
+                    ),
+                    started_wall=0.0,
+                    deadline_mono=time.monotonic() + 10,
+                    last_output_mono=time.monotonic(),
+                    last_log_size=0,
+                    log=io.StringIO(),
+                    cancel_requested=lambda: False,
+                )
+                self.assertEqual(result.status, expected_status)
+                self.assertEqual(proc.terminated, not verified)
+
+    def test_writable_runner_stops_after_sixteen_calls_without_durable_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=16)
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(read_only=False, yolo=False, log_path=log_path),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "inefficient_tool_usage")
+            self.assertTrue(proc.terminated)
+
+    def test_periodic_durable_progress_resets_tool_call_counter_before_next_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            source_path = root / "source.py"
+            _write_budget_events(log_path, count=15)
+
+            def publish_durable_progress(_delay: float) -> None:
+                source_path.write_text("changed\n", encoding="utf-8")
+                with log_path.with_suffix(".events.jsonl").open("a", encoding="utf-8") as events:
+                    events.write(
+                        json.dumps({"type": "item.started", "item": {"type": "command_execution"}})
+                        + "\n"
+                    )
+
+            completed = AgentRunResult("completed", True, 0, "partial", "done")
+            with (
+                patch(
+                    "agent_control_plane.features.agent_runner.lib.codex_process_monitor.progress_signature",
+                    side_effect=[
+                        (("before",), False),
+                        (("before",), False),
+                        (("source.py",), True),
+                        (("source.py",), True),
+                    ],
+                ),
+                patch(
+                    "agent_control_plane.features.agent_runner.lib.codex_process_monitor.time.monotonic",
+                    side_effect=[0.0, 1.0, 3.0],
+                ),
+                patch(
+                    "agent_control_plane.features.agent_runner.lib.codex_process_monitor.time.sleep",
+                    side_effect=publish_durable_progress,
+                ),
+                patch.object(
+                    CodexProcessMonitor,
+                    "_terminal_result_if_ready",
+                    side_effect=[(None, 0, 0, 0), (completed, 0, 0, 0)],
+                ),
+            ):
+                result = CodexProcessMonitor().monitor(
+                    _FakeProc(),
+                    _spec(read_only=False, yolo=False, log_path=log_path),
+                    started_wall=0.0,
+                    deadline_mono=10.0,
+                    last_output_mono=0.0,
+                    last_log_size=0,
+                    log=io.StringIO(),
+                    cancel_requested=lambda: False,
+                )
+
+            self.assertEqual(result.status, "completed")
+
+    def test_read_only_runner_is_exempt_from_inefficient_tool_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=16)
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+
+            result = CodexProcessMonitor().monitor(
+                _FakeProc(),
+                _spec(read_only=True, yolo=False, log_path=log_path, result_path=result_path),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "completed")
+
+    def test_rg_no_matches_exit_code_does_not_change_watchdog_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=16)
+            log_path.write_text("rg completed with Exit code: 1\n", encoding="utf-8")
+
+            result = CodexProcessMonitor().monitor(
+                _FakeProc(),
+                _spec(read_only=False, yolo=False, log_path=log_path),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "inefficient_tool_usage")
+
+    def test_durable_progress_resets_consecutive_tool_calls(self) -> None:
+        cases = (
+            (("before",), ("before",), 15, 1, 16),
+            (("before",), ("after",), 15, 1, 0),
+            (("progress",), ("result",), 15, 1, 0),
+            (("result",), ("verification",), 15, 1, 0),
+            (("source",), ("test",), 15, 1, 0),
+        )
+
+        for previous, current, consecutive, new_calls, expected in cases:
+            with self.subTest(current=current):
+                self.assertEqual(
+                    updated_calls_without_durable_progress(
+                        previous, current, consecutive, new_calls
+                    ),
+                    expected,
+                )
+
+    def test_monitor_distinguishes_writable_and_read_only_handoffs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result_path = Path(temp) / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            for read_only, expected in ((False, None), (True, "completed")):
+                with self.subTest(read_only=read_only):
+                    state = CodexProcessMonitor()._completed_result_if_ready(
+                        _FakeProc(),
+                        _spec(read_only=read_only, yolo=False, result_path=result_path),
+                        0.0,
+                        terminate=False,
+                    )
+                    self.assertEqual(state.status if state else None, expected)
+
+    def test_writable_process_exit_with_invalid_verification_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result_path = Path(temp) / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            proc = _FakeProc()
+            proc.terminate()
+
+            state = CodexProcessMonitor()._exited_result_if_dead(
+                proc, _spec(read_only=False, yolo=False, result_path=result_path), 0.0
+            )
+
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.status, "exited_without_result")
+
+    def test_verification_mutation_after_terminal_observation_is_late_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=0)
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_verification(root, status="partial")
+            proc = _FakeProc()
+            spec = _spec(read_only=False, yolo=False, log_path=log_path, result_path=result_path)
+            with patch.object(
+                proc,
+                "wait",
+                side_effect=lambda timeout: _write_verification(root, status="blocked"),
+            ):
+                state = CodexProcessMonitor()._completed_result_if_ready(
+                    proc, spec, 0.0, terminate=True, cancel_requested=lambda: False
+                )
+
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.status, "late_edit")
 
     def test_timeout_result_stops_clean_workspace_without_any_activity(self) -> None:
         proc = _FakeProc()
@@ -459,6 +679,26 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
 
 class CodexRunnerProgressSignatureTest(unittest.TestCase):
+    def test_only_known_temporary_patch_artifacts_are_excluded(self) -> None:
+        excluded = ("changes.rej", "changes.orig", "tmp_fix.patch", "single_fix.patch")
+
+        self.assertTrue(all(is_known_temporary_patch_artifact(path) for path in excluded))
+        self.assertFalse(is_known_temporary_patch_artifact("scoped-change.patch"))
+
+    def test_dirty_file_markers_exclude_only_known_temporary_patch_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            patch = root / "scoped-change.patch"
+            patch.write_text("visible", encoding="utf-8")
+
+            markers = dirty_file_markers_from_porcelain(
+                root,
+                "?? tmp_fix.patch\n?? scoped-change.patch\n?? changes.rej",
+            )
+
+            self.assertEqual(len(markers), 1)
+            self.assertTrue(markers[0].startswith("dirty-file:scoped-change.patch:"))
+
     def test_porcelain_changed_path_uses_target_path_for_renames(self) -> None:
         self.assertEqual(
             porcelain_changed_path("R  old/name.txt -> new/name.txt"),
@@ -508,7 +748,9 @@ def _spec(
     codex_no_progress_timeout_sec: int = 0,
     codex_forbidden_tool_markers: tuple[str, ...] = (),
     codex_resume_thread_id: str | None = None,
+    codex_tool_call_budget: int = 0,
     log_path: Path | None = None,
+    result_path: Path | None = None,
     workspace_access: str = "ide_mcp",
 ) -> AgentRunSpec:
     return AgentRunSpec(
@@ -520,11 +762,12 @@ def _spec(
         codex_sandbox_mode=codex_sandbox_mode,
         codex_disabled_mcp_servers=codex_disabled_mcp_servers,
         codex_no_progress_timeout_sec=codex_no_progress_timeout_sec,
+        codex_tool_call_budget=codex_tool_call_budget,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
         codex_resume_thread_id=codex_resume_thread_id,
         prompt="secret task prompt",
         workspace_path=Path("D:/repo/workspace"),
-        result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+        result_path=result_path or Path("D:/repo/.agent-work/tasks/task-1/result.md"),
         log_path=log_path or Path("D:/repo/runs/job-1/attempt-001.log"),
         print_timeout="10s",
         timeout_sec=30,
@@ -532,6 +775,33 @@ def _spec(
         yolo=yolo,
         read_only=read_only,
         workspace_access=workspace_access,
+    )
+
+
+def _write_budget_events(log_path: Path, *, count: int) -> None:
+    log_path.with_suffix(".events.jsonl").write_text(
+        "".join(
+            json.dumps({"type": "item.started", "item": {"type": "command_execution"}}) + "\n"
+            for _ in range(count)
+        )
+        + json.dumps({"type": "turn.completed", "usage": {}})
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_verification(root: Path, *, status: str) -> None:
+    (root / "verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": status,
+                "changed_files": [],
+                "checks": [],
+                "unverified": [],
+            }
+        ),
+        encoding="utf-8",
     )
 
 

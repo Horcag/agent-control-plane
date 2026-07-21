@@ -3,25 +3,34 @@ from __future__ import annotations
 import subprocess  # nosec B404
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Protocol, TextIO
 
 from agent_control_plane.features.agent_runner.lib.codex_telemetry import codex_turn_completed
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
+    CODEX_INEFFICIENT_TOOL_USAGE_LIMIT,
     CODEX_TOOL_TIMEOUT_MARKER,
     productive_log_activity_if_needed,
     progress_signature,
     refresh_log_activity,
+    scan_budget_lifecycle,
     scan_codex_tool_constraints,
     scan_forbidden_tool,
     scan_tool_timeouts,
+    tool_budget_policy,
+    updated_calls_without_durable_progress,
 )
 from agent_control_plane.features.agent_runner.lib.result_detector import (
     contains_capacity_marker,
     inspect_result,
     recover_result_from_last_message,
 )
-from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
+from agent_control_plane.features.agent_runner.lib.runner import (
+    AgentRunResult,
+    AgentRunSpec,
+    BudgetLifecycleEvent,
+)
 
 CODEX_COMPLETION_GRACE_SEC = 60.0
 
@@ -73,7 +82,13 @@ class CodexProcessMonitor:
         last_productive_log_scan_size = 0
         last_constraint_scan_size = 0
         tool_call_count = 0
+        budget_scan_size = 0
+        budget_tool_call_count = 0
+        budget_events: list[BudgetLifecycleEvent] = []
+        budget_policy = tool_budget_policy(spec.codex_tool_call_budget)
         current_progress_signature, workspace_dirty = progress_signature(spec)
+        observed_tool_call_count = 0
+        calls_without_durable_progress = 0
 
         while True:
             log.flush()
@@ -95,6 +110,7 @@ class CodexProcessMonitor:
                 next_signature, workspace_dirty = progress_signature(spec)
                 if next_signature != current_progress_signature:
                     current_progress_signature = next_signature
+                    calls_without_durable_progress = 0
                     last_productive_mono = now
 
             constraint_violation, last_constraint_scan_size, tool_call_count = (
@@ -104,14 +120,87 @@ class CodexProcessMonitor:
                     tool_call_count,
                 )
             )
-            if constraint_violation is not None:
+            if not spec.read_only and tool_call_count > observed_tool_call_count:
+                next_signature, workspace_dirty = progress_signature(spec)
+                calls_without_durable_progress = updated_calls_without_durable_progress(
+                    current_progress_signature,
+                    next_signature,
+                    calls_without_durable_progress,
+                    tool_call_count - observed_tool_call_count,
+                )
+                current_progress_signature = next_signature
+                observed_tool_call_count = tool_call_count
+                if calls_without_durable_progress >= CODEX_INEFFICIENT_TOOL_USAGE_LIMIT:
+                    completed = self._completed_result_if_ready(
+                        proc,
+                        spec,
+                        started_wall,
+                        terminate=True,
+                        cancel_requested=cancel_requested,
+                    )
+                    if completed is not None:
+                        return replace(completed, lifecycle_events=tuple(budget_events))
+                    terminate_spawned_process(proc)
+                    return self._stopped_result(
+                        proc,
+                        "inefficient_tool_usage",
+                        "Codex started 16 tool calls without durable progress",
+                        lifecycle_events=tuple(budget_events),
+                    )
+            budget_scan = scan_budget_lifecycle(
+                spec.log_path.with_suffix(".events.jsonl"),
+                budget_scan_size,
+                budget_tool_call_count,
+                policy=budget_policy,
+                warning_emitted=any(event.kind == "budget_warning" for event in budget_events),
+                handoff_emitted=any(event.kind == "budget_handoff" for event in budget_events),
+            )
+            budget_scan_size = budget_scan.scan_size
+            budget_tool_call_count = budget_scan.tool_call_count
+            budget_events.extend(budget_scan.events)
+            hard_budget_violation = (
+                constraint_violation
+                if constraint_violation and constraint_violation.startswith("Codex exceeded")
+                else None
+            )
+            if constraint_violation is not None and hard_budget_violation is None:
                 terminate_spawned_process(proc)
                 status = (
                     "terminal_scope_violation"
                     if constraint_violation.startswith("Terminal tool")
                     else "tool_call_budget"
                 )
-                return self._stopped_result(proc, status, constraint_violation)
+                return self._stopped_result(
+                    proc,
+                    status,
+                    constraint_violation,
+                    lifecycle_events=tuple(budget_events),
+                )
+            if hard_budget_violation is not None:
+                completed = self._completed_result_if_ready(
+                    proc,
+                    spec,
+                    started_wall,
+                    terminate=True,
+                    cancel_requested=cancel_requested,
+                )
+                if completed is not None:
+                    return replace(completed, lifecycle_events=tuple(budget_events))
+                terminate_spawned_process(proc)
+                return self._stopped_result(
+                    proc,
+                    "tool_call_budget",
+                    hard_budget_violation,
+                    lifecycle_events=tuple(budget_events),
+                )
+            if budget_scan.violation is not None:
+                terminate_spawned_process(proc)
+                return self._stopped_result(
+                    proc,
+                    "tool_call_budget",
+                    budget_scan.violation,
+                    lifecycle_events=tuple(budget_events),
+                )
 
             (
                 terminal_result,
@@ -133,7 +222,7 @@ class CodexProcessMonitor:
                 cancel_requested=cancel_requested,
             )
             if terminal_result is not None:
-                return terminal_result
+                return replace(terminal_result, lifecycle_events=tuple(budget_events))
 
             time.sleep(0.2)
 
@@ -153,7 +242,13 @@ class CodexProcessMonitor:
         last_forbidden_tool_scan_size: int,
         cancel_requested: Callable[[], bool],
     ) -> tuple[AgentRunResult | None, int, int, int]:
-        completed = self._completed_result_if_ready(proc, spec, started_wall, terminate=True)
+        completed = self._completed_result_if_ready(
+            proc,
+            spec,
+            started_wall,
+            terminate=True,
+            cancel_requested=cancel_requested,
+        )
         if completed is not None:
             return (
                 completed,
@@ -285,12 +380,24 @@ class CodexProcessMonitor:
         started_wall: float,
         *,
         terminate: bool,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> AgentRunResult | None:
         result_state = inspect_result(spec.result_path, started_wall)
-        if not result_state.done:
+        if not result_state.done or not self._valid_terminal_handoff(
+            spec, result_state.verification_state
+        ):
             return None
+        terminal_signature, _ = progress_signature(spec)
         if terminate:
-            self._await_completed_process(proc, spec)
+            if self._await_completed_process(proc, spec, cancel_requested):
+                return self._stopped_result(proc, "cancelled", "Cancel requested")
+            final_signature, _ = progress_signature(spec)
+            if final_signature != terminal_signature:
+                return self._stopped_result(
+                    proc,
+                    "late_edit",
+                    "Terminal handoff changed after it was observed",
+                )
         return self._completed_result(
             proc, result_state.status, result_state.escalation_classification
         )
@@ -305,12 +412,14 @@ class CodexProcessMonitor:
         if exit_code is None:
             return None
         last_message_path = spec.log_path.with_suffix(".last-message.md")
-        result_state = recover_result_from_last_message(
-            spec.result_path,
-            last_message_path,
-            started_wall,
+        result_state = (
+            recover_result_from_last_message(spec.result_path, last_message_path, started_wall)
+            if spec.read_only
+            else inspect_result(spec.result_path, started_wall)
         )
-        if result_state.done:
+        if result_state.done and CodexProcessMonitor._valid_terminal_handoff(
+            spec, result_state.verification_state
+        ):
             return CodexProcessMonitor._completed_result(
                 proc, result_state.status, result_state.escalation_classification
             )
@@ -366,6 +475,10 @@ class CodexProcessMonitor:
         return None
 
     @staticmethod
+    def _valid_terminal_handoff(spec: AgentRunSpec, verification_state: str | None) -> bool:
+        return spec.read_only or verification_state == "valid"
+
+    @staticmethod
     def _completed_result(
         proc: TerminableProcess,
         result_status: str | None,
@@ -385,6 +498,8 @@ class CodexProcessMonitor:
         proc: TerminableProcess,
         status: str,
         message: str,
+        *,
+        lifecycle_events: tuple[BudgetLifecycleEvent, ...] = (),
     ) -> AgentRunResult:
         return AgentRunResult(
             status=status,
@@ -392,26 +507,32 @@ class CodexProcessMonitor:
             exit_code=proc.poll(),
             result_status=None,
             message=message,
+            lifecycle_events=lifecycle_events,
         )
 
     def _await_completed_process(
         self,
         proc: TerminableProcess,
         spec: AgentRunSpec,
-    ) -> None:
+        cancel_requested: Callable[[], bool] | None,
+    ) -> bool:
         deadline = time.monotonic() + CODEX_COMPLETION_GRACE_SEC
         event_log_path = spec.log_path.with_suffix(".events.jsonl")
         while proc.poll() is None:
+            if cancel_requested is not None and cancel_requested():
+                terminate_spawned_process(proc)
+                return True
             if self._turn_completed(event_log_path):
                 try:
                     proc.wait(timeout=1.0)
                 except (OSError, subprocess.TimeoutExpired):
                     terminate_spawned_process(proc)
-                return
+                return False
             if time.monotonic() >= deadline:
                 terminate_spawned_process(proc)
-                return
+                return False
             time.sleep(0.1)
+        return False
 
 
 def terminate_spawned_process(proc: TerminableProcess) -> None:
