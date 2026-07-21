@@ -6,6 +6,13 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Added
 
+- Added `attempt_metrics.cache_creation_input_tokens` (persisted via a pragma-guarded
+  `alter table`, backfilled to 0 for existing rows) so the billing-relevant Claude split —
+  uncached input vs cache-read vs cache-write — can be reconstructed without re-parsing
+  transcripts; `metrics_report` now also reports a derived `uncached_input_tokens` total.
+  `load_attempt_metrics`, the `analytics` CLI command, and the `agent_analytics` MCP tool
+  gained a `--backend`/`backend` filter so claude and codex fleets can be analyzed
+  separately.
 - Added a first-class Claude Code backend (`claude`; `claude-code` is a legacy alias)
   alongside `codex` and `agy`, driven by a headless `claude -p --output-format
   stream-json` runner with `--effort`, `--permission-mode`, and `--session-id`/`--resume`

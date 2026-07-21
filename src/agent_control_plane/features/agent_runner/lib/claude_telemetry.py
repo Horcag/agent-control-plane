@@ -32,8 +32,10 @@ def parse_claude_jsonl(
     thread_id: str | None = None
     turn_completed = False
     result_usage: TokenUsage | None = None
+    result_cache_creation_input_tokens = 0
     total_cost_usd: float | None = None
     message_usage: dict[str, TokenUsage] = {}
+    message_cache_creation_input_tokens: dict[str, int] = {}
     error_events = 0
     tool_counts: Counter[str] = Counter()
     seen_tool_use_ids: set[str] = set()
@@ -61,6 +63,9 @@ def parse_claude_jsonl(
             usage = claude_usage_from_mapping(event.get("usage"))
             if usage is not None:
                 result_usage = usage
+                result_cache_creation_input_tokens = _cache_creation_from_mapping(
+                    event.get("usage")
+                )
             cost = event.get("total_cost_usd")
             if isinstance(cost, int | float):
                 total_cost_usd = float(cost)
@@ -74,6 +79,9 @@ def parse_claude_jsonl(
                 message_id = message.get("id")
                 key = message_id if isinstance(message_id, str) and message_id else line[:96]
                 message_usage[key] = usage
+                message_cache_creation_input_tokens[key] = _cache_creation_from_mapping(
+                    message.get("usage")
+                )
             for block in _content_blocks(message):
                 if block.get("type") != "tool_use":
                     continue
@@ -95,19 +103,21 @@ def parse_claude_jsonl(
     if session_id_hint and thread_id is None:
         thread_id = session_id_hint
     usage_total = result_usage
+    cache_creation_input_tokens = result_cache_creation_input_tokens
     if usage_total is None and message_usage:
         usage_total = _sum_usage(message_usage.values())
+        cache_creation_input_tokens = sum(message_cache_creation_input_tokens.values())
     if (
         usage_total is None
         and thread_id
         and sessions_root is not None
         and workspace_path is not None
     ):
-        recovered = latest_claude_session_usage(
-            claude_session_path(sessions_root, workspace_path, thread_id)
-        )
+        session_path = claude_session_path(sessions_root, workspace_path, thread_id)
+        recovered = latest_claude_session_usage(session_path)
         if recovered is not None:
             usage_total = recovered.usage
+            cache_creation_input_tokens = _recover_cache_creation_input_tokens(session_path)
 
     usage_available = usage_total is not None
     input_tokens = usage_total.input_tokens if usage_total else 0
@@ -157,6 +167,7 @@ def parse_claude_jsonl(
         estimated_api_usd=estimated_api_usd,
         rate_card_version=rate_card_version,
         event_log_path=path,
+        cache_creation_input_tokens=cache_creation_input_tokens,
     )
 
 
@@ -283,6 +294,43 @@ def _sum_usage(values: Any) -> TokenUsage:
             reasoning_output_tokens=0,
         )
     return total
+
+
+def _cache_creation_from_mapping(value: Any) -> int:
+    if not isinstance(value, dict):
+        return 0
+    raw = value.get("cache_creation_input_tokens")
+    return int(raw) if isinstance(raw, int | float) else 0
+
+
+def _recover_cache_creation_input_tokens(path: Path) -> int:
+    """Sum cache-creation tokens from a Claude session transcript.
+
+    Mirrors the message dedup/sidechain-skip logic in
+    ``latest_claude_session_usage`` since the shared ``TokenUsage`` schema
+    cannot carry a cache-creation field.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return 0
+    cache_creation_by_message: dict[str, int] = {}
+    for line in lines:
+        entry = _parse_event(line)
+        if entry is None or entry.get("type") != "assistant":
+            continue
+        if entry.get("isSidechain") is True:
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        message_id = message.get("id")
+        key = message_id if isinstance(message_id, str) and message_id else str(entry.get("uuid"))
+        cache_creation_by_message[key] = _cache_creation_from_mapping(usage)
+    return sum(cache_creation_by_message.values())
 
 
 def _read_new_text(path: Path, scan_size: int) -> tuple[str, int]:

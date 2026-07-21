@@ -354,13 +354,19 @@ def build_server(config_path: str | None = None) -> Any:
         limit: int = 100,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        backend: str | None = None,
         valid_only: bool = False,
     ) -> dict[str, Any]:
-        """Aggregate duration, token, cache, tool, and estimated cost metrics."""
+        """Aggregate duration, token, cache, tool, and estimated cost metrics.
+
+        backend filters to a single backend (e.g. "codex" or "claude") so
+        analytics from mixed fleets can be inspected separately.
+        """
         return control.analytics(
             limit=limit,
             model=model,
             reasoning_effort=reasoning_effort,
+            backend=backend,
             valid_only=valid_only,
         )
 

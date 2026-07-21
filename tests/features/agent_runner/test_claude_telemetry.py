@@ -71,6 +71,29 @@ def test_result_event_provides_usage_cost_and_session_identity(tmp_path) -> None
     assert metrics.reasoning_output_tokens == 0
     assert metrics.estimated_api_usd == pytest.approx(1.25)
     assert metrics.rate_card_version == "claude-code-cli"
+    assert metrics.cache_creation_input_tokens == 50
+
+
+def test_result_event_cache_creation_is_additive_detail_not_folded_out_of_input(
+    tmp_path,
+) -> None:
+    path = _events_file(
+        tmp_path,
+        [
+            _init_event(),
+            _result_event(
+                usage={
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 50,
+                    "output_tokens": 5,
+                }
+            ),
+        ],
+    )
+    metrics = parse_claude_jsonl(path, model="claude-opus-4-8", duration_sec=1.0)
+    assert metrics.cache_creation_input_tokens == 50
+    assert metrics.input_tokens == 60
 
 
 def test_success_subtype_with_is_error_true_does_not_complete_the_turn(tmp_path) -> None:
@@ -104,6 +127,7 @@ def test_assistant_usage_sum_is_the_fallback_when_result_missing(tmp_path) -> No
     assert metrics.usage_available is True
     assert metrics.input_tokens == 1050 + 10
     assert metrics.output_tokens == 45
+    assert metrics.cache_creation_input_tokens == 50
 
 
 def test_tool_use_blocks_are_counted_with_mcp_naming_and_failures(tmp_path) -> None:
@@ -199,6 +223,7 @@ def test_session_transcript_recovery_when_stream_has_no_usage(tmp_path) -> None:
     )
     assert metrics.usage_available is True
     assert metrics.input_tokens == 1050
+    assert metrics.cache_creation_input_tokens == 50
 
 
 def test_turn_completed_requires_a_result_event(tmp_path) -> None:
