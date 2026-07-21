@@ -17,6 +17,7 @@ from agent_control_plane.features.agent_runner.lib.codex_runner import (
     _workspace_environment,
 )
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
+    CODEX_INEFFICIENT_TOOL_USAGE_LIMIT,
     dirty_file_markers_from_porcelain,
     is_known_temporary_patch_artifact,
     porcelain_changed_path,
@@ -229,11 +230,13 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 self.assertEqual(result.status, expected_status)
                 self.assertEqual(proc.terminated, not verified)
 
-    def test_writable_runner_stops_after_sixteen_calls_without_durable_progress(self) -> None:
+    def test_writable_runner_stops_after_the_inefficient_tool_usage_limit_without_durable_progress(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             log_path = root / "attempt-001.log"
-            _write_budget_events(log_path, count=16)
+            _write_budget_events(log_path, count=CODEX_INEFFICIENT_TOOL_USAGE_LIMIT)
             proc = _FakeProc()
 
             result = CodexProcessMonitor().monitor(
@@ -328,7 +331,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             log_path = root / "attempt-001.log"
-            _write_budget_events(log_path, count=16)
+            _write_budget_events(log_path, count=CODEX_INEFFICIENT_TOOL_USAGE_LIMIT)
             log_path.write_text("rg completed with Exit code: 1\n", encoding="utf-8")
 
             result = CodexProcessMonitor().monitor(

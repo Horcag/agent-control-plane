@@ -92,8 +92,7 @@ class PromptBuilderTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn(
-                "Your first IDEA MCP call must be "
-                "`mcp__agentbridge_idea_64343__get_project_info`",
+                "Your first IDEA MCP call must be `mcp__agentbridge_idea_64343__get_project_info`",
                 prompt,
             )
             self.assertIn("If the IDEA MCP project root differs", prompt)
