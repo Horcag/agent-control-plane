@@ -31,6 +31,7 @@ from agent_control_plane.features.agent_runner import (
     QuotaDecision,
     WorkerLease,
     WorkerLeaseError,
+    assess_result_contract,
     capture_process_identity,
     claude_ladder_for_explicit_model,
     codex_job_capacity_units,
@@ -112,6 +113,15 @@ class AttemptGuard:
             return True
         if not self._poll_is_due():
             return False
+        self.message = self._find_violation()
+        if self.message is None:
+            return False
+        self._record_violation()
+        return True
+
+    def check_workspace_now(self) -> bool:
+        if self.message:
+            return True
         self.message = self._find_violation()
         if self.message is None:
             return False
@@ -433,6 +443,7 @@ class JobExecutionService:
             cancel_requested=guard.should_stop,
             pid_observed=lambda pid: self._record_runner_pid(job, pid),
         )
+        guard.check_workspace_now()
         self._complete_attempt(job, attempt_no, profile, result)
         return AttemptOutcome(
             result=result,
@@ -484,6 +495,9 @@ class JobExecutionService:
             exit_code=result.exit_code,
             message=result.message,
         )
+        for event in result.lifecycle_events:
+            level = "warning" if event.kind == "budget_warning" else "info"
+            self.store.add_event(job.job_id, level, event.message)
         if result.metrics is not None:
             self.store.record_attempt_metrics(
                 job.job_id,
@@ -632,13 +646,34 @@ class JobExecutionService:
         if outcome.guardrail_message:
             self.write_blocked_result_if_missing(job, outcome.guardrail_message)
             return self._finish(job.job_id, "guardrail_violation", outcome.guardrail_message)
-        if self._should_escalate_model(job, state, result):
-            return self._prepare_model_escalation(job, state, result)
-        if self._should_continue_partial(job, state, attempt_no, result):
-            self._prepare_partial_continuation(job, state, result)
-            return None
         if result.completed:
-            return self._finish(job.job_id, result.result_status or "completed", result.message)
+            assessment = assess_result_contract(
+                job.expected_result_status,
+                result.result_status or "completed",
+            )
+            if assessment.matches:
+                return self._finish(
+                    job.job_id,
+                    assessment.effective_terminal_status,
+                    result.message,
+                )
+            if (
+                assessment.expected_status == "completed"
+                and assessment.reported_status == "partial"
+                and attempt_no < state.max_attempts
+            ):
+                if self._should_escalate_model(job, state, result):
+                    return self._prepare_model_escalation(job, state, result)
+                self._prepare_partial_continuation(job, state, result)
+                return None
+            message = (
+                "result_contract_mismatch "
+                f"expected={assessment.expected_status} reported={assessment.reported_status}"
+            )
+            self.store.add_event(job.job_id, "error", message)
+            return self._finish(job.job_id, assessment.effective_terminal_status, message)
+        runner_failure = result.status
+        self.store.set_runner_failure(job.job_id, runner_failure)
         if result.status == "cancelled":
             self.write_blocked_result_if_missing(job, result.message)
             return self._finish(job.job_id, "cancelled", result.message)
@@ -657,9 +692,17 @@ class JobExecutionService:
             prefix="dirty-after-failure",
         )
         if dirty_message and not job.allow_dirty:
-            self.write_blocked_result_if_missing(job, dirty_message)
-            self.store.add_event(job.job_id, "error", dirty_message)
-            return self._finish(job.job_id, "stopped_dirty_after_failure", dirty_message)
+            self.store.set_workspace_disposition(job.job_id, "dirty_after_failure")
+            cause = runner_failure or result.status
+            message = f"runner_failure={cause}; {dirty_message}"
+            self.write_blocked_result_if_missing(job, message)
+            self.store.add_event(job.job_id, "error", message)
+            return self._finish(job.job_id, "stopped_dirty_after_failure", message)
+        if runner_failure is not None:
+            self.store.set_workspace_disposition(job.job_id, "clean")
+        if result.status == "inefficient_tool_usage":
+            self.store.add_event(job.job_id, "error", result.message)
+            return self._finish(job.job_id, result.status, result.message)
         if attempt_no < state.max_attempts:
             self.store.add_event(job.job_id, "warning", "Restarting after failed attempt")
         return None
@@ -721,19 +764,6 @@ class JobExecutionService:
         message = "Cancel requested while waiting to resize global Codex quota"
         self.write_blocked_result_if_missing(job, message)
         return self._finish(job.job_id, "cancelled", message)
-
-    def _should_continue_partial(
-        self,
-        job: JobRecord,
-        state: ExecutionState,
-        attempt_no: int,
-        result: AgentRunResult,
-    ) -> bool:
-        return (
-            normalize_backend(job.backend) in {CODEX_BACKEND, CLAUDE_BACKEND}
-            and result.result_status == "partial"
-            and attempt_no < state.max_attempts
-        )
 
     def _prepare_partial_continuation(
         self,
@@ -941,10 +971,15 @@ class JobExecutionService:
                 "inspect the preserved dirty status/patch and rerun after fixing the blocker"
             )
         job.result_path.parent.mkdir(parents=True, exist_ok=True)
+        what_changed = (
+            "worker left uncommitted workspace changes and controller preserved review evidence"
+            if artifact_note
+            else "no durable workspace changes were observed"
+        )
         job.result_path.write_text(
             "Status: blocked\n\n"
             f"Changed files: {changed_files}\n\n"
-            "What changed: nothing landed into the target branch\n\n"
+            f"What changed: {what_changed}\n\n"
             "Verification performed: none\n\n"
             f"Not verified / remaining risks: {risk_message}\n\n"
             f"Next action: {next_action}.\n",

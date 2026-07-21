@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -32,6 +34,7 @@ from agent_control_plane.features.agent_runner.lib.runner import (
 )
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.git_tools import GitError, head_commit
 from agent_control_plane.shared.native_quality import (
     resolve_native_quality_contract,
     write_native_quality_contract,
@@ -69,6 +72,11 @@ class JobLaunchOptions:
     plan_task_id: str | None = None
     plan_dispatch_token: str | None = None
     workspace_access: str | None = None
+    expected_result_status: str = "completed"
+    controller_gate_mode: str = "full"
+    expected_base_sha: str | None = None
+    effective_scope: tuple[str, ...] | None = None
+    retry_override_reason: str | None = None
 
 
 class SlotStatusView(Protocol):
@@ -146,6 +154,11 @@ class JobLauncher:
             if options.codex_premium_override_reason is not None
             else None
         )
+        retry_override_reason = _normalized_optional_text(
+            options.retry_override_reason,
+            "retry_override_reason",
+        )
+        effective_scope_json = _canonical_scope(options.effective_scope)
         if options.plan_task_id and not options.plan_id:
             raise JobLaunchError("plan_task_id requires plan_id")
         if options.plan_dispatch_token and not options.plan_id:
@@ -399,6 +412,18 @@ class JobLauncher:
             if codex_tool_call_budget <= 0:
                 raise JobLaunchError("Codex tool-call budget must be positive")
 
+        brief_path = self.config.coordination_root / "tasks" / options.task_id / "brief.md"
+        try:
+            brief_sha256 = hashlib.sha256(brief_path.read_bytes()).hexdigest()
+            launch_base_sha = head_commit(check.workspace_path)
+        except (OSError, GitError) as exc:
+            raise JobLaunchError(f"Could not capture launch provenance: {exc}") from exc
+        if options.expected_base_sha is not None and options.expected_base_sha != launch_base_sha:
+            raise JobLaunchError(
+                "expected_base_sha does not match the workspace HEAD "
+                f"({options.expected_base_sha!r} != {launch_base_sha!r})"
+            )
+
         job_id = new_job_id(options.task_id)
         run_dir = self.run_dir_for_job(job_id)
         prompt_path = run_dir / "prompt.md"
@@ -413,6 +438,8 @@ class JobLauncher:
                 backend=backend,
                 read_only=options.read_only,
                 codex_tool_call_budget=codex_tool_call_budget or 0,
+                expected_result_status=options.expected_result_status,
+                controller_gate_mode=options.controller_gate_mode,
                 workspace_access=workspace_access,
                 native_quality_contract=quality_contract,
             )
@@ -449,6 +476,12 @@ class JobLauncher:
                 codex_tool_call_budget=codex_tool_call_budget,
                 workspace_access=workspace_access,
                 slot_name=options.slot,
+                expected_result_status=options.expected_result_status,
+                controller_gate_mode=options.controller_gate_mode,
+                launch_base_sha=launch_base_sha,
+                brief_sha256=brief_sha256,
+                effective_scope_json=effective_scope_json,
+                retry_override_reason=retry_override_reason,
             )
         except ValueError as exc:
             raise JobLaunchError(str(exc)) from exc
@@ -584,6 +617,25 @@ def _backend_option(*values: str | None) -> str:
             raise JobLaunchError(f"Unsupported backend {value!r}. Expected one of: {allowed}")
         return backend
     raise JobLaunchError("No backend configured")
+
+
+def _normalized_optional_text(value: str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not (normalized := value.strip()):
+        raise JobLaunchError(f"{name} must be nonblank when provided")
+    return normalized
+
+
+def _canonical_scope(scope: tuple[str, ...] | None) -> str:
+    if scope is None:
+        return "[]"
+    normalized = []
+    for entry in scope:
+        if not isinstance(entry, str) or not (value := entry.strip()):
+            raise JobLaunchError("effective scope entries must be nonblank strings")
+        normalized.append(value)
+    return json.dumps(sorted(set(normalized)), ensure_ascii=False, separators=(",", ":"))
 
 
 def _initialize_task_artifacts(

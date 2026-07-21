@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from agent_control_plane.app.runtime.job_guardrails import (
     CODEX_DIRTY_DIFF_MAX_CHANGED_LINES,
 )
 from agent_control_plane.app.runtime.orchestrator import (
+    TERMINAL_STATUSES,
     AgentControlPlane,
     PolicyError,
     StartOptions,
@@ -46,6 +49,81 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_launcher_persists_launch_provenance_and_rejects_invalid_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            (workspace / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            _run(["git", "add", "tracked.txt"], workspace)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                workspace,
+            )
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "provenance")
+            brief_path = control.config.coordination_root / "tasks" / "provenance" / "brief.md"
+            brief_bytes = b"# Exact brief\r\n"
+            brief_path.write_bytes(brief_bytes)
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="provenance",
+                        route="main",
+                        expected_base_sha=head,
+                        effective_scope=(" tests/a.py ", "src/a.py", "src/a.py"),
+                        retry_override_reason=" approved retry ",
+                    )
+                )
+
+            self.assertEqual(job.launch_base_sha, head)
+            self.assertEqual(job.brief_sha256, hashlib.sha256(brief_bytes).hexdigest())
+            self.assertEqual(job.effective_scope_json, '["src/a.py","tests/a.py"]')
+            self.assertEqual(job.retry_override_reason, "approved retry")
+            _brief(control.config.coordination_root, "invalid-base")
+            with self.assertRaisesRegex(PolicyError, "expected_base_sha"):
+                control.start_job(
+                    StartOptions(
+                        task_id="invalid-base",
+                        route="main",
+                        expected_base_sha="0" * 40,
+                    )
+                )
+            self.assertEqual(len(control.store.list_jobs()), 1)
+
+            _brief(control.config.coordination_root, "invalid-scope")
+            with self.assertRaisesRegex(PolicyError, "scope"):
+                control.start_job(
+                    StartOptions(task_id="invalid-scope", route="main", effective_scope=(" ",))
+                )
+            with self.assertRaisesRegex(PolicyError, "retry_override_reason"):
+                control.start_job(
+                    StartOptions(
+                        task_id="invalid-scope",
+                        route="main",
+                        retry_override_reason=" ",
+                    )
+                )
+
+    def test_inefficient_tool_usage_is_terminal(self) -> None:
+        self.assertIn("inefficient_tool_usage", TERMINAL_STATUSES)
+
     def test_smoke_reports_advertised_default_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -922,6 +1000,28 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
+            (workspace / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+            _run(["git", "add", "tracked.txt"], workspace)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test User",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                workspace,
+            )
+            expected_base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             config = _config(root, workspace)
             config = replace(
                 config,
@@ -946,6 +1046,12 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                             backend=CODEX_BACKEND,
                             codex_model="gpt-5.3-codex-spark",
                             codex_reasoning_effort="high",
+                            expected_result_status="partial",
+                            controller_gate_mode="focused",
+                            expected_base_sha=expected_base_sha,
+                            effective_scope=(" tests/schema.py ", "src/schema.py"),
+                            codex_tool_call_budget=47,
+                            retry_override_reason="approved retry",
                         ),
                     ),
                 ),
@@ -956,13 +1062,23 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
 
             job_id = dispatched["dispatched"][0]["job_id"]
             job = control.store.get_job(job_id)
+            status = control.status_job(job_id)
             summary = control.summary_job(job_id)
             snapshot = control.plan_snapshot("dispatch-spark")
 
             self.assertEqual(job.codex_model, "gpt-5.3-codex-spark")
             self.assertEqual(job.codex_reasoning_effort, "high")
+            self.assertEqual(
+                (job.expected_result_status, job.controller_gate_mode), ("partial", "focused")
+            )
             self.assertIsNone(job.codex_quality_tier)
+            self.assertEqual(job.launch_base_sha, expected_base_sha)
+            self.assertEqual(job.effective_scope_json, '["src/schema.py","tests/schema.py"]')
+            self.assertEqual(job.codex_tool_call_budget, 47)
+            self.assertEqual(job.retry_override_reason, "approved retry")
+            self.assertEqual(status["controller_gate_mode"], "focused")
             self.assertEqual(summary["codex_quota_domain"], "spark")
+            self.assertEqual(summary["expected_result_status"], "partial")
             self.assertEqual(
                 snapshot["running"][0]["execution"]["codex_model"],
                 "gpt-5.3-codex-spark",
@@ -1461,6 +1577,135 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(runner.specs[1].codex_resume_thread_id, "thread-partial")
             self.assertIn("Continue the same assigned task", runner.specs[1].prompt)
 
+    def test_expected_partial_rejects_worker_completed_without_storing_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control, root, workspace, "job-partial-contract", expected_result_status="partial"
+            )
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_CapturingCompletedRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "contract_mismatch")
+            self.assertEqual(_attempt_result_status(control, job.job_id), "completed")
+
+    def test_expected_completed_partial_retries_only_when_an_attempt_remains(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(control, root, workspace, "job-completed-contract", max_restarts=0)
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_PartialThenCompletedRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "contract_mismatch")
+            self.assertEqual(_attempt_result_status(control, job.job_id), "partial")
+
+    def test_expected_partial_partial_stops_without_using_remaining_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control, root, workspace, "job-partial-match", expected_result_status="partial"
+            )
+            runner = _PartialThenCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner", return_value=runner
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "partial")
+            self.assertEqual(len(runner.specs), 1)
+
+    def test_expected_blocked_blocked_stops_as_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control, root, workspace, "job-blocked-match", expected_result_status="blocked"
+            )
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_ReportedBlockedRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "blocked")
+
+    def test_inefficient_tool_usage_stops_as_a_root_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(control, root, workspace, "job-inefficient")
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_InefficientToolUsageRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "inefficient_tool_usage")
+            self.assertEqual(_attempt_result_status(control, job.job_id), None)
+
+    def test_tool_budget_failure_preserves_dirty_workspace_with_original_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(control, root, workspace, "job-tool-budget")
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_DirtyFailureRunner("tool_call_budget"),
+            ):
+                finished = control.run_job(job.job_id)
+
+            result_text = job.result_path.read_text(encoding="utf-8")
+            self.assertEqual(finished.status, "stopped_dirty_after_failure")
+            self.assertEqual(finished.runner_failure, "tool_call_budget")
+            self.assertEqual(finished.workspace_disposition, "dirty_after_failure")
+            self.assertEqual(finished.checkpoint_disposition, "none")
+            self.assertEqual(finished.root_acceptance, "pending")
+            self.assertIn("worker left uncommitted workspace changes", result_text)
+            self.assertNotIn("nothing landed", result_text)
+
+    def test_terminal_scope_violation_preserves_original_runner_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(control, root, workspace, "job-terminal-scope")
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.PtyAgyRunner",
+                return_value=_DirtyFailureRunner("terminal_scope_violation"),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.runner_failure, "terminal_scope_violation")
+
     def test_quota_wait_retries_without_starting_model_until_acquired(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1491,7 +1736,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             workspace = _git_repo(root / "repo", "main")
             control = AgentControlPlane(_config(root, workspace))
             _brief(control.config.coordination_root, "task-1")
-            _create_job(
+            job = _create_job(
                 control,
                 root,
                 workspace,
@@ -1499,6 +1744,10 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 backend=CODEX_BACKEND,
                 codex_model="gpt-5.3-codex-spark",
             )
+            control.store.set_runner_failure(job.job_id, "late_edit")
+            control.store.set_workspace_disposition(job.job_id, "dirty_after_job")
+            control.store.set_checkpoint_disposition(job.job_id, "contaminated")
+            control.store.set_root_acceptance(job.job_id, "false_positive")
 
             status = control.status_job("job-quota-domain")
             summary = control.summary_job("job-quota-domain")
@@ -1512,6 +1761,19 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(status["codex_quota_domain"], "spark")
             self.assertEqual(summary["codex_quota_domain"], "spark")
             self.assertEqual(watch["codex_quota_domain"], "spark")
+            for payload in (status, summary):
+                self.assertEqual(
+                    tuple(
+                        payload[key]
+                        for key in (
+                            "runner_failure",
+                            "workspace_disposition",
+                            "checkpoint_disposition",
+                            "root_acceptance",
+                        )
+                    ),
+                    ("late_edit", "dirty_after_job", "contaminated", "false_positive"),
+                )
 
     def test_quota_wait_records_domain_in_event_and_passes_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1697,6 +1959,24 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn("guardrail.patch", result_text)
             self.assertTrue((job.run_dir / "guardrail.patch").exists())
 
+    def test_final_guardrail_rejects_completed_runner_late_forbidden_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(control, root, workspace, "job-1", backend=CODEX_BACKEND)
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=_LateForbiddenCompletedCodexRunner(),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "guardrail_violation")
+            self.assertIn("uv.lock", finished.last_error or "")
+            self.assertEqual(inspect_result(job.result_path, 0.0).status, "blocked")
+
     def test_codex_dirty_diff_guardrail_limits_growth_for_resumed_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -1794,6 +2074,10 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             result_state = inspect_result(job.result_path, 0.0)
 
             self.assertEqual(finished.status, "failed")
+            self.assertEqual(
+                (finished.runner_failure, finished.workspace_disposition), ("timeout", "clean")
+            )
+            self.assertEqual(finished.checkpoint_disposition, "none")
             self.assertIn("No progress before timeout", finished.last_error or "")
             self.assertEqual(result_state.status, "blocked")
             self.assertIn("No progress before timeout", result_text)
@@ -2004,6 +2288,45 @@ class _BlockedRunner:
         )
 
 
+class _ReportedBlockedRunner:
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+        spec.result_path.write_text("Status: blocked\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="blocked",
+            message="worker reported blocked",
+        )
+
+
+class _InefficientToolUsageRunner:
+    def run(self, *_args: Any, **_kwargs: Any) -> AgyRunResult:
+        return AgyRunResult(
+            status="inefficient_tool_usage",
+            completed=False,
+            exit_code=None,
+            result_status=None,
+            message="Codex started 16 tool calls without durable progress",
+        )
+
+
+class _DirtyFailureRunner:
+    def __init__(self, status: str) -> None:
+        self.status = status
+
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        (spec.workspace_path / "preserved.txt").write_text("dirty\n", encoding="utf-8")
+        return AgyRunResult(
+            status=self.status,
+            completed=False,
+            exit_code=None,
+            result_status=None,
+            message="runner exhausted its tool-call budget",
+        )
+
+
 class _CapturingCompletedRunner:
     def __init__(self) -> None:
         self.specs: list[Any] = []
@@ -2047,6 +2370,18 @@ class _LargeDirtyCodexRunner:
             exit_code=None,
             result_status=None,
             message="runner stopped after Codex dirty diff guardrail check",
+        )
+
+
+class _LateForbiddenCompletedCodexRunner:
+    def run(self, spec: Any, **_kwargs: Any) -> AgyRunResult:
+        (spec.workspace_path / "uv.lock").write_text("late\n", encoding="utf-8")
+        return AgyRunResult(
+            status="completed",
+            completed=True,
+            exit_code=0,
+            result_status="completed",
+            message="runner reported completed after late change",
         )
 
 
@@ -2164,6 +2499,8 @@ def _create_job(
     codex_tool_call_budget: int | None = None,
     workspace_access: str = "ide_mcp",
     read_only: bool = False,
+    expected_result_status: str = "completed",
+    max_restarts: int = 1,
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -2182,7 +2519,7 @@ def _create_job(
         timeout_sec=10,
         idle_timeout_sec=5,
         print_timeout="10s",
-        max_restarts=1,
+        max_restarts=max_restarts,
         yolo=False,
         allow_dirty=allow_dirty,
         read_only=read_only,
@@ -2193,6 +2530,7 @@ def _create_job(
         codex_tool_call_budget=codex_tool_call_budget,
         workspace_access=workspace_access,
         slot_name=slot_name,
+        expected_result_status=expected_result_status,
     )
 
 
@@ -2218,6 +2556,17 @@ def _record_mechanical_ladder(control: AgentControlPlane, job_id: str) -> None:
             ],
         },
     )
+
+
+def _attempt_result_status(control: AgentControlPlane, job_id: str) -> str | None:
+    database = sqlite3.connect(control.config.database_path)
+    try:
+        row = database.execute(
+            "select result_status from attempts where job_id = ? order by attempt_no", (job_id,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        database.close()
 
 
 class OrchestratorClaudeBackendTest(unittest.TestCase):

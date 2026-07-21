@@ -684,6 +684,12 @@ class AgentControlPlane:
                 plan_task_id=claim.task_id,
                 plan_dispatch_token=claim.dispatch_token,
                 workspace_access=claim.execution.workspace_access,
+                expected_result_status=claim.execution.expected_result_status,
+                controller_gate_mode=claim.execution.controller_gate_mode,
+                expected_base_sha=claim.execution.expected_base_sha,
+                effective_scope=claim.execution.effective_scope,
+                codex_tool_call_budget=claim.execution.codex_tool_call_budget,
+                retry_override_reason=claim.execution.retry_override_reason,
             )
         )
 
