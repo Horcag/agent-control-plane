@@ -212,6 +212,7 @@ def selected_native_quality_gates(
     *,
     stage: str | None = None,
     command_files: tuple[str, ...] | None = None,
+    controller_gate_mode: str = "full",
 ) -> tuple[NativeQualityGateConfig, ...]:
     normalized = tuple(path.replace("\\", "/").removeprefix("./") for path in changed_files)
     available_python_files = _changed_python_files(
@@ -219,7 +220,9 @@ def selected_native_quality_gates(
     )
     return tuple(
         gate
-        for gate in native_quality_gates_for_stage(contract, stage)
+        for gate in native_quality_gates_for_stage(
+            contract, stage, controller_gate_mode=controller_gate_mode
+        )
         if (
             not gate.include_globs
             or any(_matches_any(path, gate.include_globs) for path in normalized)
@@ -231,11 +234,19 @@ def selected_native_quality_gates(
 def native_quality_gates_for_stage(
     contract: NativeQualityContract,
     stage: str | None,
+    *,
+    controller_gate_mode: str = "full",
 ) -> tuple[NativeQualityGateConfig, ...]:
     if stage not in {None, "worker", "controller"}:
         raise ValueError("native quality stage must be worker or controller")
+    if controller_gate_mode not in {"full", "focused", "none"}:
+        raise ValueError("controller gate mode must be full, focused, or none")
     if stage is None:
         return contract.gates
+    if stage == "controller" and controller_gate_mode == "none":
+        return ()
+    if stage == "controller" and controller_gate_mode == "focused":
+        return tuple(gate for gate in contract.gates if gate.run_on == "both")
     return tuple(gate for gate in contract.gates if gate.run_on in {stage, "both"})
 
 

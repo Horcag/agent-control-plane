@@ -14,7 +14,10 @@ from agent_control_plane.shared.git_tools import (
     head_commit,
     workspace_state,
 )
-from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.path_rules import (
+    is_known_temporary_patch_artifact,
+    is_same_or_child,
+)
 
 
 class SlotCheckpointError(RuntimeError):
@@ -227,6 +230,19 @@ def checkpoint_changed_files(
         index += 1
         changes.append({"path": path.replace("\\", "/"), "status": status})
     return changes
+
+
+def checkpoint_temporary_patch_artifacts(
+    workspace_path: Path,
+    checkpoint: SlotCheckpoint,
+) -> tuple[str, ...]:
+    """Return newly introduced proven temporary patch artifacts in a checkpoint."""
+    return tuple(
+        change["path"]
+        for change in checkpoint_changed_files(workspace_path, checkpoint)
+        if change["status"].startswith(("A", "C", "R"))
+        and is_known_temporary_patch_artifact(change["path"])
+    )
 
 
 def _snapshot_tree(workspace: Path, scratch_root: Path) -> str:

@@ -11,6 +11,7 @@ from agent_control_plane.features.result_handoff.lib.slot_checkpoint import (
     SlotCheckpoint,
     SlotCheckpointError,
     checkpoint_changed_files,
+    checkpoint_temporary_patch_artifacts,
     verify_slot_checkpoint,
 )
 from agent_control_plane.shared.native_quality import (
@@ -95,6 +96,8 @@ def build_verification_bundle(
     workspace_changed: bool | None = None,
     quality_contract: NativeQualityContract | None = None,
     quality_contract_error: str | None = None,
+    expected_result_status: str | None = None,
+    controller_gate_mode: str = "full",
 ) -> dict[str, Any]:
     contract = quality_contract or NativeQualityContract(policy="off")
     result_error: str | None = None
@@ -104,6 +107,8 @@ def build_verification_bundle(
         text = ""
         result_error = str(exc)
     result = parse_result_report(text)
+    expected_status = expected_result_status or result["status"]
+    result_contract_matches = expected_status == result["status"]
     worker_verification = (
         inspect_verification_report(
             result_path,
@@ -121,12 +126,17 @@ def build_verification_bundle(
         }
     )
     actual_changes: list[dict[str, str]] = []
+    temporary_patch_artifacts: tuple[str, ...] = ()
     artifact_error = checkpoint_error
     checkpoint_verified = False
     if checkpoint is not None:
         try:
             verify_slot_checkpoint(workspace_path or checkpoint.workspace_path, checkpoint)
             actual_changes = checkpoint_changed_files(
+                workspace_path or checkpoint.workspace_path,
+                checkpoint,
+            )
+            temporary_patch_artifacts = checkpoint_temporary_patch_artifacts(
                 workspace_path or checkpoint.workspace_path,
                 checkpoint,
             )
@@ -166,7 +176,14 @@ def build_verification_bundle(
         contract=contract,
         required=quality_required,
     )
-    controller_required = quality_required and contract.policy == "controller"
+    controller_required = bool(
+        quality_required
+        and contract.policy == "controller"
+        and controller_gate_mode != "none"
+        and result_contract_matches
+        and expected_status == "completed"
+        and not temporary_patch_artifacts
+    )
     if controller_required and run_dir is not None and checkpoint is not None:
         controller_quality = inspect_native_quality_report(
             run_dir,
@@ -174,6 +191,7 @@ def build_verification_bundle(
             changed_files=changed_paths,
             command_files=command_paths,
             contract=contract,
+            controller_gate_mode=controller_gate_mode,
         )
     elif controller_required:
         controller_quality = {
@@ -201,15 +219,25 @@ def build_verification_bundle(
         "review_ready": bool(
             result["format_valid"]
             and result["status"] == "completed"
+            and expected_status == "completed"
+            and result_contract_matches
+            and controller_gate_mode == "full"
             and effective_status == "completed"
             and result_error is None
             and artifact_error is None
+            and not temporary_patch_artifacts
             and worker_verification["state"] == "valid"
             and quality_contract_error is None
             and worker_quality["status"] in {"passed", "not_required"}
             and controller_passed
         ),
         "result": result,
+        "result_contract": {
+            "expected_status": expected_status,
+            "reported_status": result["status"],
+            "matches": result_contract_matches,
+        },
+        "controller_gate_mode": controller_gate_mode,
         "result_error": result_error,
         "worker_verification": worker_verification,
         "quality_contract": {
@@ -239,6 +267,8 @@ def build_verification_bundle(
             "checkpoint_ref": checkpoint.ref_name if checkpoint is not None else None,
             "checkpoint_sha": checkpoint.commit_sha if checkpoint is not None else None,
             "checkpoint_verified": checkpoint_verified,
+            "disposition": "contaminated" if temporary_patch_artifacts else "normal",
+            "matched_paths": list(temporary_patch_artifacts),
             "error": artifact_error,
         },
     }

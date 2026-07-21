@@ -6,6 +6,7 @@ from typing import Any
 from agent_control_plane.entities.job import ReviewMetricsStore
 from agent_control_plane.entities.plan import PlanStore
 from agent_control_plane.entities.review_inbox import ReviewInboxStore
+from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.sqlite_runtime import control_database
 
 
@@ -92,6 +93,84 @@ class HandoffAcceptanceService:
             "item_id": item_id,
             "review_span_id": review_span_id,
             "accepted_sha": effective_sha,
+            "inbox_status": self.review_inbox.get(item_id).review_status,
+            "plan": self.plan_store.snapshot(plan_id),
+        }
+
+    def verify_continuation(
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        review_span_id: str,
+        checkpoint_sha: str,
+        attempt_no: int | None = None,
+        defects_found: int = 0,
+        false_positives: int = 0,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(checkpoint_sha, str) or not checkpoint_sha.strip():
+            raise ValueError("checkpoint_sha must be a non-empty string")
+        self.plan_store.initialize()
+        self.review_inbox.initialize()
+        self.review_metrics.initialize()
+        with control_database(self.database_path) as db:
+            db.execute("begin immediate")
+            target = self.plan_store.review_target_in_transaction(db, plan_id, task_id)
+            job_id = target.get("job_id")
+            if not isinstance(job_id, str) or not job_id:
+                raise ValueError(f"Plan task has no bound job: {plan_id}/{task_id}")
+            item_id = f"agent_job:{job_id}"
+            inbox_row = db.execute(
+                """
+                select source_kind, source_id, checkpoint_sha, review_status
+                from review_inbox_items where item_id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if inbox_row is None:
+                raise KeyError(f"Review inbox item not found: {item_id}")
+            if inbox_row["source_kind"] != "agent_job" or inbox_row["source_id"] != job_id:
+                raise ValueError(f"Review inbox item does not belong to plan job: {item_id}")
+            if inbox_row["checkpoint_sha"] != checkpoint_sha:
+                raise ValueError("checkpoint_sha must exactly match the review inbox checkpoint")
+            if inbox_row["review_status"] in {"accepted", "rejected"}:
+                raise ValueError(
+                    f"Review inbox item already {inbox_row['review_status']}: {item_id}"
+                )
+            self.review_inbox.resolve_in_transaction(db, item_id, "continuation_verified")
+            self.plan_store.verify_continuation_in_transaction(db, plan_id, task_id)
+            self.review_metrics.attach_job_in_transaction(
+                db,
+                review_span_id,
+                job_id=job_id,
+                outcome="continuation_verified",
+                attempt_no=attempt_no,
+                root_verified=True,
+                checkpoint_sha=checkpoint_sha,
+                defects_found=defects_found,
+                false_positives=false_positives,
+                notes=notes,
+            )
+            cursor = db.execute(
+                """
+                update jobs set checkpoint_disposition = 'continuation_verified',
+                    root_acceptance = 'pending', updated_at = ?
+                where job_id = ?
+                """,
+                (utc_now(), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Job not found: {job_id}")
+        return {
+            "status": "continuation_verified",
+            "plan_id": plan_id,
+            "task_id": task_id,
+            "job_id": job_id,
+            "item_id": item_id,
+            "review_span_id": review_span_id,
+            "checkpoint_sha": checkpoint_sha,
+            "accepted_sha": None,
             "inbox_status": self.review_inbox.get(item_id).review_status,
             "plan": self.plan_store.snapshot(plan_id),
         }

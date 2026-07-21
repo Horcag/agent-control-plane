@@ -20,6 +20,7 @@ def test_plan_service_dispatches_a_claim_through_its_job_launcher(tmp_path: Path
         launch=lambda claim: _launched_job(claim.dispatch_task_id, launched),
         cancel_job=lambda _job_id: None,
         accept_handoff=lambda *_args, **_kwargs: {},
+        verify_continuation_handoff=lambda *_args, **_kwargs: {},
         reconcile_jobs=lambda _job_id=None: {},
         process_is_alive=lambda _pid: False,
         policy_error=RuntimeError,

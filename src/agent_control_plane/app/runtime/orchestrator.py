@@ -138,9 +138,11 @@ TERMINAL_STATUSES = frozenset(
         "completed",
         "partial",
         "blocked",
+        "contract_mismatch",
         "failed",
         "cancelled",
         "guardrail_violation",
+        "inefficient_tool_usage",
         "worker_error",
         "stopped_dirty_after_failure",
     }
@@ -240,6 +242,7 @@ class AgentControlPlane:
             launch=self._launch_plan_claim,
             cancel_job=self.cancel_job,
             accept_handoff=self._accept_plan_handoff,
+            verify_continuation_handoff=self._verify_continuation_handoff,
             reconcile_jobs=self.reconcile_jobs,
             process_is_alive=process_is_alive,
             policy_error=PolicyError,
@@ -634,6 +637,29 @@ class AgentControlPlane:
             notes=notes,
         )
 
+    def verify_continuation_handoff(
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        review_span_id: str,
+        checkpoint_sha: str,
+        attempt_no: int | None = None,
+        defects_found: int = 0,
+        false_positives: int = 0,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        return self.plan_service.verify_continuation_handoff(
+            plan_id,
+            task_id,
+            review_span_id=review_span_id,
+            checkpoint_sha=checkpoint_sha,
+            attempt_no=attempt_no,
+            defects_found=defects_found,
+            false_positives=false_positives,
+            notes=notes,
+        )
+
     def reject_plan_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
         return self.plan_service.reject_plan_task(plan_id, task_id)
 
@@ -668,6 +694,16 @@ class AgentControlPlane:
             review_inbox=self.review_inbox,
             review_metrics=self.review_metrics,
         ).accept(plan_id, task_id, **kwargs)
+
+    def _verify_continuation_handoff(
+        self, plan_id: str, task_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return HandoffAcceptanceService(
+            self.config.database_path,
+            plan_store=self.plan_store,
+            review_inbox=self.review_inbox,
+            review_metrics=self.review_metrics,
+        ).verify_continuation(plan_id, task_id, **kwargs)
 
     def retry_plan_task(
         self,
@@ -781,6 +817,8 @@ class AgentControlPlane:
             "route": job.route,
             "workspace_path": str(job.workspace_path),
             "expected_branch": job.expected_branch,
+            "expected_result_status": job.expected_result_status,
+            "controller_gate_mode": job.controller_gate_mode,
             "backend": job.backend,
             "agy_model": job.agy_model,
             "codex_model": job.codex_model,
@@ -790,6 +828,10 @@ class AgentControlPlane:
             "codex_premium_override_reason": job.codex_premium_override_reason,
             "codex_tool_call_budget": job.codex_tool_call_budget,
             "workspace_access": job.workspace_access,
+            "runner_failure": job.runner_failure,
+            "workspace_disposition": job.workspace_disposition,
+            "checkpoint_disposition": job.checkpoint_disposition,
+            "root_acceptance": job.root_acceptance,
             "native_quality": self._native_quality_summary(job),
             "worker_pid": job.worker_pid,
             "worker_instance_id": job.worker_instance_id,
@@ -836,6 +878,8 @@ class AgentControlPlane:
             "job_id": job.job_id,
             "task_id": job.task_id,
             "status": job.status,
+            "expected_result_status": job.expected_result_status,
+            "controller_gate_mode": job.controller_gate_mode,
             "terminal": self._is_terminal(job),
             "last_error": job.last_error,
             "backend": job.backend,
@@ -847,6 +891,10 @@ class AgentControlPlane:
             "codex_premium_override_reason": job.codex_premium_override_reason,
             "codex_tool_call_budget": job.codex_tool_call_budget,
             "workspace_access": job.workspace_access,
+            "runner_failure": job.runner_failure,
+            "workspace_disposition": job.workspace_disposition,
+            "checkpoint_disposition": job.checkpoint_disposition,
+            "root_acceptance": job.root_acceptance,
             "native_quality": self._native_quality_summary(job),
             "worker_pid": job.worker_pid,
             "worker_instance_id": job.worker_instance_id,

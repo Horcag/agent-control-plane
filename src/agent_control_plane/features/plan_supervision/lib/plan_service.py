@@ -34,6 +34,7 @@ class PlanService:
         launch: Callable[[PlanDispatchClaim], JobRecord],
         cancel_job: Callable[[str], Any],
         accept_handoff: Callable[..., dict[str, Any]],
+        verify_continuation_handoff: Callable[..., dict[str, Any]],
         reconcile_jobs: Callable[[str | None], dict[str, Any]],
         process_is_alive: Callable[[int], bool],
         policy_error: type[RuntimeError],
@@ -45,6 +46,7 @@ class PlanService:
         self._launch = launch
         self._cancel_job = cancel_job
         self._accept_handoff = accept_handoff
+        self._verify_continuation_handoff = verify_continuation_handoff
         self._reconcile_jobs = reconcile_jobs
         self._process_is_alive = process_is_alive
         self._policy_error = policy_error
@@ -92,6 +94,11 @@ class PlanService:
     def accept_handoff(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
         self._validate_plan_task_acceptance(plan_id, task_id)
         return self._accept_handoff(plan_id, task_id, **kwargs)
+
+    def verify_continuation_handoff(
+        self, plan_id: str, task_id: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._verify_continuation_handoff(plan_id, task_id, **kwargs)
 
     def reject_plan_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
         cursor = self._plan_store.snapshot(plan_id)["cursor"]

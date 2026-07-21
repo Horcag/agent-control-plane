@@ -68,6 +68,7 @@ class NativeQualityGateRunner:
         changed_files: tuple[str, ...],
         command_files: tuple[str, ...] | None = None,
         contract: NativeQualityContract,
+        controller_gate_mode: str = "full",
     ) -> dict[str, Any]:
         resolved_command_files = changed_files if command_files is None else command_files
         selected = selected_native_quality_gates(
@@ -75,6 +76,7 @@ class NativeQualityGateRunner:
             changed_files,
             stage="controller",
             command_files=resolved_command_files,
+            controller_gate_mode=controller_gate_mode,
         )
         checks = self._run_selected_gates(
             workspace_path,
@@ -92,11 +94,12 @@ class NativeQualityGateRunner:
             status = "failed"
             reason = "one or more controller quality gates failed"
         report = {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": status,
             "reason": reason,
             "checkpoint_tree_sha": checkpoint_tree_sha,
             "contract_sha256": contract.sha256,
+            "controller_gate_mode": controller_gate_mode,
             "changed_files": list(changed_files),
             "command_files": list(resolved_command_files),
             "max_parallel": contract.max_parallel,
@@ -253,6 +256,7 @@ def inspect_native_quality_report(
     changed_files: tuple[str, ...],
     command_files: tuple[str, ...] | None = None,
     contract: NativeQualityContract,
+    controller_gate_mode: str = "full",
 ) -> dict[str, Any]:
     path = run_dir / "native-quality.json"
     if not path.exists():
@@ -271,6 +275,7 @@ def inspect_native_quality_report(
             changed_files=changed_files,
             command_files=changed_files if command_files is None else command_files,
             contract=contract,
+            controller_gate_mode=controller_gate_mode,
         )
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         return {
@@ -296,6 +301,7 @@ def _validate_report(
     changed_files: tuple[str, ...],
     command_files: tuple[str, ...],
     contract: NativeQualityContract,
+    controller_gate_mode: str,
 ) -> None:
     required = {
         "schema_version",
@@ -303,20 +309,27 @@ def _validate_report(
         "reason",
         "checkpoint_tree_sha",
         "contract_sha256",
+        "controller_gate_mode",
         "changed_files",
         "command_files",
         "max_parallel",
         "checks",
         "claims_trust",
     }
+    if isinstance(payload, dict) and payload.get("schema_version") == 2:
+        required.remove("controller_gate_mode")
+        if controller_gate_mode != "full":
+            raise ValueError("legacy controller quality reports require full gate mode")
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("controller quality report has an unexpected shape")
-    if payload["schema_version"] != 2:
+    if payload["schema_version"] not in {2, 3}:
         raise ValueError("unsupported controller quality report schema")
     if payload["checkpoint_tree_sha"] != checkpoint_tree_sha:
         raise ValueError("controller quality report belongs to a different checkpoint tree")
     if payload["contract_sha256"] != contract.sha256:
         raise ValueError("controller quality report belongs to a different quality contract")
+    if payload["schema_version"] == 3 and payload["controller_gate_mode"] != controller_gate_mode:
+        raise ValueError("controller quality report gate mode drifted")
     if payload["changed_files"] != list(changed_files):
         raise ValueError(
             "controller quality report changed-files evidence does not match checkpoint"
@@ -340,6 +353,7 @@ def _validate_report(
         changed_files,
         stage="controller",
         command_files=command_files,
+        controller_gate_mode=controller_gate_mode,
     )
     if [check.get("name") for check in checks] != [gate.name for gate in selected]:
         raise ValueError("controller quality report does not contain the selected gates")

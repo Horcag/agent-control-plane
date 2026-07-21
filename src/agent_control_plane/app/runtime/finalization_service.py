@@ -23,8 +23,10 @@ from agent_control_plane.features.result_handoff import (
     SlotCheckpointError,
     build_verification_bundle,
     checkpoint_changed_files,
+    checkpoint_temporary_patch_artifacts,
     clean_checkpointed_workspace,
     create_slot_checkpoint,
+    parse_result_report,
     verify_slot_checkpoint,
 )
 from agent_control_plane.features.slot_lifecycle import SlotManager
@@ -205,6 +207,12 @@ class FinalizationService:
             )
             return item
 
+        workspace_disposition = "clean"
+        if state.dirty:
+            workspace_disposition = (
+                "dirty_after_failure" if job.runner_failure else "dirty_after_job"
+            )
+        job = self.store.set_workspace_disposition(job.job_id, workspace_disposition)
         should_checkpoint = force_checkpoint or (
             self.config.defaults.terminal_slot_policy == "checkpoint"
         )
@@ -311,6 +319,7 @@ class FinalizationService:
             )
             return item
 
+        self._preserve_checkpoint_salvage(job)
         released = self._release_slot_status(
             job,
             status="available",
@@ -340,16 +349,50 @@ class FinalizationService:
                 terminal_status=job_status,
                 scratch_root=job.run_dir / "checkpoint",
             )
+            self._preserve_checkpoint_salvage(job)
             delivery_status = (
                 "checkpointed" if job_status == "completed" else "salvage_checkpointed"
             )
+            temporary_patch_artifacts = checkpoint_temporary_patch_artifacts(
+                job.workspace_path,
+                checkpoint,
+            )
+            if temporary_patch_artifacts:
+                paths = ", ".join(temporary_patch_artifacts)
+                self.store.set_checkpoint_disposition(job.job_id, "contaminated")
+                self._upsert_job_review(
+                    job,
+                    delivery_status="checkpoint_contaminated",
+                    checkpoint=checkpoint,
+                    slot_released=False,
+                )
+                self._release_slot_status(
+                    job,
+                    status="contaminated",
+                    note=(
+                        f"job {job.job_id} checkpoint contains temporary patch artifacts: {paths}"
+                    ),
+                    allow_inactive=allow_inactive,
+                )
+                self.store.add_event(
+                    job.job_id,
+                    "warning",
+                    f"Terminal checkpoint preserved but quarantined due to temporary artifacts: {paths}",
+                )
+                return self.review_inbox.get(f"agent_job:{job.job_id}")
             contract, contract_error = self._native_quality_contract(job)
+            result_text = _read_result_text(job.result_path, fallback=None)
+            result_report = parse_result_report(result_text) if result_text is not None else None
             if (
                 job_status == "completed"
+                and job.expected_result_status == "completed"
+                and result_report is not None
+                and result_report["status"] == "completed"
                 and job.workspace_access == "native"
                 and not job.read_only
                 and contract.policy == "controller"
                 and contract_error is None
+                and job.controller_gate_mode != "none"
             ):
                 checkpoint_changes = checkpoint_changed_files(job.workspace_path, checkpoint)
                 changed_files = tuple(change["path"] for change in checkpoint_changes)
@@ -366,6 +409,7 @@ class FinalizationService:
                         changed_files=changed_files,
                         command_files=command_files,
                         contract=contract,
+                        controller_gate_mode=job.controller_gate_mode,
                     )
             self._upsert_job_review(
                 job,
@@ -432,6 +476,12 @@ class FinalizationService:
             )
         return item
 
+    def _preserve_checkpoint_salvage(self, job: JobRecord) -> None:
+        existing = self.store.get_job(job.job_id).checkpoint_disposition
+        if existing in {"contaminated", "continuation_verified", "final_accepted"}:
+            return
+        self.store.set_checkpoint_disposition(job.job_id, "salvage")
+
     def _upsert_job_review(
         self,
         job: JobRecord,
@@ -455,6 +505,8 @@ class FinalizationService:
             ),
             quality_contract=quality_contract,
             quality_contract_error=quality_contract_error,
+            expected_result_status=job.expected_result_status,
+            controller_gate_mode=job.controller_gate_mode,
         )
         return self.review_inbox.upsert(
             ReviewInboxDraft(

@@ -115,6 +115,108 @@ def test_quality_gate_stage_selection_and_python_placeholder_are_deterministic()
     )
 
 
+def test_controller_gate_mode_selection_is_deterministic() -> None:
+    controller = NativeQualityGateConfig(
+        name="controller",
+        command=("python", "-m", "pytest"),
+        run_on="controller",
+    )
+    shared = NativeQualityGateConfig(
+        name="shared",
+        command=("ruff", "check", "."),
+        run_on="both",
+    )
+    contract = NativeQualityContract(policy="controller", gates=(controller, shared))
+
+    assert [
+        gate.name
+        for gate in selected_native_quality_gates(
+            contract, ("src/app.py",), stage="controller", controller_gate_mode="full"
+        )
+    ] == ["controller", "shared"]
+    assert [
+        gate.name
+        for gate in selected_native_quality_gates(
+            contract, ("src/app.py",), stage="controller", controller_gate_mode="focused"
+        )
+    ] == ["shared"]
+    assert (
+        selected_native_quality_gates(
+            contract, ("src/app.py",), stage="controller", controller_gate_mode="none"
+        )
+        == ()
+    )
+
+
+def test_controller_quality_inspection_rejects_gate_mode_drift(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(NativeQualityGateConfig(name="shared", command=(sys.executable, "-c", "pass")),),
+    )
+    runner = NativeQualityGateRunner()
+    runner.run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "mode",
+        checkpoint_tree_sha="tree-mode",
+        changed_files=("src/app.py",),
+        contract=contract,
+        controller_gate_mode="focused",
+    )
+
+    inspection = inspect_native_quality_report(
+        tmp_path / "runs" / "mode",
+        checkpoint_tree_sha="tree-mode",
+        changed_files=("src/app.py",),
+        contract=contract,
+        controller_gate_mode="full",
+    )
+
+    assert inspection["state"] == "invalid"
+    assert "gate mode" in inspection["error"]
+
+
+def test_controller_quality_inspection_accepts_legacy_v2_only_for_full_mode(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(NativeQualityGateConfig(name="shared", command=(sys.executable, "-c", "pass")),),
+    )
+    run_dir = tmp_path / "runs" / "legacy"
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=run_dir,
+        checkpoint_tree_sha="tree-legacy",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+    report["schema_version"] = 2
+    del report["controller_gate_mode"]
+    (run_dir / "native-quality.json").write_text(json.dumps(report), encoding="utf-8")
+
+    full = inspect_native_quality_report(
+        run_dir,
+        checkpoint_tree_sha="tree-legacy",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+    focused = inspect_native_quality_report(
+        run_dir,
+        checkpoint_tree_sha="tree-legacy",
+        changed_files=("src/app.py",),
+        contract=contract,
+        controller_gate_mode="focused",
+    )
+
+    assert full["state"] == "valid"
+    assert focused["state"] == "invalid"
+    assert "legacy" in focused["error"]
+
+
 def test_native_quality_contract_v2_round_trips_and_reads_v1_defaults() -> None:
     contract = NativeQualityContract(
         policy="controller",

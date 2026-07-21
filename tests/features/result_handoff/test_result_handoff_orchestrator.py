@@ -30,6 +30,7 @@ from agent_control_plane.shared.native_quality import (
     resolve_native_quality_contract,
     write_native_quality_contract,
 )
+from agent_control_plane.shared.sqlite_runtime import control_database
 
 
 def test_terminal_dirty_job_is_checkpointed_delivered_and_slot_becomes_available(
@@ -102,12 +103,159 @@ Not verified / remaining risks:
     assert workspace_state(slot).porcelain == ""
     assert slot_state.status == "available"
     assert slot_state.active_job_id is None
+    causal = control.store.get_job(job.job_id)
+    assert causal.workspace_disposition == "dirty_after_job"
+    assert causal.checkpoint_disposition == "salvage"
+    assert causal.root_acceptance == "pending"
 
     control.finish_job(job.job_id, "completed")
     repeated_item = control.review_inbox.get("agent_job:job-1")
     assert repeated_item.checkpoint_sha == item.checkpoint_sha
     assert repeated_item.delivery_status == "checkpointed"
     assert repeated_item.slot_released is True
+    assert control.store.get_job(job.job_id).checkpoint_disposition == "salvage"
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ("new.rej", "new.orig", "tmp_fix.patch", "single_fix.patch"),
+)
+def test_temporary_artifact_checkpoint_is_preserved_and_quarantined(
+    tmp_path: Path,
+    artifact: str,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller gate ran')")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        f"job-temporary-artifact-{artifact}",
+        status_result="completed",
+        workspace_access="native",
+    )
+    control.create_plan(
+        plan_id=f"temporary-artifact-plan-{artifact}",
+        title="Temporary artifact plan",
+        tasks=(PlanTaskDefinition("task", "Task"),),
+    )
+    control.bind_plan_job(f"temporary-artifact-plan-{artifact}", "task", job.job_id)
+    _write_completed_result(job.result_path, command=shlex.join(command), changed_file=artifact)
+    (slot / artifact).write_text("temporary patch output\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    slot_state = control.slots.inspect_slot("app-1")
+    assert bundle is not None
+    assert item.delivery_status == "checkpoint_contaminated"
+    assert item.slot_released is False
+    assert bundle["review_ready"] is False
+    assert bundle["artifact"]["checkpoint_verified"] is True
+    assert bundle["artifact"]["disposition"] == "contaminated"
+    assert bundle["artifact"]["matched_paths"] == [artifact]
+    assert bundle["controller_quality"]["state"] == "not_required"
+    assert run_git(slot, "show", f"{item.checkpoint_sha}:{artifact}") == "temporary patch output"
+    assert (slot / artifact).exists()
+    assert workspace_state(slot).dirty
+    assert slot_state.status == "contaminated"
+    assert slot_state.active_job_id is None
+    assert artifact in (slot_state.note or "")
+    causal = control.store.get_job(job.job_id)
+    assert causal.workspace_disposition == "dirty_after_job"
+    assert causal.checkpoint_disposition == "contaminated"
+    assert causal.root_acceptance == "pending"
+    assert not (job.run_dir / "native-quality.json").exists()
+    reviews = ReviewMetricsStore(control.config.database_path)
+    span_id = reviews.start_span(
+        name="Continuation", session_path=tmp_path / "rollout.jsonl", usage=TokenUsage(0, 0, 0, 0)
+    )
+    with pytest.raises(ValueError, match="cannot verify continuation"):
+        control.verify_continuation_handoff(
+            f"temporary-artifact-plan-{artifact}",
+            "task",
+            review_span_id=span_id,
+            checkpoint_sha=item.checkpoint_sha or "",
+        )
+    assert reviews.report(span_id)["job_outcomes"] == []
+    with pytest.raises(PolicyError, match="review-ready"):
+        control.accept_plan_task(f"temporary-artifact-plan-{artifact}", "task")
+
+    control.finish_job(job.job_id, "completed")
+    repeated = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert repeated.checkpoint_sha == item.checkpoint_sha
+    assert repeated.checkpoint_ref == item.checkpoint_ref
+    assert repeated.delivery_status == "checkpoint_contaminated"
+    assert control.store.get_job(job.job_id).checkpoint_disposition == "contaminated"
+
+
+def test_dirty_runner_failure_is_preserved_when_checkpointed(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    control = AgentControlPlane(_config(tmp_path, route, slot, terminal_slot_policy="checkpoint"))
+    job = _active_slot_job(control, tmp_path, slot, "job-runner-failure", status_result="partial")
+    control.store.set_runner_failure(job.job_id, "tool_call_budget")
+    (slot / "worker.txt").write_text("preserve failure cause\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "stopped_dirty_after_failure")
+
+    causal = control.store.get_job(job.job_id)
+    assert causal.runner_failure == "tool_call_budget"
+    assert causal.workspace_disposition == "dirty_after_failure"
+    assert causal.checkpoint_disposition == "salvage"
+    assert causal.root_acceptance == "pending"
+
+
+def test_scoped_patch_does_not_contaminate_checkpoint(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    control = AgentControlPlane(_config(tmp_path, route, slot, terminal_slot_policy="checkpoint"))
+    job = _active_slot_job(control, tmp_path, slot, "job-scoped-patch", status_result="completed")
+    _write_completed_result(
+        job.result_path, command="worker check", changed_file="scoped-change.patch"
+    )
+    (slot / "scoped-change.patch").write_text("ordinary patch\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert item.delivery_status == "checkpointed"
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["artifact"]["disposition"] == "normal"
+    assert item.verification_bundle["artifact"]["matched_paths"] == []
+
+
+def test_modified_preexisting_orig_does_not_contaminate_checkpoint(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    (slot / "legacy.orig").write_text("base\n", encoding="utf-8")
+    _git(slot, "add", "legacy.orig")
+    _git(slot, "commit", "-m", "track legacy artifact")
+    control = AgentControlPlane(_config(tmp_path, route, slot, terminal_slot_policy="checkpoint"))
+    job = _active_slot_job(
+        control, tmp_path, slot, "job-existing-artifact", status_result="completed"
+    )
+    _write_completed_result(job.result_path, command="worker check", changed_file="legacy.orig")
+    (slot / "legacy.orig").write_text("modified\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert item.delivery_status == "checkpointed"
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["artifact"]["disposition"] == "normal"
 
 
 def test_native_controller_quality_is_rerun_and_bound_to_checkpoint(tmp_path: Path) -> None:
@@ -193,6 +341,210 @@ def test_controller_only_gate_is_not_duplicated_by_worker(tmp_path: Path) -> Non
     assert [check["name"] for check in bundle["controller_quality"]["payload"]["checks"]] == [
         "controller"
     ]
+
+
+def test_focused_controller_mode_runs_only_shared_gates_and_cannot_be_review_ready(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    controller_command = (sys.executable, "-c", "raise SystemExit(8)")
+    shared_command = (sys.executable, "-c", "print('shared-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(
+                name="controller", command=controller_command, run_on="controller"
+            ),
+            NativeQualityGateConfig(name="shared", command=shared_command, run_on="both"),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-focused-quality",
+        status_result="completed",
+        workspace_access="native",
+        controller_gate_mode="focused",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(shared_command))
+    (slot / "worker.txt").write_text("focused quality\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    bundle = control.review_inbox.get(f"agent_job:{job.job_id}").verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is False
+    assert bundle["result_contract"] == {
+        "expected_status": "completed",
+        "reported_status": "completed",
+        "matches": True,
+    }
+    assert bundle["controller_gate_mode"] == "focused"
+    assert [check["name"] for check in bundle["controller_quality"]["payload"]["checks"]] == [
+        "shared"
+    ]
+
+
+def test_partial_result_does_not_run_completed_only_controller_gates(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "raise SystemExit(8)")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-partial-no-controller-gates",
+        status_result="partial",
+        workspace_access="native",
+        expected_result_status="partial",
+    )
+    job.result_path.write_text(
+        """Status: partial
+
+Changed files:
+- worker.txt
+
+What changed:
+- Recorded the partial outcome.
+
+Verification performed:
+- none
+
+Not verified / remaining risks:
+- remaining work
+""",
+        encoding="utf-8",
+    )
+    job.result_path.with_name("verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "partial",
+                "changed_files": [{"path": "worker.txt", "change": "added"}],
+                "checks": [],
+                "unverified": ["remaining work"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (slot / "worker.txt").write_text("partial result\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "partial")
+
+    bundle = control.review_inbox.get(f"agent_job:{job.job_id}").verification_bundle
+    assert bundle is not None
+    assert bundle["controller_quality"]["state"] == "not_required"
+    assert bundle["review_ready"] is False
+    causal = control.store.get_job(job.job_id)
+    assert causal.workspace_disposition == "dirty_after_job"
+    assert causal.checkpoint_disposition == "salvage"
+    assert causal.root_acceptance == "pending"
+
+
+@pytest.mark.parametrize("disposition", ("continuation_verified", "final_accepted"))
+def test_checkpoint_replay_preserves_stronger_disposition(tmp_path: Path, disposition: str) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    control = AgentControlPlane(_config(tmp_path, route, slot, terminal_slot_policy="checkpoint"))
+    job = _active_slot_job(control, tmp_path, slot, "job-strong-replay", status_result="completed")
+    (slot / "worker.txt").write_text("durable result\n", encoding="utf-8")
+    control.finish_job(job.job_id, "completed")
+    checkpoint_sha = control.review_inbox.get(f"agent_job:{job.job_id}").checkpoint_sha
+    control.store.set_checkpoint_disposition(job.job_id, disposition)
+
+    control.finish_job(job.job_id, "completed")
+
+    assert control.review_inbox.get(f"agent_job:{job.job_id}").checkpoint_sha == checkpoint_sha
+    assert control.store.get_job(job.job_id).checkpoint_disposition == disposition
+
+
+def test_none_controller_gate_mode_does_not_run_or_write_a_quality_report(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "raise SystemExit(8)")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-none-controller-gates",
+        status_result="completed",
+        workspace_access="native",
+        controller_gate_mode="none",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    (slot / "worker.txt").write_text("no controller gates\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    bundle = control.review_inbox.get(f"agent_job:{job.job_id}").verification_bundle
+    assert bundle is not None
+    assert not (job.run_dir / "native-quality.json").exists()
+    assert bundle["controller_quality"]["state"] == "not_required"
+    assert bundle["review_ready"] is False
+
+
+def test_result_contract_mismatch_does_not_run_controller_gates(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "raise SystemExit(8)")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-mismatch-no-controller-gates",
+        status_result="completed",
+        workspace_access="native",
+        expected_result_status="partial",
+    )
+    _write_completed_result(job.result_path, command="worker check")
+    (slot / "worker.txt").write_text("mismatched result\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    bundle = control.review_inbox.get(f"agent_job:{job.job_id}").verification_bundle
+    assert bundle is not None
+    assert bundle["result_contract"]["matches"] is False
+    assert bundle["controller_quality"]["state"] == "not_required"
+    assert bundle["review_ready"] is False
 
 
 def test_shared_gate_uses_expanded_changed_python_files_for_both_stages(
@@ -630,12 +982,108 @@ def test_accept_handoff_rolls_back_every_decision_when_review_attach_fails(
     assert reviews.report(span_id)["job_outcomes"] == []
 
 
+def test_continuation_handoff_is_atomic_idempotent_and_does_not_accept(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot, terminal_slot_policy="checkpoint")
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-continuation",
+        status_result="partial",
+        expected_result_status="partial",
+        controller_gate_mode="focused",
+    )
+    _finish_review_ready_plan(
+        control, slot, job, plan_id="continuation-plan", result_status="partial"
+    )
+    reviews = ReviewMetricsStore(config.database_path)
+    span_id = reviews.start_span(
+        name="Continuation", session_path=tmp_path / "rollout.jsonl", usage=TokenUsage(0, 0, 0, 0)
+    )
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert (
+        control.plan_snapshot("continuation-plan")["requires_root_decision"][0]["state"]
+        == "partial"
+    )
+    assert item.delivery_status == "salvage_checkpointed"
+    checkpoint_sha = item.checkpoint_sha
+    assert checkpoint_sha is not None
+
+    verified = control.verify_continuation_handoff(
+        "continuation-plan", "task", review_span_id=span_id, checkpoint_sha=checkpoint_sha
+    )
+    replay = control.verify_continuation_handoff(
+        "continuation-plan", "task", review_span_id=span_id, checkpoint_sha=checkpoint_sha
+    )
+
+    assert verified["status"] == replay["status"] == "continuation_verified"
+    assert (
+        control.review_inbox.get(f"agent_job:{job.job_id}").review_status == "continuation_verified"
+    )
+    snapshot = control.plan_snapshot("continuation-plan")
+    assert snapshot["status"] == "active"
+    assert snapshot["requires_root_decision"][0]["task_id"] == "task"
+    assert snapshot["requires_root_decision"][0]["state"] == "partial"
+    assert control.store.get_job(job.job_id).checkpoint_disposition == "continuation_verified"
+    assert control.store.get_job(job.job_id).root_acceptance == "pending"
+    outcome = reviews.report(span_id)["job_outcomes"][0]
+    assert outcome["checkpoint_sha"] == checkpoint_sha
+    assert outcome["accepted_sha"] is None
+
+
+def test_continuation_handoff_fails_closed_for_mismatched_or_contaminated_checkpoint(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot, terminal_slot_policy="checkpoint")
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control, tmp_path, slot, "job-continuation-fail", status_result="partial"
+    )
+    _finish_review_ready_plan(control, slot, job, plan_id="continuation-fail-plan")
+    reviews = ReviewMetricsStore(config.database_path)
+    span_id = reviews.start_span(
+        name="Continuation", session_path=tmp_path / "rollout.jsonl", usage=TokenUsage(0, 0, 0, 0)
+    )
+    item_id = f"agent_job:{job.job_id}"
+
+    with pytest.raises(ValueError, match="exactly match"):
+        control.verify_continuation_handoff(
+            "continuation-fail-plan", "task", review_span_id=span_id, checkpoint_sha="wrong"
+        )
+    with control_database(config.database_path) as db:
+        db.execute(
+            "update review_inbox_items set verification_bundle_json = null, slot_released = 0 where item_id = ?",
+            (item_id,),
+        )
+    checkpoint_sha = control.review_inbox.get(item_id).checkpoint_sha
+    assert checkpoint_sha is not None
+    with pytest.raises(ValueError, match="cannot verify continuation"):
+        control.verify_continuation_handoff(
+            "continuation-fail-plan",
+            "task",
+            review_span_id=span_id,
+            checkpoint_sha=checkpoint_sha,
+        )
+
+    assert control.review_inbox.get(item_id).review_status == "pending"
+    assert (
+        control.plan_snapshot("continuation-fail-plan")["awaiting_review"][0]["task_id"] == "task"
+    )
+    assert reviews.report(span_id)["job_outcomes"] == []
+
+
 def test_checkpoint_cleanup_failure_keeps_slot_dirty_and_review_ref_visible(tmp_path: Path) -> None:
     route = _committed_repo(tmp_path / "repo")
     slot = _committed_repo(tmp_path / "slots" / "app-1")
     config = _config(tmp_path, route, slot, terminal_slot_policy="checkpoint")
     control = AgentControlPlane(config)
     job = _active_slot_job(control, tmp_path, slot, "job-1", status_result="cancelled")
+    control.store.set_runner_failure(job.job_id, "tool_call_budget")
     (slot / "worker.txt").write_text("salvage me\n", encoding="utf-8")
 
     with patch(
@@ -654,6 +1102,10 @@ def test_checkpoint_cleanup_failure_keeps_slot_dirty_and_review_ref_visible(tmp_
     assert workspace_state(slot).dirty
     assert slot_state.status == "dirty_after_job"
     assert slot_state.active_job_id is None
+    causal = control.store.get_job(job.job_id)
+    assert causal.runner_failure == "tool_call_budget"
+    assert causal.workspace_disposition == "dirty_after_failure"
+    assert causal.checkpoint_disposition == "salvage"
 
 
 def test_manual_checkpoint_recovers_an_inactive_dirty_terminal_slot(tmp_path: Path) -> None:
@@ -786,6 +1238,8 @@ def _active_slot_job(
     *,
     status_result: str,
     workspace_access: str = "ide_mcp",
+    expected_result_status: str = "completed",
+    controller_gate_mode: str = "full",
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -811,6 +1265,8 @@ def _active_slot_job(
         read_only=False,
         workspace_access=workspace_access,
         slot_name="app-1",
+        expected_result_status=expected_result_status,
+        controller_gate_mode=controller_gate_mode,
     )
     control.slots.sync_configured_slots()
     control.slot_store.acquire_slot("app-1", job.job_id)
@@ -830,6 +1286,7 @@ def _finish_review_ready_plan(
     job,
     *,
     plan_id: str,
+    result_status: str = "completed",
 ) -> None:
     control.create_plan(
         plan_id=plan_id,
@@ -838,7 +1295,7 @@ def _finish_review_ready_plan(
     )
     control.bind_plan_job(plan_id, "task", job.job_id)
     job.result_path.write_text(
-        """Status: completed
+        f"""Status: {result_status}
 
 Changed files:
 - worker.txt
@@ -858,7 +1315,7 @@ Not verified / remaining risks:
         json.dumps(
             {
                 "schema_version": 1,
-                "status": "completed",
+                "status": result_status,
                 "changed_files": [{"path": "worker.txt", "change": "added"}],
                 "checks": [
                     {
@@ -875,7 +1332,7 @@ Not verified / remaining risks:
         encoding="utf-8",
     )
     (slot / "worker.txt").write_text("reviewed result\n", encoding="utf-8")
-    control.finish_job(job.job_id, "completed")
+    control.finish_job(job.job_id, result_status)
 
 
 def _config(
