@@ -28,7 +28,10 @@ from agent_control_plane.shared.git_tools import (
     workspace_state,
 )
 
-CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 500
+# 500 killed legitimate Claude implementation jobs three times on 2026-07-20/21:
+# a single Write of one large test file crosses it between 2s guardrail polls,
+# faster than any incremental-commit discipline can reset the baseline.
+CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 1200
 ROUTE_ROOT_INDEX_GRACE_SEC = 15.0
 
 
