@@ -483,6 +483,11 @@ The file must be JSON only, use schema_version 1, and contain exactly:
 - status: completed, partial, or blocked; it must match result.md.
 - changed_files: objects with path and change (added, modified, deleted, renamed, or untracked).
 - checks: objects with command, cwd, outcome (passed, failed, or not_run), exit_code, and summary.
+  Record exactly ONE entry per check, holding that check's FINAL outcome and exit_code. If a check
+  applies autofixes and exits non-zero on the first pass while making changes (e.g. pre-commit
+  hooks), re-run it until it is stable and record ONLY the final run — do NOT record intermediate
+  non-zero autofix runs. A recorded check with a non-zero exit_code (or outcome other than passed)
+  is treated as a failed verification and blocks normal acceptance.
 - unverified: an array of concrete remaining risks or omitted checks.
 Example: {{"schema_version":1,"status":"completed","changed_files":[],"checks":[{{"command":"pytest -q","cwd":".","outcome":"passed","exit_code":0,"summary":"3 passed"}}],"unverified":[]}}
 Missing or malformed verification.json does not keep the worker alive, but it blocks normal acceptance."""
