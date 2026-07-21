@@ -58,6 +58,29 @@ class JobStoreTest(unittest.TestCase):
 
             self.assertTrue(store.cancel_requested("job-2"))
 
+    def test_request_cancel_does_not_resurrect_a_finished_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            _create_job(store, root, "job-done")
+
+            # Worker finished and the job finalized before the racing cancel lands.
+            store.mark_finished("job-done", "completed")
+            store.mark_finalization_completed("job-done")
+
+            cancelled = store.request_cancel("job-done")
+
+            # The cancel must be a no-op: clobbering the terminal status back to
+            # cancel_requested would exclude the job from reconciliation and
+            # strand its owning plan in "cancelling" forever.
+            self.assertEqual(cancelled.status, "completed")
+            self.assertFalse(cancelled.cancel_requested)
+            self.assertIsNotNone(cancelled.finished_at)
+            self.assertNotIn(
+                "job-done",
+                {job.job_id for job in store.reconciliation_candidates()},
+            )
+
     def test_routing_decision_readback_is_deterministic_after_store_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

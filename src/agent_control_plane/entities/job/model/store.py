@@ -489,7 +489,25 @@ class JobStore:
         )
 
     def request_cancel(self, job_id: str) -> JobRecord:
-        return self.update_job(job_id, cancel_requested=True, status="cancel_requested")
+        """Request cooperative cancellation without ever resurrecting a finished job.
+
+        A cancel that races a worker finishing must not overwrite a terminal
+        job's status back to ``cancel_requested``: such a job is excluded from
+        ``reconciliation_candidates`` and would strand its owning plan in
+        ``cancelling`` forever. Fail closed by scoping the write to jobs that
+        have not finished; an already-finished job is returned unchanged.
+        """
+        self.initialize()
+        with self._connect() as db:
+            db.execute(
+                """
+                update jobs
+                set cancel_requested = 1, status = 'cancel_requested', updated_at = ?
+                where job_id = ? and finished_at is null
+                """,
+                (utc_now(), job_id),
+            )
+        return self.get_job(job_id)
 
     def cancel_requested(self, job_id: str) -> bool:
         return self.get_job(job_id).cancel_requested

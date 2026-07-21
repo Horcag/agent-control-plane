@@ -54,6 +54,42 @@ def test_plan_cancel_stops_dispatch_and_tracks_running_jobs(tmp_path: Path) -> N
     assert plans.snapshot("transfer")["status"] == "cancelled"
 
 
+def test_plan_leaves_cancelling_when_bound_job_finished_before_cancel_landed(
+    tmp_path: Path,
+) -> None:
+    """Regression: a cancel that raced a finishing worker stranded the job at
+    ``cancel_requested`` with ``finished_at`` set. That row is excluded from
+    reconciliation, so it used to pin the owning plan in ``cancelling`` forever.
+    The lifecycle sweep must treat a finished-and-finalized job as inactive
+    regardless of its clobbered status string.
+    """
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    job = _create_job(jobs, tmp_path, "job-raced")
+    plans.create_plan(
+        plan_id="wave",
+        title="Wave",
+        tasks=(PlanTaskDefinition("task", "Task"),),
+    )
+    plans.bind_job("wave", "task", job.job_id)
+
+    assert plans.request_cancel("wave")["status"] == "cancelling"
+
+    # Reproduce the stranded row exactly: finished + finalized, yet the status
+    # string was clobbered back to cancel_requested by the racing cancel.
+    jobs.update_job(
+        job.job_id,
+        status="cancel_requested",
+        cancel_requested=True,
+        finished_at=OLD_TIMESTAMP,
+        finalization_status="completed",
+    )
+
+    assert plans.snapshot("wave")["status"] == "cancelled"
+
+
 def test_plan_archive_is_explicit_terminal_state_and_hidden_by_default(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     JobStore(database).initialize()

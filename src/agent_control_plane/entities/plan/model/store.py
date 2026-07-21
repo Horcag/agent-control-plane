@@ -1161,10 +1161,16 @@ class PlanStore:
             active_count = int(
                 db.execute(
                     """
-                    select count(*) as count from plan_tasks
-                    where plan_id = ? and state in (
+                    select count(*) as count from plan_tasks t
+                    left join jobs j on j.job_id = t.job_id
+                    where t.plan_id = ? and t.state in (
                         'dispatching', 'created', 'queued', 'running', 'waiting_quota',
                         'cancel_requested', 'finalizing'
+                    )
+                    and (
+                        t.job_id is null
+                        or j.finished_at is null
+                        or j.finalization_status != 'completed'
                     )
                     """,
                     (plan_id,),
