@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from agent_control_plane.features.agent_runner.lib.result_detector import (
+    assess_result_contract,
     contains_capacity_marker,
     inspect_result,
     parse_escalation_classification,
@@ -14,6 +15,15 @@ from agent_control_plane.features.agent_runner.lib.result_detector import (
 
 
 class ResultDetectorTest(unittest.TestCase):
+    def test_result_contract_assessment_is_explicit_and_fail_closed(self) -> None:
+        matched = assess_result_contract("partial", "partial")
+        mismatch = assess_result_contract("partial", "completed")
+
+        self.assertTrue(matched.matches)
+        self.assertEqual(matched.effective_terminal_status, "partial")
+        self.assertFalse(mismatch.matches)
+        self.assertEqual(mismatch.effective_terminal_status, "contract_mismatch")
+
     def test_classification_is_closed_and_fail_closed(self) -> None:
         self.assertEqual(
             parse_escalation_classification("Escalation-Classification: model_capability\n"),

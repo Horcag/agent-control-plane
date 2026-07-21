@@ -262,6 +262,197 @@ class JobStoreTest(unittest.TestCase):
                 ("job-store-premium-override-reason-v3-20260718",),
             )
 
+    def test_controller_contract_v4_migrates_v3_rows_idempotently(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            database = Path(temp) / "jobs.sqlite3"
+            store = JobStore(database)
+            _create_job(store, Path(temp), "job-v3")
+            db = sqlite3.connect(database)
+            try:
+                db.execute("alter table jobs drop column expected_result_status")
+                db.execute("alter table jobs drop column controller_gate_mode")
+                db.execute(
+                    "delete from schema_migrations where component = 'job_store' and version = 4"
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            store.initialize()
+            store.initialize()
+
+            db = sqlite3.connect(database)
+            try:
+                migrations = dict(
+                    db.execute(
+                        "select version, checksum from schema_migrations "
+                        "where component = 'job_store' and version in (3, 4)"
+                    )
+                )
+            finally:
+                db.close()
+            self.assertEqual(migrations[3], "job-store-premium-override-reason-v3-20260718")
+            self.assertEqual(migrations[4], "job-store-controller-contract-v4-20260719")
+            job = store.get_job("job-v3")
+            self.assertEqual(
+                (job.expected_result_status, job.controller_gate_mode), ("completed", "full")
+            )
+
+    def test_controller_contract_is_durable_and_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            job = JobStore(database).create_job(
+                **_job_kwargs(root, "job-contract"),
+                expected_result_status="partial",
+                controller_gate_mode="focused",
+            )
+
+            restarted = JobStore(database).get_job(job.job_id)
+            self.assertEqual(
+                (restarted.expected_result_status, restarted.controller_gate_mode),
+                ("partial", "focused"),
+            )
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                JobStore(database).update_job(job.job_id, expected_result_status="completed")
+
+    def test_launch_provenance_v6_is_durable_and_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            job = JobStore(database).create_job(
+                **_job_kwargs(root, "job-provenance"),
+                launch_base_sha="a" * 40,
+                brief_sha256="b" * 64,
+                effective_scope_json='["src/a.py","tests/a.py"]',
+                retry_override_reason="approved retry",
+            )
+
+            restarted = JobStore(database).get_job(job.job_id)
+            self.assertEqual(
+                (
+                    restarted.launch_base_sha,
+                    restarted.brief_sha256,
+                    restarted.effective_scope_json,
+                    restarted.retry_override_reason,
+                ),
+                ("a" * 40, "b" * 64, '["src/a.py","tests/a.py"]', "approved retry"),
+            )
+            with self.assertRaisesRegex(ValueError, "immutable"):
+                JobStore(database).update_job(job.job_id, launch_base_sha="c" * 40)
+
+    def test_causal_outcomes_v5_migrate_v4_rows_idempotently(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            store = JobStore(database)
+            _create_job(store, root, "job-v4")
+            fields = [
+                "runner_failure",
+                "workspace_disposition",
+                "checkpoint_disposition",
+                "root_acceptance",
+                "launch_base_sha",
+                "brief_sha256",
+                "effective_scope_json",
+                "retry_override_reason",
+            ]
+            db = sqlite3.connect(database)
+            ledger = dict(
+                db.execute(
+                    "select version, checksum from schema_migrations "
+                    "where component = 'job_store' and version in (3, 4)"
+                )
+            )
+            for column in fields:
+                db.execute(f"alter table jobs drop column {column}")
+            db.execute(
+                "delete from schema_migrations where component = 'job_store' and version = 5"
+            )
+            db.execute(
+                "delete from schema_migrations where component = 'job_store' and version = 6"
+            )
+            db.commit()
+            db.close()
+
+            store.initialize()
+            store.initialize()
+
+            restarted = JobStore(database).get_job("job-v4")
+            self.assertEqual(
+                tuple(getattr(restarted, field) for field in fields),
+                (None, "unknown", "none", "pending", None, None, "[]", None),
+            )
+            db = sqlite3.connect(database)
+            migrations = dict(
+                db.execute(
+                    "select version, checksum from schema_migrations "
+                    "where component = 'job_store' and version in (3, 4, 5, 6)"
+                )
+            )
+            db.close()
+            self.assertEqual((migrations[3], migrations[4]), (ledger[3], ledger[4]))
+            self.assertEqual(migrations[5], "job-store-causal-outcomes-v5-20260719")
+            self.assertEqual(migrations[6], "job-store-launch-provenance-v6-20260719")
+
+    def test_causal_outcomes_are_durable_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            store = JobStore(database)
+            job = _create_job(store, root, "job-causal")
+
+            for runner_failure in (
+                "tool_call_budget",
+                "terminal_scope_violation",
+                "tool_timeout",
+                "controller_transport_failure",
+            ):
+                store.set_runner_failure(job.job_id, runner_failure)
+                self.assertEqual(store.get_job(job.job_id).runner_failure, runner_failure)
+            store.set_workspace_disposition(job.job_id, "dirty_after_failure")
+            store.set_checkpoint_disposition(job.job_id, "salvage")
+            store.set_root_acceptance(job.job_id, "rejected")
+
+            restarted = JobStore(database).get_job(job.job_id)
+            self.assertEqual(
+                tuple(
+                    getattr(restarted, field)
+                    for field in (
+                        "runner_failure",
+                        "workspace_disposition",
+                        "checkpoint_disposition",
+                        "root_acceptance",
+                    )
+                ),
+                ("controller_transport_failure", "dirty_after_failure", "salvage", "rejected"),
+            )
+            for invalid in ("", " ", "tool-timeout", "a" * 65):
+                with self.assertRaisesRegex(ValueError, "Invalid runner failure"):
+                    store.set_runner_failure(job.job_id, invalid)
+
+    def test_causal_setter_migrates_pre_v5_database_before_writing(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            job = _create_job(JobStore(database), root, "job-pre-v5")
+            db = sqlite3.connect(database)
+            db.execute("alter table jobs drop column runner_failure")
+            db.execute(
+                "delete from schema_migrations where component = 'job_store' and version = 5"
+            )
+            db.commit()
+            db.close()
+
+            restarted = JobStore(database).set_runner_failure(job.job_id, "tool_timeout")
+            self.assertEqual(restarted.runner_failure, "tool_timeout")
+
     def test_old_jobs_table_migration(self) -> None:
         import sqlite3
 
@@ -332,28 +523,32 @@ class JobStoreTest(unittest.TestCase):
 
 
 def _create_job(store: JobStore, root: Path, job_id: str):
-    return store.create_job(
-        job_id=job_id,
-        task_id="task-1",
-        route="main",
-        workspace_path=root / "workspace",
-        expected_branch="review/pr",
-        config_path=root / "config.toml",
-        run_dir=root / "runs" / job_id,
-        prompt_path=root / "runs" / job_id / "prompt.md",
-        result_path=root / "tasks" / "task-1" / "result.md",
-        timeout_sec=10,
-        idle_timeout_sec=5,
-        print_timeout="10s",
-        max_restarts=0,
-        yolo=False,
-        allow_dirty=False,
-        read_only=False,
-        backend="codex-spark",
-        agy_model="Gemini 3.5 Flash (High)",
-        codex_model="gpt-5",
-        codex_reasoning_effort="low",
-    )
+    return store.create_job(**_job_kwargs(root, job_id))
+
+
+def _job_kwargs(root: Path, job_id: str) -> dict[str, object]:
+    return {
+        "job_id": job_id,
+        "task_id": "task-1",
+        "route": "main",
+        "workspace_path": root / "workspace",
+        "expected_branch": "review/pr",
+        "config_path": root / "config.toml",
+        "run_dir": root / "runs" / job_id,
+        "prompt_path": root / "runs" / job_id / "prompt.md",
+        "result_path": root / "tasks" / "task-1" / "result.md",
+        "timeout_sec": 10,
+        "idle_timeout_sec": 5,
+        "print_timeout": "10s",
+        "max_restarts": 0,
+        "yolo": False,
+        "allow_dirty": False,
+        "read_only": False,
+        "backend": "codex-spark",
+        "agy_model": "Gemini 3.5 Flash (High)",
+        "codex_model": "gpt-5",
+        "codex_reasoning_effort": "low",
+    }
 
 
 def _record_attempt(store: JobStore, root: Path, job_id: str) -> None:

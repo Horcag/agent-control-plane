@@ -55,6 +55,27 @@ class ResultState:
     escalation_classification: str | None = None
 
 
+@dataclass(frozen=True)
+class ResultContractAssessment:
+    expected_status: str
+    reported_status: str
+    matches: bool
+    effective_terminal_status: str
+
+
+def assess_result_contract(
+    expected_status: str,
+    reported_status: str,
+) -> ResultContractAssessment:
+    matches = expected_status == reported_status
+    return ResultContractAssessment(
+        expected_status=expected_status,
+        reported_status=reported_status,
+        matches=matches,
+        effective_terminal_status=reported_status if matches else "contract_mismatch",
+    )
+
+
 def inspect_result(path: Path, started_at: float) -> ResultState:
     if not path.exists():
         return ResultState(done=False, status=None, reason="result file does not exist")

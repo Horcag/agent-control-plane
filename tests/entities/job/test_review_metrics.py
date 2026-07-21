@@ -1,13 +1,32 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from pathlib import Path
 
+import pytest
+
 from agent_control_plane.entities.job import AttemptMetrics, JobStore, ReviewMetricsStore
+from agent_control_plane.entities.plan import PlanStore, PlanTaskDefinition
 from agent_control_plane.shared.codex_session_usage import TokenUsage, latest_session_usage
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration
 
 
-def test_review_report_counts_root_tax_and_accepted_agent_work(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("outcome", "accepted_tokens", "review_tax", "checkpoint_sha", "accepted_sha"),
+    (
+        ("accepted", 600, 1 / 12, None, "accepted123"),
+        ("continuation_verified", 0, None, "checkpoint123", None),
+    ),
+)
+def test_review_report_accounts_for_accepted_and_continuation_work(
+    tmp_path: Path,
+    outcome: str,
+    accepted_tokens: int,
+    review_tax: float | None,
+    checkpoint_sha: str | None,
+    accepted_sha: str | None,
+) -> None:
     job_store = JobStore(tmp_path / "jobs.sqlite3")
     _create_job(job_store, tmp_path)
     log_path = tmp_path / "attempt.log"
@@ -38,9 +57,10 @@ def test_review_report_counts_root_tax_and_accepted_agent_work(tmp_path: Path) -
         span_id,
         job_id="job-1",
         attempt_no=1,
-        outcome="accepted",
+        outcome=outcome,
         root_verified=True,
-        accepted_sha="abc123",
+        checkpoint_sha=checkpoint_sha,
+        accepted_sha=accepted_sha,
         defects_found=2,
         false_positives=1,
     )
@@ -49,17 +69,19 @@ def test_review_report_counts_root_tax_and_accepted_agent_work(tmp_path: Path) -
     report = store.report(span_id)
 
     assert report["root_usage"]["comparable_tokens"] == 50
-    assert report["accepted_agent_comparable_tokens"] == 600
+    assert report["accepted_agent_comparable_tokens"] == accepted_tokens
     assert report["agent_comparable_tokens"] == 600
-    assert report["agent_comparable_by_outcome"]["accepted"] == 600
-    assert report["agent_acceptance_efficiency"] == 1.0
-    assert report["review_tax"] == 50 / 600
+    assert report["agent_comparable_by_outcome"][outcome] == 600
+    assert report["agent_acceptance_efficiency"] == accepted_tokens / 600
+    assert report["review_tax"] == review_tax
     assert report["total_comparable_tokens"] == 650
     assert report["defects_found"] == 2
     assert report["false_positives"] == 1
     assert report["checkpoints"][0]["phase"] == "review"
     assert report["job_outcomes"][0]["root_verified"] is True
     assert report["job_outcomes"][0]["metrics_attempt_no"] == 1
+    assert report["job_outcomes"][0]["checkpoint_sha"] == checkpoint_sha
+    assert report["job_outcomes"][0]["accepted_sha"] == accepted_sha
 
 
 def test_latest_session_usage_reads_newest_snapshot_from_file_tail(tmp_path: Path) -> None:
@@ -76,6 +98,73 @@ def test_latest_session_usage_reads_newest_snapshot_from_file_tail(tmp_path: Pat
     assert snapshot is not None
     assert snapshot.recorded_at == "2026-07-13T11:00:00Z"
     assert snapshot.usage.comparable_tokens == 17
+
+
+def test_review_metrics_v2_preserves_v1_rows_and_is_idempotent(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    _create_job(jobs, tmp_path)
+    apply_schema_migration(
+        database,
+        component="review_metrics_store",
+        version=1,
+        checksum="review-metrics-store-v1-20260715",
+        migrate=ReviewMetricsStore._migrate_schema,
+    )
+    with sqlite3.connect(database) as db:
+        db.execute(
+            """
+            insert into review_spans values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy",
+                "Legacy",
+                "rollout",
+                "completed",
+                "t",
+                "t",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                "t",
+                "t",
+            ),
+        )
+        db.execute(
+            """
+            insert into review_job_outcomes values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("legacy", "job-1", None, "accepted", 1, "legacy-accepted", 0, 0, "legacy", "t"),
+        )
+
+    plans = PlanStore(database)
+    plans.create_plan(plan_id="legacy", title="Legacy", tasks=(PlanTaskDefinition("task", "Task"),))
+    plans.bind_job("legacy", "task", "job-1")
+    jobs.mark_finished("job-1", "completed")
+    jobs.mark_finalization_completed("job-1")
+    assert plans.snapshot("legacy")["completed_tasks"] == [
+        {"task_id": "task", "job_id": "job-1", "accepted_sha": "legacy-accepted"}
+    ]
+
+    store = ReviewMetricsStore(database)
+    store.initialize()
+    store.initialize()
+
+    with sqlite3.connect(database) as db:
+        row = db.execute(
+            "select outcome, accepted_sha, checkpoint_sha, notes from review_job_outcomes"
+        ).fetchone()
+        versions = db.execute(
+            "select version from schema_migrations where component = 'review_metrics_store' order by version"
+        ).fetchall()
+    assert row == ("accepted", "legacy-accepted", None, "legacy")
+    assert versions == [(1,), (2,)]
 
 
 def _create_job(store: JobStore, root: Path) -> None:

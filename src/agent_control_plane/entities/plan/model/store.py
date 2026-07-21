@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import uuid
 from collections import Counter
@@ -30,9 +31,11 @@ TERMINAL_JOB_STATES = frozenset(
         "completed",
         "partial",
         "blocked",
+        "contract_mismatch",
         "failed",
         "cancelled",
         "guardrail_violation",
+        "inefficient_tool_usage",
         "worker_error",
         "stopped_dirty_after_failure",
     }
@@ -43,9 +46,11 @@ DECISION_STATES = frozenset(
         "dispatch_failed",
         "partial",
         "blocked",
+        "contract_mismatch",
         "failed",
         "cancelled",
         "guardrail_violation",
+        "inefficient_tool_usage",
         "worker_error",
         "stopped_dirty_after_failure",
         "rejected",
@@ -68,6 +73,12 @@ class PlanExecutionSpec:
     claude_model: str | None = None
     claude_reasoning_effort: str | None = None
     codex_premium_override_reason: str | None = None
+    expected_result_status: str = "completed"
+    controller_gate_mode: str = "full"
+    expected_base_sha: str | None = None
+    effective_scope: tuple[str, ...] = ()
+    codex_tool_call_budget: int | None = None
+    retry_override_reason: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "route", _required("execution route", self.route))
@@ -85,6 +96,25 @@ class PlanExecutionSpec:
         ):
             value = getattr(self, field_name)
             object.__setattr__(self, field_name, value.strip() if value and value.strip() else None)
+        if self.expected_result_status not in {"partial", "completed", "blocked"}:
+            raise ValueError("expected_result_status must be partial, completed, or blocked")
+        if self.controller_gate_mode not in {"focused", "full", "none"}:
+            raise ValueError("controller_gate_mode must be focused, full, or none")
+        object.__setattr__(self, "expected_base_sha", _normalized_object_id(self.expected_base_sha))
+        object.__setattr__(
+            self, "effective_scope", _canonical_effective_scope(self.effective_scope)
+        )
+        if self.codex_tool_call_budget is not None and (
+            not isinstance(self.codex_tool_call_budget, int)
+            or isinstance(self.codex_tool_call_budget, bool)
+            or self.codex_tool_call_budget <= 0
+        ):
+            raise ValueError("codex_tool_call_budget must be positive when provided")
+        object.__setattr__(
+            self,
+            "retry_override_reason",
+            _normalized_optional_text(self.retry_override_reason, "retry_override_reason"),
+        )
 
 
 @dataclass(frozen=True)
@@ -152,6 +182,13 @@ class PlanStore:
             version=5,
             checksum="plan-execution-contract-v5-20260717",
             migrate=self._migrate_plan_execution_contract,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="plan_store",
+            version=6,
+            checksum="plan-controller-contract-v6-20260719",
+            migrate=self._migrate_plan_controller_contract,
         )
 
     @classmethod
@@ -277,6 +314,10 @@ class PlanStore:
         # now load as None through PlanExecutionSpec normalization.
         # This no-op migration keeps older durable plans readable and preserves
         # backward compatibility.
+        db.execute("pragma schema_version")
+
+    @staticmethod
+    def _migrate_plan_controller_contract(db: sqlite3.Connection) -> None:
         db.execute("pragma schema_version")
 
     def create_plan(
@@ -781,6 +822,12 @@ class PlanStore:
                     claude_model=execution.claude_model,
                     claude_reasoning_effort=execution.claude_reasoning_effort,
                     codex_premium_override_reason=execution.codex_premium_override_reason,
+                    expected_result_status=execution.expected_result_status,
+                    controller_gate_mode=execution.controller_gate_mode,
+                    expected_base_sha=execution.expected_base_sha,
+                    effective_scope=execution.effective_scope,
+                    codex_tool_call_budget=execution.codex_tool_call_budget,
+                    retry_override_reason=execution.retry_override_reason,
                 )
             now = utc_now()
             db.execute(
@@ -830,6 +877,11 @@ class PlanStore:
             "accepted",
             accepted_sha=accepted_sha,
         )
+
+    def verify_continuation_in_transaction(
+        self, db: sqlite3.Connection, plan_id: str, task_id: str
+    ) -> None:
+        self._record_decision_in_transaction(db, plan_id, task_id, "continuation_verified")
 
     def reject_task(self, plan_id: str, task_id: str) -> None:
         self._record_decision(plan_id, task_id, "rejected")
@@ -1016,9 +1068,20 @@ class PlanStore:
             raise ValueError(f"Plan task already accepted: {plan_id}/{task_id}")
         if task["review_status"] == "rejected" and decision == "rejected":
             return
-        if task["job_id"] is None or task["state"] != "awaiting_review":
+        if task["review_status"] == "continuation_verified":
+            if decision == "continuation_verified":
+                return
+            raise ValueError(f"Plan task already continuation-verified: {plan_id}/{task_id}")
+        eligible_state = task["state"] == "awaiting_review" or (
+            decision == "continuation_verified" and task["state"] == "partial"
+        )
+        if task["job_id"] is None or not eligible_state:
             raise ValueError(f"Plan task has no eligible completed worker: {plan_id}/{task_id}")
-        state = "completed" if decision == "accepted" else "rejected"
+        state = {
+            "accepted": "completed",
+            "rejected": "rejected",
+            "continuation_verified": "partial",
+        }[decision]
         now = utc_now()
         db.execute(
             """
@@ -1030,7 +1093,13 @@ class PlanStore:
         self._add_event(
             db,
             plan_id,
-            "task_accepted" if decision == "accepted" else "task_rejected",
+            (
+                "task_accepted"
+                if decision == "accepted"
+                else "task_rejected"
+                if decision == "rejected"
+                else "task_continuation_verified"
+            ),
             {"job_id": task["job_id"], "accepted_sha": accepted_sha},
             task_id=task_id,
         )
@@ -1095,7 +1164,7 @@ class PlanStore:
         db: sqlite3.Connection,
         task: sqlite3.Row,
     ) -> tuple[str, str | None]:
-        if task["review_status"] in {"accepted", "rejected"}:
+        if task["review_status"] in {"accepted", "rejected", "continuation_verified"}:
             return task["review_status"], task["accepted_sha"]
         if task["observed_job_status"] != "completed":
             return task["review_status"], task["accepted_sha"]
@@ -1120,6 +1189,8 @@ class PlanStore:
             return "accepted", review["accepted_sha"]
         if review["outcome"] == "rejected":
             return "rejected", None
+        if review["outcome"] == "continuation_verified":
+            return "continuation_verified", None
         return task["review_status"], task["accepted_sha"]
 
     def _refresh_ready_states(self, db: sqlite3.Connection, plan_id: str) -> None:
@@ -1470,6 +1541,12 @@ def _execution_json(execution: PlanExecutionSpec) -> str:
             "claude_model": execution.claude_model,
             "claude_reasoning_effort": execution.claude_reasoning_effort,
             "codex_premium_override_reason": execution.codex_premium_override_reason,
+            "expected_result_status": execution.expected_result_status,
+            "controller_gate_mode": execution.controller_gate_mode,
+            "expected_base_sha": execution.expected_base_sha,
+            "effective_scope": execution.effective_scope,
+            "codex_tool_call_budget": execution.codex_tool_call_budget,
+            "retry_override_reason": execution.retry_override_reason,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -1498,6 +1575,12 @@ def _execution_from_json(value: str | None) -> PlanExecutionSpec | None:
         claude_model=_optional_text(payload.get("claude_model")),
         claude_reasoning_effort=_optional_text(payload.get("claude_reasoning_effort")),
         codex_premium_override_reason=_optional_text(payload.get("codex_premium_override_reason")),
+        expected_result_status=str(payload.get("expected_result_status", "completed")),
+        controller_gate_mode=str(payload.get("controller_gate_mode", "full")),
+        expected_base_sha=payload.get("expected_base_sha"),
+        effective_scope=tuple(payload.get("effective_scope", ())),
+        codex_tool_call_budget=payload.get("codex_tool_call_budget"),
+        retry_override_reason=payload.get("retry_override_reason"),
     )
 
 
@@ -1520,9 +1603,46 @@ def _execution_summary(execution: PlanExecutionSpec) -> dict[str, Any]:
         "codex_reasoning_effort": execution.codex_reasoning_effort,
         "claude_model": execution.claude_model,
         "claude_reasoning_effort": execution.claude_reasoning_effort,
+        "expected_result_status": execution.expected_result_status,
+        "controller_gate_mode": execution.controller_gate_mode,
+        "expected_base_sha": execution.expected_base_sha,
+        "effective_scope": list(execution.effective_scope),
+        "effective_scope_sha256": hashlib.sha256(
+            json.dumps(execution.effective_scope, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "codex_tool_call_budget": execution.codex_tool_call_budget,
+        "retry_override_reason": execution.retry_override_reason,
         "brief_sha256": hashlib.sha256(brief_bytes).hexdigest(),
         "brief_chars": len(execution.brief),
     }
+
+
+def _normalized_object_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", normalized):
+        raise ValueError("expected_base_sha must be a full 40- or 64-hex object id")
+    return normalized
+
+
+def _canonical_effective_scope(value: tuple[str, ...]) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise ValueError("effective_scope must be a tuple of strings")
+    normalized: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not (cleaned := entry.strip()):
+            raise ValueError("effective_scope entries must be nonblank strings")
+        normalized.append(cleaned)
+    return tuple(sorted(set(normalized)))
+
+
+def _normalized_optional_text(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not (normalized := value.strip()):
+        raise ValueError(f"{field_name} must be a nonblank string when provided")
+    return normalized
 
 
 def _dispatch_task_id(
@@ -1579,6 +1699,8 @@ def _state_for_job(
         return "completed"
     if review_status == "rejected":
         return "rejected"
+    if review_status == "continuation_verified":
+        return "partial"
     if job_status == "completed":
         return "awaiting_review"
     return job_status or "pending"
