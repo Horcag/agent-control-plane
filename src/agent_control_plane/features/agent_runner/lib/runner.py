@@ -61,6 +61,7 @@ class AgentRunSpec:
     claude_allowed_tools: tuple[str, ...] = ()
     claude_sessions_root: Path | None = None
     claude_max_turns: int = 0
+    claude_bare: bool = True
 
 
 @dataclass(frozen=True)

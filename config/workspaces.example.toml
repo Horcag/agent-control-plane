@@ -81,6 +81,8 @@ claude_allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
 # CLAUDE_CONFIG_DIR setups.
 # claude_sessions_root = "${USERPROFILE}/.claude/projects"
 claude_max_turns = 0
+# Isolates workers from the operator's user-scope MCP servers/plugins/skills/CLAUDE.md.
+claude_bare = true
 guardrail_poll_sec = 2
 prepare_slots = true
 auto_switch_agy_on_quota = false

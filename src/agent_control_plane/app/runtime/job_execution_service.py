@@ -543,6 +543,7 @@ class JobExecutionService:
             claude_allowed_tools=self.config.defaults.claude_allowed_tools,
             claude_sessions_root=self.config.defaults.claude_sessions_root,
             claude_max_turns=self.config.defaults.claude_max_turns,
+            claude_bare=self.config.defaults.claude_bare,
         )
 
     def _disabled_mcp_servers(self, job: JobRecord) -> tuple[str, ...]:

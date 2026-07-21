@@ -156,6 +156,8 @@ class ClaudeExecRunner:
             "stream-json",
             "--verbose",
         ]
+        if spec.claude_bare:
+            command.extend(["--bare", "--strict-mcp-config"])
         if spec.codex_resume_thread_id is not None:
             command.extend(["--resume", spec.codex_resume_thread_id])
         else:

@@ -262,6 +262,7 @@ claude_permission_mode = "dontAsk"
 claude_allowed_tools = ["Read", "Bash"]
 claude_sessions_root = "claude-sessions"
 claude_max_turns = 40
+claude_bare = false
 
 [[control.claude_model_catalog.models]]
 model = "claude-opus-4-8"
@@ -302,6 +303,7 @@ claude_reasoning_effort = "low"
                 (root / "claude-sessions").resolve(strict=False),
             )
             self.assertEqual(config.defaults.claude_max_turns, 40)
+            self.assertFalse(config.defaults.claude_bare)
             metadata = {model.model: model for model in config.claude_model_catalog.models}
             self.assertTrue(metadata["claude-opus-4-8"].premium)
             self.assertEqual(metadata["claude-opus-4-8"].api_usd_rate.input, 5.0)
@@ -346,6 +348,7 @@ required_branch = "main"
             )
             self.assertIsNone(config.defaults.claude_sessions_root)
             self.assertEqual(config.defaults.claude_max_turns, 0)
+            self.assertTrue(config.defaults.claude_bare)
             self.assertEqual(config.claude_model_catalog.models, ())
             self.assertEqual(config.claude_model_catalog.inventory, ())
 
