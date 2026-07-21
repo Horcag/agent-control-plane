@@ -228,7 +228,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     durations = sorted(float(row["duration_sec"]) for row in rows)
     input_tokens = sum(int(row["input_tokens"]) for row in rows)
     cached_tokens = sum(int(row["cached_input_tokens"]) for row in rows)
-    cache_creation_tokens = sum(int(row["cache_creation_input_tokens"]) for row in rows)
+    cache_creation_tokens = sum(int(row.get("cache_creation_input_tokens") or 0) for row in rows)
     output_tokens = sum(int(row["output_tokens"]) for row in rows)
     reasoning_tokens = sum(int(row["reasoning_output_tokens"]) for row in rows)
     total_duration = sum(durations)

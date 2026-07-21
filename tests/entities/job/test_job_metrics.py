@@ -155,6 +155,102 @@ class JobMetricsStoreTest(unittest.TestCase):
             self.assertIn("cache_creation_input_tokens", columns)
             self.assertEqual(attempts[0]["cache_creation_input_tokens"], 0)
 
+    def test_pre_existing_database_gets_cache_creation_column_without_rerunning_v1(self) -> None:
+        """Reproduces the production KeyError: v1 stays recorded as applied (unlike the
+        legacy-table test above, which deletes that record and lets _migrate_schema
+        re-run through its own call site). The fix is the unconditional
+        create_attempt_metrics_table(db) call in initialize(); removing it must fail
+        this test.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            _create_job(store, root)
+            log_path = root / "runs" / "job-1" / "attempt-001.log"
+            store.start_attempt("job-1", 1, log_path)
+            store.finish_attempt("job-1", 1, "completed", result_status="completed", exit_code=0)
+            store.initialize()
+
+            db = sqlite3.connect(store.database_path)
+            try:
+                db.execute("drop table attempt_metrics")
+                db.execute(
+                    """
+                    create table attempt_metrics (
+                        job_id text not null references jobs(job_id),
+                        attempt_no integer not null,
+                        backend text not null,
+                        model text,
+                        reasoning_effort text,
+                        duration_sec real not null,
+                        thread_id text,
+                        event_count integer not null,
+                        turn_completed integer not null,
+                        usage_available integer not null,
+                        input_tokens integer not null,
+                        cached_input_tokens integer not null,
+                        output_tokens integer not null,
+                        reasoning_output_tokens integer not null,
+                        tool_calls integer not null,
+                        failed_tool_calls integer not null,
+                        error_events integer not null,
+                        tool_counts_json text not null,
+                        estimated_credits real,
+                        estimated_api_usd real,
+                        rate_card_version text not null,
+                        event_log_path text,
+                        created_at text not null,
+                        primary key(job_id, attempt_no)
+                    )
+                    """
+                )
+                db.execute(
+                    """
+                    insert into attempt_metrics (
+                        job_id, attempt_no, backend, model, reasoning_effort,
+                        duration_sec, thread_id, event_count, turn_completed, usage_available,
+                        input_tokens, cached_input_tokens, output_tokens,
+                        reasoning_output_tokens, tool_calls, failed_tool_calls, error_events,
+                        tool_counts_json, estimated_credits, estimated_api_usd,
+                        rate_card_version, event_log_path, created_at
+                    ) values (
+                        'job-1', 1, 'codex', 'gpt-5.6-terra', 'medium',
+                        20.0, 'thread-1', 7, 1, 1,
+                        1000, 600, 200,
+                        50, 2, 1, 0,
+                        '{}', 0.10375, 0.00415,
+                        '2026-07-09', null, '2026-07-20T10:00:00Z'
+                    )
+                    """
+                )
+                columns = {row[1] for row in db.execute("pragma table_info(attempt_metrics)")}
+                self.assertNotIn("cache_creation_input_tokens", columns)
+                migrated = {
+                    row[0]
+                    for row in db.execute(
+                        "select version from schema_migrations where component = 'job_store'"
+                    )
+                }
+                self.assertIn(1, migrated)
+                db.commit()
+            finally:
+                db.close()
+
+            reopened = JobStore(root / "jobs.sqlite3")
+            reopened.initialize()
+
+            db = sqlite3.connect(store.database_path)
+            try:
+                columns = {row[1] for row in db.execute("pragma table_info(attempt_metrics)")}
+            finally:
+                db.close()
+            self.assertIn("cache_creation_input_tokens", columns)
+
+            attempts = reopened.attempt_metrics("job-1")
+            self.assertEqual(attempts[0]["cache_creation_input_tokens"], 0)
+            report = reopened.metrics_report(limit=10)
+            self.assertEqual(report["totals"]["cache_creation_input_tokens"], 0)
+
     def test_backend_filter_restricts_loaded_rows(self) -> None:
         with sqlite3.connect(":memory:") as db:
             db.row_factory = sqlite3.Row

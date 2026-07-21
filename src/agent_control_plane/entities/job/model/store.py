@@ -123,6 +123,13 @@ class JobStore:
             checksum="job-store-premium-override-reason-v3-20260718",
             migrate=self._migrate_premium_override_reason,
         )
+        # create_attempt_metrics_table is idempotent (CREATE TABLE IF NOT EXISTS +
+        # pragma-guarded ALTERs), so calling it here unconditionally on every
+        # initialize() is the only mechanism by which its guarded column adds
+        # (e.g. cache_creation_input_tokens) reach databases where the v1
+        # migration above was already recorded and therefore never re-runs.
+        with self._connect() as db:
+            create_attempt_metrics_table(db)
 
     @staticmethod
     def _migrate_premium_override_reason(db: sqlite3.Connection) -> None:
