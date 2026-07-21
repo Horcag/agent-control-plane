@@ -239,6 +239,8 @@ def build_server(config_path: str | None = None) -> Any:
         plan_id: str | None = None,
         plan_task_id: str | None = None,
         workspace_access: str | None = None,
+        expected_result_status: str = "completed",
+        controller_gate_mode: str = "full",
     ) -> dict[str, Any]:
         """Start an agent job and optionally wait briefly for a terminal result."""
         normalized_backend = normalize_backend(backend) if backend is not None else None
@@ -248,6 +250,13 @@ def build_server(config_path: str | None = None) -> Any:
                 "ok": False,
                 "error": f"Unsupported backend {backend!r}. Expected one of: {allowed}",
             }
+        if expected_result_status not in {"partial", "completed", "blocked"}:
+            return {
+                "ok": False,
+                "error": "expected_result_status must be partial, completed, or blocked",
+            }
+        if controller_gate_mode not in {"focused", "full", "none"}:
+            return {"ok": False, "error": "controller_gate_mode must be focused, full, or none"}
         try:
             job = control.start_job(
                 StartOptions(
@@ -274,6 +283,8 @@ def build_server(config_path: str | None = None) -> Any:
                     plan_id=plan_id,
                     plan_task_id=plan_task_id,
                     workspace_access=workspace_access,
+                    expected_result_status=expected_result_status,
+                    controller_gate_mode=controller_gate_mode,
                 )
             )
         except PolicyError as exc:
@@ -282,6 +293,8 @@ def build_server(config_path: str | None = None) -> Any:
             "ok": True,
             "job_id": job.job_id,
             "status": job.status,
+            "expected_result_status": job.expected_result_status,
+            "controller_gate_mode": job.controller_gate_mode,
             "run_dir": str(job.run_dir),
             "result_path": str(job.result_path),
             "backend": job.backend,
@@ -922,6 +935,12 @@ def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         codex_reasoning_effort=_optional_text(payload.get("codex_reasoning_effort")),
         claude_model=_optional_text(payload.get("claude_model")),
         claude_reasoning_effort=_optional_text(payload.get("claude_reasoning_effort")),
+        expected_result_status=str(payload.get("expected_result_status", "completed")),
+        controller_gate_mode=str(payload.get("controller_gate_mode", "full")),
+        expected_base_sha=payload.get("expected_base_sha"),
+        effective_scope=tuple(payload.get("effective_scope", ())),
+        codex_tool_call_budget=payload.get("codex_tool_call_budget"),
+        retry_override_reason=payload.get("retry_override_reason"),
     )
 
 

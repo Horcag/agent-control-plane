@@ -55,6 +55,34 @@ class _SyncingControl:
         return [{"path": str(self.slots._path)}]
 
 
+def test_mcp_plan_execution_spec_validates_controller_contract() -> None:
+    execution = mcp_server._plan_execution_spec(
+        {
+            "route": "acp",
+            "brief": "Focused task",
+            "expected_result_status": "partial",
+            "controller_gate_mode": "focused",
+            "expected_base_sha": "A" * 40,
+            "effective_scope": [" tests/api.py ", "src/api.py", "src/api.py"],
+            "codex_tool_call_budget": 47,
+            "retry_override_reason": " approved retry ",
+        }
+    )
+
+    assert execution is not None
+    assert execution.expected_result_status == "partial"
+    assert execution.controller_gate_mode == "focused"
+    assert execution.expected_base_sha == "a" * 40
+    assert execution.effective_scope == ("src/api.py", "tests/api.py")
+    assert execution.codex_tool_call_budget == 47
+    assert execution.retry_override_reason == "approved retry"
+
+    with pytest.raises(ValueError, match="expected_result_status"):
+        mcp_server._plan_execution_spec(
+            {"route": "acp", "brief": "Invalid task", "expected_result_status": "unexpected"}
+        )
+
+
 def test_config_provider_reloads_before_a_tool_call_and_reports_fingerprints(tmp_path) -> None:
     config_path = tmp_path / "config" / "workspaces.toml"
     config_path.parent.mkdir()
@@ -385,6 +413,8 @@ def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:
         runner_pid=None,
         read_only=False,
         slot_name="app-1",
+        expected_result_status="completed",
+        controller_gate_mode="full",
     )
 
     with patch(
@@ -403,6 +433,7 @@ def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:
 
     assert options.workspace_access == "native"
     assert response["workspace_access"] == "native"
+    assert (options.expected_result_status, options.controller_gate_mode) == ("completed", "full")
 
 
 def test_mcp_start_forwards_premium_override_reason(monkeypatch) -> None:
@@ -430,6 +461,8 @@ def test_mcp_start_forwards_premium_override_reason(monkeypatch) -> None:
         runner_pid=None,
         read_only=False,
         slot_name="app-1",
+        expected_result_status="partial",
+        controller_gate_mode="focused",
     )
 
     with patch(
@@ -445,8 +478,33 @@ def test_mcp_start_forwards_premium_override_reason(monkeypatch) -> None:
         codex_model="gpt-5.6-sol",
         codex_premium_override_reason="approved benchmark",
         workspace_access="native",
+        expected_result_status="partial",
+        controller_gate_mode="focused",
     )
 
     options = control.start_job.call_args.args[0]
     assert options.codex_premium_override_reason == "approved benchmark"
     assert response["codex_premium_override_reason"] == "approved benchmark"
+    assert response["expected_result_status"] == "partial"
+
+
+def test_mcp_start_rejects_invalid_controller_contract(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+    control = Mock()
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        server = build_server()
+
+    response = server.tools["agent_start_job"](
+        task_id="invalid", route="app", expected_result_status="unexpected"
+    )
+
+    assert response["ok"] is False
+    control.start_job.assert_not_called()

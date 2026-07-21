@@ -107,6 +107,8 @@ def main(argv: list[str] | None = None) -> int:
                     plan_id=args.plan_id,
                     plan_task_id=args.plan_task_id,
                     workspace_access=args.workspace_access,
+                    expected_result_status=args.expected_result_status,
+                    controller_gate_mode=args.controller_gate_mode,
                 )
             )
             payload = _job_payload(job)
@@ -433,6 +435,14 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument("--agy-model", help="Antigravity model to use when --backend=agy")
     start.add_argument("--codex-model", help="Model to use when --backend=codex")
     start.add_argument("--codex-premium-override-reason")
+    start.add_argument(
+        "--expected-result-status",
+        choices=("partial", "completed", "blocked"),
+        default="completed",
+    )
+    start.add_argument(
+        "--controller-gate-mode", choices=("focused", "full", "none"), default="full"
+    )
     start.add_argument(
         "--codex-reasoning-effort",
         help=(
@@ -920,6 +930,8 @@ def _job_payload(job: Any) -> dict[str, Any]:
     return {
         "job_id": job.job_id,
         "status": job.status,
+        "expected_result_status": job.expected_result_status,
+        "controller_gate_mode": job.controller_gate_mode,
         "run_dir": str(job.run_dir),
         "prompt_path": str(job.prompt_path),
         "result_path": str(job.result_path),

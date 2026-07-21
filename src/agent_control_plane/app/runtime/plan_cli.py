@@ -134,6 +134,12 @@ def plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:
         codex_premium_override_reason=optional_manifest_text(
             payload.get("codex_premium_override_reason")
         ),
+        expected_result_status=str(payload.get("expected_result_status", "completed")),
+        controller_gate_mode=str(payload.get("controller_gate_mode", "full")),
+        expected_base_sha=payload.get("expected_base_sha"),
+        effective_scope=tuple(payload.get("effective_scope", ())),
+        codex_tool_call_budget=payload.get("codex_tool_call_budget"),
+        retry_override_reason=payload.get("retry_override_reason"),
     )
 
 
@@ -150,6 +156,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         args.claude_model,
         args.claude_reasoning_effort,
         args.codex_premium_override_reason,
+        args.expected_result_status,
+        args.controller_gate_mode,
     )
     if not any(value is not None for value in values) and not args.read_only:
         return None
@@ -172,6 +180,8 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         claude_model=args.claude_model,
         claude_reasoning_effort=args.claude_reasoning_effort,
         codex_premium_override_reason=args.codex_premium_override_reason,
+        expected_result_status=args.expected_result_status or "completed",
+        controller_gate_mode=args.controller_gate_mode or "full",
     )
 
 

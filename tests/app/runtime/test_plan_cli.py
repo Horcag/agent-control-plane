@@ -5,6 +5,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from agent_control_plane.app.runtime.cli import _build_parser, main
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
 from agent_control_plane.app.runtime.plan_cli import plan_execution_spec, read_plan_manifest
@@ -110,6 +112,16 @@ def test_start_parser_accepts_premium_override_reason() -> None:
     assert args.codex_premium_override_reason == "approved benchmark"
 
 
+def test_start_parser_validates_and_defaults_controller_contract() -> None:
+    defaults = _build_parser().parse_args(["start", "--task-id", "task", "--route", "dev"])
+    assert (defaults.expected_result_status, defaults.controller_gate_mode) == ("completed", "full")
+
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            ["start", "--task-id", "task", "--route", "dev", "--expected-result-status", "bad"]
+        )
+
+
 def test_list_reports_persisted_workspace_access(capsys) -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -186,6 +198,10 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
             "gpt-5.3-codex-spark",
             "--codex-reasoning-effort",
             "high",
+            "--expected-result-status",
+            "partial",
+            "--controller-gate-mode",
+            "focused",
         ]
     )
     assert add.route == "app"
@@ -193,6 +209,8 @@ def test_plan_dispatch_and_retry_parsers_expose_one_shot_controls() -> None:
     assert add.backend == "codex"
     assert add.codex_model == "gpt-5.3-codex-spark"
     assert add.codex_reasoning_effort == "high"
+    assert add.expected_result_status == "partial"
+    assert add.controller_gate_mode == "focused"
 
 
 def test_plan_manifest_preserves_premium_override_reason() -> None:
@@ -265,6 +283,48 @@ def test_plan_execution_spec_reads_explicit_codex_contract() -> None:
     assert execution is not None
     assert execution.codex_model == "gpt-5.3-codex-spark"
     assert execution.codex_reasoning_effort == "high"
+    assert execution.expected_result_status == "completed"
+    assert execution.controller_gate_mode == "full"
+
+
+def test_plan_execution_spec_reads_controller_contract() -> None:
+    execution = plan_execution_spec(
+        {
+            "route": "app",
+            "brief": "Focused run",
+            "expected_result_status": "partial",
+            "controller_gate_mode": "focused",
+            "expected_base_sha": "A" * 40,
+            "effective_scope": [" tests/api.py ", "src/api.py", "src/api.py"],
+            "codex_tool_call_budget": 47,
+            "retry_override_reason": " approved retry ",
+        }
+    )
+
+    assert execution is not None
+    assert execution.expected_result_status == "partial"
+    assert execution.controller_gate_mode == "focused"
+    assert execution.expected_base_sha == "a" * 40
+    assert execution.effective_scope == ("src/api.py", "tests/api.py")
+    assert execution.codex_tool_call_budget == 47
+    assert execution.retry_override_reason == "approved retry"
+
+
+def test_plan_add_task_parser_rejects_invalid_controller_contract() -> None:
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(
+            [
+                "plan",
+                "add-task",
+                "transfer",
+                "--task-id",
+                "api",
+                "--title",
+                "API",
+                "--expected-result-status",
+                "unexpected",
+            ]
+        )
 
 
 def _run_cli(cwd: Path, *arguments: str) -> dict[str, object]:
