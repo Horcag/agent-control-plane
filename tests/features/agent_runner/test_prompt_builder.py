@@ -92,7 +92,8 @@ class PromptBuilderTest(unittest.TestCase):
                 prompt,
             )
             self.assertIn(
-                "first IDEA MCP call must be\n  `mcp__agentbridge_idea_64343__get_project_info`",
+                "Your first IDEA MCP call must be "
+                "`mcp__agentbridge_idea_64343__get_project_info`",
                 prompt,
             )
             self.assertIn("If the IDEA MCP project root differs", prompt)
@@ -463,6 +464,18 @@ class PromptBuilderTest(unittest.TestCase):
                 read_only=False,
             )
 
+            # Read-only IDE prompt
+            ide_readonly = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="ide_mcp",
+                read_only=True,
+            )
+
             # Assertions for native writable
             self.assertIn("Task ID: task-1", native_writable)
             self.assertIn("Workspace route: main", native_writable)
@@ -550,6 +563,16 @@ class PromptBuilderTest(unittest.TestCase):
             # IDE mode keeps the host-specific terminal and edit safety rules.
             self.assertIn("Set-Location -LiteralPath", ide_prompt)
             self.assertIn("auto_format_and_optimize_imports=false", ide_prompt)
+
+            # Read-only IDE prompt: inspect via IDE MCP read tools, no writes, recovered.
+            self.assertIn("This is a READ-ONLY inspection job.", ide_readonly)
+            self.assertIn("Use only the IDEA MCP server `agentbridge_idea_64343`", ide_readonly)
+            self.assertIn("mcp__agentbridge_idea_64343__get_project_info", ide_readonly)
+            self.assertIn("FORBIDDEN from any change", ide_readonly)
+            self.assertIn("The response itself will be recovered", ide_readonly)
+            self.assertNotIn("Maintain live progress/state in:", ide_readonly)
+            self.assertNotIn("Mandatory result file format", ide_readonly)
+            self.assertTrue(len(ide_readonly) < len(ide_prompt) * 0.6)
 
             # Materially smaller check (e.g. less than half the size of IDE prompt)
             self.assertTrue(len(native_writable) < len(ide_prompt) * 0.6)

@@ -14,6 +14,7 @@ def _spec(
     claude_bare: bool = True,
     codex_resume_thread_id: str | None = None,
     workspace_access: str = "native",
+    claude_mcp_config_path: Path | None = None,
 ) -> AgentRunSpec:
     return AgentRunSpec(
         backend="claude",
@@ -41,6 +42,7 @@ def _spec(
         claude_allowed_tools=claude_allowed_tools,
         claude_max_turns=claude_max_turns,
         claude_bare=claude_bare,
+        claude_mcp_config_path=claude_mcp_config_path,
     )
 
 
@@ -82,9 +84,12 @@ def test_resume_reuses_the_prior_session() -> None:
     assert "--session-id" not in command
 
 
-def test_read_only_forces_plan_permission_mode() -> None:
+def test_read_only_uses_default_permission_mode_not_plan() -> None:
+    # Headless `claude -p` cannot complete plan mode's ExitPlanMode approval, so read-only
+    # runs under default prompting and relies on the restricted allowlist instead.
     command = _command(_spec(read_only=True))
-    assert command[command.index("--permission-mode") + 1] == "plan"
+    assert command[command.index("--permission-mode") + 1] == "default"
+    assert "plan" not in command
     assert "--dangerously-skip-permissions" not in command
 
 
@@ -103,6 +108,21 @@ def test_allowed_tools_and_max_turns_are_forwarded() -> None:
 def test_ide_mcp_access_does_not_expose_the_result_dir() -> None:
     command = _command(_spec(workspace_access="ide_mcp"))
     assert "--add-dir" not in command
+
+
+def test_ide_mcp_passes_the_selected_server_mcp_config() -> None:
+    mcp_config = Path("D:/repo/runs/job-1/claude-mcp-config.json")
+    command = _command(_spec(workspace_access="ide_mcp", claude_mcp_config_path=mcp_config))
+    assert command[command.index("--mcp-config") + 1] == str(mcp_config)
+    # claude_bare isolation stays on, so --strict-mcp-config + --mcp-config means the
+    # worker loads exactly the one selected IDE MCP server and nothing else.
+    assert "--strict-mcp-config" in command
+    assert "--add-dir" not in command
+
+
+def test_native_jobs_do_not_pass_an_mcp_config() -> None:
+    command = _command(_spec())
+    assert "--mcp-config" not in command
 
 
 def test_bare_isolation_flags_are_on_by_default() -> None:

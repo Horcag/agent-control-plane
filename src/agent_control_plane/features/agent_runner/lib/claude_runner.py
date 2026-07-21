@@ -10,6 +10,7 @@ from typing import TextIO
 
 from agent_control_plane.features.agent_runner.lib.claude_telemetry import (
     claude_turn_completed,
+    extract_claude_final_message,
     parse_claude_jsonl,
     render_claude_json_line,
     scan_claude_tool_constraints,
@@ -45,6 +46,19 @@ class ClaudeProcessMonitor(CodexProcessMonitor):
             tool_call_count,
             tool_call_budget=spec.codex_tool_call_budget,
         )
+
+    @staticmethod
+    def _exited_result_if_dead(
+        proc: subprocess.Popen[str],
+        spec: AgentRunSpec,
+        started_wall: float,
+    ) -> AgentRunResult | None:
+        # Claude has no --output-last-message, so a read-only worker returns its answer as
+        # its final message instead of writing result.md. Materialize the last-message file
+        # from the event log before the inherited recovery reads it.
+        if spec.read_only and proc.poll() is not None:
+            _materialize_claude_last_message(spec)
+        return CodexProcessMonitor._exited_result_if_dead(proc, spec, started_wall)
 
 
 class ClaudeExecRunner:
@@ -158,6 +172,11 @@ class ClaudeExecRunner:
         ]
         if spec.claude_bare:
             command.extend(["--strict-mcp-config", "--setting-sources", "project"])
+        if spec.claude_mcp_config_path is not None:
+            # ide_mcp: hand the worker exactly the route's IDE MCP server. With
+            # ``--strict-mcp-config`` (from claude_bare) this is the only MCP server the
+            # worker can load; without it the server is added on top of operator scope.
+            command.extend(["--mcp-config", str(spec.claude_mcp_config_path)])
         if spec.codex_resume_thread_id is not None:
             command.extend(["--resume", spec.codex_resume_thread_id])
         else:
@@ -165,7 +184,11 @@ class ClaudeExecRunner:
         if spec.yolo:
             command.append("--dangerously-skip-permissions")
         elif spec.read_only:
-            command.extend(["--permission-mode", "plan"])
+            # Read-only is NOT plan mode: headless `claude -p` cannot complete plan mode's
+            # ExitPlanMode approval, so it stalls there. Instead run under `default`
+            # prompting so any tool the control plane did not allowlist (Edit/Write) is
+            # denied, and let the restricted allowlist enforce read-only.
+            command.extend(["--permission-mode", "default"])
         else:
             command.extend(["--permission-mode", spec.claude_permission_mode])
         if spec.claude_allowed_tools:
@@ -188,6 +211,18 @@ class ClaudeExecRunner:
         except OSError as exc:
             log.write(f"\n[failed to send prompt to claude stdin: {exc}]\n")
             log.flush()
+
+
+def _materialize_claude_last_message(spec: AgentRunSpec) -> None:
+    """Write the worker's final message to the last-message file recovery reads."""
+
+    last_message_path = spec.log_path.with_suffix(".last-message.md")
+    if last_message_path.exists():
+        return
+    final = extract_claude_final_message(spec.log_path.with_suffix(".events.jsonl"))
+    if final is None:
+        return
+    last_message_path.write_text(final, encoding="utf-8")
 
 
 def _default_claude_sessions_root() -> Path:

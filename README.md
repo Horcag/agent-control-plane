@@ -155,10 +155,13 @@ acceptance.
 The backend selects the runner (`codex`, `agy`, or `claude`; `claude-code` is a legacy
 alias for `claude`). Workspace access is separate: `ide_mcp` uses the configured IDE
 integration, while `native` uses native shell and file tools in the assigned workspace.
-Set it globally, per route, or per job; the most specific setting wins. `ide_mcp` is
-Codex/AGY-only and does not apply to Claude Code — the claude backend requires
-`workspace_access = "native"` and does not provide IDEA diagnostics/refactors. Claude
-Code jobs also do not draw from the global Codex quota broker.
+Set it globally, per route, or per job; the most specific setting wins. Codex and Claude
+Code support both modes (agy is `ide_mcp` only). For a claude `ide_mcp` job, ACP hands the
+worker exactly the route's IDE MCP server through a per-job `--mcp-config` — sourced from a
+`[control.claude_mcp_servers]` override or, by default, the operator's Claude config — while
+`claude_bare` isolation keeps every other operator MCP server out of the worker; a server
+that cannot be resolved fails the launch closed. Claude Code jobs do not draw from the
+global Codex quota broker.
 
 For operational procedures and failure handling, see [Operations](docs/operations.md) and
 the [Recovery matrix](docs/recovery-matrix.md). Quality gates run only when configured;

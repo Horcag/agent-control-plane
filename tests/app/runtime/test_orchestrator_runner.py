@@ -2163,6 +2163,7 @@ def _create_job(
     codex_quality_tier: str | None = None,
     codex_tool_call_budget: int | None = None,
     workspace_access: str = "ide_mcp",
+    read_only: bool = False,
 ):
     run_dir = root / "runs" / job_id
     run_dir.mkdir(parents=True)
@@ -2184,7 +2185,7 @@ def _create_job(
         max_restarts=1,
         yolo=False,
         allow_dirty=allow_dirty,
-        read_only=False,
+        read_only=read_only,
         backend=backend,
         codex_model=codex_model,
         codex_reasoning_effort=codex_reasoning_effort,
@@ -2275,14 +2276,19 @@ class OrchestratorClaudeBackendTest(unittest.TestCase):
             self.assertEqual(job.codex_model, "claude-opus-4-8")
             self.assertEqual(job.codex_reasoning_effort, "medium")
 
-    def test_claude_backend_requires_native_workspace_access(self) -> None:
+    def test_claude_ide_mcp_blocks_when_ide_server_unresolvable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
-            control = AgentControlPlane(_config(root, workspace))
+            config = replace(
+                _config(root, workspace),
+                claude_config_path=root / "no-such-claude.json",
+                claude_mcp_servers={},
+            )
+            control = AgentControlPlane(config)
             _brief(control.config.coordination_root, "task-claude-idemcp")
 
-            with self.assertRaisesRegex(PolicyError, "requires workspace_access=native"):
+            with self.assertRaisesRegex(PolicyError, "cannot resolve its IDE"):
                 control.start_job(
                     StartOptions(
                         task_id="task-claude-idemcp",
@@ -2290,6 +2296,126 @@ class OrchestratorClaudeBackendTest(unittest.TestCase):
                         backend=CLAUDE_BACKEND,
                     )
                 )
+
+    def test_claude_ide_mcp_launches_with_resolvable_ide_server(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            config = replace(
+                _config(root, workspace),
+                claude_config_path=root / "no-such-claude.json",
+                claude_mcp_servers={
+                    "agentbridge_idea_64343": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:64343/mcp",
+                    }
+                },
+            )
+            control = AgentControlPlane(config)
+            _brief(control.config.coordination_root, "task-claude-idemcp-ok")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-claude-idemcp-ok",
+                        route="main",
+                        backend=CLAUDE_BACKEND,
+                    )
+                )
+
+            self.assertEqual(job.backend, CLAUDE_BACKEND)
+            self.assertEqual(job.workspace_access, "ide_mcp")
+
+    def test_claude_ide_mcp_spec_wires_mcp_config_and_tool_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            config = replace(
+                base,
+                claude_config_path=root / "no-such-claude.json",
+                claude_mcp_servers={
+                    "agentbridge_idea_64343": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:64343/mcp",
+                    }
+                },
+                routes=MappingProxyType(
+                    {"main": replace(base.routes["main"], ide_mcp_server="agentbridge_idea_64343")}
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-claude-idemcp",
+                backend=CLAUDE_BACKEND,
+                codex_model="claude-sonnet-5",
+                codex_reasoning_effort="medium",
+                workspace_access="ide_mcp",
+            )
+            runner = _CapturingCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.ClaudeExecRunner",
+                return_value=runner,
+            ):
+                control.run_job(job.job_id)
+
+            spec = runner.specs[0]
+            self.assertIsNotNone(spec.claude_mcp_config_path)
+            self.assertTrue(Path(spec.claude_mcp_config_path).is_file())
+            # The bare worker can only call the IDE MCP if its tools are allowlisted.
+            self.assertIn("mcp__agentbridge_idea_64343", spec.claude_allowed_tools)
+
+    def test_claude_ide_mcp_read_only_drops_builtin_write_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            config = replace(
+                base,
+                claude_config_path=root / "no-such-claude.json",
+                claude_mcp_servers={
+                    "agentbridge_idea_64343": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:64343/mcp",
+                    }
+                },
+                routes=MappingProxyType(
+                    {"main": replace(base.routes["main"], ide_mcp_server="agentbridge_idea_64343")}
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-claude-ro",
+                backend=CLAUDE_BACKEND,
+                codex_model="claude-sonnet-5",
+                codex_reasoning_effort="medium",
+                workspace_access="ide_mcp",
+                read_only=True,
+            )
+            runner = _CapturingCompletedRunner()
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.ClaudeExecRunner",
+                return_value=runner,
+            ):
+                control.run_job(job.job_id)
+
+            spec = runner.specs[0]
+            # Read-only drops the write-capable builtins so default prompting denies them...
+            self.assertNotIn("Edit", spec.claude_allowed_tools)
+            self.assertNotIn("Write", spec.claude_allowed_tools)
+            # ...while reads and the IDE MCP server stay available.
+            self.assertIn("Read", spec.claude_allowed_tools)
+            self.assertIn("mcp__agentbridge_idea_64343", spec.claude_allowed_tools)
 
     def test_claude_model_override_is_rejected_for_codex_backend(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

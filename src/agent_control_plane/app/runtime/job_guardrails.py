@@ -31,7 +31,10 @@ from agent_control_plane.shared.git_tools import (
 # 500 killed legitimate Claude implementation jobs three times on 2026-07-20/21:
 # a single Write of one large test file crosses it between 2s guardrail polls,
 # faster than any incremental-commit discipline can reset the baseline.
-CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 1200
+# TEMP 2026-07-21 (root, multi-slot decomposition window): raised 1200 -> 8000 to
+# admit large-file cohesion splits (e.g. contracts_test.go 1500 -> 6 files peaks
+# ~1470-2900 changed lines before the original is trimmed). REVERT to 1200 after.
+CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 8000
 ROUTE_ROOT_INDEX_GRACE_SEC = 15.0
 
 

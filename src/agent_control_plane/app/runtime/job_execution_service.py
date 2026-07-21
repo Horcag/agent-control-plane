@@ -35,6 +35,9 @@ from agent_control_plane.features.agent_runner import (
     claude_ladder_for_explicit_model,
     codex_job_capacity_units,
     normalize_backend,
+    resolve_claude_mcp_server_definition,
+    select_ide_mcp_server,
+    write_claude_mcp_config,
 )
 from agent_control_plane.features.antigravity_accounts import (
     AntigravityManagerAdapter,
@@ -44,6 +47,10 @@ from agent_control_plane.features.antigravity_accounts import (
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.git_tools import compact_status_preview
+
+# Write-capable builtin Claude tools dropped from a read-only worker's allowlist so the
+# headless worker (which cannot answer a permission prompt) is denied file mutations.
+_CLAUDE_WRITE_TOOLS = frozenset({"Edit", "Write"})
 
 
 class JobFinalizer(Protocol):
@@ -505,6 +512,7 @@ class JobExecutionService:
         profile: ModelProfile,
         log_path: Path,
     ) -> AgentRunSpec:
+        claude_mcp_config_path, claude_allowed_tools = self._claude_binding(job)
         return AgentRunSpec(
             backend=job.backend,
             agy_command=self.config.agy_command,
@@ -540,11 +548,37 @@ class JobExecutionService:
                 else None
             ),
             claude_permission_mode=self.config.defaults.claude_permission_mode,
-            claude_allowed_tools=self.config.defaults.claude_allowed_tools,
+            claude_allowed_tools=claude_allowed_tools,
             claude_sessions_root=self.config.defaults.claude_sessions_root,
             claude_max_turns=self.config.defaults.claude_max_turns,
             claude_bare=self.config.defaults.claude_bare,
+            claude_mcp_config_path=claude_mcp_config_path,
         )
+
+    def _claude_binding(self, job: JobRecord) -> tuple[Path | None, tuple[str, ...]]:
+        """Resolve the IDE MCP config and tool allowlist for a claude job.
+
+        Two concerns, both expressed through the worker's ``--allowedTools``:
+        - Read-only: drop the write-capable builtin tools so, under ``default`` prompting,
+          the headless worker is denied any file mutation (it cannot answer a prompt).
+        - ide_mcp: the worker is launched bare, so ACP hands it exactly the route's IDE MCP
+          server via a per-job ``--mcp-config`` file and allowlists that server's
+          ``mcp__<server>__*`` tools so it may call them without an approval it can never get.
+        Native and non-claude jobs get no MCP config.
+        """
+
+        allowed_tools = tuple(self.config.defaults.claude_allowed_tools)
+        if job.read_only:
+            allowed_tools = tuple(t for t in allowed_tools if t not in _CLAUDE_WRITE_TOOLS)
+        if normalize_backend(job.backend) != CLAUDE_BACKEND or job.workspace_access == "native":
+            return None, allowed_tools
+        server_name = select_ide_mcp_server(self.config, job.route)
+        definition = resolve_claude_mcp_server_definition(self.config, server_name)
+        config_path = write_claude_mcp_config(job.run_dir, server_name, definition)
+        server_tools = f"mcp__{server_name.replace('-', '_')}"
+        if server_tools not in allowed_tools:
+            allowed_tools = (*allowed_tools, server_tools)
+        return config_path, allowed_tools
 
     def _disabled_mcp_servers(self, job: JobRecord) -> tuple[str, ...]:
         disabled = list(dict.fromkeys(self.config.defaults.codex_disabled_mcp_servers))

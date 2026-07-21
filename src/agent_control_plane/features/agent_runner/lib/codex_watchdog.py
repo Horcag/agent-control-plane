@@ -11,7 +11,11 @@ from agent_control_plane.shared.git_tools import GitError, workspace_state
 from agent_control_plane.shared.path_rules import is_known_temporary_patch_artifact
 
 CODEX_TOOL_TIMEOUT_LIMIT = 2
-CODEX_INEFFICIENT_TOOL_USAGE_LIMIT = 16
+# Consecutive tool calls without any durable-progress signature change before the worker is
+# stopped. Resets to 0 on any progress (repo tree dirtied, agent-progress.md/result.md/
+# verification.json touched). Read-heavy orientation on an unfamiliar codebase routinely
+# spends 15-20 calls, so 16 was too aggressive and killed legitimate workers mid-orientation.
+CODEX_INEFFICIENT_TOOL_USAGE_LIMIT = 50
 CODEX_TOOL_TIMEOUT_MARKER = "Exit code: 124"
 CODEX_FORBIDDEN_TOOL_MARKERS_BY_NAME: dict[str, str] = {
     "web_search": "\nweb search:",

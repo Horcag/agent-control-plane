@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 from agent_control_plane.features.agent_runner.lib.agy_idea_prompt import build_agy_task_prompt
+from agent_control_plane.features.agent_runner.lib.claude_mcp_config import select_ide_mcp_server
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import tool_budget_policy
 from agent_control_plane.shared.agent_backends import AGY_BACKEND, CODEX_BACKEND
 from agent_control_plane.shared.config import ControlConfig
@@ -88,6 +89,7 @@ Mandatory execution rules:
 {native_quality_rules}
 - Inspect the final diff before claiming completion.
 - You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
+- When a commit is explicitly requested, never add a `Co-Authored-By`, `Generated with Claude Code`, or any AI/model-attribution trailer to the commit message; use only the requested message.
 - You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID.
 - Write the final result in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
 - For Status: partial, emit exactly one machine-readable line `Escalation-Classification: model_capability` only when the remaining issue is a model capability or task-reasoning limitation likely to benefit from the next configured model. Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or `guardrail` for other blockers. Omit the line for unclassified results. Never classify an environment blocker as model_capability. Status: blocked never escalates.
@@ -134,6 +136,48 @@ Mandatory execution rules:
     idea_create_root = _idea_create_root(idea_edit_path, idea_project_root)
     idea_server, tool_namespace, forbidden_idea_servers = _idea_mcp_settings(config, route)
 
+    if read_only:
+        return f"""Task ID: {task_id}
+Workspace route: {route}
+Workspace path: {workspace_path}
+IDEA MCP edit root: {idea_edit_root}
+Expected IDEA MCP project root: {expected_idea_project_root}
+Expected branch: {expected_branch}
+Controller result status: {expected_result_status}
+
+Read before acting:
+- {protocol_path}
+- {routing_path}
+- {brief_path}
+
+Inspect (read-only) only in:
+- {workspace_path}
+
+This is a READ-ONLY inspection job.
+- Use only the IDEA MCP server `{idea_server}` through native `{tool_namespace}*` READ
+  tools (for example `get_project_info`, `read_file`, `git_status`, `git_log`, `git_diff`,
+  `search_text`, `get_problems`). Your first IDEA MCP call must be
+  `{tool_namespace}get_project_info`; require its reported project Path, after normalizing
+  separators and resolving it, to equal exactly `{expected_idea_project_root}`. If it
+  differs, respond with Status: blocked stating the expected and actual roots.
+- {forbidden_idea_servers} are forbidden. Do not discover, call, or fall back to them.
+- You are FORBIDDEN from any change: do not call `{tool_namespace}write_file`,
+  `{tool_namespace}edit_text`, or any create/delete/move/refactor/format/run/terminal or
+  git-mutating tool, do not update the progress file, and do not write a result file.
+- Do not present a plan or ask how to proceed; perform the inspection directly and answer.
+- Do not use web search or raw shell `exec`; the runner treats those markers as forbidden.
+- You MUST write your final response beginning with exactly one of: Status: completed,
+  Status: partial, Status: blocked, followed by Changed files (none), What changed,
+  Verification performed, and Not verified / remaining risks.
+- For Status: partial, emit exactly one machine-readable line
+  `Escalation-Classification: model_capability` only when the remaining issue is a model
+  capability or task-reasoning limitation likely to benefit from the next configured model.
+  Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or
+  `guardrail` for other blockers. Omit the line for unclassified results. Never classify an
+  environment blocker as model_capability. Status: blocked never escalates.
+- The response itself will be recovered and written to: {result_path}
+"""
+
     return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
@@ -168,10 +212,9 @@ Mandatory execution rules:
 {_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
 - {forbidden_idea_servers} are forbidden for this job. Do not
   discover, call, configure, or fall back to those servers.
-- In Codex / `codex exec`, the first IDEA MCP call must be
-  `{tool_namespace}get_project_info`. Require its reported project Path,
-  after normalizing separators and resolving it, to equal exactly
-  `{expected_idea_project_root}`.
+- Your first IDEA MCP call must be `{tool_namespace}get_project_info`.
+  Require its reported project Path, after normalizing separators and resolving
+  it, to equal exactly `{expected_idea_project_root}`.
 - If the IDEA MCP project root differs, do not read, search, edit, run Git, or
   execute repository commands through that server. Write Status: blocked with
   the expected and actual roots, then stop.
@@ -391,19 +434,7 @@ def _idea_create_root(workspace_path: Path, project_root: Path) -> str:
 
 def _idea_mcp_settings(config: ControlConfig, route: str) -> tuple[str, str, str]:
     disabled = set(config.defaults.codex_disabled_mcp_servers)
-    route_config = config.routes.get(route)
-    configured_server = route_config.ide_mcp_server if route_config is not None else None
-
-    if configured_server is not None:
-        if configured_server in disabled:
-            raise ValueError(
-                f"Route {route!r} selects disabled IDEA MCP server {configured_server!r}"
-            )
-        server = configured_server
-    elif "agentbridge_idea_64343" in disabled and "agentbridge_idea_8644" not in disabled:
-        server = "agentbridge_idea_8644"
-    else:
-        server = "agentbridge_idea_64343"
+    server = select_ide_mcp_server(config, route)
 
     tool_namespace = f"mcp__{server.replace('-', '_')}__"
     forbidden_servers = tuple(sorted(disabled - {server}))

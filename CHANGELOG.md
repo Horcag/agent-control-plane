@@ -6,6 +6,28 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Added
 
+- The claude backend now supports `workspace_access = "ide_mcp"` (previously native-only),
+  reaching the route's IDEA/AgentBridge MCP server the same way Codex does. ACP writes a
+  per-job `runs/<job-id>/claude-mcp-config.json` with exactly that one server and passes it
+  via `--mcp-config`; combined with `claude_bare`'s `--strict-mcp-config` the worker loads
+  that server and nothing else from operator scope. It also appends `mcp__<server>` to the
+  worker's `--allowedTools` so the headless worker can call the IDE MCP tools without an
+  interactive approval it can never get. The server endpoint resolves from a new
+  `[control.claude_mcp_servers.<name>]` override, or by default from the operator's Claude
+  config (`~/.claude.json`, relocatable via `[control] claude_config_path`). A claude
+  ide_mcp job whose server cannot be resolved fails closed at launch instead of spawning a
+  worker with no IDE tools. The prompt's project-root canary is now backend-neutral.
+
+### Fixed
+
+- Read-only claude jobs now work. Headless `claude -p` cannot complete plan mode's
+  ExitPlanMode approval, so read-only no longer uses `--permission-mode plan`; instead it
+  runs under `default` prompting with the write-capable builtin tools (`Edit`, `Write`)
+  dropped from `--allowedTools`, so file mutations are denied. Claude has no
+  `--output-last-message`, so the runner now materializes `<attempt>.last-message.md` from
+  the worker's final stream-json message, letting the existing read-only result recovery
+  produce `result.md`. The ide_mcp prompt gained a read-only variant that inspects through
+  IDE MCP read tools and returns its answer for recovery instead of writing files.
 - Added `attempt_metrics.cache_creation_input_tokens` (persisted via a pragma-guarded
   `alter table`, backfilled to 0 for existing rows) so the billing-relevant Claude split —
   uncached input vs cache-read vs cache-write — can be reconstructed without re-parsing

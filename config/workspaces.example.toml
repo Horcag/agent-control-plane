@@ -13,6 +13,16 @@ agy_command = "agy"
 codex_command = "codex"
 # Optional override for the Claude Code CLI executable. Defaults to "claude" on PATH.
 # claude_command = "claude"
+# Where ACP sources IDE MCP server endpoints for claude ide_mcp jobs when they are not
+# given an explicit [control.claude_mcp_servers] override. Defaults to the operator's
+# Claude config at "${USERPROFILE}/.claude.json".
+# claude_config_path = "${USERPROFILE}/.claude.json"
+# Explicit IDE MCP endpoints for claude ide_mcp jobs. The server name must match the
+# route's ide_mcp_server (see [routes.*] below). An override here wins over the operator
+# Claude config and makes claude ide_mcp launches self-contained (useful for CI/headless).
+# [control.claude_mcp_servers.agentbridge_idea_8644]
+# type = "http"
+# url = "http://127.0.0.1:8644/mcp"
 
 [control.defaults]
 timeout_sec = 3600
@@ -68,9 +78,10 @@ codex_spark_soft_limit_percent = 100
 codex_spark_models = ["gpt-5.3-codex-spark"]
 codex_quota_poll_sec = 30
 codex_sessions_root = "${USERPROFILE}/.codex/sessions"
-# Claude Code backend defaults. The claude backend requires
-# workspace_access = "native" (no ide_mcp/IDEA support) and does not draw from
-# the codex_global_quota_database broker above.
+# Claude Code backend defaults. The claude backend supports both workspace_access
+# modes; for ide_mcp it reaches the route's IDE MCP server through a per-job
+# --mcp-config (see [control.claude_mcp_servers] above) and does not draw from the
+# codex_global_quota_database broker above.
 claude_model = "default"
 claude_reasoning_effort = "medium"
 # One of: default, acceptEdits, plan, dontAsk.
@@ -202,12 +213,13 @@ rate_card_source = "operator-supplied example rates; verify before use"
 path = "../my-project"
 required_branch = "main"
 # Optional route override: "ide_mcp" or "native". A per-job override has priority.
-# The claude backend requires "native" (no ide_mcp/IDEA support).
+# Codex and Claude Code support both modes; agy is ide_mcp only.
 # workspace_access = "native"
 # Optional route-specific Claude Code model and reasoning effort.
 # claude_model = "claude-opus-4-8"
 # claude_reasoning_effort = "high"
-# Use a stable AgentBridge IDE/port ID from ~/.codex/config.toml.
+# Stable AgentBridge IDE/port ID. Codex reads it from ~/.codex/config.toml; claude
+# ide_mcp jobs resolve the same name via [control.claude_mcp_servers] or ~/.claude.json.
 ide_mcp_server = "agentbridge_idea_8644"
 # Optional: MCP server name from Antigravity User/mcp.json. Configure an
 # AgentBridge server for AGY jobs that edit external managed slots; otherwise

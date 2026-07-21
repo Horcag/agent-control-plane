@@ -261,6 +261,8 @@ class ControlConfig:
     routing_policies: tuple[CodexRoutingPolicyConfig, ...] = ()
     claude_command: str = "claude"
     claude_model_catalog: ClaudeModelCatalogConfig = field(default_factory=ClaudeModelCatalogConfig)
+    claude_mcp_servers: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    claude_config_path: Path | None = None
 
 
 def default_config_path() -> Path:
@@ -603,6 +605,8 @@ def load_config(
         agy_command=str(control.get("agy_command", "agy")),
         codex_command=str(control.get("codex_command", "codex")),
         claude_command=str(control.get("claude_command", "claude")),
+        claude_mcp_servers=MappingProxyType(_claude_mcp_servers(control)),
+        claude_config_path=_claude_config_path_value(control),
         defaults=defaults,
         model_catalog=model_catalog,
         routing_policies=routing_policies,
@@ -611,6 +615,25 @@ def load_config(
         slots=MappingProxyType(slots),
         slot_prepare=tuple(slot_prepare),
     )
+
+
+def _claude_mcp_servers(control: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    raw = control.get("claude_mcp_servers", {})
+    if not isinstance(raw, dict):
+        raise ValueError("[control.claude_mcp_servers] must be a table")
+    result: dict[str, dict[str, Any]] = {}
+    for name, definition in raw.items():
+        if not isinstance(definition, dict):
+            raise ValueError(f"[control.claude_mcp_servers.{name}] must be a table")
+        result[str(name)] = dict(definition)
+    return result
+
+
+def _claude_config_path_value(control: Mapping[str, Any]) -> Path | None:
+    raw = control.get("claude_config_path")
+    if raw is None:
+        return None
+    return Path(_string_value(raw)).expanduser()
 
 
 def _table(raw: Mapping[str, Any], key: str) -> dict[str, Any]:

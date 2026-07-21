@@ -45,6 +45,39 @@ class ConfigTest(unittest.TestCase):
 
         self.assertFalse(metadata.premium)
 
+    def test_loads_claude_mcp_servers_and_config_path(self) -> None:
+        config = load_config(
+            config_contents=(
+                b"[control]\n"
+                b'coordination_root = ".agent-work"\n'
+                b'runs_root = "runs"\n'
+                b'database = "runs/jobs.sqlite3"\n'
+                b'worktree_root = "worktrees"\n'
+                b'worktree_base = "repo"\n'
+                b'slot_root = "slots"\n'
+                b'claude_config_path = "~/custom-claude.json"\n'
+                b"[control.claude_mcp_servers.agentbridge_idea_64343]\n"
+                b'type = "http"\n'
+                b'url = "http://127.0.0.1:64343/mcp"\n'
+                b"[control.defaults]\n"
+                b"timeout_sec = 10\n"
+                b"idle_timeout_sec = 5\n"
+                b'print_timeout = "10s"\n'
+                b"[routes.main]\n"
+                b'path = "repo"\n'
+                b'required_branch = "main"\n'
+            )
+        )
+
+        self.assertEqual(
+            dict(config.claude_mcp_servers["agentbridge_idea_64343"]),
+            {"type": "http", "url": "http://127.0.0.1:64343/mcp"},
+        )
+        self.assertEqual(
+            config.claude_config_path,
+            Path("~/custom-claude.json").expanduser(),
+        )
+
     def test_loads_slot_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

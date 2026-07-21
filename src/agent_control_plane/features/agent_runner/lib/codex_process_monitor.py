@@ -393,11 +393,19 @@ class CodexProcessMonitor:
                 return self._stopped_result(proc, "cancelled", "Cancel requested")
             final_signature, _ = progress_signature(spec)
             if final_signature != terminal_signature:
-                return self._stopped_result(
-                    proc,
-                    "late_edit",
-                    "Terminal handoff changed after it was observed",
-                )
+                # A trailing edit (typically a formatter/linter auto-fix that runs after the
+                # handoff was written) can change the tree without invalidating the result.
+                # Only fail as a late edit when the handoff is no longer a valid completion.
+                post_state = inspect_result(spec.result_path, started_wall)
+                if not (
+                    post_state.done
+                    and self._valid_terminal_handoff(spec, post_state.verification_state)
+                ):
+                    return self._stopped_result(
+                        proc,
+                        "late_edit",
+                        "Terminal handoff changed after it was observed",
+                    )
         return self._completed_result(
             proc, result_state.status, result_state.escalation_classification
         )
@@ -412,16 +420,25 @@ class CodexProcessMonitor:
         if exit_code is None:
             return None
         last_message_path = spec.log_path.with_suffix(".last-message.md")
+        # A process can exit a moment before its result/verification files are fully flushed
+        # and observable. Re-inspect briefly before concluding there is no valid result.
         result_state = (
             recover_result_from_last_message(spec.result_path, last_message_path, started_wall)
             if spec.read_only
             else inspect_result(spec.result_path, started_wall)
         )
-        if result_state.done and CodexProcessMonitor._valid_terminal_handoff(
-            spec, result_state.verification_state
-        ):
-            return CodexProcessMonitor._completed_result(
-                proc, result_state.status, result_state.escalation_classification
+        for _ in range(10):
+            if result_state.done and CodexProcessMonitor._valid_terminal_handoff(
+                spec, result_state.verification_state
+            ):
+                return CodexProcessMonitor._completed_result(
+                    proc, result_state.status, result_state.escalation_classification
+                )
+            time.sleep(0.2)
+            result_state = (
+                recover_result_from_last_message(spec.result_path, last_message_path, started_wall)
+                if spec.read_only
+                else inspect_result(spec.result_path, started_wall)
             )
         if contains_capacity_marker(spec.log_path, last_message_path):
             return AgentRunResult(

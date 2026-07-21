@@ -63,6 +63,7 @@ class AgentRunSpec:
     claude_sessions_root: Path | None = None
     claude_max_turns: int = 0
     claude_bare: bool = True
+    claude_mcp_config_path: Path | None = None
 
 
 @dataclass(frozen=True)

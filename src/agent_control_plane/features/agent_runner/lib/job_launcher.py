@@ -9,6 +9,10 @@ from typing import Any, Protocol, TypeVar
 from agent_control_plane.entities.job import JobRecord, JobStore, new_job_id
 from agent_control_plane.entities.plan import PlanStore
 from agent_control_plane.entities.workspace import StartRequest, WorkspacePolicy
+from agent_control_plane.features.agent_runner.lib.claude_mcp_config import (
+    resolve_claude_mcp_server_definition,
+    select_ide_mcp_server,
+)
 from agent_control_plane.features.agent_runner.lib.claude_model_catalog import (
     claude_ladder_for_explicit_model,
 )
@@ -241,10 +245,17 @@ class JobLauncher:
         if normalized_backend == AGY_BACKEND and workspace_access == "native":
             raise JobLaunchError("workspace_access=native is not supported with the agy backend")
         if normalized_backend == CLAUDE_BACKEND and workspace_access != "native":
-            raise JobLaunchError(
-                "The claude backend requires workspace_access=native; "
-                "ide_mcp workers are Codex/agy only"
-            )
+            # claude ide_mcp reaches the IDE the same way Codex does — through a per-route
+            # MCP server — so it must resolve to a concrete endpoint before launch. Fail
+            # closed here rather than spawn a bare worker that has no IDE tools.
+            try:
+                ide_mcp_server = select_ide_mcp_server(self.config, options.route)
+                resolve_claude_mcp_server_definition(self.config, ide_mcp_server)
+            except ValueError as exc:
+                raise JobLaunchError(
+                    f"claude ide_mcp job on route {options.route!r} cannot resolve its IDE "
+                    f"MCP server: {exc}"
+                ) from exc
         if options.agy_model is not None and normalized_backend != AGY_BACKEND:
             raise JobLaunchError("--agy-model can only be used with the agy backend")
         if options.claude_model is not None and normalized_backend != CLAUDE_BACKEND:

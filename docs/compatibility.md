@@ -20,10 +20,14 @@ keys, and accepted-value meanings. Additive changes are preferred. Invalid
 configuration must fail closed.
 
 The promise covers the codex, agy, and claude (Claude Code CLI; `claude-code` is a
-legacy alias) backends, subject to the installed external CLI. ide_mcp remains the
-legacy IDEA/AgentBridge access mode and does not apply to the claude backend; native
-uses native shell/search/edit tools. The claude backend is native-only: it requires
-`workspace_access = "native"` and does not use ide_mcp/IDEA diagnostics. Agents stay
+legacy alias) backends, subject to the installed external CLI. `native` uses native
+shell/search/edit tools; `ide_mcp` drives the workspace through the route's
+IDEA/AgentBridge MCP server. All three backends support `ide_mcp`, and codex/claude also
+support `native` (agy is `ide_mcp` only). For a claude `ide_mcp` job, ACP hands the
+worker exactly that one route server via a per-job `--mcp-config`, sourced from a
+`[control.claude_mcp_servers]` override or, by default, the operator's Claude config;
+`claude_bare` isolation still keeps every other operator MCP server out of the worker. A
+claude `ide_mcp` job whose server cannot be resolved fails closed at launch. Agents stay
 inside the declared route and slot workspace. ACP does not promise arbitrary IDE
 modules or external workspace paths.
 

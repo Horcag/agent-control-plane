@@ -8,6 +8,7 @@ from agent_control_plane.features.agent_runner.lib.claude_model_catalog import (
 )
 from agent_control_plane.features.agent_runner.lib.claude_telemetry import (
     claude_turn_completed,
+    extract_claude_final_message,
     parse_claude_jsonl,
     render_claude_json_line,
     scan_claude_tool_constraints,
@@ -268,3 +269,35 @@ def test_render_produces_watchdog_compatible_markers() -> None:
     )
     assert search_line.startswith("web search: q")
     assert render_claude_json_line(json.dumps({"type": "stream_event"})) == ""
+
+
+def test_extract_final_message_prefers_the_result_event_text(tmp_path) -> None:
+    path = _events_file(
+        tmp_path,
+        [
+            _init_event(),
+            _assistant_event([{"type": "text", "text": "thinking out loud"}]),
+            _result_event(result="Status: completed\n\nFinal answer."),
+        ],
+    )
+    assert extract_claude_final_message(path) == "Status: completed\n\nFinal answer."
+
+
+def test_extract_final_message_falls_back_to_last_assistant_text(tmp_path) -> None:
+    path = _events_file(
+        tmp_path,
+        [
+            _init_event(),
+            _assistant_event([{"type": "text", "text": "first"}]),
+            _assistant_event([{"type": "text", "text": "Status: completed final"}]),
+            # result event without a textual `result` field must not win
+            _result_event(),
+        ],
+    )
+    assert extract_claude_final_message(path) == "Status: completed final"
+
+
+def test_extract_final_message_returns_none_without_text(tmp_path) -> None:
+    path = _events_file(tmp_path, [_init_event()])
+    assert extract_claude_final_message(path) is None
+    assert extract_claude_final_message(tmp_path / "missing.jsonl") is None

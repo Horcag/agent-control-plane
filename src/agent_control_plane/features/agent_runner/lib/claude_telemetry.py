@@ -182,6 +182,41 @@ def claude_turn_completed(path: Path) -> bool:
     )
 
 
+def extract_claude_final_message(event_log_path: Path) -> str | None:
+    """Return the worker's final assistant text from a Claude stream-json event log.
+
+    Prefers the terminal ``result`` event's ``result`` field (the CLI's own final message)
+    and falls back to the last assistant message's concatenated text blocks. This
+    materializes the ``.last-message.md`` that read-only recovery reads, since Claude has no
+    ``--output-last-message`` equivalent the way Codex does.
+    """
+
+    try:
+        lines = event_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    final_result: str | None = None
+    final_assistant: str | None = None
+    for line in lines:
+        event = _parse_event(line)
+        if event is None:
+            continue
+        event_type = event.get("type")
+        if event_type == "result":
+            result_text = event.get("result")
+            if isinstance(result_text, str) and result_text.strip():
+                final_result = result_text
+        elif event_type == "assistant":
+            joined = "".join(
+                str(block.get("text") or "")
+                for block in _content_blocks(event.get("message"))
+                if block.get("type") == "text"
+            ).strip()
+            if joined:
+                final_assistant = joined
+    return final_result or final_assistant
+
+
 def render_claude_json_line(line: str) -> str:
     event = _parse_event(line)
     if event is None:

@@ -1,3 +1,8 @@
+from agent_control_plane.features.agent_runner.lib.claude_mcp_config import (
+    resolve_claude_mcp_server_definition,
+    select_ide_mcp_server,
+    write_claude_mcp_config,
+)
 from agent_control_plane.features.agent_runner.lib.claude_model_catalog import (
     build_claude_model_catalog,
     claude_ladder_for_explicit_model,
@@ -126,6 +131,9 @@ __all__ = [
     "parse_routing_history_records",
     "probe_worker_lease",
     "process_is_alive",
+    "resolve_claude_mcp_server_definition",
+    "select_ide_mcp_server",
     "supports_verified_process_termination",
     "terminate_verified_process",
+    "write_claude_mcp_config",
 ]

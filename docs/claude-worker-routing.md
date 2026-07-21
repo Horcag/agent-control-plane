@@ -135,6 +135,22 @@ the worker's own login/session intact. This is the source of the roughly 2x cost
 reduction noted above (per-request static context drops from ~90K to ~42K tokens) —
 it removes prompt overhead the worker never needed, not capability.
 
+## Workspace access (`ide_mcp`)
+
+The claude backend supports both `native` and `ide_mcp` workspace access. In `native`
+mode the worker edits through native shell/file tools. In `ide_mcp` mode it drives the
+route's IntelliJ/AgentBridge MCP server through `mcp__<server>__*` tools, exactly like
+Codex. Because the worker is launched bare, ACP writes a per-job
+`runs/<job-id>/claude-mcp-config.json` holding only that one server and passes it via
+`--mcp-config`; with `claude_bare`'s `--strict-mcp-config` that is the sole MCP server the
+worker can load. ACP also appends `mcp__<server>` to the worker's `--allowedTools`, since a
+headless `claude -p` worker cannot answer an interactive tool-permission prompt. The
+endpoint resolves from a `[control.claude_mcp_servers.<name>]`
+override, or by default from the operator's Claude config (`~/.claude.json`, relocatable
+with `[control] claude_config_path`). The server name matches the route's `ide_mcp_server`.
+A claude `ide_mcp` job whose server cannot be resolved is blocked at launch rather than
+spawned without IDE tools.
+
 Token accounting for cost estimates follows the Anthropic usage fields directly:
 `input_tokens` (ACP's total-input convention) sums uncached input, cache-read, and
 cache-creation tokens; `cached_input_tokens` tracks cache-read tokens only;
