@@ -941,6 +941,8 @@ def test_accept_handoff_atomically_resolves_inbox_plan_and_review(tmp_path: Path
     assert accepted["accepted_sha"] == checkpoint_sha
     assert control.review_inbox.get(f"agent_job:{job.job_id}").review_status == "accepted"
     assert control.plan_snapshot("atomic-plan")["status"] == "completed"
+    assert control.store.get_job(job.job_id).checkpoint_disposition == "final_accepted"
+    assert control.store.get_job(job.job_id).root_acceptance == "accepted"
     outcome = reviews.report(span_id)["job_outcomes"][0]
     assert outcome["outcome"] == "accepted"
     assert outcome["root_verified"] is True
@@ -966,6 +968,9 @@ def test_accept_handoff_rolls_back_every_decision_when_review_attach_fails(
         session_path=tmp_path / "rollout.jsonl",
         usage=TokenUsage(0, 0, 0, 0),
     )
+    pre_accept_job = control.store.get_job(job.job_id)
+    pre_accept_disposition = pre_accept_job.checkpoint_disposition
+    pre_accept_root_acceptance = pre_accept_job.root_acceptance
 
     with pytest.raises(KeyError, match="Attempt not found"):
         control.accept_handoff(
@@ -980,6 +985,11 @@ def test_accept_handoff_rolls_back_every_decision_when_review_attach_fails(
     assert snapshot["status"] == "active"
     assert snapshot["awaiting_review"][0]["task_id"] == "task"
     assert reviews.report(span_id)["job_outcomes"] == []
+    post_accept_job = control.store.get_job(job.job_id)
+    assert post_accept_job.checkpoint_disposition == pre_accept_disposition
+    assert post_accept_job.root_acceptance == pre_accept_root_acceptance
+    assert post_accept_job.checkpoint_disposition != "final_accepted"
+    assert post_accept_job.root_acceptance != "accepted"
 
 
 def test_continuation_handoff_is_atomic_idempotent_and_does_not_accept(tmp_path: Path) -> None:

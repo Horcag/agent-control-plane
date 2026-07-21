@@ -84,6 +84,16 @@ class HandoffAcceptanceService:
                 false_positives=false_positives,
                 notes=notes,
             )
+            cursor = db.execute(
+                """
+                update jobs set checkpoint_disposition = 'final_accepted',
+                    root_acceptance = 'accepted', updated_at = ?
+                where job_id = ?
+                """,
+                (utc_now(), job_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"Job not found: {job_id}")
 
         return {
             "status": "accepted",
