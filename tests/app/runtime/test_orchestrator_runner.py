@@ -10,6 +10,9 @@ from types import MappingProxyType
 from typing import Any
 from unittest.mock import patch
 
+from agent_control_plane.app.runtime.job_guardrails import (
+    CODEX_DIRTY_DIFF_MAX_CHANGED_LINES,
+)
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
     PolicyError,
@@ -2034,7 +2037,8 @@ class _MutatingForbiddenFileRunner:
 
 class _LargeDirtyCodexRunner:
     def run(self, spec: Any, **kwargs: Any) -> AgyRunResult:
-        changed_lines = "".join(f"changed {index}\n" for index in range(520))
+        line_count = CODEX_DIRTY_DIFF_MAX_CHANGED_LINES + 50
+        changed_lines = "".join(f"changed {index}\n" for index in range(line_count))
         (spec.workspace_path / "tracked.py").write_text(changed_lines, encoding="utf-8")
         kwargs["cancel_requested"]()
         return AgyRunResult(
