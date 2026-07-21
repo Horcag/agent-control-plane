@@ -122,6 +122,7 @@ def parse_codex_jsonl(
             else "unknown"
         ),
         event_log_path=path,
+        cache_creation_input_tokens=0,
     )
 
 

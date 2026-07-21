@@ -878,6 +878,7 @@ class AgentControlPlane:
         limit: int = 100,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        backend: str | None = None,
         valid_only: bool = False,
     ) -> dict[str, Any]:
         if limit <= 0:
@@ -886,12 +887,14 @@ class AgentControlPlane:
             limit=limit,
             model=model,
             reasoning_effort=reasoning_effort,
+            backend=backend,
             valid_only=valid_only,
         )
         report["filters"] = {
             "limit": limit,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "backend": backend,
             "valid_only": valid_only,
         }
         return report

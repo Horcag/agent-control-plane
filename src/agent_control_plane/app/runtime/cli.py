@@ -147,6 +147,7 @@ def main(argv: list[str] | None = None) -> int:
                     limit=args.limit,
                     model=args.model,
                     reasoning_effort=args.reasoning_effort,
+                    backend=args.backend,
                     valid_only=args.valid_only,
                 )
             )
@@ -522,6 +523,7 @@ def _build_parser() -> argparse.ArgumentParser:
     analytics.add_argument("--limit", type=int, default=100)
     analytics.add_argument("--model")
     analytics.add_argument("--reasoning-effort")
+    analytics.add_argument("--backend", help="Filter to a single backend (e.g. codex, claude)")
     analytics.add_argument(
         "--valid-only",
         action="store_true",

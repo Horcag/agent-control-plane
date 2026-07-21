@@ -30,6 +30,7 @@ class AttemptMetrics:
     estimated_api_usd: float | None
     rate_card_version: str
     event_log_path: Path | None
+    cache_creation_input_tokens: int = 0
 
     @property
     def uncached_input_tokens(self) -> int:
@@ -75,6 +76,7 @@ def create_attempt_metrics_table(db: sqlite3.Connection) -> None:
             rate_card_version text not null,
             event_log_path text,
             created_at text not null,
+            cache_creation_input_tokens integer not null default 0,
             primary key(job_id, attempt_no)
         )
         """
@@ -82,6 +84,11 @@ def create_attempt_metrics_table(db: sqlite3.Connection) -> None:
     columns = {row["name"] for row in db.execute("pragma table_info(attempt_metrics)")}
     if "thread_id" not in columns:
         db.execute("alter table attempt_metrics add column thread_id text")
+    if "cache_creation_input_tokens" not in columns:
+        db.execute(
+            "alter table attempt_metrics "
+            "add column cache_creation_input_tokens integer not null default 0"
+        )
 
 
 def save_attempt_metrics(
@@ -102,8 +109,8 @@ def save_attempt_metrics(
             input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens,
             tool_calls, failed_tool_calls, error_events, tool_counts_json,
             estimated_credits, estimated_api_usd, rate_card_version,
-            event_log_path, created_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            event_log_path, created_at, cache_creation_input_tokens
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             job_id,
@@ -129,6 +136,7 @@ def save_attempt_metrics(
             metrics.rate_card_version,
             str(metrics.event_log_path) if metrics.event_log_path else None,
             utc_now(),
+            metrics.cache_creation_input_tokens,
         ),
     )
 
@@ -139,6 +147,7 @@ def load_attempt_metrics(
     job_id: str | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
+    backend: str | None = None,
     valid_only: bool = False,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
@@ -153,6 +162,7 @@ def load_attempt_metrics(
         where (? is null or m.job_id = ?)
           and (? is null or m.model = ?)
           and (? is null or m.reasoning_effort = ?)
+          and (? is null or m.backend = ?)
           and (? = 0 or (a.status = 'completed' and m.usage_available = 1 and m.turn_completed = 1))
         order by m.created_at desc, m.attempt_no desc
         limit ?
@@ -164,6 +174,8 @@ def load_attempt_metrics(
             model,
             reasoning_effort,
             reasoning_effort,
+            backend,
+            backend,
             int(valid_only),
             max(1, limit),
         ),
@@ -216,6 +228,7 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     durations = sorted(float(row["duration_sec"]) for row in rows)
     input_tokens = sum(int(row["input_tokens"]) for row in rows)
     cached_tokens = sum(int(row["cached_input_tokens"]) for row in rows)
+    cache_creation_tokens = sum(int(row["cache_creation_input_tokens"]) for row in rows)
     output_tokens = sum(int(row["output_tokens"]) for row in rows)
     reasoning_tokens = sum(int(row["reasoning_output_tokens"]) for row in rows)
     total_duration = sum(durations)
@@ -243,6 +256,8 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "p95_duration_sec": _nearest_rank(durations, 0.95),
         "input_tokens": input_tokens,
         "cached_input_tokens": cached_tokens,
+        "cache_creation_input_tokens": cache_creation_tokens,
+        "uncached_input_tokens": max(0, input_tokens - cached_tokens),
         "output_tokens": output_tokens,
         "reasoning_output_tokens": reasoning_tokens,
         "cache_hit_ratio": cached_tokens / input_tokens if input_tokens else 0.0,
