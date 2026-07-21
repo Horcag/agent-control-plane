@@ -34,6 +34,8 @@ All notable changes are recorded here. This project follows Keep a Changelog.
   `--strict-mcp-config --setting-sources project` to the claude runner command
   so workers never load the operator's user-scope MCP servers, plugins,
   skills, or `CLAUDE.md`, while keeping the CLI's subscription login intact.
+- Added `docs/claude-worker-routing.md`, documenting cheap-first model/effort
+  selection, premium gating, and worker isolation for the claude backend.
 
 ## [0.1.0] - 2026-07-16
 

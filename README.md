@@ -93,6 +93,7 @@ or accept a patch. Review the diff and verification before recording acceptance.
 ## Further reading
 
 - [Operations](docs/operations.md)
+- [Claude worker routing](docs/claude-worker-routing.md)
 - [Recovery matrix](docs/recovery-matrix.md)
 - [Compatibility](docs/compatibility.md)
 - [Upgrading](docs/upgrading.md)
