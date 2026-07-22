@@ -188,11 +188,11 @@ class ControlDefaults:
     terminal_slot_policy: str = "preserve"
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
-    codex_no_progress_timeout_sec: int = 240
+    no_progress_timeout_sec: int = 240
     dirty_diff_max_changed_lines: int = DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES
-    codex_tool_timeout_limit: int = 6
-    codex_tool_call_budget_grace_sec: int = 120
-    codex_invalid_verification_grace_sec: int = 120
+    tool_timeout_limit: int = 6
+    tool_call_budget_grace_sec: int = 120
+    invalid_verification_grace_sec: int = 120
     codex_quality_tier: str = "deep"
     codex_mechanical_model: str = "default"
     codex_mechanical_reasoning_effort: str = "low"
@@ -378,9 +378,11 @@ def load_config(
         codex_forbidden_tool_markers=_string_tuple(
             defaults_raw.get("codex_forbidden_tool_markers", [])
         ),
-        codex_no_progress_timeout_sec=_non_negative_int(
-            defaults_raw.get("codex_no_progress_timeout_sec", 240),
-            "codex_no_progress_timeout_sec",
+        no_progress_timeout_sec=_non_negative_int(
+            _aliased_default(
+                defaults_raw, "no_progress_timeout_sec", "codex_no_progress_timeout_sec", 240
+            ),
+            "no_progress_timeout_sec",
         ),
         dirty_diff_max_changed_lines=_non_negative_int(
             defaults_raw.get(
@@ -389,17 +391,27 @@ def load_config(
             ),
             "dirty_diff_max_changed_lines",
         ),
-        codex_tool_timeout_limit=_non_negative_int(
-            defaults_raw.get("codex_tool_timeout_limit", 6),
-            "codex_tool_timeout_limit",
+        tool_timeout_limit=_non_negative_int(
+            _aliased_default(defaults_raw, "tool_timeout_limit", "codex_tool_timeout_limit", 6),
+            "tool_timeout_limit",
         ),
-        codex_tool_call_budget_grace_sec=_non_negative_int(
-            defaults_raw.get("codex_tool_call_budget_grace_sec", 120),
-            "codex_tool_call_budget_grace_sec",
+        tool_call_budget_grace_sec=_non_negative_int(
+            _aliased_default(
+                defaults_raw,
+                "tool_call_budget_grace_sec",
+                "codex_tool_call_budget_grace_sec",
+                120,
+            ),
+            "tool_call_budget_grace_sec",
         ),
-        codex_invalid_verification_grace_sec=_non_negative_int(
-            defaults_raw.get("codex_invalid_verification_grace_sec", 120),
-            "codex_invalid_verification_grace_sec",
+        invalid_verification_grace_sec=_non_negative_int(
+            _aliased_default(
+                defaults_raw,
+                "invalid_verification_grace_sec",
+                "codex_invalid_verification_grace_sec",
+                120,
+            ),
+            "invalid_verification_grace_sec",
         ),
         codex_quality_tier=_routing_policy_name_value(
             defaults_raw.get("codex_quality_tier", "deep")
@@ -996,6 +1008,21 @@ def _required(raw: Mapping[str, Any], key: str) -> Any:
 def _path(raw: Mapping[str, Any], key: str, base: Path) -> Path:
     value = _required(raw, key)
     return _coerce_path(value, base)
+
+
+def _aliased_default(
+    defaults_raw: Mapping[str, Any], new_key: str, old_key: str, fallback: Any
+) -> Any:
+    """Read a `[control.defaults]` key that has a deprecated `codex_`-prefixed alias.
+
+    The new key wins when both are present; the old key keeps working as a deprecated
+    alias so existing configs are not broken by the rename.
+    """
+    if new_key in defaults_raw:
+        return defaults_raw[new_key]
+    if old_key in defaults_raw:
+        return defaults_raw[old_key]
+    return fallback
 
 
 def _optional_path(raw: Mapping[str, Any], key: str, base: Path) -> Path | None:

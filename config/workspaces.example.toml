@@ -49,7 +49,12 @@ native_quality_policy = "worker"
 # them in a controller-owned Git ref and review inbox, then cleans and releases the slot.
 terminal_slot_policy = "checkpoint"
 codex_disabled_mcp_servers = []
-codex_no_progress_timeout_sec = 600
+# These four keys govern the watchdog for both codex and claude backend workers, so they
+# use neutral names. The old codex_-prefixed keys (codex_no_progress_timeout_sec,
+# codex_tool_timeout_limit, codex_tool_call_budget_grace_sec,
+# codex_invalid_verification_grace_sec) still work as deprecated aliases; if both the new
+# and old key are set, the new key wins.
+no_progress_timeout_sec = 600
 # Kill a writable worker whose uncommitted diff grows past this many changed lines
 # without a valid result. This targets runaway agents trashing a workspace, not
 # honest implementation size — keep it far above real slices. 0 disables the check.
@@ -57,20 +62,20 @@ codex_no_progress_timeout_sec = 600
 dirty_diff_max_changed_lines = 8000
 # Consecutive "Exit code: 124" tool-timeout markers observed in the worker log before the
 # job is killed as tool_timeout. 0 disables the check entirely.
-codex_tool_timeout_limit = 6
+tool_timeout_limit = 6
 # Grace window (seconds) after a hard tool-call-budget breach before the worker is
 # terminated, so a worker mid-stroke can still write its terminal handoff. The job still
 # completes normally if a valid handoff lands within the window. A runaway cap
 # (budget + max(4, budget // 10) tool calls) terminates immediately even during the grace
 # window. 0 restores the legacy behavior of terminating the instant the budget is crossed.
-codex_tool_call_budget_grace_sec = 120
+tool_call_budget_grace_sec = 120
 # Grace window (seconds) after the monitor observes a done result with an INVALID
 # verification.json (present but failing schema/consistency checks) before the worker is
 # terminated as invalid_verification, naming the concrete validator error. A valid rewrite
 # landing within the window clears the timer and the job completes normally. Missing (not
 # yet written) verification.json is unaffected. 0 restores the legacy behavior where an
 # invalid file is only ever caught indirectly by an unrelated watchdog.
-codex_invalid_verification_grace_sec = 120
+invalid_verification_grace_sec = 120
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
 codex_quality_tier = "cheap-first"

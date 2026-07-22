@@ -388,10 +388,8 @@ class AgentControlPlane:
                 "poll_sec": self.config.defaults.guardrail_poll_sec,
                 "forbidden_status_globs": self.config.defaults.forbidden_status_globs,
                 "dirty_diff_max_changed_lines": (self.config.defaults.dirty_diff_max_changed_lines),
-                "codex_no_progress_timeout_sec": (
-                    self.config.defaults.codex_no_progress_timeout_sec
-                ),
-                "codex_tool_timeout_limit": self.config.defaults.codex_tool_timeout_limit,
+                "no_progress_timeout_sec": (self.config.defaults.no_progress_timeout_sec),
+                "tool_timeout_limit": self.config.defaults.tool_timeout_limit,
             },
             "antigravity_manager": {
                 "auto_switch_agy_on_quota": self.config.defaults.auto_switch_agy_on_quota,

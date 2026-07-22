@@ -44,7 +44,7 @@ class ClaudeProcessMonitor(CodexProcessMonitor):
             spec.log_path.with_suffix(".events.jsonl"),
             scan_size,
             tool_call_count,
-            tool_call_budget=spec.codex_tool_call_budget,
+            tool_call_budget=spec.tool_call_budget,
         )
 
     @staticmethod

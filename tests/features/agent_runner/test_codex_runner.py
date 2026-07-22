@@ -221,7 +221,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                         yolo=False,
                         log_path=log_path,
                         result_path=result_path,
-                        codex_tool_call_budget=1,
+                        tool_call_budget=1,
                     ),
                     started_wall=0.0,
                     deadline_mono=time.monotonic() + 10,
@@ -252,8 +252,8 @@ class CodexRunnerCommandTest(unittest.TestCase):
                     yolo=False,
                     log_path=log_path,
                     result_path=result_path,
-                    codex_tool_call_budget=1,
-                    codex_tool_call_budget_grace_sec=120,
+                    tool_call_budget=1,
+                    tool_call_budget_grace_sec=120,
                 ),
                 started_wall=0.0,
                 deadline_mono=time.monotonic() + 10,
@@ -282,8 +282,8 @@ class CodexRunnerCommandTest(unittest.TestCase):
                     yolo=False,
                     log_path=log_path,
                     result_path=result_path,
-                    codex_tool_call_budget=1,
-                    codex_tool_call_budget_grace_sec=1,
+                    tool_call_budget=1,
+                    tool_call_budget_grace_sec=1,
                 ),
                 started_wall=0.0,
                 deadline_mono=time.monotonic() + 10,
@@ -332,8 +332,8 @@ class CodexRunnerCommandTest(unittest.TestCase):
                         yolo=False,
                         log_path=log_path,
                         result_path=result_path,
-                        codex_tool_call_budget=1,
-                        codex_tool_call_budget_grace_sec=120,
+                        tool_call_budget=1,
+                        tool_call_budget_grace_sec=120,
                     ),
                     started_wall=0.0,
                     deadline_mono=time.monotonic() + 15,
@@ -535,7 +535,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                     read_only=False,
                     yolo=False,
                     result_path=result_path,
-                    codex_invalid_verification_grace_sec=120,
+                    invalid_verification_grace_sec=120,
                 ),
                 0.0,
             )
@@ -561,7 +561,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                     yolo=False,
                     log_path=log_path,
                     result_path=result_path,
-                    codex_invalid_verification_grace_sec=1,
+                    invalid_verification_grace_sec=1,
                 ),
                 started_wall=0.0,
                 deadline_mono=time.monotonic() + 10,
@@ -602,7 +602,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                         yolo=False,
                         log_path=log_path,
                         result_path=result_path,
-                        codex_invalid_verification_grace_sec=5,
+                        invalid_verification_grace_sec=5,
                     ),
                     started_wall=0.0,
                     deadline_mono=time.monotonic() + 10,
@@ -633,7 +633,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                     yolo=False,
                     log_path=log_path,
                     result_path=result_path,
-                    codex_invalid_verification_grace_sec=0,
+                    invalid_verification_grace_sec=0,
                 ),
                 started_wall=0.0,
                 deadline_mono=time.monotonic() + 0.3,
@@ -671,7 +671,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
     def test_timeout_result_stops_clean_workspace_without_any_activity(self) -> None:
         proc = _FakeProc()
-        spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
+        spec = _spec(read_only=False, yolo=False, no_progress_timeout_sec=5)
 
         result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
@@ -690,7 +690,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
     def test_timeout_result_stops_when_output_continues_without_progress(self) -> None:
         proc = _FakeProc()
-        spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
+        spec = _spec(read_only=False, yolo=False, no_progress_timeout_sec=5)
 
         result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
@@ -710,7 +710,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
     def test_timeout_result_stops_dirty_workspace_without_file_progress(self) -> None:
         proc = _FakeProc()
-        spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
+        spec = _spec(read_only=False, yolo=False, no_progress_timeout_sec=5)
 
         result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
@@ -730,7 +730,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
     def test_timeout_result_keeps_recent_productive_progress(self) -> None:
         proc = _FakeProc()
-        spec = _spec(read_only=False, yolo=False, codex_no_progress_timeout_sec=5)
+        spec = _spec(read_only=False, yolo=False, no_progress_timeout_sec=5)
 
         result = CodexProcessMonitor()._timeout_result_if_needed(
             proc,
@@ -758,7 +758,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 read_only=False,
                 yolo=False,
                 log_path=log_path,
-                codex_tool_timeout_limit=2,
+                tool_timeout_limit=2,
             )
 
             result, scan_size, timeout_count = CodexProcessMonitor()._tool_timeout_result_if_needed(
@@ -1070,13 +1070,13 @@ def _spec(
     yolo: bool,
     codex_sandbox_mode: str = "workspace-write",
     codex_disabled_mcp_servers: tuple[str, ...] = (),
-    codex_no_progress_timeout_sec: int = 0,
-    codex_tool_timeout_limit: int = 6,
+    no_progress_timeout_sec: int = 0,
+    tool_timeout_limit: int = 6,
     codex_forbidden_tool_markers: tuple[str, ...] = (),
     codex_resume_thread_id: str | None = None,
-    codex_tool_call_budget: int = 0,
-    codex_tool_call_budget_grace_sec: int = 0,
-    codex_invalid_verification_grace_sec: int = 0,
+    tool_call_budget: int = 0,
+    tool_call_budget_grace_sec: int = 0,
+    invalid_verification_grace_sec: int = 0,
     log_path: Path | None = None,
     result_path: Path | None = None,
     workspace_access: str = "ide_mcp",
@@ -1089,11 +1089,11 @@ def _spec(
         codex_reasoning_effort="low",
         codex_sandbox_mode=codex_sandbox_mode,
         codex_disabled_mcp_servers=codex_disabled_mcp_servers,
-        codex_no_progress_timeout_sec=codex_no_progress_timeout_sec,
-        codex_tool_timeout_limit=codex_tool_timeout_limit,
-        codex_tool_call_budget=codex_tool_call_budget,
-        codex_tool_call_budget_grace_sec=codex_tool_call_budget_grace_sec,
-        codex_invalid_verification_grace_sec=codex_invalid_verification_grace_sec,
+        no_progress_timeout_sec=no_progress_timeout_sec,
+        tool_timeout_limit=tool_timeout_limit,
+        tool_call_budget=tool_call_budget,
+        tool_call_budget_grace_sec=tool_call_budget_grace_sec,
+        invalid_verification_grace_sec=invalid_verification_grace_sec,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
         codex_resume_thread_id=codex_resume_thread_id,
         prompt="secret task prompt",

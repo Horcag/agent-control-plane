@@ -62,7 +62,7 @@ class CodexProcessMonitor:
             spec.log_path.with_suffix(".events.jsonl"),
             scan_size,
             tool_call_count,
-            tool_call_budget=spec.codex_tool_call_budget,
+            tool_call_budget=spec.tool_call_budget,
             terminal_tab_name=spec.codex_terminal_tab_name,
         )
 
@@ -92,7 +92,7 @@ class CodexProcessMonitor:
         budget_scan_size = 0
         budget_tool_call_count = 0
         budget_events: list[BudgetLifecycleEvent] = []
-        budget_policy = tool_budget_policy(spec.codex_tool_call_budget)
+        budget_policy = tool_budget_policy(spec.tool_call_budget)
         current_progress_signature, workspace_dirty = progress_signature(spec)
         observed_tool_call_count = 0
         calls_without_durable_progress = 0
@@ -189,7 +189,7 @@ class CodexProcessMonitor:
                     lifecycle_events=tuple(budget_events),
                 )
             if hard_budget_violation is not None and budget_breach_mono is None:
-                if spec.codex_tool_call_budget_grace_sec <= 0:
+                if spec.tool_call_budget_grace_sec <= 0:
                     completed = self._completed_result_if_ready(
                         proc,
                         spec,
@@ -213,13 +213,13 @@ class CodexProcessMonitor:
                         "budget_breach",
                         tool_call_count,
                         f"{hard_budget_violation}; granting a "
-                        f"{spec.codex_tool_call_budget_grace_sec}s grace window to finish "
+                        f"{spec.tool_call_budget_grace_sec}s grace window to finish "
                         "the terminal handoff",
                     )
                 )
 
             if budget_breach_mono is not None and budget_breach_message is not None:
-                runaway_cap = tool_call_budget_runaway_cap(spec.codex_tool_call_budget)
+                runaway_cap = tool_call_budget_runaway_cap(spec.tool_call_budget)
                 if tool_call_count > runaway_cap:
                     terminate_spawned_process(proc)
                     return self._stopped_result(
@@ -229,7 +229,7 @@ class CodexProcessMonitor:
                         "fired during the grace window",
                         lifecycle_events=tuple(budget_events),
                     )
-                if now - budget_breach_mono >= spec.codex_tool_call_budget_grace_sec:
+                if now - budget_breach_mono >= spec.tool_call_budget_grace_sec:
                     completed = self._completed_result_if_ready(
                         proc,
                         spec,
@@ -244,7 +244,7 @@ class CodexProcessMonitor:
                         proc,
                         "tool_call_budget",
                         f"{budget_breach_message}; grace of "
-                        f"{spec.codex_tool_call_budget_grace_sec}s expired without a "
+                        f"{spec.tool_call_budget_grace_sec}s expired without a "
                         "terminal handoff",
                         lifecycle_events=tuple(budget_events),
                     )
@@ -257,7 +257,7 @@ class CodexProcessMonitor:
                     lifecycle_events=tuple(budget_events),
                 )
 
-            if not spec.read_only and spec.codex_invalid_verification_grace_sec > 0:
+            if not spec.read_only and spec.invalid_verification_grace_sec > 0:
                 invalid_result_state = inspect_result(spec.result_path, started_wall)
                 if (
                     invalid_result_state.done
@@ -272,7 +272,7 @@ class CodexProcessMonitor:
                         invalid_verification_marker = marker
                     elif (
                         now - invalid_verification_breach_mono
-                        >= spec.codex_invalid_verification_grace_sec
+                        >= spec.invalid_verification_grace_sec
                     ):
                         terminate_spawned_process(proc)
                         return replace(
@@ -281,7 +281,7 @@ class CodexProcessMonitor:
                                 "invalid_verification",
                                 _invalid_verification_message(
                                     invalid_result_state,
-                                    spec.codex_invalid_verification_grace_sec,
+                                    spec.invalid_verification_grace_sec,
                                 ),
                             ),
                             lifecycle_events=tuple(budget_events),
@@ -419,7 +419,7 @@ class CodexProcessMonitor:
             spec.log_path,
             scan_size,
             timeout_count,
-            spec.codex_tool_timeout_limit,
+            spec.tool_timeout_limit,
         )
         if not triggered:
             return None, next_scan_size, timeout_count
@@ -431,7 +431,7 @@ class CodexProcessMonitor:
                 "tool_timeout",
                 "Codex tool calls repeatedly hit "
                 f"{CODEX_TOOL_TIMEOUT_MARKER}; stopping after "
-                f"{timeout_count} occurrences (limit {spec.codex_tool_timeout_limit}) "
+                f"{timeout_count} occurrences (limit {spec.tool_timeout_limit}) "
                 "instead of continuing without a result",
             ),
             next_scan_size,
@@ -532,7 +532,7 @@ class CodexProcessMonitor:
             )
         if (
             not spec.read_only
-            and spec.codex_invalid_verification_grace_sec > 0
+            and spec.invalid_verification_grace_sec > 0
             and result_state.done
             and result_state.verification_state == "invalid"
         ):
@@ -583,14 +583,14 @@ class CodexProcessMonitor:
                 "idle_timeout",
                 f"No codex output for {spec.idle_timeout_sec} seconds",
             )
-        if 0 < spec.codex_no_progress_timeout_sec <= now - last_productive_mono:
+        if 0 < spec.no_progress_timeout_sec <= now - last_productive_mono:
             terminate_spawned_process(proc)
             detail = "workspace is dirty" if workspace_dirty else "workspace is clean"
             return CodexProcessMonitor._stopped_result(
                 proc,
                 "no_progress_timeout",
                 "No result/progress file update or workspace file changes for "
-                f"{spec.codex_no_progress_timeout_sec} seconds ({detail})",
+                f"{spec.no_progress_timeout_sec} seconds ({detail})",
             )
         return None
 

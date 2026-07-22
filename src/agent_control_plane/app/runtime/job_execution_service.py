@@ -553,13 +553,11 @@ class JobExecutionService:
             idle_timeout_sec=job.idle_timeout_sec,
             yolo=job.yolo,
             read_only=job.read_only,
-            codex_no_progress_timeout_sec=self.config.defaults.codex_no_progress_timeout_sec,
-            codex_tool_timeout_limit=self.config.defaults.codex_tool_timeout_limit,
-            codex_tool_call_budget=job.codex_tool_call_budget or 0,
-            codex_tool_call_budget_grace_sec=self.config.defaults.codex_tool_call_budget_grace_sec,
-            codex_invalid_verification_grace_sec=(
-                self.config.defaults.codex_invalid_verification_grace_sec
-            ),
+            no_progress_timeout_sec=self.config.defaults.no_progress_timeout_sec,
+            tool_timeout_limit=self.config.defaults.tool_timeout_limit,
+            tool_call_budget=job.codex_tool_call_budget or 0,
+            tool_call_budget_grace_sec=self.config.defaults.tool_call_budget_grace_sec,
+            invalid_verification_grace_sec=(self.config.defaults.invalid_verification_grace_sec),
             codex_terminal_tab_name=None if job.workspace_access == "native" else job.task_id,
             codex_forbidden_tool_markers=self._effective_forbidden_markers(job, state),
             codex_resume_thread_id=state.resume_thread_id,
