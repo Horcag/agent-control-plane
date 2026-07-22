@@ -70,6 +70,8 @@ class ReviewInboxItem:
     created_at: str
     updated_at: str
     reviewed_at: str | None
+    requalify_count: int = 0
+    requalified_at: str | None = None
     result_text: str | None = None
     result_sha256: str | None = None
     verification_state: str | None = None
@@ -106,6 +108,8 @@ class ReviewInboxItem:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "reviewed_at": self.reviewed_at,
+            "requalify_count": self.requalify_count,
+            "requalified_at": self.requalified_at,
             "result_text": self.result_text,
             "result_sha256": self.result_sha256,
             "verification_state": self.verification_state,
@@ -137,6 +141,13 @@ class ReviewInboxStore:
             version=2,
             checksum="review-inbox-payloads-v2-20260715",
             migrate=self._migrate_payload_schema,
+        )
+        apply_schema_migration(
+            self.database_path,
+            component="review_inbox_store",
+            version=3,
+            checksum="review-inbox-requalify-v3-20260722",
+            migrate=self._migrate_requalify_schema,
         )
 
     @staticmethod
@@ -195,6 +206,33 @@ class ReviewInboxStore:
             """
         )
         ReviewInboxStore._ensure_item_schema(db)
+
+    @staticmethod
+    def _migrate_requalify_schema(db: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in db.execute("pragma table_info(review_inbox_items)").fetchall()
+        }
+        if "requalify_count" not in columns:
+            db.execute(
+                "alter table review_inbox_items"
+                " add column requalify_count integer not null default 0"
+            )
+        if "requalified_at" not in columns:
+            db.execute("alter table review_inbox_items add column requalified_at text")
+        db.execute(
+            """
+            create table if not exists review_inbox_requalifications (
+                item_id text not null
+                    references review_inbox_items(item_id) on delete cascade,
+                attempt integer not null,
+                previous_bundle_json text,
+                new_bundle_json text not null,
+                requalified_at text not null,
+                primary key (item_id, attempt)
+            )
+            """
+        )
 
     @staticmethod
     def _ensure_item_schema(db: sqlite3.Connection) -> None:
@@ -455,6 +493,71 @@ class ReviewInboxStore:
         if cursor.rowcount != 1:
             raise KeyError(f"Review inbox item not found: {item_id}")
 
+    def requalify(self, item_id: str, verification_bundle: dict[str, Any]) -> ReviewInboxItem:
+        """Durably replace a pending item's bundle, keeping the prior bundle for audit."""
+        new_bundle_json = _json_text(verification_bundle)
+        if new_bundle_json is None:
+            raise ValueError("verification_bundle must not be empty")
+        self.initialize()
+        now = utc_now()
+        with self._connect() as db:
+            db.execute("begin immediate")
+            row = db.execute(
+                """
+                select review_status, verification_bundle_json, requalify_count
+                from review_inbox_items where item_id = ?
+                """,
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Review inbox item not found: {item_id}")
+            if row["review_status"] != "pending":
+                raise ValueError(
+                    f"Review item {item_id} is already {row['review_status']} "
+                    "and cannot be requalified"
+                )
+            attempt = int(row["requalify_count"] or 0) + 1
+            db.execute(
+                """
+                insert into review_inbox_requalifications (
+                    item_id, attempt, previous_bundle_json, new_bundle_json, requalified_at
+                ) values (?, ?, ?, ?, ?)
+                """,
+                (item_id, attempt, row["verification_bundle_json"], new_bundle_json, now),
+            )
+            db.execute(
+                """
+                update review_inbox_items
+                set verification_bundle_json = ?, requalify_count = ?,
+                    requalified_at = ?, updated_at = ?
+                where item_id = ?
+                """,
+                (new_bundle_json, attempt, now, now, item_id),
+            )
+        return self.get(item_id)
+
+    def requalification_history(self, item_id: str) -> list[dict[str, Any]]:
+        self.initialize()
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                select attempt, previous_bundle_json, new_bundle_json, requalified_at
+                from review_inbox_requalifications
+                where item_id = ?
+                order by attempt
+                """,
+                (item_id,),
+            ).fetchall()
+        return [
+            {
+                "attempt": row["attempt"],
+                "previous_bundle": _json_object(row["previous_bundle_json"]),
+                "new_bundle": _json_object(row["new_bundle_json"]),
+                "requalified_at": row["requalified_at"],
+            }
+            for row in rows
+        ]
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with control_database(self.database_path) as db:
@@ -490,6 +593,8 @@ def _item_from_row(row: sqlite3.Row) -> ReviewInboxItem:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         reviewed_at=row["reviewed_at"],
+        requalify_count=int(row["requalify_count"]) if "requalify_count" in columns else 0,
+        requalified_at=row["requalified_at"] if "requalified_at" in columns else None,
         result_text=row["payload_result_text"] if "payload_result_text" in columns else None,
         result_sha256=(
             row["payload_result_sha256"] if "payload_result_sha256" in columns else None

@@ -352,11 +352,50 @@ def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> No
         "agent_review_inbox_list",
         "agent_review_inbox_get",
         "agent_review_inbox_resolve",
+        "agent_review_inbox_requalify",
         "agent_accept_handoff",
         "agent_sync_subagent_results",
         "agent_slots_checkpoint",
         "agent_reconcile",
     }.issubset(server.tools)
+
+
+def test_mcp_review_inbox_requalify_delegates_and_returns_clean_errors(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.requalify_review_inbox_item.return_value = {
+        "item_id": "agent_job:job-1",
+        "verification_bundle": {"review_ready": True},
+    }
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        assert server.tools["agent_review_inbox_requalify"]("agent_job:job-1") == {
+            "ok": True,
+            "item": {
+                "item_id": "agent_job:job-1",
+                "verification_bundle": {"review_ready": True},
+            },
+        }
+        control.requalify_review_inbox_item.side_effect = ValueError(
+            "Review item agent_job:job-1 is already accepted and cannot be requalified"
+        )
+        assert server.tools["agent_review_inbox_requalify"]("agent_job:job-1") == {
+            "ok": False,
+            "error": ("Review item agent_job:job-1 is already accepted and cannot be requalified"),
+        }
+
+    control.requalify_review_inbox_item.assert_called_with("agent_job:job-1")
 
 
 def test_mcp_reconcile_requires_explicit_verified_runner_termination(monkeypatch) -> None:

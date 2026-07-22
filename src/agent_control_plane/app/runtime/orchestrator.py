@@ -386,9 +386,7 @@ class AgentControlPlane:
             "guardrails": {
                 "poll_sec": self.config.defaults.guardrail_poll_sec,
                 "forbidden_status_globs": self.config.defaults.forbidden_status_globs,
-                "dirty_diff_max_changed_lines": (
-                    self.config.defaults.dirty_diff_max_changed_lines
-                ),
+                "dirty_diff_max_changed_lines": (self.config.defaults.dirty_diff_max_changed_lines),
                 "codex_no_progress_timeout_sec": (
                     self.config.defaults.codex_no_progress_timeout_sec
                 ),
@@ -1196,6 +1194,9 @@ class AgentControlPlane:
 
     def resolve_review_inbox_item(self, item_id: str, decision: str) -> dict[str, Any]:
         return self.review_inbox.resolve(item_id, decision).as_dict()
+
+    def requalify_review_inbox_item(self, item_id: str) -> dict[str, Any]:
+        return self.finalization.requalify(item_id).as_dict()
 
     def sync_subagent_results(
         self,

@@ -187,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
+            if args.inbox_command == "requalify":
+                _print_json(control.requalify_review_inbox_item(args.item_id))
+                return 0
             if args.inbox_command == "sync-subagents":
                 _print_json(
                     control.sync_subagent_results(
@@ -582,6 +585,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     inbox_resolve.add_argument("item_id")
     inbox_resolve.add_argument("--decision", choices=("accepted", "rejected"), required=True)
+
+    inbox_requalify = inbox_subparsers.add_parser(
+        "requalify",
+        parents=[common],
+        help=(
+            "Re-run controller quality gates against a pending item's durable checkpoint "
+            "and rebuild its verification bundle"
+        ),
+    )
+    inbox_requalify.add_argument("item_id")
 
     inbox_sync = inbox_subparsers.add_parser(
         "sync-subagents",

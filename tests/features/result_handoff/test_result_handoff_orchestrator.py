@@ -1330,6 +1330,156 @@ def test_subagent_sync_returns_only_five_lightweight_item_references(tmp_path: P
     assert "result_excerpt" not in payload["items"][0]
 
 
+def test_requalify_flips_review_ready_once_the_flaky_controller_gate_passes(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    marker = tmp_path / "flaky-gate-marker"
+    flaky_command = (
+        sys.executable,
+        "-c",
+        f"import pathlib, sys; sys.exit(0 if pathlib.Path(r'{marker}').exists() else 1)",
+    )
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(
+            NativeQualityGateConfig(name="flaky", command=flaky_command, run_on="controller"),
+        ),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-requalify-flaky",
+        status_result="completed",
+        workspace_access="native",
+    )
+    worker_command = f"{shlex.quote(sys.executable)} -c \"print('worker-fast-check')\""
+    _write_completed_result(job.result_path, command=worker_command)
+    (slot / "worker.txt").write_text("quality checked by requalify\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "completed")
+
+    item_id = f"agent_job:{job.job_id}"
+    first = control.review_inbox.get(item_id)
+    assert first.verification_bundle is not None
+    assert first.verification_bundle["review_ready"] is False
+    assert first.verification_bundle["controller_quality"]["payload"]["status"] == "failed"
+    assert first.requalify_count == 0
+
+    marker.write_text("now passing\n", encoding="utf-8")
+    result = control.requalify_review_inbox_item(item_id)
+    bundle = result["verification_bundle"]
+
+    assert bundle["review_ready"] is True
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    updated = control.review_inbox.get(item_id)
+    assert updated.verification_bundle == bundle
+    assert updated.requalify_count == 1
+    assert updated.requalified_at is not None
+    assert updated.review_status == "pending"
+    # Worker-side evidence is recomputed from the same result_path, not fabricated or dropped.
+    assert (
+        updated.verification_bundle["worker_verification"]
+        == first.verification_bundle["worker_verification"]
+    )
+    assert (
+        updated.verification_bundle["worker_quality"] == first.verification_bundle["worker_quality"]
+    )
+    # The live slot worktree was never touched by requalify.
+    assert workspace_state(slot).porcelain == ""
+
+
+def test_requalify_rejects_missing_checkpoint_ref_and_leaves_the_record_unchanged(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    control = AgentControlPlane(_config(tmp_path, route, slot, terminal_slot_policy="preserve"))
+    control.review_inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="ghost-job",
+            source_status="completed",
+            delivery_status="checkpointed",
+            workspace_path=slot,
+            checkpoint_ref="refs/agent-control-plane/jobs/does-not-exist",
+            checkpoint_sha="a" * 40,
+            checkpoint_tree_sha="b" * 40,
+            base_sha=run_git(slot, "rev-parse", "HEAD"),
+            result_text="Status: completed\n",
+            verification_bundle={"schema_version": 1, "review_ready": False},
+        )
+    )
+    control.store.create_job(
+        job_id="ghost-job",
+        task_id="ghost-task",
+        route="app",
+        workspace_path=slot,
+        expected_branch="main",
+        config_path=control.config.config_path,
+        run_dir=tmp_path / "runs" / "ghost-job",
+        prompt_path=tmp_path / "runs" / "ghost-job" / "prompt.md",
+        result_path=tmp_path / "runs" / "ghost-job" / "result.md",
+        timeout_sec=10,
+        idle_timeout_sec=5,
+        print_timeout="10s",
+        max_restarts=0,
+        yolo=False,
+        allow_dirty=False,
+        read_only=False,
+        workspace_access="native",
+    )
+
+    with pytest.raises(ValueError, match="no longer resolvable"):
+        control.requalify_review_inbox_item("agent_job:ghost-job")
+
+    unchanged = control.review_inbox.get("agent_job:ghost-job")
+    assert unchanged.verification_bundle == {"schema_version": 1, "review_ready": False}
+    assert unchanged.requalify_count == 0
+
+
+def test_requalify_refuses_a_resolved_item(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-requalify-resolved",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_completed_result(job.result_path, command=shlex.join(command))
+    (slot / "worker.txt").write_text("quality checked\n", encoding="utf-8")
+    control.finish_job(job.job_id, "completed")
+    item_id = f"agent_job:{job.job_id}"
+    control.resolve_review_inbox_item(item_id, "accepted")
+
+    with pytest.raises(ValueError, match="cannot be requalified"):
+        control.requalify_review_inbox_item(item_id)
+
+    unchanged = control.review_inbox.get(item_id)
+    assert unchanged.review_status == "accepted"
+    assert unchanged.requalify_count == 0
+
+
 def _active_slot_job(
     control: AgentControlPlane,
     root: Path,

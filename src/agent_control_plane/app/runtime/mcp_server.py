@@ -623,6 +623,17 @@ def build_server(config_path: str | None = None) -> Any:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
+    def agent_review_inbox_requalify(item_id: str) -> dict[str, Any]:
+        """Re-run controller gates against a pending item's checkpoint and rebuild its bundle."""
+        try:
+            return {
+                "ok": True,
+                "item": control.requalify_review_inbox_item(item_id),
+            }
+        except (KeyError, ValueError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
     def agent_accept_handoff(
         plan_id: str,
         task_id: str,

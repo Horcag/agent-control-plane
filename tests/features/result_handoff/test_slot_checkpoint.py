@@ -11,6 +11,7 @@ import pytest
 
 from agent_control_plane.features.result_handoff import (
     SlotCheckpointError,
+    checked_out_checkpoint_worktree,
     clean_checkpointed_workspace,
     create_slot_checkpoint,
 )
@@ -202,6 +203,32 @@ def test_existing_job_ref_with_different_tree_is_never_overwritten(tmp_path: Pat
         )
 
     assert run_git(repo, "rev-parse", first.ref_name) == first.commit_sha
+
+
+def test_checked_out_checkpoint_worktree_materializes_and_cleans_up(tmp_path: Path) -> None:
+    repo = _committed_repo(tmp_path / "repo")
+    (repo / "tracked.txt").write_text("dirty change\n", encoding="utf-8")
+    checkpoint = create_slot_checkpoint(
+        repo,
+        job_id="job-requalify",
+        task_id="task-requalify",
+        terminal_status="completed",
+        scratch_root=tmp_path / "scratch",
+    )
+    clean_checkpointed_workspace(repo, checkpoint, scratch_root=tmp_path / "scratch")
+    assert (repo / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+
+    with checked_out_checkpoint_worktree(
+        repo, checkpoint, scratch_root=tmp_path / "requalify-scratch"
+    ) as worktree:
+        assert worktree.is_dir()
+        assert worktree != repo
+        assert (worktree / "tracked.txt").read_text(encoding="utf-8") == "dirty change\n"
+        assert workspace_state(worktree).porcelain == ""
+        assert (repo / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+
+    assert not worktree.exists()
+    assert run_git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
 def _committed_repo(path: Path) -> Path:

@@ -199,6 +199,72 @@ def test_review_inbox_missing_verification_blocks_normal_acceptance(tmp_path: Pa
         store.resolve(item.item_id, "accepted")
 
 
+def test_requalify_replaces_bundle_and_keeps_prior_bundle_for_audit(tmp_path: Path) -> None:
+    store = ReviewInboxStore(tmp_path / "jobs.sqlite3")
+    original = store.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-flaky",
+            source_status="completed",
+            delivery_status="checkpointed",
+            checkpoint_ref="refs/agent-control-plane/jobs/abc",
+            checkpoint_sha="a" * 40,
+            checkpoint_tree_sha="b" * 40,
+            base_sha="c" * 40,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(review_ready=False),
+        )
+    )
+
+    updated = store.requalify(original.item_id, _valid_bundle(review_ready=True))
+
+    assert updated.item_id == original.item_id
+    assert updated.verification_bundle == _valid_bundle(review_ready=True)
+    assert updated.requalify_count == 1
+    assert updated.requalified_at is not None
+    assert updated.review_status == "pending"
+
+    history = store.requalification_history(original.item_id)
+    assert len(history) == 1
+    assert history[0]["attempt"] == 1
+    assert history[0]["previous_bundle"] == _valid_bundle(review_ready=False)
+    assert history[0]["new_bundle"] == _valid_bundle(review_ready=True)
+
+
+def test_requalify_refuses_a_resolved_item_and_leaves_it_unchanged(tmp_path: Path) -> None:
+    store = ReviewInboxStore(tmp_path / "jobs.sqlite3")
+    item = store.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-resolved",
+            source_status="completed",
+            delivery_status="checkpointed",
+            checkpoint_ref="refs/agent-control-plane/jobs/abc",
+            checkpoint_sha="a" * 40,
+            checkpoint_tree_sha="b" * 40,
+            base_sha="c" * 40,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(review_ready=True),
+        )
+    )
+    store.resolve(item.item_id, "accepted")
+
+    with pytest.raises(ValueError, match="cannot be requalified"):
+        store.requalify(item.item_id, _valid_bundle(review_ready=True))
+
+    unchanged = store.get(item.item_id)
+    assert unchanged.review_status == "accepted"
+    assert unchanged.requalify_count == 0
+    assert store.requalification_history(item.item_id) == []
+
+
+def test_requalify_unknown_item_raises_key_error(tmp_path: Path) -> None:
+    store = ReviewInboxStore(tmp_path / "jobs.sqlite3")
+
+    with pytest.raises(KeyError):
+        store.requalify("agent_job:missing", _valid_bundle(review_ready=True))
+
+
 def _valid_bundle(*, review_ready: bool) -> dict:
     return {
         "schema_version": 1,

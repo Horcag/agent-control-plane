@@ -38,6 +38,14 @@ def test_inbox_resolve_parser_keeps_review_separate_from_plan_acceptance() -> No
     assert args.decision == "accepted"
 
 
+def test_inbox_requalify_parser_takes_only_the_item_id() -> None:
+    args = _build_parser().parse_args(["inbox", "requalify", "agent_job:job-1"])
+
+    assert args.command == "inbox"
+    assert args.inbox_command == "requalify"
+    assert args.item_id == "agent_job:job-1"
+
+
 def test_accept_handoff_parser_collects_all_atomic_decision_inputs() -> None:
     args = _build_parser().parse_args(
         [

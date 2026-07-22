@@ -22,6 +22,7 @@ from agent_control_plane.features.result_handoff import (
     SlotCheckpoint,
     SlotCheckpointError,
     build_verification_bundle,
+    checked_out_checkpoint_worktree,
     checkpoint_changed_files,
     checkpoint_temporary_patch_artifacts,
     clean_checkpointed_workspace,
@@ -174,6 +175,92 @@ class FinalizationService:
         completed = self.store.mark_finalization_completed(job_id)
         self.store.add_event(job_id, "info", "Terminal finalization completed")
         return completed
+
+    def requalify(self, item_id: str) -> ReviewInboxItem:
+        """Re-run controller quality gates against a durable checkpoint and rebuild the bundle.
+
+        Never moves branches, never mutates the slot workspace, and never
+        touches the record until the rebuilt bundle is ready to persist:
+        any failure below leaves the existing inbox record unchanged.
+        """
+        item = self.review_inbox.get(item_id)
+        if item.review_status != "pending":
+            raise ValueError(
+                f"Review item {item_id} is already {item.review_status} and cannot be requalified"
+            )
+        if item.source_kind != "agent_job":
+            raise ValueError(f"Review item {item_id} has no requalifiable job checkpoint")
+        if not all(
+            (item.checkpoint_ref, item.checkpoint_sha, item.checkpoint_tree_sha, item.base_sha)
+        ):
+            raise ValueError(
+                f"Review item {item_id} has no durable checkpoint to requalify against"
+            )
+        job = self.store.get_job(item.source_id)
+        checkpoint = SlotCheckpoint(
+            job_id=job.job_id,
+            task_id=job.task_id,
+            terminal_status=job.status,
+            workspace_path=job.workspace_path.resolve(strict=False),
+            ref_name=str(item.checkpoint_ref),
+            commit_sha=str(item.checkpoint_sha),
+            tree_sha=str(item.checkpoint_tree_sha),
+            base_sha=str(item.base_sha),
+        )
+        try:
+            verify_slot_checkpoint(job.workspace_path, checkpoint)
+        except (GitError, OSError, SlotCheckpointError) as exc:
+            raise ValueError(
+                f"Checkpoint ref for {item_id} is no longer resolvable: {exc}"
+            ) from exc
+        contract, contract_error = self._native_quality_contract(job)
+        if contract_error is not None:
+            raise ValueError(f"Native quality contract for {item_id} is invalid: {contract_error}")
+        checkpoint_changes = checkpoint_changed_files(job.workspace_path, checkpoint)
+        changed_files = tuple(change["path"] for change in checkpoint_changes)
+        command_files = tuple(
+            change["path"] for change in checkpoint_changes if not change["status"].startswith("D")
+        )
+        if contract.policy == "controller" and job.controller_gate_mode != "none" and changed_files:
+            with checked_out_checkpoint_worktree(
+                job.workspace_path,
+                checkpoint,
+                scratch_root=job.run_dir / "requalify",
+            ) as worktree:
+                self.native_quality_runner.run(
+                    workspace_path=worktree,
+                    run_dir=job.run_dir,
+                    checkpoint_tree_sha=checkpoint.tree_sha,
+                    changed_files=changed_files,
+                    command_files=command_files,
+                    contract=contract,
+                    controller_gate_mode=job.controller_gate_mode,
+                )
+                if workspace_state(worktree).dirty:
+                    raise SlotCheckpointError(
+                        f"Controller quality gate mutated the checkpoint checkout for {item_id}; "
+                        "requalify aborted"
+                    )
+        verification_bundle = build_verification_bundle(
+            job.result_path,
+            workspace_path=job.workspace_path,
+            checkpoint=checkpoint,
+            run_dir=job.run_dir,
+            source_status=job.status,
+            workspace_changed=True,
+            quality_contract=contract,
+            quality_contract_error=None,
+            expected_result_status=job.expected_result_status,
+            controller_gate_mode=job.controller_gate_mode,
+        )
+        updated = self.review_inbox.requalify(item_id, verification_bundle)
+        self.store.add_event(
+            job.job_id,
+            "info",
+            f"Review inbox item {item_id} requalified "
+            f"(review_ready={verification_bundle.get('review_ready')})",
+        )
+        return updated
 
     def finish_slot_lifecycle(
         self,

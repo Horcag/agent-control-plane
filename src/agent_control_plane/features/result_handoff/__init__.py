@@ -12,6 +12,7 @@ from agent_control_plane.features.result_handoff.lib.native_quality import (
 from agent_control_plane.features.result_handoff.lib.slot_checkpoint import (
     SlotCheckpoint,
     SlotCheckpointError,
+    checked_out_checkpoint_worktree,
     checkpoint_changed_files,
     checkpoint_temporary_patch_artifacts,
     clean_checkpointed_workspace,
@@ -30,6 +31,7 @@ __all__ = [
     "SlotCheckpoint",
     "SlotCheckpointError",
     "build_verification_bundle",
+    "checked_out_checkpoint_worktree",
     "checkpoint_changed_files",
     "checkpoint_temporary_patch_artifacts",
     "clean_checkpointed_workspace",

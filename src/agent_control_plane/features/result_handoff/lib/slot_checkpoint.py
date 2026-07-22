@@ -4,6 +4,9 @@ import hashlib
 import os
 import subprocess  # nosec B404
 import tempfile
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -186,6 +189,33 @@ def verify_slot_checkpoint(workspace_path: Path, checkpoint: SlotCheckpoint) -> 
     verified_tree = _git(workspace, "rev-parse", f"{verified_sha}^{{tree}}")
     if verified_sha != checkpoint.commit_sha or verified_tree != checkpoint.tree_sha:
         raise SlotCheckpointError("Checkpoint ref no longer matches the verified commit and tree")
+
+
+@contextmanager
+def checked_out_checkpoint_worktree(
+    workspace_path: Path,
+    checkpoint: SlotCheckpoint,
+    *,
+    scratch_root: Path,
+) -> Iterator[Path]:
+    """Materialize an immutable checkpoint commit into a disposable worktree.
+
+    The live slot workspace is never touched: this checks out
+    ``checkpoint.commit_sha`` into a fresh ``git worktree`` under
+    ``scratch_root`` so controller gates can run against real files even
+    after the slot's own working tree has been reset. The worktree is
+    removed unconditionally on exit.
+    """
+    workspace = workspace_path.resolve(strict=False)
+    if workspace != checkpoint.workspace_path.resolve(strict=False):
+        raise SlotCheckpointError("Checkpoint belongs to a different workspace")
+    scratch = _prepare_scratch_root(workspace, scratch_root)
+    worktree_dir = scratch / f"checkout-{uuid.uuid4().hex}"
+    _git(workspace, "worktree", "add", "--detach", str(worktree_dir), checkpoint.commit_sha)
+    try:
+        yield worktree_dir
+    finally:
+        _git(workspace, "worktree", "remove", "--force", str(worktree_dir))
 
 
 def checkpoint_changed_files(
