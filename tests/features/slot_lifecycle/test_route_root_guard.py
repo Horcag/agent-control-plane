@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from agent_control_plane.app.runtime.job_guardrails import (
     JobGuardrails,
     WorkspaceDirtyBaseline,
+    _status_entries,
 )
 from agent_control_plane.features.slot_lifecycle.lib.route_root_guard import (
     RouteRootGuard,
@@ -114,6 +115,38 @@ class RouteRootGuardTest(unittest.TestCase):
         self.assertEqual(changed, ("leftover.py",))
         self.assertEqual(guard.head, "head-a")
 
+    def test_head_advance_with_committed_baseline_dirty_entry_is_accepted(self) -> None:
+        guard = RouteRootGuard(
+            head="head-a",
+            entries={"README.md": (" M", "file:before")},
+        )
+
+        changed = guard.evaluate(
+            _snapshot(head="head-b", entries={}),
+            now=10.0,
+            staged_grace_sec=5.0,
+        )
+
+        self.assertEqual(changed, ())
+        self.assertEqual(guard.head, "head-b")
+        self.assertEqual(guard.entries, {})
+
+    def test_head_advance_with_new_dirty_alongside_committed_entry_is_rejected(self) -> None:
+        guard = RouteRootGuard(
+            head="head-a",
+            entries={"README.md": (" M", "file:before")},
+        )
+
+        changed = guard.evaluate(
+            _snapshot(head="head-b", entries={"other.py": (" M", "file:new")}),
+            now=10.0,
+            staged_grace_sec=5.0,
+        )
+
+        self.assertEqual(changed, ("other.py",))
+        self.assertEqual(guard.head, "head-a")
+        self.assertEqual(guard.entries, {"README.md": (" M", "file:before")})
+
     def test_unstable_snapshot_is_deferred_without_mutating_state(self) -> None:
         guard = RouteRootGuard(head="head-a", entries={})
 
@@ -175,6 +208,89 @@ class RouteRootGuardTest(unittest.TestCase):
             self.assertIsNone(staged_message)
             self.assertIsNone(committed_message)
             self.assertNotEqual(baseline.guard.head, initial.head)
+
+    def test_operator_commit_of_preexisting_dirty_route_root_file_is_tolerated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_root = root / "repo"
+            route_root.mkdir()
+            _run(["git", "init"], route_root)
+            readme = route_root / "README.md"
+            readme.write_text("before\n", encoding="utf-8")
+            _run(["git", "add", "README.md"], route_root)
+            _commit(route_root, "seed")
+
+            # Route root is already dirty (unrelated to the slot job) when the
+            # guardrail baseline is captured.
+            readme.write_text("mid-flight\n", encoding="utf-8")
+
+            guardrails = JobGuardrails(())
+            initial = guardrails.route_root_snapshot(route_root)
+            baseline = WorkspaceDirtyBaseline(
+                path=route_root,
+                guard=RouteRootGuard(head=initial.head, entries=dict(initial.entries)),
+            )
+            job = Mock()
+            job.job_id = "job-1"
+            job.workspace_path = root / "slot"
+            job.run_dir = root / "run"
+            job.run_dir.mkdir()
+
+            # The ROOT operator commits the change directly.
+            _run(["git", "add", "README.md"], route_root)
+            _commit(route_root, "operator commit")
+
+            with (
+                patch(
+                    "agent_control_plane.app.runtime.job_guardrails.time.monotonic",
+                    return_value=10.0,
+                ),
+                self.assertLogs(
+                    "agent_control_plane.app.runtime.job_guardrails", level="WARNING"
+                ) as logs,
+            ):
+                message = guardrails.route_root_violation(job, baseline)
+
+            self.assertIsNone(message)
+            self.assertEqual(baseline.guard.entries, {})
+            self.assertTrue(any("tolerated as operator commit" in line for line in logs.output))
+
+    def test_route_root_snapshot_reports_full_path_for_lone_unstaged_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_root = root / "repo"
+            route_root.mkdir()
+            _run(["git", "init"], route_root)
+            readme = route_root / "README.md"
+            readme.write_text("before\n", encoding="utf-8")
+            _run(["git", "add", "README.md"], route_root)
+            _commit(route_root, "seed")
+
+            # The only route-root status line becomes " M README.md" -- a
+            # leading space that a naive whole-output .strip() would eat.
+            readme.write_text("after\n", encoding="utf-8")
+
+            guardrails = JobGuardrails(())
+            snapshot = guardrails.route_root_snapshot(route_root)
+
+            self.assertIn("README.md", snapshot.entries)
+            self.assertNotIn("EADME.md", snapshot.entries)
+
+
+class StatusEntriesParsingTest(unittest.TestCase):
+    def test_status_entries_reports_full_paths_across_status_kinds(self) -> None:
+        porcelain = "?? README.md\n M docs/x.md\nR  old.md -> new.md\n"
+
+        entries = _status_entries(porcelain)
+
+        self.assertEqual(
+            entries,
+            (
+                ("??", "README.md"),
+                (" M", "docs/x.md"),
+                ("R ", "new.md"),
+            ),
+        )
 
 
 def _snapshot(

@@ -37,9 +37,14 @@ class RouteRootGuard:
 
         changed = self._changed_paths(snapshot)
         if snapshot.head != self.head:
-            if changed:
-                return changed
+            # A baseline entry that disappeared because it was committed is not
+            # a violation; only a path still present in the new snapshot (new or
+            # further modified) is genuinely new dirty state.
+            new_dirty = tuple(path for path in changed if path in snapshot.entries)
+            if new_dirty:
+                return new_dirty
             self.head = snapshot.head
+            self.entries = dict(snapshot.entries)
             self.pending_index_since = None
             return ()
 

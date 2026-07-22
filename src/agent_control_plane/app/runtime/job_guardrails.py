@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,8 @@ from agent_control_plane.shared.git_tools import (
 # baseline — keep this far above honest implementation-slice size.
 DIRTY_DIFF_MAX_CHANGED_LINES = DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES
 ROUTE_ROOT_INDEX_GRACE_SEC = 15.0
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -135,12 +138,21 @@ class JobGuardrails:
             snapshot = self.route_root_snapshot(baseline.path)
         except GitError as exc:
             return f"Route root guardrail could not inspect git status: {exc}"
+        previous_head = baseline.guard.head
         changed = baseline.guard.evaluate(
             snapshot,
             now=time.monotonic(),
             staged_grace_sec=ROUTE_ROOT_INDEX_GRACE_SEC,
         )
         if not changed:
+            if snapshot.head is not None and snapshot.head != previous_head:
+                _logger.warning(
+                    "route root HEAD moved from %s to %s during job %s; "
+                    "tolerated as operator commit",
+                    previous_head,
+                    snapshot.head,
+                    job.job_id,
+                )
             return None
         status_path = job.run_dir / "route-root-guardrail-status.txt"
         status_path.write_text(snapshot.porcelain, encoding="utf-8")
@@ -194,11 +206,7 @@ class JobGuardrails:
         *,
         max_changed_lines: int | None = None,
     ) -> str | None:
-        limit = (
-            DIRTY_DIFF_MAX_CHANGED_LINES
-            if max_changed_lines is None
-            else max_changed_lines
-        )
+        limit = DIRTY_DIFF_MAX_CHANGED_LINES if max_changed_lines is None else max_changed_lines
         if limit <= 0:
             return None
         if normalize_backend(job.backend) not in {CODEX_BACKEND, CLAUDE_BACKEND}:

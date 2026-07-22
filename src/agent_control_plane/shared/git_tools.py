@@ -64,7 +64,12 @@ def run_git(path: Path, *args: str) -> str:
     if proc.returncode != 0:
         detail = proc.stderr.strip() or proc.stdout.strip() or f"git exited {proc.returncode}"
         raise GitError(detail)
-    return proc.stdout.strip()
+    # rstrip only: `git status --porcelain` lines can start with a significant
+    # leading space (e.g. " M path" for an unstaged-only change), and a plain
+    # .strip() on the whole multi-line output eats that space off the first
+    # line, shifting every downstream fixed-offset slice by one and truncating
+    # the first character of that entry's path.
+    return proc.stdout.rstrip()
 
 
 def workspace_state(path: Path) -> GitWorkspaceState:

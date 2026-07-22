@@ -46,6 +46,23 @@ class GitToolsTest(unittest.TestCase):
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
 
+    def test_run_git_preserves_leading_space_of_porcelain_status_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+            completed = subprocess.CompletedProcess(
+                args=["git"],
+                returncode=0,
+                stdout=" M README.md\n",
+                stderr="",
+            )
+
+            with patch(
+                "agent_control_plane.shared.git_tools.subprocess.run", return_value=completed
+            ):
+                output = run_git(repo, "status", "--porcelain=v1")
+
+            self.assertEqual(output, " M README.md")
+
     def test_run_git_wraps_timeout_with_repository_and_command(self) -> None:
         repo = Path("repo")
         timeout = subprocess.TimeoutExpired(["git", "status"], GIT_TIMEOUT_SEC)
