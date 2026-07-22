@@ -50,6 +50,7 @@ def test_plan_service_dispatches_a_claim_through_its_job_launcher(tmp_path: Path
             "attempt_no": 1,
             "job_id": f"job-{dispatch_task_id}",
             "status": "queued",
+            "inherited_base": None,
         }
     ]
     assert (tmp_path / ".agent-work" / "tasks" / dispatch_task_id / "brief.md").read_text(

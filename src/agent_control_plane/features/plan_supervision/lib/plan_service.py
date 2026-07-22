@@ -13,7 +13,10 @@ from agent_control_plane.entities.plan import (
     PlanTaskDefinition,
 )
 from agent_control_plane.entities.review_inbox import ReviewInboxStore
-from agent_control_plane.features.plan_supervision.lib.dispatcher import PlanDispatcher
+from agent_control_plane.features.plan_supervision.lib.dispatcher import (
+    CheckoutSlot,
+    PlanDispatcher,
+)
 from agent_control_plane.features.plan_supervision.lib.retry_fingerprint import (
     circuit_breaker_state,
     fingerprint_from_job,
@@ -49,6 +52,7 @@ class PlanService:
         reconcile_jobs: Callable[[str | None], dict[str, Any]],
         process_is_alive: Callable[[int], bool],
         policy_error: type[RuntimeError],
+        checkout_slot: CheckoutSlot | None = None,
     ) -> None:
         self._coordination_root = coordination_root
         self._job_store = job_store
@@ -61,6 +65,7 @@ class PlanService:
         self._reconcile_jobs = reconcile_jobs
         self._process_is_alive = process_is_alive
         self._policy_error = policy_error
+        self._checkout_slot = checkout_slot
 
     def create_plan(
         self,
@@ -123,6 +128,7 @@ class PlanService:
             coordination_root=self._coordination_root,
             launch=self._launch,
             process_is_alive=self._process_is_alive,
+            checkout_slot=self._checkout_slot,
         ).dispatch(plan_id, max_jobs=max_jobs)
 
     def retry_plan_task(

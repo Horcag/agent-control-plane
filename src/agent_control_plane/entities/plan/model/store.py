@@ -1091,6 +1091,24 @@ class PlanStore:
                 job_ids.append(job_id)
         return job_ids
 
+    def dependency_accepted_shas(self, plan_id: str, task_id: str) -> list[str]:
+        """Accepted shas of this task's dependencies that have one, in dependency order."""
+        self.initialize()
+        with self._connect() as db:
+            self._require_task(db, plan_id, task_id)
+            rows = db.execute(
+                """
+                select t.accepted_sha
+                from plan_task_dependencies d
+                join plan_tasks t
+                  on t.plan_id = d.plan_id and t.task_id = d.dependency_task_id
+                where d.plan_id = ? and d.task_id = ? and t.accepted_sha is not null
+                order by d.dependency_task_id
+                """,
+                (plan_id, task_id),
+            ).fetchall()
+        return [str(row["accepted_sha"]) for row in rows]
+
     def accept_task(self, plan_id: str, task_id: str, *, accepted_sha: str | None = None) -> None:
         self._record_decision(plan_id, task_id, "accepted", accepted_sha=accepted_sha)
 

@@ -9,11 +9,13 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_control_plane.entities.job import JobStore, ReviewMetricsStore
 from agent_control_plane.entities.plan import (
+    PlanDispatchClaim,
     PlanExecutionSpec,
     PlanStore,
     PlanTaskDefinition,
@@ -738,6 +740,308 @@ def test_dispatch_failure_is_durable_and_not_automatically_reclaimed(tmp_path: P
     blocked = plans.snapshot("dispatch")["blocked"][0]
     assert blocked["state"] == "dispatch_failed"
     assert blocked["dispatch_error"] == "slot unavailable"
+
+
+def test_dependency_accepted_shas_returns_accepted_shas_in_dependency_order(
+    tmp_path: Path,
+) -> None:
+    jobs = JobStore(tmp_path / "jobs.sqlite3")
+    jobs.initialize()
+    plans = PlanStore(tmp_path / "jobs.sqlite3")
+    plans.create_plan(
+        plan_id="chain",
+        title="Chain",
+        tasks=(
+            PlanTaskDefinition("b", "B"),
+            PlanTaskDefinition("a", "A"),
+            PlanTaskDefinition("c", "C", depends_on=("b", "a")),
+        ),
+    )
+    _accept_dependency(
+        plans, jobs, tmp_path, plan_id="chain", task_id="a", job_id="a-job", accepted_sha="sha-a"
+    )
+    _accept_dependency(
+        plans, jobs, tmp_path, plan_id="chain", task_id="b", job_id="b-job", accepted_sha="sha-b"
+    )
+
+    assert plans.dependency_accepted_shas("chain", "c") == ["sha-a", "sha-b"]
+
+
+def test_dispatch_auto_positions_slot_from_single_accepted_dependency(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "base", "Base", execution=PlanExecutionSpec(route="dev", brief="Base work")
+            ),
+            PlanTaskDefinition(
+                "dependent",
+                "Dependent",
+                depends_on=("base",),
+                execution=PlanExecutionSpec(route="dev", brief="Dependent work", slot="alpha"),
+            ),
+        ),
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="base",
+        job_id="base-job",
+        accepted_sha="deadbeef" * 5,
+    )
+    checkouts: list[dict[str, str]] = []
+    launched: list[PlanDispatchClaim] = []
+
+    def checkout_slot(slot_name: str, *, branch: str, start_point: str) -> None:
+        checkouts.append({"slot": slot_name, "branch": branch, "start_point": start_point})
+
+    def launch(claim: PlanDispatchClaim) -> SimpleNamespace:
+        launched.append(claim)
+        return SimpleNamespace(job_id=f"job-{claim.dispatch_task_id}", status="queued")
+
+    result = PlanDispatcher(
+        plan_store=plans,
+        job_store=jobs,
+        coordination_root=tmp_path / ".agent-work",
+        launch=launch,
+        process_is_alive=lambda _pid: False,
+        checkout_slot=checkout_slot,
+    ).dispatch("dispatch")
+
+    assert len(checkouts) == 1
+    assert checkouts[0]["slot"] == "alpha"
+    assert checkouts[0]["start_point"] == "deadbeef" * 5
+    assert len(launched) == 1
+    assert launched[0].execution.expected_base_sha == "deadbeef" * 5
+    assert result["dispatched"][0]["inherited_base"] == "deadbeef" * 5
+
+
+def test_dispatch_skips_auto_position_when_not_a_single_accepted_dependency(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "solo",
+                "Solo",
+                execution=PlanExecutionSpec(route="dev", brief="No deps", slot="alpha"),
+            ),
+            PlanTaskDefinition(
+                "first", "First", execution=PlanExecutionSpec(route="dev", brief="First")
+            ),
+            PlanTaskDefinition(
+                "second", "Second", execution=PlanExecutionSpec(route="dev", brief="Second")
+            ),
+            PlanTaskDefinition(
+                "multi",
+                "Multi",
+                depends_on=("first", "second"),
+                execution=PlanExecutionSpec(route="dev", brief="Multi dep", slot="beta"),
+            ),
+            PlanTaskDefinition(
+                "unaccepted",
+                "Unaccepted",
+                execution=PlanExecutionSpec(route="dev", brief="Unaccepted parent"),
+            ),
+            PlanTaskDefinition(
+                "single_unaccepted",
+                "SingleUnaccepted",
+                depends_on=("unaccepted",),
+                execution=PlanExecutionSpec(
+                    route="dev", brief="Depends on unaccepted parent", slot="gamma"
+                ),
+            ),
+        ),
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="first",
+        job_id="first-job",
+        accepted_sha="sha-first",
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="second",
+        job_id="second-job",
+        accepted_sha="sha-second",
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="unaccepted",
+        job_id="unaccepted-job",
+        accepted_sha=None,
+    )
+    checkouts: list[dict[str, str]] = []
+    launched: list[str] = []
+
+    def checkout_slot(slot_name: str, *, branch: str, start_point: str) -> None:
+        checkouts.append({"slot": slot_name})
+
+    def launch(claim: PlanDispatchClaim) -> SimpleNamespace:
+        launched.append(claim.task_id)
+        return SimpleNamespace(job_id=f"job-{claim.dispatch_task_id}", status="queued")
+
+    result = PlanDispatcher(
+        plan_store=plans,
+        job_store=jobs,
+        coordination_root=tmp_path / ".agent-work",
+        launch=launch,
+        process_is_alive=lambda _pid: False,
+        checkout_slot=checkout_slot,
+    ).dispatch("dispatch", max_jobs=10)
+
+    assert checkouts == []
+    assert set(launched) == {"solo", "multi", "single_unaccepted"}
+    assert result["failures"] == []
+
+
+def test_dispatch_respects_operator_provided_expected_base_sha(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "base", "Base", execution=PlanExecutionSpec(route="dev", brief="Base work")
+            ),
+            PlanTaskDefinition(
+                "dependent",
+                "Dependent",
+                depends_on=("base",),
+                execution=PlanExecutionSpec(
+                    route="dev",
+                    brief="Dependent work",
+                    slot="alpha",
+                    expected_base_sha="f" * 40,
+                ),
+            ),
+        ),
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="base",
+        job_id="base-job",
+        accepted_sha="d" * 40,
+    )
+    checkouts: list[dict[str, str]] = []
+    launched: list[PlanDispatchClaim] = []
+
+    def checkout_slot(slot_name: str, *, branch: str, start_point: str) -> None:
+        checkouts.append({"slot": slot_name})
+
+    def launch(claim: PlanDispatchClaim) -> SimpleNamespace:
+        launched.append(claim)
+        return SimpleNamespace(job_id=f"job-{claim.dispatch_task_id}", status="queued")
+
+    PlanDispatcher(
+        plan_store=plans,
+        job_store=jobs,
+        coordination_root=tmp_path / ".agent-work",
+        launch=launch,
+        process_is_alive=lambda _pid: False,
+        checkout_slot=checkout_slot,
+    ).dispatch("dispatch")
+
+    assert checkouts == []
+    assert launched[0].execution.expected_base_sha == "f" * 40
+
+
+def test_dispatch_marks_task_failed_when_checkout_slot_raises(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "base", "Base", execution=PlanExecutionSpec(route="dev", brief="Base work")
+            ),
+            PlanTaskDefinition(
+                "dependent",
+                "Dependent",
+                depends_on=("base",),
+                execution=PlanExecutionSpec(route="dev", brief="Dependent work", slot="alpha"),
+            ),
+        ),
+    )
+    _accept_dependency(
+        plans,
+        jobs,
+        tmp_path,
+        plan_id="dispatch",
+        task_id="base",
+        job_id="base-job",
+        accepted_sha="deadbeef" * 5,
+    )
+
+    def checkout_slot(slot_name: str, *, branch: str, start_point: str) -> None:
+        raise RuntimeError("slot busy")
+
+    def launch(_claim: PlanDispatchClaim) -> SimpleNamespace:
+        pytest.fail("must not launch a task whose slot positioning failed")
+
+    result = PlanDispatcher(
+        plan_store=plans,
+        job_store=jobs,
+        coordination_root=tmp_path / ".agent-work",
+        launch=launch,
+        process_is_alive=lambda _pid: False,
+        checkout_slot=checkout_slot,
+    ).dispatch("dispatch")
+
+    assert result["dispatched"] == []
+    assert len(result["failures"]) == 1
+    assert "slot busy" in result["failures"][0]["error"]
+    blocked = plans.snapshot("dispatch")["blocked"][0]
+    assert blocked["task_id"] == "dependent"
+    assert blocked["state"] == "dispatch_failed"
+
+
+def _accept_dependency(
+    plans: PlanStore,
+    jobs: JobStore,
+    root: Path,
+    *,
+    plan_id: str,
+    task_id: str,
+    job_id: str,
+    accepted_sha: str | None,
+) -> None:
+    _create_job(jobs, root, job_id=job_id, task_id=f"{task_id}-run")
+    plans.bind_job(plan_id, task_id, job_id)
+    jobs.mark_finished(job_id, "completed")
+    jobs.mark_finalization_completed(job_id)
+    plans.accept_task(plan_id, task_id, accepted_sha=accepted_sha)
 
 
 def test_dead_dispatch_owner_is_reconciled_to_explicit_retry_state(tmp_path: Path) -> None:

@@ -246,6 +246,7 @@ class AgentControlPlane:
             reconcile_jobs=self.reconcile_jobs,
             process_is_alive=process_is_alive,
             policy_error=PolicyError,
+            checkout_slot=self.checkout_slot,
         )
 
     @property
