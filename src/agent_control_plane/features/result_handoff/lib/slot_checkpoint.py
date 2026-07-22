@@ -205,17 +205,56 @@ def checked_out_checkpoint_worktree(
     ``scratch_root`` so controller gates can run against real files even
     after the slot's own working tree has been reset. The worktree is
     removed unconditionally on exit.
+
+    Untracked tool environments named in ``_LINKED_ENV_DIRS`` (``.venv``,
+    ``node_modules``) are exposed inside the worktree as directory links to
+    the slot's own copies, because controller gate commands resolve
+    interpreters relative to their cwd and those directories are never part
+    of the checkpoint tree. The links are detached before the worktree is
+    removed so the linked contents are never deleted.
     """
     workspace = workspace_path.resolve(strict=False)
     if workspace != checkpoint.workspace_path.resolve(strict=False):
         raise SlotCheckpointError("Checkpoint belongs to a different workspace")
     scratch = _prepare_scratch_root(workspace, scratch_root)
     worktree_dir = scratch / f"checkout-{uuid.uuid4().hex}"
-    _git(workspace, "worktree", "add", "--detach", str(worktree_dir), checkpoint.commit_sha)
+    _git(
+        workspace,
+        "-c",
+        "core.longpaths=true",
+        "worktree",
+        "add",
+        "--detach",
+        str(worktree_dir),
+        checkpoint.commit_sha,
+    )
+    linked: list[Path] = []
     try:
+        for name in _LINKED_ENV_DIRS:
+            source = workspace / name
+            target = worktree_dir / name
+            if source.is_dir() and not target.exists():
+                _link_directory(source, target)
+                linked.append(target)
         yield worktree_dir
     finally:
+        for target in linked:
+            if target.is_dir():
+                os.rmdir(target)
         _git(workspace, "worktree", "remove", "--force", str(worktree_dir))
+
+
+_LINKED_ENV_DIRS = (".venv", "node_modules")
+
+
+def _link_directory(source: Path, target: Path) -> None:
+    """Create a directory link (junction on Windows) without copying contents."""
+    if os.name == "nt":
+        import _winapi
+
+        _winapi.CreateJunction(str(source), str(target))
+    else:
+        os.symlink(source, target, target_is_directory=True)
 
 
 def checkpoint_changed_files(
