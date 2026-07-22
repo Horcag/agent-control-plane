@@ -138,6 +138,7 @@ class PlanService:
         *,
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
+        allow_awaiting_review: bool = False,
     ) -> dict[str, Any]:
         task = self._plan_store.get_task(plan_id, task_id)
         execution = task["execution"]
@@ -173,6 +174,7 @@ class PlanService:
             task_id,
             brief_override=brief_override,
             retry_override_reason=retry_override_reason,
+            allow_awaiting_review=allow_awaiting_review,
         )
         return {"task": retried, "snapshot": self._plan_store.snapshot(plan_id)}
 

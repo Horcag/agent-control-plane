@@ -795,19 +795,29 @@ class PlanStore:
         *,
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
+        allow_awaiting_review: bool = False,
     ) -> dict[str, Any]:
-        """Explicitly clear a failed/rejected attempt so it may be dispatched again."""
+        """Explicitly clear a failed/rejected attempt so it may be dispatched again.
+
+        `awaiting_review` is only retryable when `allow_awaiting_review` is set: the
+        pending handoff is rejected first (same transaction, reusing the reject path)
+        so the inbox record and review_status stay consistent with a root decision.
+        """
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
             self._sync_plan(db, plan_id)
             self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
-            retryable_states = BLOCKED_STATES - {"awaiting_review"}
+            retryable_states = BLOCKED_STATES | (
+                {"awaiting_review"} if allow_awaiting_review else set()
+            )
             if task["state"] not in retryable_states:
                 raise ValueError(
                     f"Plan task is not eligible for retry: {plan_id}/{task_id} ({task['state']})"
                 )
+            if task["state"] == "awaiting_review":
+                self._record_decision_in_transaction(db, plan_id, task_id, "rejected")
             execution = _execution_from_json(task["execution_json"])
             if execution is None:
                 raise ValueError(f"Plan task has no execution specification: {plan_id}/{task_id}")

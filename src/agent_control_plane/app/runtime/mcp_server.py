@@ -526,14 +526,21 @@ def build_server(config_path: str | None = None) -> Any:
         task_id: str,
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
+        allow_awaiting_review: bool = False,
     ) -> dict[str, Any]:
-        """Explicitly make a failed task eligible for a new dispatch attempt."""
+        """Explicitly make a failed task eligible for a new dispatch attempt.
+
+        `allow_awaiting_review` is an explicit opt-in to retry a task that is still
+        `awaiting_review` (its pending handoff is rejected first) so accidental
+        double-runs of a task the root has not decided on stay impossible by default.
+        """
         try:
             return control.retry_plan_task(
                 plan_id,
                 task_id,
                 brief_override=brief_override,
                 retry_override_reason=retry_override_reason,
+                allow_awaiting_review=allow_awaiting_review,
             )
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}

@@ -75,6 +75,7 @@ def handle_plan_command(control: Any, args: argparse.Namespace) -> Any:
             args.task_id,
             brief_override=read_retry_brief(args.brief_file),
             retry_override_reason=args.retry_override_reason,
+            allow_awaiting_review=args.allow_awaiting_review,
         )
     if args.plan_command == "cancel":
         return control.cancel_plan(args.plan_id)

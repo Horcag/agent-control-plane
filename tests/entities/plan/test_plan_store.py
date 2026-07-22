@@ -637,6 +637,77 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
     assert claims[0].execution.retry_override_reason == "transient infrastructure failure"
 
 
+def test_awaiting_review_retry_without_flag_is_rejected(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="stuck",
+        title="Stuck",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Do it")
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="stuck-job", task_id="stuck-run")
+    plans.bind_job("stuck", "task", "stuck-job")
+    jobs.mark_finished("stuck-job", "completed")
+    jobs.mark_finalization_completed("stuck-job")
+
+    assert plans.snapshot("stuck")["awaiting_review"][0]["task_id"] == "task"
+
+    with pytest.raises(ValueError, match=r"not eligible for retry.*awaiting_review"):
+        plans.retry_task("stuck", "task")
+
+
+def test_awaiting_review_retry_with_flag_rejects_pending_handoff_and_keeps_dependents_locked(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="stuck",
+        title="Stuck",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Do it")
+            ),
+            PlanTaskDefinition("next", "Next", depends_on=("task",)),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="stuck-job", task_id="stuck-run")
+    plans.bind_job("stuck", "task", "stuck-job")
+    jobs.mark_finished("stuck-job", "completed")
+    jobs.mark_finalization_completed("stuck-job")
+    cursor = plans.snapshot("stuck")["cursor"]
+
+    retried = plans.retry_task("stuck", "task", allow_awaiting_review=True)
+    events = plans.snapshot("stuck", since=cursor)["changes"]
+    claims = plans.claim_ready_tasks("stuck", limit=1)
+
+    event_names = [event["event"] for event in events]
+    assert event_names.index("task_rejected") < event_names.index("task_retry_requested")
+    rejected_event = next(event for event in events if event["event"] == "task_rejected")
+    retried_event = next(event for event in events if event["event"] == "task_retry_requested")
+    assert rejected_event["job_id"] == "stuck-job"
+    assert retried_event["previous_state"] == "awaiting_review"
+
+    assert retried["state"] == "ready"
+    assert claims[0].task_id == "task"
+    assert claims[0].attempt_no == 1
+
+    snapshot = plans.snapshot("stuck")
+    assert snapshot["ready_next"] == []
+    assert all(task["task_id"] != "next" for task in snapshot["ready_next"])
+
+    with pytest.raises(ValueError, match="eligible completed worker"):
+        plans.accept_task("stuck", "task")
+
+
 @pytest.mark.parametrize("terminal_status", ("contract_mismatch", "inefficient_tool_usage"))
 def test_terminal_failure_is_retryable_and_does_not_unlock_dependents(
     tmp_path: Path,

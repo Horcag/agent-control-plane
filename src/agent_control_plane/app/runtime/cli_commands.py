@@ -186,6 +186,14 @@ def add_plan_parser(
         "--retry-override-reason",
         help="Escape hatch for one identical retry after a circuit-breaking failure",
     )
+    plan_retry.add_argument(
+        "--allow-awaiting-review",
+        action="store_true",
+        help=(
+            "Explicit opt-in to retry a task still awaiting_review (a stuck handoff); "
+            "rejects the pending handoff first so accidental double-runs stay impossible"
+        ),
+    )
 
     plan_cancel = plan_subparsers.add_parser(
         "cancel",

@@ -225,6 +225,26 @@ def test_two_identical_circuit_breaking_failures_escalate_to_strategy_revision(
     assert result["task"]["state"] in {"pending", "ready"}
 
 
+def test_awaiting_review_retry_requires_explicit_opt_in(tmp_path: Path) -> None:
+    service, job_store, plan_store = _service(tmp_path)
+    _create_task(service, "plan-h")
+    _make_job(
+        job_store,
+        tmp_path,
+        "job-1",
+        status="completed",
+        runner_failure=None,
+    )
+    plan_store.bind_job("plan-h", "task", "job-1")
+
+    with pytest.raises(ValueError, match=r"not eligible for retry.*awaiting_review"):
+        service.retry_plan_task("plan-h", "task")
+
+    result = service.retry_plan_task("plan-h", "task", allow_awaiting_review=True)
+
+    assert result["task"]["state"] in {"pending", "ready"}
+
+
 def test_escalated_task_is_never_auto_dispatched(tmp_path: Path) -> None:
     service, job_store, plan_store = _service(tmp_path)
     _create_task(service, "plan-g")
