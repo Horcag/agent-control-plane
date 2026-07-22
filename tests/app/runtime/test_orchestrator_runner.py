@@ -2471,9 +2471,7 @@ class _LargeDirtyCodexRunner:
 
     def run(self, spec: Any, **kwargs: Any) -> AgyRunResult:
         line_count = (
-            self._line_count
-            if self._line_count is not None
-            else DIRTY_DIFF_MAX_CHANGED_LINES + 50
+            self._line_count if self._line_count is not None else DIRTY_DIFF_MAX_CHANGED_LINES + 50
         )
         changed_lines = "".join(f"changed {index}\n" for index in range(line_count))
         (spec.workspace_path / "tracked.py").write_text(changed_lines, encoding="utf-8")
