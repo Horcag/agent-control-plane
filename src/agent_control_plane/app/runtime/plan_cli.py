@@ -32,6 +32,12 @@ def handle_plan_command(control: Any, args: argparse.Namespace) -> Any:
             depends_on=tuple(args.depends_on),
             execution=cli_plan_execution_spec(args),
         )
+    if args.plan_command == "edit-task":
+        return control.edit_plan_task(
+            args.plan_id,
+            args.task_id,
+            **cli_plan_edit_overrides(args),
+        )
     if args.plan_command == "bind":
         return control.bind_plan_job(args.plan_id, args.task_id, args.job_id)
     if args.plan_command == "accept":
@@ -184,6 +190,44 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
         expected_result_status=args.expected_result_status or "completed",
         controller_gate_mode=args.controller_gate_mode or "full",
     )
+
+
+def cli_plan_edit_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Build edit_plan_task kwargs from only the flags the operator actually provided."""
+    overrides: dict[str, Any] = {}
+    if args.title is not None:
+        overrides["title"] = args.title
+    if args.depends_on is not None:
+        overrides["depends_on"] = tuple(args.depends_on)
+    if args.brief_file is not None:
+        overrides["brief"] = read_retry_brief(args.brief_file)
+    if args.route is not None:
+        overrides["route"] = args.route
+    if args.slot is not None:
+        overrides["slot"] = args.slot
+    if args.backend is not None:
+        overrides["backend"] = args.backend
+    if args.workspace_access is not None:
+        overrides["workspace_access"] = args.workspace_access
+    if args.read_only is not None:
+        overrides["read_only"] = args.read_only
+    if args.codex_quality_tier is not None:
+        overrides["codex_quality_tier"] = args.codex_quality_tier
+    if args.codex_model is not None:
+        overrides["codex_model"] = args.codex_model
+    if args.codex_reasoning_effort is not None:
+        overrides["codex_reasoning_effort"] = args.codex_reasoning_effort
+    if args.claude_model is not None:
+        overrides["claude_model"] = args.claude_model
+    if args.claude_reasoning_effort is not None:
+        overrides["claude_reasoning_effort"] = args.claude_reasoning_effort
+    if args.codex_premium_override_reason is not None:
+        overrides["codex_premium_override_reason"] = args.codex_premium_override_reason
+    if args.expected_result_status is not None:
+        overrides["expected_result_status"] = args.expected_result_status
+    if args.controller_gate_mode is not None:
+        overrides["controller_gate_mode"] = args.controller_gate_mode
+    return overrides
 
 
 def read_retry_brief(path: str | None) -> str | None:

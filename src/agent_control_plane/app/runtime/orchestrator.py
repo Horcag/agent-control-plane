@@ -726,6 +726,9 @@ class AgentControlPlane:
             retry_override_reason=retry_override_reason,
         )
 
+    def edit_plan_task(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
+        return self.plan_service.edit_plan_task(plan_id, task_id, **kwargs)
+
     def cancel_plan(self, plan_id: str) -> dict[str, Any]:
         return self.plan_service.cancel_plan(plan_id)
 

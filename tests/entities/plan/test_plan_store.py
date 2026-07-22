@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -891,6 +892,189 @@ def test_plan_store_initialization_preserves_legacy_v4_and_registers_v5(tmp_path
     assert migration_checksums[4] == "plan-slot-allocation-v4-20260716"
     assert migration_checksums[5] == "plan-execution-contract-v5-20260717"
     assert migration_checksums[6] == "plan-controller-contract-v6-20260719"
+
+
+def test_edit_task_partial_update_preserves_unspecified_fields(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(
+                    route="dev",
+                    brief="First draft",
+                    codex_model="model-a",
+                    codex_reasoning_effort="max",
+                    expected_result_status="partial",
+                    controller_gate_mode="focused",
+                    codex_tool_call_budget=10,
+                ),
+            ),
+        ),
+    )
+
+    edited = plans.edit_task("edit", "task", brief="Revised brief", codex_model="model-b")
+
+    assert edited["state"] == "ready"
+    assert edited["execution"]["brief_sha256"] == hashlib.sha256(b"Revised brief").hexdigest()
+    task = plans.get_task("edit", "task")
+    assert task["execution"] is not None
+    assert task["execution"].brief == "Revised brief"
+    assert task["execution"].codex_model == "model-b"
+    assert task["execution"].codex_reasoning_effort == "max"
+    assert task["execution"].expected_result_status == "partial"
+    assert task["execution"].controller_gate_mode == "focused"
+    assert task["execution"].codex_tool_call_budget == 10
+
+
+def test_edit_task_only_brief_leaves_all_other_fields_unchanged(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    original = PlanExecutionSpec(
+        route="dev",
+        brief="First draft",
+        slot="slot-a",
+        backend="codex",
+        codex_model="model-a",
+        codex_tool_call_budget=7,
+    )
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(PlanTaskDefinition("task", "Task", execution=original),),
+    )
+
+    plans.edit_task("edit", "task", brief="Only the brief changes")
+
+    task = plans.get_task("edit", "task")
+    execution = task["execution"]
+    assert execution is not None
+    assert execution.brief == "Only the brief changes"
+    assert execution.slot == "slot-a"
+    assert execution.backend == "codex"
+    assert execution.codex_model == "model-a"
+    assert execution.codex_tool_call_budget == 7
+
+
+def test_edit_task_fails_closed_once_dispatched(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="job-1", task_id="task-run")
+    plans.bind_job("edit", "task", "job-1")
+
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Too late")
+
+    task = plans.get_task("edit", "task")
+    assert task["execution"] is not None
+    assert task["execution"].brief == "Draft"
+
+
+def test_edit_task_fails_closed_while_awaiting_review(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="job-1", task_id="task-run")
+    plans.bind_job("edit", "task", "job-1")
+    jobs.mark_finished("job-1", "completed")
+    jobs.mark_finalization_completed("job-1")
+    assert plans.snapshot("edit")["awaiting_review"][0]["task_id"] == "task"
+
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Too late")
+
+
+def test_edit_task_after_edit_can_be_dispatched_with_new_brief(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Original")
+            ),
+        ),
+    )
+
+    plans.edit_task("edit", "task", brief="Edited before first dispatch")
+    claims = plans.claim_ready_tasks("edit", limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].execution.brief == "Edited before first dispatch"
+    assert claims[0].attempt_no == 1
+
+
+def test_edit_task_depends_on_revalidates_graph_and_refreshes_ready_states(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition("schema", "Transfer schema"),
+            PlanTaskDefinition("api", "Transfer API"),
+        ),
+    )
+    assert {task["task_id"] for task in plans.snapshot("edit")["ready_next"]} == {
+        "schema",
+        "api",
+    }
+
+    edited = plans.edit_task("edit", "api", depends_on=("schema",))
+
+    assert edited["state"] == "pending"
+    assert [task["task_id"] for task in plans.snapshot("edit")["ready_next"]] == ["schema"]
+
+
+def test_edit_task_rejects_cycle_and_unknown_dependency(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition("schema", "Transfer schema"),
+            PlanTaskDefinition("api", "Transfer API", depends_on=("schema",)),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unknown task"):
+        plans.edit_task("edit", "schema", depends_on=("nonexistent",))
+    with pytest.raises(ValueError, match="cycle"):
+        plans.edit_task("edit", "schema", depends_on=("api",))
 
 
 def _plan_store(root: Path) -> PlanStore:

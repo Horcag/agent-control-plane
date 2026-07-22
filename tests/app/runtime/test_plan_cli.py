@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -308,6 +309,73 @@ def test_plan_execution_spec_reads_controller_contract() -> None:
     assert execution.effective_scope == ("src/api.py", "tests/api.py")
     assert execution.codex_tool_call_budget == 47
     assert execution.retry_override_reason == "approved retry"
+
+
+def test_plan_edit_task_parser_exposes_partial_update_fields() -> None:
+    edit = _build_parser().parse_args(
+        [
+            "plan",
+            "edit-task",
+            "transfer",
+            "schema",
+            "--brief-file",
+            "repair.md",
+            "--codex-model",
+            "gpt-5.3-codex-spark",
+        ]
+    )
+
+    assert edit.plan_command == "edit-task"
+    assert edit.plan_id == "transfer"
+    assert edit.task_id == "schema"
+    assert edit.brief_file == "repair.md"
+    assert edit.codex_model == "gpt-5.3-codex-spark"
+    assert edit.title is None
+    assert edit.depends_on is None
+    assert edit.read_only is None
+
+
+def test_cli_edit_task_updates_brief_in_place_before_first_dispatch(tmp_path: Path) -> None:
+    config = tmp_path / "workspaces.toml"
+    config.write_text(_config_text(tmp_path), encoding="utf-8")
+    manifest = tmp_path / "plan.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "plan_id": "edit-drill",
+                "title": "Edit drill",
+                "tasks": [
+                    {
+                        "task_id": "task",
+                        "title": "Task",
+                        "execution": {"route": "app", "brief": "Original brief"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    brief_file = tmp_path / "revised.md"
+    brief_file.write_text("Revised brief", encoding="utf-8")
+
+    _run_cli(tmp_path, "plan", "create", "--manifest", str(manifest), "--config", str(config))
+    edited = _run_cli(
+        tmp_path,
+        "plan",
+        "edit-task",
+        "edit-drill",
+        "task",
+        "--brief-file",
+        str(brief_file),
+        "--config",
+        str(config),
+    )
+    dispatched = _run_cli(tmp_path, "plan", "dispatch", "edit-drill", "--config", str(config))
+
+    assert (
+        edited["task"]["execution"]["brief_sha256"] == hashlib.sha256(b"Revised brief").hexdigest()
+    )
+    assert dispatched["claimed"] == 1
 
 
 def test_plan_add_task_parser_rejects_invalid_controller_contract() -> None:

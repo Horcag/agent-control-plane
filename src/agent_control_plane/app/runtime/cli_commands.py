@@ -70,6 +70,42 @@ def add_plan_parser(
         ),
     )
 
+    plan_edit = plan_subparsers.add_parser(
+        "edit-task",
+        parents=[common],
+        help="Edit a never-dispatched (pending/ready) plan task's fields in place",
+    )
+    plan_edit.add_argument("plan_id")
+    plan_edit.add_argument("task_id")
+    plan_edit.add_argument("--title")
+    plan_edit.add_argument("--depends-on", action="append", default=None)
+    plan_edit.add_argument("--route")
+    plan_edit.add_argument("--brief-file")
+    plan_edit.add_argument("--slot")
+    plan_edit.add_argument("--backend", choices=SUPPORTED_BACKENDS)
+    plan_edit.add_argument("--workspace-access", choices=("ide_mcp", "native"))
+    plan_edit.add_argument("--read-only", dest="read_only", action="store_true", default=None)
+    plan_edit.add_argument("--codex-quality-tier")
+    plan_edit.add_argument("--expected-result-status", choices=("partial", "completed", "blocked"))
+    plan_edit.add_argument("--controller-gate-mode", choices=("focused", "full", "none"))
+    plan_edit.add_argument("--codex-premium-override-reason")
+    plan_edit.add_argument("--codex-model", help="Model to use when --backend=codex")
+    plan_edit.add_argument(
+        "--codex-reasoning-effort",
+        help=(
+            "Codex reasoning effort to use when --backend=codex; known catalog models "
+            "must use an effort declared by the current cache"
+        ),
+    )
+    plan_edit.add_argument("--claude-model", help="Model to use when --backend=claude")
+    plan_edit.add_argument(
+        "--claude-reasoning-effort",
+        help=(
+            "Claude reasoning effort to use when --backend=claude; known catalog models "
+            "must use an effort declared by the builtin Claude inventory"
+        ),
+    )
+
     plan_bind = plan_subparsers.add_parser(
         "bind", parents=[common], help="Bind an existing job to a logical plan task"
     )

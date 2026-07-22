@@ -170,6 +170,10 @@ class PlanService:
         )
         return {"task": retried, "snapshot": self._plan_store.snapshot(plan_id)}
 
+    def edit_plan_task(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
+        task = self._plan_store.edit_task(plan_id, task_id, **kwargs)
+        return {"task": task, "snapshot": self._plan_store.snapshot(plan_id)}
+
     def _current_attempt_job(self, job_id: str | None) -> JobRecord | None:
         if not job_id:
             return None

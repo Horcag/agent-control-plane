@@ -58,6 +58,8 @@ DECISION_STATES = frozenset(
 )
 BLOCKED_STATES = DECISION_STATES - {"awaiting_review"}
 
+_UNSET: Any = object()
+
 
 @dataclass(frozen=True)
 class PlanExecutionSpec:
@@ -866,6 +868,193 @@ class PlanStore:
                 "state": updated["state"],
                 "attempt_no": int(updated["attempt_no"]),
                 "execution": _execution_summary(execution),
+            }
+
+    def edit_task(
+        self,
+        plan_id: str,
+        task_id: str,
+        *,
+        title: Any = _UNSET,
+        depends_on: Any = _UNSET,
+        brief: Any = _UNSET,
+        route: Any = _UNSET,
+        slot: Any = _UNSET,
+        backend: Any = _UNSET,
+        workspace_access: Any = _UNSET,
+        read_only: Any = _UNSET,
+        codex_quality_tier: Any = _UNSET,
+        codex_model: Any = _UNSET,
+        codex_reasoning_effort: Any = _UNSET,
+        claude_model: Any = _UNSET,
+        claude_reasoning_effort: Any = _UNSET,
+        codex_premium_override_reason: Any = _UNSET,
+        expected_result_status: Any = _UNSET,
+        controller_gate_mode: Any = _UNSET,
+        expected_base_sha: Any = _UNSET,
+        effective_scope: Any = _UNSET,
+        codex_tool_call_budget: Any = _UNSET,
+        retry_override_reason: Any = _UNSET,
+    ) -> dict[str, Any]:
+        """Edit a never-dispatched task's fields in place (partial update, sentinel-gated)."""
+        self.initialize()
+        execution_overrides = {
+            "brief": brief,
+            "route": route,
+            "slot": slot,
+            "backend": backend,
+            "workspace_access": workspace_access,
+            "read_only": read_only,
+            "codex_quality_tier": codex_quality_tier,
+            "codex_model": codex_model,
+            "codex_reasoning_effort": codex_reasoning_effort,
+            "claude_model": claude_model,
+            "claude_reasoning_effort": claude_reasoning_effort,
+            "codex_premium_override_reason": codex_premium_override_reason,
+            "expected_result_status": expected_result_status,
+            "controller_gate_mode": controller_gate_mode,
+            "expected_base_sha": expected_base_sha,
+            "effective_scope": effective_scope,
+            "codex_tool_call_budget": codex_tool_call_budget,
+            "retry_override_reason": retry_override_reason,
+        }
+        with self._connect() as db:
+            db.execute("begin immediate")
+            self._require_active_plan(db, plan_id)
+            task = self._require_task(db, plan_id, task_id)
+            if task["job_id"] is not None or task["state"] not in {"pending", "ready"}:
+                raise ValueError(
+                    f"Plan task {task_id} is not editable in state {task['state']}; only a "
+                    "never-dispatched pending/ready task can be edited (use `plan retry "
+                    "--brief-file` for a failed task)"
+                )
+            changed_fields: list[str] = []
+            new_title = task["title"]
+            if title is not _UNSET:
+                new_title = _required("task title", title)
+                changed_fields.append("title")
+
+            execution = _execution_from_json(task["execution_json"])
+            if any(value is not _UNSET for value in execution_overrides.values()):
+                if execution is None:
+                    raise ValueError(
+                        f"Plan task has no execution specification: {plan_id}/{task_id}"
+                    )
+                execution = PlanExecutionSpec(
+                    route=_pick(execution_overrides["route"], execution.route),
+                    brief=_pick(execution_overrides["brief"], execution.brief),
+                    slot=_pick(execution_overrides["slot"], execution.slot),
+                    backend=_pick(execution_overrides["backend"], execution.backend),
+                    workspace_access=_pick(
+                        execution_overrides["workspace_access"], execution.workspace_access
+                    ),
+                    read_only=_pick(execution_overrides["read_only"], execution.read_only),
+                    codex_quality_tier=_pick(
+                        execution_overrides["codex_quality_tier"], execution.codex_quality_tier
+                    ),
+                    codex_model=_pick(execution_overrides["codex_model"], execution.codex_model),
+                    codex_reasoning_effort=_pick(
+                        execution_overrides["codex_reasoning_effort"],
+                        execution.codex_reasoning_effort,
+                    ),
+                    claude_model=_pick(execution_overrides["claude_model"], execution.claude_model),
+                    claude_reasoning_effort=_pick(
+                        execution_overrides["claude_reasoning_effort"],
+                        execution.claude_reasoning_effort,
+                    ),
+                    codex_premium_override_reason=_pick(
+                        execution_overrides["codex_premium_override_reason"],
+                        execution.codex_premium_override_reason,
+                    ),
+                    expected_result_status=_pick(
+                        execution_overrides["expected_result_status"],
+                        execution.expected_result_status,
+                    ),
+                    controller_gate_mode=_pick(
+                        execution_overrides["controller_gate_mode"],
+                        execution.controller_gate_mode,
+                    ),
+                    expected_base_sha=_pick(
+                        execution_overrides["expected_base_sha"], execution.expected_base_sha
+                    ),
+                    effective_scope=_pick(
+                        execution_overrides["effective_scope"], execution.effective_scope
+                    ),
+                    codex_tool_call_budget=_pick(
+                        execution_overrides["codex_tool_call_budget"],
+                        execution.codex_tool_call_budget,
+                    ),
+                    retry_override_reason=_pick(
+                        execution_overrides["retry_override_reason"],
+                        execution.retry_override_reason,
+                    ),
+                )
+                changed_fields.extend(
+                    name for name, value in execution_overrides.items() if value is not _UNSET
+                )
+
+            depends_on_changed = depends_on is not _UNSET
+            new_depends_on = tuple(depends_on) if depends_on_changed else ()
+            if depends_on_changed:
+                existing = self._task_definitions(db, plan_id)
+                updated_graph = tuple(
+                    definition
+                    if definition.task_id != task_id
+                    else PlanTaskDefinition(
+                        task_id, new_title, new_depends_on, definition.execution
+                    )
+                    for definition in existing
+                )
+                _validate_task_graph(updated_graph)
+                changed_fields.append("depends_on")
+
+            if not changed_fields:
+                raise ValueError(f"Plan task edit requires at least one changed field: {task_id}")
+
+            now = utc_now()
+            db.execute(
+                """
+                update plan_tasks set title = ?, execution_json = ?, updated_at = ?
+                where plan_id = ? and task_id = ?
+                """,
+                (
+                    new_title,
+                    _execution_json(execution) if execution is not None else task["execution_json"],
+                    now,
+                    plan_id,
+                    task_id,
+                ),
+            )
+            if depends_on_changed:
+                db.execute(
+                    "delete from plan_task_dependencies where plan_id = ? and task_id = ?",
+                    (plan_id, task_id),
+                )
+                for dependency in new_depends_on:
+                    db.execute(
+                        """
+                        insert into plan_task_dependencies (plan_id, task_id, dependency_task_id)
+                        values (?, ?, ?)
+                        """,
+                        (plan_id, task_id, dependency),
+                    )
+            self._add_event(
+                db,
+                plan_id,
+                "task_edited",
+                {"changed_fields": changed_fields},
+                task_id=task_id,
+            )
+            if depends_on_changed:
+                self._refresh_ready_states(db, plan_id)
+            updated = self._require_task(db, plan_id, task_id)
+            return {
+                "plan_id": plan_id,
+                "task_id": task_id,
+                "title": updated["title"],
+                "state": updated["state"],
+                "attempt_no": int(updated["attempt_no"]),
+                "execution": _execution_summary(execution) if execution is not None else None,
             }
 
     def get_task(self, plan_id: str, task_id: str) -> dict[str, Any]:
@@ -1780,6 +1969,10 @@ def _compact_result(path: Path | None, limit: int = 1200) -> str | None:
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
+
+
+def _pick(value: Any, current: Any) -> Any:
+    return current if value is _UNSET else value
 
 
 def _required(name: str, value: str) -> str:
