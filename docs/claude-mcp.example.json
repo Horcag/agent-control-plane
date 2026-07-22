@@ -1,0 +1,25 @@
+{
+  "//": [
+    "First install the MCP extra into this clone's virtual environment:",
+    "  .\\.venv\\Scripts\\python.exe -m pip install -e \".[mcp]\"",
+    "Then register the server in Claude Code (user scope), replacing the placeholder paths:",
+    "  claude mcp add-json agent_control_plane --scope user '<the mcpServers.agent_control_plane object below>'",
+    "or copy the mcpServers block into ~/.claude.json manually and restart Claude Code.",
+    "MCP_TOOL_TIMEOUT should stay above the default 25-second watch/plan-watch window."
+  ],
+  "mcpServers": {
+    "agent_control_plane": {
+      "type": "stdio",
+      "command": "C:\\path\\to\\agent-control-plane\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "agent_control_plane.app.runtime.mcp_server",
+        "--config",
+        "C:\\path\\to\\agent-control-plane\\config\\workspaces.toml"
+      ],
+      "env": {
+        "MCP_TOOL_TIMEOUT": "90000"
+      }
+    }
+  }
+}

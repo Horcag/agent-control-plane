@@ -53,6 +53,10 @@ python -m venv .venv
 python -m pip install -e ".[dev,mcp]"
 ```
 
+To register the ACP MCP server in a coordinating agent, use the templates in
+[docs/codex-mcp.example.toml](docs/codex-mcp.example.toml) (Codex `config.toml`) or
+[docs/claude-mcp.example.json](docs/claude-mcp.example.json) (Claude Code `mcpServers`).
+
 ## Five-minute offline demo
 
 The demo uses local fixtures and does not call an agent, IDEA, or the network. Run it,
