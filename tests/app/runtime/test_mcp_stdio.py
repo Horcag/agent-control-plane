@@ -48,37 +48,54 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
             env={**os.environ, "PYTHONPATH": python_path},
         )
         timings: list[float] = []
-        async with stdio_client(server) as (read, write), ClientSession(read, write) as session:
-            with anyio.fail_after(5):
-                await session.initialize()
-            smoke = await _call_tool(session, "agent_smoke", {}, timings)
-            unscoped = await session.call_tool("agent_slots_list", {})
-            assert unscoped.isError is True
-            await _call_tool(session, "agent_slots_list", {"route": "acp"}, timings)
-            await _call_tool(session, "agent_slots_list", {"all_routes": True}, timings)
-            await _call_tool(
-                session,
-                "agent_slots_cleanup",
-                {"max_per_route": 1, "apply": False, "route": "acp"},
-                timings,
-            )
-            _write_config(config_path, new_slot)
-            reloaded_slots = await _call_tool(
-                session,
-                "agent_slots_list",
-                {"route": "acp"},
-                timings,
-            )
-            reloaded_smoke = await _call_tool(session, "agent_smoke", {}, timings)
-            with pytest.raises(TimeoutError):
-                with anyio.fail_after(0.01):
-                    await session.call_tool("agent_smoke", {})
-            await anyio.sleep(0.5)
-        return timings, {
-            "smoke": smoke,
-            "slots": reloaded_slots,
-            "reloaded_smoke": reloaded_smoke,
-        }
+        results: dict[object, object] = {}
+        try:
+            async with (
+                stdio_client(server) as (read, write),
+                ClientSession(read, write) as session,
+            ):
+                with anyio.fail_after(5):
+                    await session.initialize()
+                smoke = await _call_tool(session, "agent_smoke", {}, timings)
+                unscoped = await session.call_tool("agent_slots_list", {})
+                assert unscoped.isError is True
+                await _call_tool(session, "agent_slots_list", {"route": "acp"}, timings)
+                await _call_tool(session, "agent_slots_list", {"all_routes": True}, timings)
+                await _call_tool(
+                    session,
+                    "agent_slots_cleanup",
+                    {"max_per_route": 1, "apply": False, "route": "acp"},
+                    timings,
+                )
+                _write_config(config_path, new_slot)
+                reloaded_slots = await _call_tool(
+                    session,
+                    "agent_slots_list",
+                    {"route": "acp"},
+                    timings,
+                )
+                reloaded_smoke = await _call_tool(session, "agent_smoke", {}, timings)
+                with pytest.raises(TimeoutError):
+                    with anyio.fail_after(0.01):
+                        await session.call_tool("agent_smoke", {})
+                results.update(
+                    {
+                        "smoke": smoke,
+                        "slots": reloaded_slots,
+                        "reloaded_smoke": reloaded_smoke,
+                    }
+                )
+                await anyio.sleep(0.5)
+        except BaseExceptionGroup as group:
+            # The deliberately cancelled 0.01s call_tool above leaves a late server response
+            # in flight; if it lands while the stdio client is tearing down, stdout_reader
+            # raises BrokenResourceError on the closed memory stream. That shutdown race is
+            # not what this test asserts, so swallow it — but only once every result has
+            # been collected, and only if nothing else went wrong in the task group.
+            _broken, rest = group.split(anyio.BrokenResourceError)
+            if rest is not None or not results:
+                raise
+        return timings, results
 
     timings, results = anyio.run(exercise)
 
