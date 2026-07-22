@@ -1539,18 +1539,13 @@ def _committed_repo(path: Path) -> Path:
     path.mkdir(parents=True)
     _git(path, "init")
     _git(path, "checkout", "-b", "main")
+    # Persist the author identity so every later commit to this repo works even when the
+    # environment has no global/system git identity (e.g. CI runners).
+    _git(path, "config", "user.name", "ACP Test")
+    _git(path, "config", "user.email", "acp-test@example.invalid")
     (path / "base.txt").write_text("base\n", encoding="utf-8")
     _git(path, "add", ".")
-    _git(
-        path,
-        "-c",
-        "user.name=ACP Test",
-        "-c",
-        "user.email=acp-test@example.invalid",
-        "commit",
-        "-m",
-        "base",
-    )
+    _git(path, "commit", "-m", "base")
     return path
 
 
