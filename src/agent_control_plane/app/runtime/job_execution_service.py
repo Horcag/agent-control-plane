@@ -556,6 +556,7 @@ class JobExecutionService:
             codex_no_progress_timeout_sec=self.config.defaults.codex_no_progress_timeout_sec,
             codex_tool_timeout_limit=self.config.defaults.codex_tool_timeout_limit,
             codex_tool_call_budget=job.codex_tool_call_budget or 0,
+            codex_tool_call_budget_grace_sec=self.config.defaults.codex_tool_call_budget_grace_sec,
             codex_terminal_tab_name=None if job.workspace_access == "native" else job.task_id,
             codex_forbidden_tool_markers=self._effective_forbidden_markers(job, state),
             codex_resume_thread_id=state.resume_thread_id,

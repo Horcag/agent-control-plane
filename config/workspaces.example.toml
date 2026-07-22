@@ -58,6 +58,12 @@ dirty_diff_max_changed_lines = 8000
 # Consecutive "Exit code: 124" tool-timeout markers observed in the worker log before the
 # job is killed as tool_timeout. 0 disables the check entirely.
 codex_tool_timeout_limit = 6
+# Grace window (seconds) after a hard tool-call-budget breach before the worker is
+# terminated, so a worker mid-stroke can still write its terminal handoff. The job still
+# completes normally if a valid handoff lands within the window. A runaway cap
+# (budget + max(4, budget // 10) tool calls) terminates immediately even during the grace
+# window. 0 restores the legacy behavior of terminating the instant the budget is crossed.
+codex_tool_call_budget_grace_sec = 120
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
 codex_quality_tier = "cheap-first"

@@ -191,6 +191,7 @@ class ControlDefaults:
     codex_no_progress_timeout_sec: int = 240
     dirty_diff_max_changed_lines: int = DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES
     codex_tool_timeout_limit: int = 6
+    codex_tool_call_budget_grace_sec: int = 120
     codex_quality_tier: str = "deep"
     codex_mechanical_model: str = "default"
     codex_mechanical_reasoning_effort: str = "low"
@@ -390,6 +391,10 @@ def load_config(
         codex_tool_timeout_limit=_non_negative_int(
             defaults_raw.get("codex_tool_timeout_limit", 6),
             "codex_tool_timeout_limit",
+        ),
+        codex_tool_call_budget_grace_sec=_non_negative_int(
+            defaults_raw.get("codex_tool_call_budget_grace_sec", 120),
+            "codex_tool_call_budget_grace_sec",
         ),
         codex_quality_tier=_routing_policy_name_value(
             defaults_raw.get("codex_quality_tier", "deep")

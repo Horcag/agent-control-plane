@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -231,6 +232,122 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 )
                 self.assertEqual(result.status, expected_status)
                 self.assertEqual(proc.terminated, not verified)
+
+    def test_budget_breach_grace_window_completes_normally_when_handoff_lands_in_time(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=2)
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_verification(root, status="partial")
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    codex_tool_call_budget=1,
+                    codex_tool_call_budget_grace_sec=120,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(proc.terminated)
+            self.assertTrue(any(event.kind == "budget_breach" for event in result.lifecycle_events))
+
+    def test_budget_breach_grace_window_expires_without_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            _write_budget_events(log_path, count=2)
+            result_path = root / "result.md"
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    codex_tool_call_budget=1,
+                    codex_tool_call_budget_grace_sec=1,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "tool_call_budget")
+            self.assertTrue(proc.terminated)
+            self.assertIn("grace of", result.message)
+            self.assertTrue(any(event.kind == "budget_breach" for event in result.lifecycle_events))
+
+    def test_budget_breach_runaway_cap_terminates_immediately_during_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            events_path = log_path.with_suffix(".events.jsonl")
+            # budget=1 -> runaway cap = 1 + max(4, 1 // 10) = 5; the first 2 calls cross the
+            # budget (breach). Four more, appended one at a time slower than the monitor's
+            # poll cadence so each is counted on its own scan, push the count to 6 (> 5),
+            # firing the runaway cap instead of waiting out the grace window.
+            _write_budget_events(log_path, count=2)
+            result_path = root / "result.md"
+            proc = _FakeProc()
+
+            def _append_more_calls() -> None:
+                for _ in range(4):
+                    time.sleep(0.3)
+                    with events_path.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps(
+                                {"type": "item.started", "item": {"type": "command_execution"}}
+                            )
+                            + "\n"
+                        )
+
+            appender = threading.Thread(target=_append_more_calls, daemon=True)
+            appender.start()
+            try:
+                result = CodexProcessMonitor().monitor(
+                    proc,
+                    _spec(
+                        read_only=False,
+                        yolo=False,
+                        log_path=log_path,
+                        result_path=result_path,
+                        codex_tool_call_budget=1,
+                        codex_tool_call_budget_grace_sec=120,
+                    ),
+                    started_wall=0.0,
+                    deadline_mono=time.monotonic() + 15,
+                    last_output_mono=time.monotonic(),
+                    last_log_size=0,
+                    log=io.StringIO(),
+                    cancel_requested=lambda: False,
+                )
+            finally:
+                appender.join(timeout=5)
+
+            self.assertEqual(result.status, "tool_call_budget")
+            self.assertTrue(proc.terminated)
+            self.assertIn("runaway cap", result.message)
 
     def test_writable_runner_stops_after_the_inefficient_tool_usage_limit_without_durable_progress(
         self,
@@ -825,6 +942,7 @@ def _spec(
     codex_forbidden_tool_markers: tuple[str, ...] = (),
     codex_resume_thread_id: str | None = None,
     codex_tool_call_budget: int = 0,
+    codex_tool_call_budget_grace_sec: int = 0,
     log_path: Path | None = None,
     result_path: Path | None = None,
     workspace_access: str = "ide_mcp",
@@ -840,6 +958,7 @@ def _spec(
         codex_no_progress_timeout_sec=codex_no_progress_timeout_sec,
         codex_tool_timeout_limit=codex_tool_timeout_limit,
         codex_tool_call_budget=codex_tool_call_budget,
+        codex_tool_call_budget_grace_sec=codex_tool_call_budget_grace_sec,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
         codex_resume_thread_id=codex_resume_thread_id,
         prompt="secret task prompt",

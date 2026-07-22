@@ -19,6 +19,7 @@ from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     scan_forbidden_tool,
     scan_tool_timeouts,
     tool_budget_policy,
+    tool_call_budget_runaway_cap,
     updated_calls_without_durable_progress,
 )
 from agent_control_plane.features.agent_runner.lib.result_detector import (
@@ -89,6 +90,8 @@ class CodexProcessMonitor:
         current_progress_signature, workspace_dirty = progress_signature(spec)
         observed_tool_call_count = 0
         calls_without_durable_progress = 0
+        budget_breach_mono: float | None = None
+        budget_breach_message: str | None = None
 
         while True:
             log.flush()
@@ -176,23 +179,66 @@ class CodexProcessMonitor:
                     constraint_violation,
                     lifecycle_events=tuple(budget_events),
                 )
-            if hard_budget_violation is not None:
-                completed = self._completed_result_if_ready(
-                    proc,
-                    spec,
-                    started_wall,
-                    terminate=True,
-                    cancel_requested=cancel_requested,
+            if hard_budget_violation is not None and budget_breach_mono is None:
+                if spec.codex_tool_call_budget_grace_sec <= 0:
+                    completed = self._completed_result_if_ready(
+                        proc,
+                        spec,
+                        started_wall,
+                        terminate=True,
+                        cancel_requested=cancel_requested,
+                    )
+                    if completed is not None:
+                        return replace(completed, lifecycle_events=tuple(budget_events))
+                    terminate_spawned_process(proc)
+                    return self._stopped_result(
+                        proc,
+                        "tool_call_budget",
+                        hard_budget_violation,
+                        lifecycle_events=tuple(budget_events),
+                    )
+                budget_breach_mono = now
+                budget_breach_message = hard_budget_violation
+                budget_events.append(
+                    BudgetLifecycleEvent(
+                        "budget_breach",
+                        tool_call_count,
+                        f"{hard_budget_violation}; granting a "
+                        f"{spec.codex_tool_call_budget_grace_sec}s grace window to finish "
+                        "the terminal handoff",
+                    )
                 )
-                if completed is not None:
-                    return replace(completed, lifecycle_events=tuple(budget_events))
-                terminate_spawned_process(proc)
-                return self._stopped_result(
-                    proc,
-                    "tool_call_budget",
-                    hard_budget_violation,
-                    lifecycle_events=tuple(budget_events),
-                )
+
+            if budget_breach_mono is not None and budget_breach_message is not None:
+                runaway_cap = tool_call_budget_runaway_cap(spec.codex_tool_call_budget)
+                if tool_call_count > runaway_cap:
+                    terminate_spawned_process(proc)
+                    return self._stopped_result(
+                        proc,
+                        "tool_call_budget",
+                        f"{budget_breach_message}; runaway cap of {runaway_cap} tool calls "
+                        "fired during the grace window",
+                        lifecycle_events=tuple(budget_events),
+                    )
+                if now - budget_breach_mono >= spec.codex_tool_call_budget_grace_sec:
+                    completed = self._completed_result_if_ready(
+                        proc,
+                        spec,
+                        started_wall,
+                        terminate=True,
+                        cancel_requested=cancel_requested,
+                    )
+                    if completed is not None:
+                        return replace(completed, lifecycle_events=tuple(budget_events))
+                    terminate_spawned_process(proc)
+                    return self._stopped_result(
+                        proc,
+                        "tool_call_budget",
+                        f"{budget_breach_message}; grace of "
+                        f"{spec.codex_tool_call_budget_grace_sec}s expired without a "
+                        "terminal handoff",
+                        lifecycle_events=tuple(budget_events),
+                    )
             if budget_scan.violation is not None:
                 terminate_spawned_process(proc)
                 return self._stopped_result(

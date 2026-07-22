@@ -265,6 +265,13 @@ def _is_discovery_item(item: dict[str, Any]) -> bool:
     return normalized.startswith(("rg ", "rg.exe ", "get-content "))
 
 
+def tool_call_budget_runaway_cap(tool_call_budget: int) -> int:
+    """Hard ceiling during a budget-breach grace window: the grace is for finishing the
+    handoff, not for continuing to work, so a worker that keeps calling tools well past the
+    breach is stopped immediately instead of waiting out the rest of the grace window."""
+    return tool_call_budget + max(4, tool_call_budget // 10)
+
+
 def _ceil_fraction(value: int, percentage: int) -> int:
     return (value * percentage + 99) // 100
 
