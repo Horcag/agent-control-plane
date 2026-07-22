@@ -932,11 +932,17 @@ class PlanStore:
             db.execute("begin immediate")
             self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
-            if task["job_id"] is not None or task["state"] not in {"pending", "ready"}:
+            if (
+                task["job_id"] is not None
+                or task["dispatch_token"] is not None
+                or task["state"] not in {"pending", "ready"}
+                or int(task["attempt_no"]) != 0
+            ):
                 raise ValueError(
-                    f"Plan task {task_id} is not editable in state {task['state']}; only a "
-                    "never-dispatched pending/ready task can be edited (use `plan retry "
-                    "--brief-file` for a failed task)"
+                    f"Plan task {task_id} is not editable in state {task['state']} "
+                    f"(attempt_no={int(task['attempt_no'])}); only a task that has never been "
+                    "claimed (pending/ready, attempt_no == 0, no job or dispatch token) can be "
+                    "edited (use `plan retry --brief-file` for a task that has already run)"
                 )
             changed_fields: list[str] = []
             new_title = task["title"]

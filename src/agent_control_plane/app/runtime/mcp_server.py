@@ -423,6 +423,70 @@ def build_server(config_path: str | None = None) -> Any:
             return {"ok": False, "error": str(exc)}
 
     @mcp.tool()
+    def agent_plan_edit_task(
+        plan_id: str,
+        task_id: str,
+        title: str | None = None,
+        depends_on: list[str] | None = None,
+        brief: str | None = None,
+        route: str | None = None,
+        slot: str | None = None,
+        backend: str | None = None,
+        workspace_access: str | None = None,
+        read_only: bool | None = None,
+        codex_quality_tier: str | None = None,
+        codex_model: str | None = None,
+        codex_reasoning_effort: str | None = None,
+        claude_model: str | None = None,
+        claude_reasoning_effort: str | None = None,
+        codex_premium_override_reason: str | None = None,
+        expected_result_status: str | None = None,
+        controller_gate_mode: str | None = None,
+    ) -> dict[str, Any]:
+        """Edit a never-claimed (pending/ready, attempt_no 0) plan task's fields in place.
+
+        Only fields explicitly passed here are changed; omit a field to leave it as-is.
+        Refused once the task has a job, a dispatch token, or a prior attempt.
+        """
+        overrides: dict[str, Any] = {}
+        if title is not None:
+            overrides["title"] = title
+        if depends_on is not None:
+            overrides["depends_on"] = tuple(depends_on)
+        if brief is not None:
+            overrides["brief"] = brief
+        if route is not None:
+            overrides["route"] = route
+        if slot is not None:
+            overrides["slot"] = slot
+        if backend is not None:
+            overrides["backend"] = backend
+        if workspace_access is not None:
+            overrides["workspace_access"] = workspace_access
+        if read_only is not None:
+            overrides["read_only"] = read_only
+        if codex_quality_tier is not None:
+            overrides["codex_quality_tier"] = codex_quality_tier
+        if codex_model is not None:
+            overrides["codex_model"] = codex_model
+        if codex_reasoning_effort is not None:
+            overrides["codex_reasoning_effort"] = codex_reasoning_effort
+        if claude_model is not None:
+            overrides["claude_model"] = claude_model
+        if claude_reasoning_effort is not None:
+            overrides["claude_reasoning_effort"] = claude_reasoning_effort
+        if codex_premium_override_reason is not None:
+            overrides["codex_premium_override_reason"] = codex_premium_override_reason
+        if expected_result_status is not None:
+            overrides["expected_result_status"] = expected_result_status
+        if controller_gate_mode is not None:
+            overrides["controller_gate_mode"] = controller_gate_mode
+        try:
+            return control.edit_plan_task(plan_id, task_id, **overrides)
+        except (KeyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @mcp.tool()
     def agent_plan_bind_job(plan_id: str, task_id: str, job_id: str) -> dict[str, Any]:
         """Bind an already-created job to a logical plan task."""
         try:

@@ -258,6 +258,7 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
         "agent_model_routing_explain",
         "agent_plan_create",
         "agent_plan_add_task",
+        "agent_plan_edit_task",
         "agent_plan_bind_job",
         "agent_plan_snapshot",
         "agent_plan_watch",

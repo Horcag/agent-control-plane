@@ -1386,6 +1386,34 @@ def test_edit_task_fails_closed_while_awaiting_review(tmp_path: Path) -> None:
         plans.edit_task("edit", "task", brief="Too late")
 
 
+def test_edit_task_fails_closed_once_attempted_even_after_retry_returns_it_to_pending(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    claims = plans.claim_ready_tasks("edit", limit=1)
+    assert claims[0].attempt_no == 1
+    plans.mark_dispatch_failed(
+        "edit", "task", dispatch_token=claims[0].dispatch_token, error="boom"
+    )
+    retried = plans.retry_task("edit", "task")
+    assert retried["state"] == "ready"
+    assert retried["attempt_no"] == 1
+
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Too late")
+
+
 def test_edit_task_after_edit_can_be_dispatched_with_new_brief(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     JobStore(database).initialize()
