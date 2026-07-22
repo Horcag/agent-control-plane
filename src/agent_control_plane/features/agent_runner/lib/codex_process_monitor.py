@@ -66,6 +66,10 @@ class CodexProcessMonitor:
             terminal_tab_name=spec.codex_terminal_tab_name,
         )
 
+    @staticmethod
+    def _is_budget_breach(violation: str) -> bool:
+        return violation.startswith("Codex exceeded")
+
     def monitor(
         self,
         proc: subprocess.Popen[str],
@@ -151,7 +155,8 @@ class CodexProcessMonitor:
                     return self._stopped_result(
                         proc,
                         "inefficient_tool_usage",
-                        "Codex started 16 tool calls without durable progress",
+                        f"Codex started {calls_without_durable_progress} tool calls "
+                        f"without durable progress (limit {CODEX_INEFFICIENT_TOOL_USAGE_LIMIT})",
                         lifecycle_events=tuple(budget_events),
                     )
             budget_scan = scan_budget_lifecycle(
@@ -167,7 +172,7 @@ class CodexProcessMonitor:
             budget_events.extend(budget_scan.events)
             hard_budget_violation = (
                 constraint_violation
-                if constraint_violation and constraint_violation.startswith("Codex exceeded")
+                if constraint_violation and self._is_budget_breach(constraint_violation)
                 else None
             )
             if constraint_violation is not None and hard_budget_violation is None:

@@ -371,6 +371,11 @@ class CodexRunnerCommandTest(unittest.TestCase):
 
             self.assertEqual(result.status, "inefficient_tool_usage")
             self.assertTrue(proc.terminated)
+            self.assertIn(str(CODEX_INEFFICIENT_TOOL_USAGE_LIMIT), result.message)
+            self.assertIn(
+                f"started {CODEX_INEFFICIENT_TOOL_USAGE_LIMIT} tool calls", result.message
+            )
+            self.assertNotIn("started 16 tool calls", result.message)
 
     def test_periodic_durable_progress_resets_tool_call_counter_before_next_call(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

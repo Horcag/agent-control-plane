@@ -48,6 +48,10 @@ class ClaudeProcessMonitor(CodexProcessMonitor):
         )
 
     @staticmethod
+    def _is_budget_breach(violation: str) -> bool:
+        return violation.startswith("Claude tool-call budget of")
+
+    @staticmethod
     def _exited_result_if_dead(
         proc: subprocess.Popen[str],
         spec: AgentRunSpec,

@@ -1,6 +1,15 @@
+import io
+import json
+import tempfile
+import threading
+import time
+import unittest
 from pathlib import Path
 
-from agent_control_plane.features.agent_runner.lib.claude_runner import ClaudeExecRunner
+from agent_control_plane.features.agent_runner.lib.claude_runner import (
+    ClaudeExecRunner,
+    ClaudeProcessMonitor,
+)
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunSpec
 
 
@@ -15,6 +24,10 @@ def _spec(
     codex_resume_thread_id: str | None = None,
     workspace_access: str = "native",
     claude_mcp_config_path: Path | None = None,
+    codex_tool_call_budget: int = 0,
+    codex_tool_call_budget_grace_sec: int = 0,
+    log_path: Path | None = None,
+    result_path: Path | None = None,
 ) -> AgentRunSpec:
     return AgentRunSpec(
         backend="claude",
@@ -25,10 +38,12 @@ def _spec(
         codex_sandbox_mode="workspace-write",
         codex_disabled_mcp_servers=(),
         codex_resume_thread_id=codex_resume_thread_id,
+        codex_tool_call_budget=codex_tool_call_budget,
+        codex_tool_call_budget_grace_sec=codex_tool_call_budget_grace_sec,
         prompt="secret task prompt",
         workspace_path=Path("D:/repo/workspace"),
-        result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
-        log_path=Path("D:/repo/runs/job-1/attempt-001.log"),
+        result_path=result_path or Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+        log_path=log_path or Path("D:/repo/runs/job-1/attempt-001.log"),
         print_timeout="10s",
         timeout_sec=30,
         idle_timeout_sec=10,
@@ -137,3 +152,218 @@ def test_bare_isolation_can_be_disabled() -> None:
     assert "--bare" not in command
     assert "--strict-mcp-config" not in command
     assert "--setting-sources" not in command
+
+
+class _FakeProc:
+    def __init__(self) -> None:
+        self.terminated = False
+        self.killed = False
+        self.wait_timeout: float | None = None
+
+    def poll(self) -> int | None:
+        return 0 if self.terminated or self.killed else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_timeout = timeout
+        return 0
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def _write_claude_tool_calls(log_path: Path, *, count: int) -> None:
+    lines = [
+        json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": f"call-{i}", "name": "Bash", "input": {}}
+                    ]
+                },
+            }
+        )
+        for i in range(count)
+    ]
+    lines.append(json.dumps({"type": "result", "subtype": "success", "is_error": False}))
+    log_path.with_suffix(".events.jsonl").write_text(
+        "".join(line + "\n" for line in lines), encoding="utf-8"
+    )
+
+
+def _write_verification(root: Path, *, status: str) -> None:
+    (root / "verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": status,
+                "changed_files": [],
+                "checks": [],
+                "unverified": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_claude_budget_breach_kills_immediately_when_grace_is_zero() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        _write_claude_tool_calls(log_path, count=2)
+        result_path = root / "result.md"
+        proc = _FakeProc()
+
+        result = ClaudeProcessMonitor().monitor(
+            proc,
+            _spec(
+                read_only=False,
+                log_path=log_path,
+                result_path=result_path,
+                codex_tool_call_budget=1,
+                codex_tool_call_budget_grace_sec=0,
+            ),
+            started_wall=0.0,
+            deadline_mono=time.monotonic() + 10,
+            last_output_mono=time.monotonic(),
+            last_log_size=0,
+            log=io.StringIO(),
+            cancel_requested=lambda: False,
+        )
+
+        assert result.status == "tool_call_budget"
+        assert proc.terminated
+        assert "Claude tool-call budget of 1 exceeded" in result.message
+        assert not any(event.kind == "budget_breach" for event in result.lifecycle_events)
+
+
+def test_claude_budget_breach_grace_window_completes_normally_when_handoff_lands_in_time() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        _write_claude_tool_calls(log_path, count=2)
+        result_path = root / "result.md"
+        result_path.write_text("Status: partial\n", encoding="utf-8")
+        _write_verification(root, status="partial")
+        proc = _FakeProc()
+
+        result = ClaudeProcessMonitor().monitor(
+            proc,
+            _spec(
+                read_only=False,
+                log_path=log_path,
+                result_path=result_path,
+                codex_tool_call_budget=1,
+                codex_tool_call_budget_grace_sec=120,
+            ),
+            started_wall=0.0,
+            deadline_mono=time.monotonic() + 10,
+            last_output_mono=time.monotonic(),
+            last_log_size=0,
+            log=io.StringIO(),
+            cancel_requested=lambda: False,
+        )
+
+        assert result.status == "completed"
+        assert not proc.terminated
+        assert any(event.kind == "budget_breach" for event in result.lifecycle_events)
+
+
+def test_claude_budget_breach_grace_window_expires_without_handoff() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        _write_claude_tool_calls(log_path, count=2)
+        result_path = root / "result.md"
+        proc = _FakeProc()
+
+        result = ClaudeProcessMonitor().monitor(
+            proc,
+            _spec(
+                read_only=False,
+                log_path=log_path,
+                result_path=result_path,
+                codex_tool_call_budget=1,
+                codex_tool_call_budget_grace_sec=1,
+            ),
+            started_wall=0.0,
+            deadline_mono=time.monotonic() + 10,
+            last_output_mono=time.monotonic(),
+            last_log_size=0,
+            log=io.StringIO(),
+            cancel_requested=lambda: False,
+        )
+
+        assert result.status == "tool_call_budget"
+        assert proc.terminated
+        assert "grace of" in result.message
+        assert any(event.kind == "budget_breach" for event in result.lifecycle_events)
+
+
+def test_claude_budget_breach_runaway_cap_terminates_immediately_during_grace() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        events_path = log_path.with_suffix(".events.jsonl")
+        # budget=1 -> runaway cap = 1 + max(4, 1 // 10) = 5; two calls cross the budget
+        # (breach), then four more appended slower than the monitor's poll cadence push the
+        # count to 6 (> 5), firing the runaway cap instead of waiting out the grace window.
+        _write_claude_tool_calls(log_path, count=2)
+        result_path = root / "result.md"
+        proc = _FakeProc()
+
+        def _append_more_calls() -> None:
+            for i in range(4):
+                time.sleep(0.3)
+                with events_path.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "message": {
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": f"extra-{i}",
+                                            "name": "Bash",
+                                            "input": {},
+                                        }
+                                    ]
+                                },
+                            }
+                        )
+                        + "\n"
+                    )
+
+        appender = threading.Thread(target=_append_more_calls, daemon=True)
+        appender.start()
+        try:
+            result = ClaudeProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    codex_tool_call_budget=1,
+                    codex_tool_call_budget_grace_sec=120,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 15,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+        finally:
+            appender.join(timeout=5)
+
+        assert result.status == "tool_call_budget"
+        assert proc.terminated
+        assert "runaway cap" in result.message
+
+
+if __name__ == "__main__":
+    unittest.main()
