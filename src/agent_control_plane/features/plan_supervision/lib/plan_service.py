@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -28,7 +29,11 @@ from agent_control_plane.features.plan_supervision.lib.supervisor import (
     PlanRunOptions,
     PlanSupervisor,
 )
+from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.git_tools import GitError, is_git_workspace, run_git
 from agent_control_plane.shared.verification_report import inspect_verification_report
+
+_ACCEPTED_SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class PlanRetryError(ValueError):
@@ -53,6 +58,7 @@ class PlanService:
         process_is_alive: Callable[[int], bool],
         policy_error: type[RuntimeError],
         checkout_slot: CheckoutSlot | None = None,
+        config: ControlConfig | None = None,
     ) -> None:
         self._coordination_root = coordination_root
         self._job_store = job_store
@@ -66,6 +72,7 @@ class PlanService:
         self._process_is_alive = process_is_alive
         self._policy_error = policy_error
         self._checkout_slot = checkout_slot
+        self._config = config
 
     def create_plan(
         self,
@@ -103,13 +110,21 @@ class PlanService:
         self, plan_id: str, task_id: str, *, accepted_sha: str | None = None
     ) -> dict[str, Any]:
         self._validate_plan_task_acceptance(plan_id, task_id)
+        warning = self._validate_accepted_sha(plan_id, task_id, accepted_sha)
         cursor = self._plan_store.snapshot(plan_id)["cursor"]
         self._plan_store.accept_task(plan_id, task_id, accepted_sha=accepted_sha)
-        return self._plan_store.snapshot(plan_id, since=cursor)
+        result = self._plan_store.snapshot(plan_id, since=cursor)
+        if warning:
+            result["accept_sha_warning"] = warning
+        return result
 
     def accept_handoff(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
         self._validate_plan_task_acceptance(plan_id, task_id)
-        return self._accept_handoff(plan_id, task_id, **kwargs)
+        warning = self._validate_accepted_sha(plan_id, task_id, kwargs.get("accepted_sha"))
+        result = self._accept_handoff(plan_id, task_id, **kwargs)
+        if warning:
+            result["accept_sha_warning"] = warning
+        return result
 
     def verify_continuation_handoff(
         self, plan_id: str, task_id: str, **kwargs: Any
@@ -333,3 +348,42 @@ class PlanService:
                 f"Plan task handoff is not review-ready for acceptance: {plan_id}/{task_id}"
             )
         return target
+
+    def _validate_accepted_sha(
+        self, plan_id: str, task_id: str, accepted_sha: str | None
+    ) -> str | None:
+        """Reject fabricated/abbreviated shas; return a warning when the sha cannot be checked."""
+        if accepted_sha is None:
+            return None
+        normalized = accepted_sha.strip().lower() if isinstance(accepted_sha, str) else ""
+        if not _ACCEPTED_SHA_PATTERN.fullmatch(normalized):
+            raise ValueError(
+                f"accepted_sha must be a full 40-hex commit id for {plan_id}/{task_id}, "
+                f"got {accepted_sha!r}"
+            )
+        execution = self._plan_store.get_task(plan_id, task_id)["execution"]
+        if execution is None:
+            return (
+                f"accepted_sha {normalized} was not verified against a repository: "
+                f"{plan_id}/{task_id} has no execution route"
+            )
+        route_config = self._config.routes.get(execution.route) if self._config else None
+        if route_config is None:
+            return (
+                f"accepted_sha {normalized} was not verified against a repository: "
+                f"route {execution.route!r} has no configured root"
+            )
+        route_root = route_config.path
+        if not is_git_workspace(route_root):
+            return (
+                f"accepted_sha {normalized} was not verified against a repository: "
+                f"route root {route_root} is not a git repository"
+            )
+        try:
+            run_git(route_root, "rev-parse", "--verify", f"{normalized}^{{commit}}")
+        except GitError as error:
+            raise ValueError(
+                f"accepted_sha {normalized} does not resolve to a commit in route repository "
+                f"{route_root} for {plan_id}/{task_id}: {error}"
+            ) from error
+        return None
