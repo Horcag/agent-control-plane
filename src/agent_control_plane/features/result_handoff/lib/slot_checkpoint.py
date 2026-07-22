@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess  # nosec B404
+import sys
 import tempfile
 import uuid
 from collections.abc import Iterator
@@ -249,7 +250,7 @@ _LINKED_ENV_DIRS = (".venv", "node_modules")
 
 def _link_directory(source: Path, target: Path) -> None:
     """Create a directory link (junction on Windows) without copying contents."""
-    if os.name == "nt":
+    if sys.platform == "win32":
         import _winapi
 
         _winapi.CreateJunction(str(source), str(target))
