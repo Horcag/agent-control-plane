@@ -576,6 +576,88 @@ class PromptBuilderTest(unittest.TestCase):
             # Materially smaller check (e.g. less than half the size of IDE prompt)
             self.assertTrue(len(native_writable) < len(ide_prompt) * 0.6)
 
+    def test_prompt_lists_exact_worker_only_gate_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _coordination_files(root, "task-1")
+            config = ControlConfig(
+                config_path=root / "workspaces.toml",
+                project_root=root,
+                coordination_root=root / ".agent-work",
+                runs_root=root / "runs",
+                database_path=root / "runs" / "jobs.sqlite3",
+                worktree_root=root / "worktrees",
+                worktree_base=root / "main",
+                slot_root=root / "slots",
+                agy_command="agy",
+                codex_command="codex",
+                defaults=ControlDefaults(
+                    timeout_sec=10,
+                    idle_timeout_sec=5,
+                    print_timeout="10s",
+                    max_restarts=0,
+                    yolo=False,
+                    allow_dirty=False,
+                    prepare_slots=True,
+                    guardrail_poll_sec=2.0,
+                    forbidden_status_globs=("uv.lock", ".venv/**"),
+                ),
+                routes=MappingProxyType(
+                    {
+                        "main": RouteConfig(
+                            name="main",
+                            path=root / "main",
+                            required_branch="main",
+                            worktree_root=root / "worktrees",
+                            worktree_base=root / "main",
+                            source_roots=(Path("backend"),),
+                            test_roots=(Path("backend/tests"),),
+                            exclude_dirs=(),
+                            native_quality_policy="controller",
+                            native_quality_max_parallel=1,
+                            native_quality_gates=(
+                                NativeQualityGateConfig(
+                                    name="controller-only",
+                                    command=("python", "scripts/run_affected_tests.py"),
+                                    include_globs=(),
+                                    run_on="controller",
+                                ),
+                                NativeQualityGateConfig(
+                                    name="worker-only",
+                                    command=("python", "-m", "mypy", "--strict", "src"),
+                                    include_globs=("*.py", "**/*.py"),
+                                    run_on="worker",
+                                ),
+                            ),
+                        )
+                    }
+                ),
+                slots=MappingProxyType({}),
+                slot_prepare=(),
+            )
+
+            workspace = root.parent / "main-tiger-agent-slots" / "dev-3"
+            prompt = build_task_prompt(
+                config=config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="native",
+                read_only=False,
+            )
+
+            self.assertIn(
+                "[worker-only] cwd=.: python -m mypy --strict src; Applies to: *.py, **/*.py",
+                prompt,
+            )
+            self.assertIn(
+                "Controller-executed gates (maximum 1 in parallel): controller-only.",
+                prompt,
+            )
+            self.assertNotIn("[controller-only] cwd=", prompt)
+
 
 def _coordination_files(
     root: Path,
