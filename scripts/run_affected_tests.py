@@ -3,12 +3,15 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import subprocess  # nosec B404
 import sys
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+
+FULL_SUITE_ENV_VAR = "ACP_QUALITY_FULL_SUITE"
 
 
 @dataclass(frozen=True)
@@ -214,16 +217,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--head", default="HEAD", help="Git head revision (default: HEAD)")
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="Repository root")
     parser.add_argument("--list", action="store_true", help="Print selection JSON without pytest")
+    parser.add_argument(
+        "--full-suite",
+        action="store_true",
+        help=(
+            "Force the full test suite regardless of the change set "
+            f"(also honors {FULL_SUITE_ENV_VAR}=1). Used for zero-change verification "
+            "evidence, where an empty change set must not silently skip testing."
+        ),
+    )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     repo_root = args.repo.resolve(strict=False)
+    force_full_suite = args.full_suite or os.environ.get(FULL_SUITE_ENV_VAR) == "1"
     try:
         changed = (
             changed_worktree_files(repo_root)
             if args.worktree
             else changed_files_since(repo_root, args.base, args.head)
         )
-        selection = select_affected_tests(repo_root, changed)
+        if force_full_suite:
+            selection = TestSelection(
+                (), full_suite=True, reason="explicit full-suite mode requested"
+            )
+        else:
+            selection = select_affected_tests(repo_root, changed)
     except RuntimeError as exc:
         changed = ()
         selection = TestSelection((), full_suite=True, reason=f"git comparison failed: {exc}")

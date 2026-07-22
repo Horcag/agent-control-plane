@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from scripts.run_affected_tests import changed_worktree_files, select_affected_tests
+
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "run_affected_tests.py"
 
 
 def test_source_change_follows_transitive_import_graph(tmp_path: Path) -> None:
@@ -111,6 +117,75 @@ def test_changed_worktree_files_includes_tracked_untracked_and_deleted_paths(
     )
 
 
+def test_full_suite_flag_forces_full_suite_despite_empty_change_set(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.name", "ACP Test")
+    _git(tmp_path, "config", "user.email", "acp-test@example.invalid")
+    _write(tmp_path, "base.txt", "base\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT),
+            "--repo",
+            str(tmp_path),
+            "--worktree",
+            "--full-suite",
+            "--list",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["changed_files"] == []
+    assert payload["full_suite"] is True
+    assert payload["reason"] == "explicit full-suite mode requested"
+
+
+def test_full_suite_env_var_forces_full_suite_despite_empty_change_set(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.name", "ACP Test")
+    _git(tmp_path, "config", "user.email", "acp-test@example.invalid")
+    _write(tmp_path, "base.txt", "base\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--repo", str(tmp_path), "--worktree", "--list"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "ACP_QUALITY_FULL_SUITE": "1"},
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["full_suite"] is True
+
+
+def test_empty_change_set_without_full_suite_flag_skips_everything(tmp_path: Path) -> None:
+    _git(tmp_path, "init")
+    _git(tmp_path, "config", "user.name", "ACP Test")
+    _git(tmp_path, "config", "user.email", "acp-test@example.invalid")
+    _write(tmp_path, "base.txt", "base\n")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-m", "base")
+
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPT), "--repo", str(tmp_path), "--worktree", "--list"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["changed_files"] == []
+    assert payload["full_suite"] is False
+
+
 def _write(root: Path, relative_path: str, content: str) -> None:
     path = root / relative_path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,6 +193,4 @@ def _write(root: Path, relative_path: str, content: str) -> None:
 
 
 def _git(path: Path, *args: str) -> None:
-    import subprocess
-
     subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)

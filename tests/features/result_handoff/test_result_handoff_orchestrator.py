@@ -885,6 +885,169 @@ def test_native_controller_gate_that_mutates_workspace_quarantines_slot(
     assert run_git(slot, "show", f"{item.checkpoint_sha}:worker.txt") == "checkpointed original"
 
 
+def test_zero_change_completed_job_reaches_review_ready_via_clean_tree_evidence(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-zero-change",
+        status_result="completed",
+        workspace_access="native",
+    )
+    expected_head_tree = run_git(slot, "rev-parse", "HEAD^{tree}")
+    _write_zero_change_result(job.result_path)
+
+    finished = control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert finished.status == "completed"
+    assert bundle is not None
+    assert bundle["review_ready"] is True
+    assert bundle["artifact"]["kind"] == "clean_tree"
+    assert bundle["artifact"]["clean_tree_sha"] == expected_head_tree
+    assert bundle["artifact"]["checkpoint_sha"] is None
+    assert bundle["controller_quality"]["state"] == "valid"
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    assert bundle["controller_quality"]["payload"]["checkpoint_tree_sha"] == expected_head_tree
+    assert bundle["controller_quality"]["payload"]["changed_files"] == []
+    assert item.checkpoint_ref is None
+    assert item.slot_released is True
+    assert workspace_state(slot).porcelain == ""
+    assert run_git(slot, "rev-parse", "HEAD^{tree}") == expected_head_tree
+
+
+def test_zero_change_completed_job_with_failing_gate_is_not_review_ready(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "raise SystemExit(7)")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-zero-change-failing",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_zero_change_result(job.result_path)
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["review_ready"] is False
+    assert bundle["artifact"]["kind"] == "clean_tree"
+    assert bundle["controller_quality"]["state"] == "valid"
+    assert bundle["controller_quality"]["payload"]["status"] == "failed"
+    # The workspace itself is untouched and still clean, so the slot is safe to reuse
+    # even though review acceptance is blocked.
+    assert item.slot_released is True
+    assert workspace_state(slot).porcelain == ""
+
+
+def test_zero_change_completed_job_with_mutating_gate_is_not_review_ready_and_keeps_slot(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('gate-mutated.txt').write_text('unexpected')",
+    )
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="mutating", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-zero-change-mutating",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_zero_change_result(job.result_path)
+
+    finished = control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert finished.finalization_status == "failed"
+    assert item.delivery_status == "checkpoint_failed"
+    assert item.verification_bundle is not None
+    assert item.verification_bundle["review_ready"] is False
+    assert "clean-tree evidence rejected" in (item.checkpoint_error or "")
+    assert item.slot_released is False
+    slot_state = control.slots.inspect_slot("app-1")
+    assert slot_state.status == "checkpoint_failed"
+
+
+def test_zero_change_result_only_without_controller_evidence_stays_not_review_ready(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy=None,
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-zero-change-ide-mcp",
+        status_result="completed",
+        workspace_access="ide_mcp",
+    )
+    _write_zero_change_result(job.result_path)
+
+    control.finish_job(job.job_id, "completed")
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["artifact"]["kind"] == "result_only"
+    assert bundle["controller_quality"]["state"] == "not_required"
+    # Native quality is not applicable to ide_mcp workspaces; the format/worker
+    # checks alone still make this reviewable, matching pre-existing behavior.
+    assert bundle["review_ready"] is True
+
+
 def test_persisted_quality_contract_drift_is_not_executed(tmp_path: Path) -> None:
     route = _committed_repo(tmp_path / "repo")
     slot = _committed_repo(tmp_path / "slots" / "app-1")
@@ -1396,6 +1559,104 @@ def test_requalify_flips_review_ready_once_the_flaky_controller_gate_passes(
     assert workspace_state(slot).porcelain == ""
 
 
+def test_requalify_flips_review_ready_for_clean_tree_evidence_once_flaky_gate_passes(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    marker = tmp_path / "flaky-clean-tree-marker"
+    flaky_command = (
+        sys.executable,
+        "-c",
+        f"import pathlib, sys; sys.exit(0 if pathlib.Path(r'{marker}').exists() else 1)",
+    )
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="flaky", command=flaky_command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-requalify-clean-tree",
+        status_result="completed",
+        workspace_access="native",
+    )
+    expected_head_tree = run_git(slot, "rev-parse", "HEAD^{tree}")
+    _write_zero_change_result(job.result_path)
+
+    control.finish_job(job.job_id, "completed")
+
+    item_id = f"agent_job:{job.job_id}"
+    first = control.review_inbox.get(item_id)
+    assert first.verification_bundle is not None
+    assert first.verification_bundle["review_ready"] is False
+    assert first.verification_bundle["artifact"]["kind"] == "clean_tree"
+    assert first.checkpoint_ref is None
+    assert first.requalify_count == 0
+
+    marker.write_text("now passing\n", encoding="utf-8")
+    result = control.requalify_review_inbox_item(item_id)
+    bundle = result["verification_bundle"]
+
+    assert bundle["review_ready"] is True
+    assert bundle["artifact"]["kind"] == "clean_tree"
+    assert bundle["artifact"]["clean_tree_sha"] == expected_head_tree
+    updated = control.review_inbox.get(item_id)
+    assert updated.verification_bundle == bundle
+    assert updated.requalify_count == 1
+    assert updated.review_status == "pending"
+    assert workspace_state(slot).porcelain == ""
+    assert run_git(slot, "rev-parse", "HEAD^{tree}") == expected_head_tree
+
+
+def test_requalify_rejects_clean_tree_evidence_once_head_moves(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller-ok')")
+    config = _config(
+        tmp_path,
+        route,
+        slot,
+        terminal_slot_policy="checkpoint",
+        native_quality_policy="controller",
+        native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+    )
+    control = AgentControlPlane(config)
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-requalify-clean-tree-moved",
+        status_result="completed",
+        workspace_access="native",
+    )
+    _write_zero_change_result(job.result_path)
+
+    control.finish_job(job.job_id, "completed")
+
+    item_id = f"agent_job:{job.job_id}"
+    first = control.review_inbox.get(item_id)
+    assert first.verification_bundle is not None
+    assert first.verification_bundle["review_ready"] is True
+
+    (slot / "new-file.txt").write_text("moved on\n", encoding="utf-8")
+    _git(slot, "add", ".")
+    _git(slot, "commit", "-m", "moved head after acceptance evidence was recorded")
+
+    with pytest.raises(ValueError, match="HEAD moved"):
+        control.requalify_review_inbox_item(item_id)
+
+    unchanged = control.review_inbox.get(item_id)
+    assert unchanged.verification_bundle == first.verification_bundle
+    assert unchanged.requalify_count == 0
+
+
 def test_requalify_rejects_missing_checkpoint_ref_and_leaves_the_record_unchanged(
     tmp_path: Path,
 ) -> None:
@@ -1583,6 +1844,46 @@ Not verified / remaining risks:
     )
     (slot / "worker.txt").write_text("reviewed result\n", encoding="utf-8")
     control.finish_job(job.job_id, result_status)
+
+
+def _write_zero_change_result(result_path: Path) -> None:
+    result_path.write_text(
+        """Status: completed
+
+Changed files:
+- none
+
+What changed:
+- Confirmed the existing behavior is already correct; no edits were needed.
+
+Verification performed:
+- pytest -q (passed)
+
+Not verified / remaining risks:
+- none
+""",
+        encoding="utf-8",
+    )
+    result_path.with_name("verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "changed_files": [],
+                "checks": [
+                    {
+                        "command": "pytest -q",
+                        "cwd": ".",
+                        "outcome": "passed",
+                        "exit_code": 0,
+                        "summary": "3 passed",
+                    }
+                ],
+                "unverified": [],
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _config(

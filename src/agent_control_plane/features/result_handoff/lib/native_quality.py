@@ -21,6 +21,7 @@ from agent_control_plane.shared.native_quality import (
 from agent_control_plane.shared.path_rules import is_same_or_child
 
 MAX_QUALITY_OUTPUT_CHARS = 8_000
+FULL_SUITE_ENV_VAR = "ACP_QUALITY_FULL_SUITE"
 
 
 def _resolve_gate_executable(cwd: Path, command: tuple[str, ...]) -> tuple[str, ...]:
@@ -69,6 +70,7 @@ class NativeQualityGateRunner:
         command_files: tuple[str, ...] | None = None,
         contract: NativeQualityContract,
         controller_gate_mode: str = "full",
+        full_suite: bool = False,
     ) -> dict[str, Any]:
         resolved_command_files = changed_files if command_files is None else command_files
         selected = selected_native_quality_gates(
@@ -83,6 +85,7 @@ class NativeQualityGateRunner:
             selected,
             resolved_command_files,
             max_parallel=contract.max_parallel,
+            full_suite=full_suite,
         )
         if not selected:
             status = "failed"
@@ -116,6 +119,7 @@ class NativeQualityGateRunner:
         command_files: tuple[str, ...],
         *,
         max_parallel: int,
+        full_suite: bool = False,
     ) -> list[dict[str, Any]]:
         if not gates:
             return []
@@ -123,7 +127,9 @@ class NativeQualityGateRunner:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             return list(
                 executor.map(
-                    lambda gate: self._run_gate(workspace_path, gate, command_files),
+                    lambda gate: self._run_gate(
+                        workspace_path, gate, command_files, full_suite=full_suite
+                    ),
                     gates,
                 )
             )
@@ -133,6 +139,8 @@ class NativeQualityGateRunner:
         workspace_path: Path,
         gate: NativeQualityGateConfig,
         command_files: tuple[str, ...],
+        *,
+        full_suite: bool = False,
     ) -> dict[str, Any]:
         workspace = workspace_path.resolve(strict=False)
         cwd = (workspace / gate.working_dir).resolve(strict=False)
@@ -158,6 +166,10 @@ class NativeQualityGateRunner:
                 output="quality gate working_dir does not exist",
                 command=command,
             )
+        spawn_env = None
+        if full_suite:
+            spawn_env = os.environ.copy()
+            spawn_env[FULL_SUITE_ENV_VAR] = "1"
         with tempfile.TemporaryFile() as output_file:
             spawn_command = _resolve_gate_executable(cwd, command)
             try:
@@ -169,6 +181,7 @@ class NativeQualityGateRunner:
                     stdin=subprocess.DEVNULL,
                     check=False,
                     timeout=gate.timeout_sec,
+                    env=spawn_env,
                 )
             except subprocess.TimeoutExpired:
                 output = _read_output_tail(output_file)

@@ -94,6 +94,7 @@ def build_verification_bundle(
     run_dir: Path | None = None,
     source_status: str | None = None,
     workspace_changed: bool | None = None,
+    clean_tree_sha: str | None = None,
     quality_contract: NativeQualityContract | None = None,
     quality_contract_error: str | None = None,
     expected_result_status: str | None = None,
@@ -163,7 +164,9 @@ def build_verification_bundle(
     has_changes = workspace_changed if workspace_changed is not None else bool(changed_paths)
     effective_status = source_status or result["status"]
     quality_required = bool(
-        contract.policy != "off" and effective_status == "completed" and has_changes
+        contract.policy != "off"
+        and effective_status == "completed"
+        and (has_changes or clean_tree_sha is not None)
     )
     worker_quality = _assess_worker_quality(
         worker_verification,
@@ -190,6 +193,15 @@ def build_verification_bundle(
             checkpoint_tree_sha=checkpoint.tree_sha,
             changed_files=changed_paths,
             command_files=command_paths,
+            contract=contract,
+            controller_gate_mode=controller_gate_mode,
+        )
+    elif controller_required and run_dir is not None and checkpoint is None and clean_tree_sha:
+        controller_quality = inspect_native_quality_report(
+            run_dir,
+            checkpoint_tree_sha=clean_tree_sha,
+            changed_files=(),
+            command_files=(),
             contract=contract,
             controller_gate_mode=controller_gate_mode,
         )
@@ -263,10 +275,17 @@ def build_verification_bundle(
         ),
         "actual_changed_files_missing_from_worker_bundle": sorted(actual - worker_changes),
         "artifact": {
-            "kind": "checkpoint" if checkpoint is not None else "result_only",
+            "kind": (
+                "checkpoint"
+                if checkpoint is not None
+                else "clean_tree"
+                if clean_tree_sha is not None
+                else "result_only"
+            ),
             "checkpoint_ref": checkpoint.ref_name if checkpoint is not None else None,
             "checkpoint_sha": checkpoint.commit_sha if checkpoint is not None else None,
             "checkpoint_verified": checkpoint_verified,
+            "clean_tree_sha": clean_tree_sha if checkpoint is None else None,
             "disposition": "contaminated" if temporary_patch_artifacts else "normal",
             "matched_paths": list(temporary_patch_artifacts),
             "error": artifact_error,

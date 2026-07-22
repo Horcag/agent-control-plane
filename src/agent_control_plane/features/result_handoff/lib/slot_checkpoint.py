@@ -179,6 +179,25 @@ def clean_checkpointed_workspace(
         )
 
 
+def verify_clean_workspace_tree(workspace_path: Path) -> str:
+    """Return ``HEAD^{tree}`` for a workspace verified to have no pending changes.
+
+    Used by the zero-change evidence path: a genuinely clean workspace has
+    nothing to checkpoint, so controller quality gates bind directly to this
+    tree sha instead of a checkpoint commit.
+    """
+    workspace = workspace_path.resolve(strict=False)
+    try:
+        state = workspace_state(workspace)
+    except GitError as exc:
+        raise SlotCheckpointError(f"Could not inspect workspace: {exc}") from exc
+    if state.dirty:
+        raise SlotCheckpointError(
+            "Workspace has pending changes; not eligible for clean-tree evidence"
+        )
+    return _git(workspace, "rev-parse", "HEAD^{tree}")
+
+
 def verify_slot_checkpoint(workspace_path: Path, checkpoint: SlotCheckpoint) -> None:
     workspace = workspace_path.resolve(strict=False)
     if workspace != checkpoint.workspace_path.resolve(strict=False):

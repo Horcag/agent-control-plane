@@ -4,6 +4,7 @@ import sqlite3
 import uuid
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from agent_control_plane.entities.job import JobRecord, JobStore
 from agent_control_plane.entities.review_inbox import (
@@ -28,6 +29,7 @@ from agent_control_plane.features.result_handoff import (
     clean_checkpointed_workspace,
     create_slot_checkpoint,
     parse_result_report,
+    verify_clean_workspace_tree,
     verify_slot_checkpoint,
 )
 from agent_control_plane.features.slot_lifecycle import SlotManager
@@ -190,13 +192,35 @@ class FinalizationService:
             )
         if item.source_kind != "agent_job":
             raise ValueError(f"Review item {item_id} has no requalifiable job checkpoint")
-        if not all(
+        has_checkpoint = all(
             (item.checkpoint_ref, item.checkpoint_sha, item.checkpoint_tree_sha, item.base_sha)
-        ):
+        )
+        clean_tree_sha = None if has_checkpoint else _existing_clean_tree_sha(item)
+        if not has_checkpoint and clean_tree_sha is None:
             raise ValueError(
-                f"Review item {item_id} has no durable checkpoint to requalify against"
+                f"Review item {item_id} has no durable checkpoint or clean-tree evidence "
+                "to requalify against"
             )
         job = self.store.get_job(item.source_id)
+        if has_checkpoint:
+            verification_bundle = self._requalify_checkpoint(item_id, item, job)
+        else:
+            verification_bundle = self._requalify_clean_tree(item_id, job, str(clean_tree_sha))
+        updated = self.review_inbox.requalify(item_id, verification_bundle)
+        self.store.add_event(
+            job.job_id,
+            "info",
+            f"Review inbox item {item_id} requalified "
+            f"(review_ready={verification_bundle.get('review_ready')})",
+        )
+        return updated
+
+    def _requalify_checkpoint(
+        self,
+        item_id: str,
+        item: ReviewInboxItem,
+        job: JobRecord,
+    ) -> dict[str, Any]:
         checkpoint = SlotCheckpoint(
             job_id=job.job_id,
             task_id=job.task_id,
@@ -241,7 +265,7 @@ class FinalizationService:
                         f"Controller quality gate mutated the checkpoint checkout for {item_id}; "
                         "requalify aborted"
                     )
-        verification_bundle = build_verification_bundle(
+        return build_verification_bundle(
             job.result_path,
             workspace_path=job.workspace_path,
             checkpoint=checkpoint,
@@ -253,14 +277,57 @@ class FinalizationService:
             expected_result_status=job.expected_result_status,
             controller_gate_mode=job.controller_gate_mode,
         )
-        updated = self.review_inbox.requalify(item_id, verification_bundle)
-        self.store.add_event(
-            job.job_id,
-            "info",
-            f"Review inbox item {item_id} requalified "
-            f"(review_ready={verification_bundle.get('review_ready')})",
+
+    def _requalify_clean_tree(
+        self,
+        item_id: str,
+        job: JobRecord,
+        clean_tree_sha: str,
+    ) -> dict[str, Any]:
+        try:
+            current_tree = verify_clean_workspace_tree(job.workspace_path)
+        except (GitError, SlotCheckpointError) as exc:
+            raise ValueError(
+                f"Clean-tree workspace for {item_id} could not be verified: {exc}"
+            ) from exc
+        if current_tree != clean_tree_sha:
+            raise ValueError(
+                f"HEAD moved for {item_id} since the recorded clean-tree evidence; "
+                "nothing to materialize for requalify"
+            )
+        contract, contract_error = self._native_quality_contract(job)
+        if contract_error is not None:
+            raise ValueError(f"Native quality contract for {item_id} is invalid: {contract_error}")
+        if contract.policy == "controller" and job.controller_gate_mode != "none":
+            self.native_quality_runner.run(
+                workspace_path=job.workspace_path,
+                run_dir=job.run_dir,
+                checkpoint_tree_sha=clean_tree_sha,
+                changed_files=(),
+                command_files=(),
+                contract=contract,
+                controller_gate_mode=job.controller_gate_mode,
+                full_suite=True,
+            )
+            after_tree = verify_clean_workspace_tree(job.workspace_path)
+            if after_tree != clean_tree_sha:
+                raise SlotCheckpointError(
+                    f"Controller quality gates mutated the clean tree for {item_id}; "
+                    "requalify aborted"
+                )
+        return build_verification_bundle(
+            job.result_path,
+            workspace_path=job.workspace_path,
+            checkpoint=None,
+            run_dir=job.run_dir,
+            source_status=job.status,
+            workspace_changed=False,
+            clean_tree_sha=clean_tree_sha,
+            quality_contract=contract,
+            quality_contract_error=None,
+            expected_result_status=job.expected_result_status,
+            controller_gate_mode=job.controller_gate_mode,
         )
-        return updated
 
     def finish_slot_lifecycle(
         self,
@@ -317,6 +384,10 @@ class FinalizationService:
                 job_status,
                 allow_inactive=allow_inactive,
             )
+        if not state.dirty and job_status == "completed":
+            clean_tree_item = self._release_clean_tree_quality(job, allow_inactive=allow_inactive)
+            if clean_tree_item is not None:
+                return clean_tree_item
 
         slot_status, slot_note = self._slot_release_status(job, job_status)
         if state.dirty:
@@ -563,6 +634,114 @@ class FinalizationService:
             )
         return item
 
+    def _release_clean_tree_quality(
+        self,
+        job: JobRecord,
+        *,
+        allow_inactive: bool,
+    ) -> ReviewInboxItem | None:
+        """Produce controller-quality evidence for a genuinely clean, zero-change job.
+
+        Returns None (leaving the caller's plain "ready" path in place) when the
+        job is not eligible for controller quality evidence at all, so this is a
+        pure addition: it never makes an otherwise-uncovered job worse.
+        """
+        contract, contract_error = self._native_quality_contract(job)
+        result_text = _read_result_text(job.result_path, fallback=None)
+        result_report = parse_result_report(result_text) if result_text is not None else None
+        eligible = (
+            job.expected_result_status == "completed"
+            and result_report is not None
+            and result_report["status"] == "completed"
+            and job.workspace_access == "native"
+            and not job.read_only
+            and contract.policy == "controller"
+            and contract_error is None
+            and job.controller_gate_mode != "none"
+        )
+        if not eligible:
+            return None
+        try:
+            clean_tree_sha = verify_clean_workspace_tree(job.workspace_path)
+        except (GitError, SlotCheckpointError):
+            return None
+
+        checkpoint_error: str | None = None
+        try:
+            self.native_quality_runner.run(
+                workspace_path=job.workspace_path,
+                run_dir=job.run_dir,
+                checkpoint_tree_sha=clean_tree_sha,
+                changed_files=(),
+                command_files=(),
+                contract=contract,
+                controller_gate_mode=job.controller_gate_mode,
+                full_suite=True,
+            )
+            after_state = workspace_state(job.workspace_path)
+            if after_state.dirty:
+                checkpoint_error = (
+                    "controller quality gates left the clean workspace dirty; "
+                    "clean-tree evidence rejected"
+                )
+            else:
+                after_tree = verify_clean_workspace_tree(job.workspace_path)
+                if after_tree != clean_tree_sha:
+                    checkpoint_error = (
+                        "HEAD tree changed while controller quality gates ran against "
+                        "the clean tree; evidence rejected"
+                    )
+        except (GitError, OSError, SlotCheckpointError) as exc:
+            checkpoint_error = f"controller quality gates against the clean tree failed: {exc}"
+
+        if checkpoint_error is not None:
+            # The workspace was verified clean before the gates ran, so anything wrong
+            # now was introduced by the gate run itself. That is still an environment
+            # integrity failure, not merely a failed check: never hand the slot to
+            # another job in this state, same fail-closed posture as a checkpoint whose
+            # workspace changed underneath it.
+            item = self._upsert_job_review(
+                job,
+                delivery_status="checkpoint_failed",
+                checkpoint_error=checkpoint_error,
+                slot_released=False,
+            )
+            self._release_slot_status(
+                job,
+                status="checkpoint_failed",
+                note=f"job {job.job_id} clean-tree controller quality evidence failed: {checkpoint_error}",
+                allow_inactive=True,
+            )
+            self.store.add_event(
+                job.job_id,
+                "error",
+                f"Clean-tree controller quality evidence failed: {checkpoint_error}",
+            )
+            return item
+
+        delivery_status = "ready"
+        item = self._upsert_job_review(
+            job,
+            delivery_status=delivery_status,
+            clean_tree_sha=clean_tree_sha,
+            slot_released=False,
+        )
+        slot_status, slot_note = self._slot_release_status(job, job.status)
+        released = self._release_slot_status(
+            job,
+            status=slot_status,
+            note=slot_note,
+            allow_inactive=allow_inactive,
+        )
+        if slot_status == "available" and released:
+            item = self._upsert_job_review(
+                job,
+                delivery_status=delivery_status,
+                clean_tree_sha=clean_tree_sha,
+                slot_released=True,
+            )
+        return item
+
     def _preserve_checkpoint_salvage(self, job: JobRecord) -> None:
         existing = self.store.get_job(job.job_id).checkpoint_disposition
         if existing in {"contaminated", "continuation_verified", "final_accepted"}:
@@ -576,6 +755,7 @@ class FinalizationService:
         delivery_status: str,
         checkpoint: SlotCheckpoint | None = None,
         checkpoint_error: str | None = None,
+        clean_tree_sha: str | None = None,
         slot_released: bool,
     ) -> ReviewInboxItem:
         result_text = _read_result_text(job.result_path, fallback=job.last_error)
@@ -588,8 +768,11 @@ class FinalizationService:
             run_dir=job.run_dir,
             source_status=job.status,
             workspace_changed=(
-                True if checkpoint is not None or "dirty" in delivery_status else None
+                False
+                if clean_tree_sha is not None
+                else (True if checkpoint is not None or "dirty" in delivery_status else None)
             ),
+            clean_tree_sha=clean_tree_sha,
             quality_contract=quality_contract,
             quality_contract_error=quality_contract_error,
             expected_result_status=job.expected_result_status,
@@ -690,3 +873,14 @@ def _read_result_text(path: Path, *, fallback: str | None) -> str | None:
     except OSError:
         return fallback
     return text or fallback
+
+
+def _existing_clean_tree_sha(item: ReviewInboxItem) -> str | None:
+    bundle = item.verification_bundle
+    if not isinstance(bundle, dict):
+        return None
+    artifact = bundle.get("artifact")
+    if not isinstance(artifact, dict) or artifact.get("kind") != "clean_tree":
+        return None
+    clean_tree_sha = artifact.get("clean_tree_sha")
+    return clean_tree_sha if isinstance(clean_tree_sha, str) and clean_tree_sha else None

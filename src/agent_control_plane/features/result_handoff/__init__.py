@@ -17,6 +17,7 @@ from agent_control_plane.features.result_handoff.lib.slot_checkpoint import (
     checkpoint_temporary_patch_artifacts,
     clean_checkpointed_workspace,
     create_slot_checkpoint,
+    verify_clean_workspace_tree,
     verify_slot_checkpoint,
 )
 from agent_control_plane.features.result_handoff.lib.verification_bundle import (
@@ -39,5 +40,6 @@ __all__ = [
     "inspect_native_quality_report",
     "parse_result_report",
     "scan_codex_subagent_completions",
+    "verify_clean_workspace_tree",
     "verify_slot_checkpoint",
 ]
