@@ -50,6 +50,11 @@ native_quality_policy = "worker"
 terminal_slot_policy = "checkpoint"
 codex_disabled_mcp_servers = []
 codex_no_progress_timeout_sec = 600
+# Kill a writable worker whose uncommitted diff grows past this many changed lines
+# without a valid result. This targets runaway agents trashing a workspace, not
+# honest implementation size — keep it far above real slices. 0 disables the check.
+# Each [routes.<name>] table may override it with the same key.
+dirty_diff_max_changed_lines = 8000
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
 codex_quality_tier = "cheap-first"

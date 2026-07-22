@@ -76,6 +76,7 @@ class ExecutionState:
     guardrail_baseline: GuardrailBaseline
     route_root_baseline: WorkspaceDirtyBaseline | None
     forbidden_tool_markers: tuple[str, ...]
+    dirty_diff_max_changed_lines: int
     max_attempts: int
     model_index: int = 0
     resume_thread_id: str | None = None
@@ -146,9 +147,10 @@ class AttemptGuard:
                 self._state.route_root_baseline,
             )
         if violation is None:
-            violation = self._execution.guardrails.codex_dirty_diff_violation(
+            violation = self._execution.guardrails.dirty_diff_violation(
                 self._job,
                 self._state.guardrail_baseline,
+                max_changed_lines=self._state.dirty_diff_max_changed_lines,
             )
         return violation
 
@@ -406,6 +408,11 @@ class JobExecutionService:
             if route_config and route_config.codex_forbidden_tool_markers is not None
             else self.config.defaults.codex_forbidden_tool_markers
         )
+        dirty_diff_max_changed_lines = (
+            route_config.dirty_diff_max_changed_lines
+            if route_config and route_config.dirty_diff_max_changed_lines is not None
+            else self.config.defaults.dirty_diff_max_changed_lines
+        )
         max_attempts = job.max_restarts + (
             len(model_ladder) if normalize_backend(job.backend) == CODEX_BACKEND else 1
         )
@@ -417,6 +424,7 @@ class JobExecutionService:
             guardrail_baseline=self.guardrails.workspace_baseline(job),
             route_root_baseline=self.guardrails.route_root_baseline(job, route_config),
             forbidden_tool_markers=forbidden_tool_markers,
+            dirty_diff_max_changed_lines=dirty_diff_max_changed_lines,
             max_attempts=max_attempts,
             last_result_message=f"{job.backend} did not run",
         )

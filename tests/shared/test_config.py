@@ -78,6 +78,41 @@ class ConfigTest(unittest.TestCase):
             Path("~/custom-claude.json").expanduser(),
         )
 
+    def test_dirty_diff_ceiling_defaults_and_overrides(self) -> None:
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+        )
+        route = b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+
+        config = load_config(config_contents=base + route)
+        self.assertEqual(config.defaults.dirty_diff_max_changed_lines, 8000)
+        self.assertIsNone(config.routes["main"].dirty_diff_max_changed_lines)
+
+        config = load_config(
+            config_contents=(
+                base
+                + b"[control.defaults]\n"
+                + b"dirty_diff_max_changed_lines = 0\n"
+                + route
+                + b"dirty_diff_max_changed_lines = 2500\n"
+            )
+        )
+        self.assertEqual(config.defaults.dirty_diff_max_changed_lines, 0)
+        self.assertEqual(config.routes["main"].dirty_diff_max_changed_lines, 2500)
+
+        with self.assertRaises(ValueError):
+            load_config(
+                config_contents=(
+                    base + route + b"dirty_diff_max_changed_lines = -1\n"
+                )
+            )
+
     def test_loads_slot_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

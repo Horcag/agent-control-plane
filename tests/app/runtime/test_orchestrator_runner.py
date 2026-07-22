@@ -8,12 +8,13 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 from agent_control_plane.app.runtime.job_guardrails import (
-    CODEX_DIRTY_DIFF_MAX_CHANGED_LINES,
+    DIRTY_DIFF_MAX_CHANGED_LINES,
+    JobGuardrails,
 )
 from agent_control_plane.app.runtime.orchestrator import (
     TERMINAL_STATUSES,
@@ -1913,7 +1914,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(result_state.status, "blocked")
             self.assertIn("uv.lock", result_text)
 
-    def test_codex_dirty_diff_guardrail_stops_large_patch(self) -> None:
+    def test_dirty_diff_guardrail_stops_large_patch(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -1953,11 +1954,117 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             result_state = inspect_result(job.result_path, 0.0)
 
             self.assertEqual(finished.status, "guardrail_violation")
-            self.assertIn("Codex dirty diff exceeded", finished.last_error or "")
+            self.assertIn("Dirty diff exceeded", finished.last_error or "")
             self.assertEqual(result_state.status, "blocked")
             self.assertIn("tracked.py", result_text)
             self.assertIn("guardrail.patch", result_text)
             self.assertTrue((job.run_dir / "guardrail.patch").exists())
+
+    def test_dirty_diff_guardrail_honors_route_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            tracked_file = workspace / "tracked.py"
+            tracked_file.write_text("base\n", encoding="utf-8")
+            _run(["git", "add", "tracked.py"], workspace)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Agy Test",
+                    "-c",
+                    "user.email=agy@example.test",
+                    "commit",
+                    "-m",
+                    "seed",
+                ],
+                workspace,
+            )
+            config = _config(root, workspace)
+            config = replace(
+                config,
+                routes=MappingProxyType(
+                    {
+                        "main": replace(
+                            config.routes["main"],
+                            dirty_diff_max_changed_lines=40,
+                        )
+                    }
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(control.config.coordination_root, "task-1")
+            job = _create_job(
+                control,
+                root,
+                workspace,
+                "job-1",
+                backend=CODEX_BACKEND,
+            )
+
+            with patch(
+                "agent_control_plane.app.runtime.orchestrator.CodexExecRunner",
+                return_value=_LargeDirtyCodexRunner(line_count=100),
+            ):
+                finished = control.run_job(job.job_id)
+
+            self.assertEqual(finished.status, "guardrail_violation")
+            self.assertIn("exceeded 40 changed-line growth", finished.last_error or "")
+
+    def test_dirty_diff_guardrail_explicit_limit_and_disable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            tracked_file = workspace / "tracked.py"
+            tracked_file.write_text("base\n", encoding="utf-8")
+            _run(["git", "add", "tracked.py"], workspace)
+            _run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Agy Test",
+                    "-c",
+                    "user.email=agy@example.test",
+                    "commit",
+                    "-m",
+                    "seed",
+                ],
+                workspace,
+            )
+            guardrails = JobGuardrails(("uv.lock",))
+            job = SimpleNamespace(
+                backend=CODEX_BACKEND,
+                result_path=root / "missing-result.md",
+                workspace_path=workspace,
+                read_only=False,
+            )
+            baseline = guardrails.workspace_baseline(job)  # type: ignore[arg-type]
+            tracked_file.write_text(
+                "".join(f"changed {index}\n" for index in range(60)),
+                encoding="utf-8",
+            )
+
+            violation = guardrails.dirty_diff_violation(
+                job,  # type: ignore[arg-type]
+                baseline,
+                max_changed_lines=50,
+            )
+            self.assertIsNotNone(violation)
+            self.assertIn("exceeded 50 changed-line growth", violation or "")
+
+            self.assertIsNone(
+                guardrails.dirty_diff_violation(
+                    job,  # type: ignore[arg-type]
+                    baseline,
+                    max_changed_lines=0,
+                )
+            )
+            self.assertIsNone(
+                guardrails.dirty_diff_violation(
+                    job,  # type: ignore[arg-type]
+                    baseline,
+                )
+            )
 
     def test_final_guardrail_rejects_completed_runner_late_forbidden_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1977,7 +2084,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn("uv.lock", finished.last_error or "")
             self.assertEqual(inspect_result(job.result_path, 0.0).status, "blocked")
 
-    def test_codex_dirty_diff_guardrail_limits_growth_for_resumed_job(self) -> None:
+    def test_dirty_diff_guardrail_limits_growth_for_resumed_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -2019,7 +2126,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 finished = control.run_job(job.job_id)
 
             self.assertEqual(finished.status, "guardrail_violation")
-            self.assertIn("Codex dirty diff exceeded", finished.last_error or "")
+            self.assertIn("Dirty diff exceeded", finished.last_error or "")
             self.assertIn("baseline", finished.last_error or "")
             self.assertIn("growth", finished.last_error or "")
 
@@ -2359,8 +2466,15 @@ class _MutatingForbiddenFileRunner:
 
 
 class _LargeDirtyCodexRunner:
+    def __init__(self, line_count: int | None = None) -> None:
+        self._line_count = line_count
+
     def run(self, spec: Any, **kwargs: Any) -> AgyRunResult:
-        line_count = CODEX_DIRTY_DIFF_MAX_CHANGED_LINES + 50
+        line_count = (
+            self._line_count
+            if self._line_count is not None
+            else DIRTY_DIFF_MAX_CHANGED_LINES + 50
+        )
         changed_lines = "".join(f"changed {index}\n" for index in range(line_count))
         (spec.workspace_path / "tracked.py").write_text(changed_lines, encoding="utf-8")
         kwargs["cancel_requested"]()
@@ -2369,7 +2483,7 @@ class _LargeDirtyCodexRunner:
             completed=False,
             exit_code=None,
             result_status=None,
-            message="runner stopped after Codex dirty diff guardrail check",
+            message="runner stopped after Dirty diff guardrail check",
         )
 
 

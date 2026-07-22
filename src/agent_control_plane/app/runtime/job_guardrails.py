@@ -18,7 +18,10 @@ from agent_control_plane.features.agent_runner import (
     normalize_backend,
 )
 from agent_control_plane.features.slot_lifecycle import RouteRootGuard, RouteRootSnapshot
-from agent_control_plane.shared.config import RouteConfig
+from agent_control_plane.shared.config import (
+    DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES,
+    RouteConfig,
+)
 from agent_control_plane.shared.git_tools import (
     GitError,
     compact_status_preview,
@@ -28,10 +31,13 @@ from agent_control_plane.shared.git_tools import (
     workspace_state,
 )
 
-# 500 killed legitimate Claude implementation jobs three times on 2026-07-20/21:
-# a single Write of one large test file crosses it between 2s guardrail polls,
-# faster than any incremental-commit discipline can reset the baseline.
-CODEX_DIRTY_DIFF_MAX_CHANGED_LINES = 1200
+# Fallback when the caller does not pass an explicit ceiling. The effective value is
+# resolved from config (defaults.dirty_diff_max_changed_lines, per-route
+# override) by JobExecutionService; calibration history lives next to the default in
+# shared.config. A single Write of one large file crosses low ceilings between 2s
+# guardrail polls, faster than any incremental-commit discipline can reset the
+# baseline — keep this far above honest implementation-slice size.
+DIRTY_DIFF_MAX_CHANGED_LINES = DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES
 ROUTE_ROOT_INDEX_GRACE_SEC = 15.0
 
 
@@ -181,11 +187,20 @@ class JobGuardrails:
         )
         return f"Forbidden workspace change detected: {details}"
 
-    def codex_dirty_diff_violation(
+    def dirty_diff_violation(
         self,
         job: JobRecord,
         baseline: GuardrailBaseline,
+        *,
+        max_changed_lines: int | None = None,
     ) -> str | None:
+        limit = (
+            DIRTY_DIFF_MAX_CHANGED_LINES
+            if max_changed_lines is None
+            else max_changed_lines
+        )
+        if limit <= 0:
+            return None
         if normalize_backend(job.backend) not in {CODEX_BACKEND, CLAUDE_BACKEND}:
             return None
         if inspect_result(job.result_path, 0.0).done:
@@ -193,20 +208,20 @@ class JobGuardrails:
         try:
             state = workspace_state(job.workspace_path)
         except GitError as exc:
-            return f"Codex dirty diff guardrail could not inspect git status: {exc}"
+            return f"Dirty diff guardrail could not inspect git status: {exc}"
         if not state.dirty:
             return None
         try:
             patch = diff_patch(job.workspace_path)
         except GitError as exc:
-            return f"Codex dirty diff guardrail could not inspect git diff: {exc}"
+            return f"Dirty diff guardrail could not inspect git diff: {exc}"
         changed_lines = self._diff_changed_line_count(patch)
         growth = max(0, changed_lines - baseline.diff_changed_lines)
-        if growth <= CODEX_DIRTY_DIFF_MAX_CHANGED_LINES:
+        if growth <= limit:
             return None
         return (
-            "Codex dirty diff exceeded "
-            f"{CODEX_DIRTY_DIFF_MAX_CHANGED_LINES} changed-line growth "
+            "Dirty diff exceeded "
+            f"{limit} changed-line growth "
             f"without a valid result (baseline {baseline.diff_changed_lines}, "
             f"current {changed_lines}, growth {growth}). "
             f"Dirty status: {compact_status_preview(state.porcelain)}"

@@ -108,6 +108,15 @@ class CodexRoutingPolicyConfig:
     adaptive: CodexAdaptiveRoutingConfig | None = None
 
 
+# Ceiling on uncommitted changed-line growth before the dirty-diff guardrail kills a
+# writable worker. Calibration history: 500 killed legitimate Claude implementation
+# jobs three times on 2026-07-20/21; 1200 killed a legitimate 1426-line slice on
+# 2026-07-22 (DCC-012B0a). The guardrail targets runaway agents trashing a workspace
+# (tens of thousands of junk lines), not honest implementation size, so the default
+# stays far above real slices. 0 disables the check.
+DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES = 8000
+
+
 @dataclass(frozen=True)
 class RouteConfig:
     name: str
@@ -135,6 +144,7 @@ class RouteConfig:
     native_quality_max_parallel: int = 1
     native_quality_gates: tuple[NativeQualityGateConfig, ...] = ()
     monitor_route_root: bool = True
+    dirty_diff_max_changed_lines: int | None = None
 
 
 @dataclass(frozen=True)
@@ -179,6 +189,7 @@ class ControlDefaults:
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
     codex_no_progress_timeout_sec: int = 240
+    dirty_diff_max_changed_lines: int = DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES
     codex_quality_tier: str = "deep"
     codex_mechanical_model: str = "default"
     codex_mechanical_reasoning_effort: str = "low"
@@ -368,6 +379,13 @@ def load_config(
             defaults_raw.get("codex_no_progress_timeout_sec", 240),
             "codex_no_progress_timeout_sec",
         ),
+        dirty_diff_max_changed_lines=_non_negative_int(
+            defaults_raw.get(
+                "dirty_diff_max_changed_lines",
+                DEFAULT_DIRTY_DIFF_MAX_CHANGED_LINES,
+            ),
+            "dirty_diff_max_changed_lines",
+        ),
         codex_quality_tier=_routing_policy_name_value(
             defaults_raw.get("codex_quality_tier", "deep")
         ),
@@ -539,6 +557,10 @@ def load_config(
             native_quality_max_parallel=native_quality_max_parallel,
             native_quality_gates=native_quality_gates,
             monitor_route_root=bool(value.get("monitor_route_root", True)),
+            dirty_diff_max_changed_lines=_optional_non_negative_int(
+                value.get("dirty_diff_max_changed_lines"),
+                f"routes.{name}.dirty_diff_max_changed_lines",
+            ),
         )
 
     if not routes:
@@ -1204,12 +1226,15 @@ def _terminal_slot_policy_value(value: Any) -> str:
     return policy
 
 
-def _optional_non_negative_int(value: Any) -> int | None:
+def _optional_non_negative_int(
+    value: Any,
+    key: str = "control.defaults.auto_archive_days",
+) -> int | None:
     if value is None:
         return None
     parsed = int(value)
     if parsed < 0:
-        raise ValueError("control.defaults.auto_archive_days must be non-negative")
+        raise ValueError(f"{key} must be non-negative")
     return parsed
 
 

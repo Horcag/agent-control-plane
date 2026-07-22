@@ -11,10 +11,7 @@ from typing import Any
 
 from agent_control_plane.app.runtime.finalization_service import FinalizationService
 from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
-from agent_control_plane.app.runtime.job_guardrails import (
-    CODEX_DIRTY_DIFF_MAX_CHANGED_LINES,
-    JobGuardrails,
-)
+from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
 from agent_control_plane.entities.job import (
     JobRecord,
     JobStore,
@@ -389,7 +386,9 @@ class AgentControlPlane:
             "guardrails": {
                 "poll_sec": self.config.defaults.guardrail_poll_sec,
                 "forbidden_status_globs": self.config.defaults.forbidden_status_globs,
-                "codex_dirty_diff_max_changed_lines": CODEX_DIRTY_DIFF_MAX_CHANGED_LINES,
+                "dirty_diff_max_changed_lines": (
+                    self.config.defaults.dirty_diff_max_changed_lines
+                ),
                 "codex_no_progress_timeout_sec": (
                     self.config.defaults.codex_no_progress_timeout_sec
                 ),
