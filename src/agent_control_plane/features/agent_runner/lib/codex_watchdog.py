@@ -111,10 +111,13 @@ def scan_tool_timeouts(
     log_path: Path,
     scan_size: int,
     timeout_count: int,
+    limit: int = CODEX_TOOL_TIMEOUT_LIMIT,
 ) -> tuple[bool, int, int]:
     text, next_scan_size = _read_new_log_text(log_path, scan_size)
     timeout_count += text.count(CODEX_TOOL_TIMEOUT_MARKER)
-    return timeout_count >= CODEX_TOOL_TIMEOUT_LIMIT, next_scan_size, timeout_count
+    if limit <= 0:
+        return False, next_scan_size, timeout_count
+    return timeout_count >= limit, next_scan_size, timeout_count
 
 
 def scan_forbidden_tool(

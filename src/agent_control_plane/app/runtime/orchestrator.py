@@ -392,6 +392,7 @@ class AgentControlPlane:
                 "codex_no_progress_timeout_sec": (
                     self.config.defaults.codex_no_progress_timeout_sec
                 ),
+                "codex_tool_timeout_limit": self.config.defaults.codex_tool_timeout_limit,
             },
             "antigravity_manager": {
                 "auto_switch_agy_on_quota": self.config.defaults.auto_switch_agy_on_quota,

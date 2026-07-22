@@ -55,6 +55,9 @@ codex_no_progress_timeout_sec = 600
 # honest implementation size — keep it far above real slices. 0 disables the check.
 # Each [routes.<name>] table may override it with the same key.
 dirty_diff_max_changed_lines = 8000
+# Consecutive "Exit code: 124" tool-timeout markers observed in the worker log before the
+# job is killed as tool_timeout. 0 disables the check entirely.
+codex_tool_timeout_limit = 6
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
 codex_quality_tier = "cheap-first"

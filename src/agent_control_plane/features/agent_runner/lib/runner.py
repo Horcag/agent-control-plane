@@ -49,6 +49,7 @@ class AgentRunSpec:
     read_only: bool
     agy_model: str | None = None
     codex_no_progress_timeout_sec: int = 0
+    codex_tool_timeout_limit: int = 6
     codex_tool_call_budget: int = 0
     codex_terminal_tab_name: str | None = None
     codex_forbidden_tool_markers: tuple[str, ...] = ()

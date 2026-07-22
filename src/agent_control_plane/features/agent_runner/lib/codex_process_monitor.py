@@ -331,6 +331,7 @@ class CodexProcessMonitor:
             spec.log_path,
             scan_size,
             timeout_count,
+            spec.codex_tool_timeout_limit,
         )
         if not triggered:
             return None, next_scan_size, timeout_count
@@ -342,7 +343,8 @@ class CodexProcessMonitor:
                 "tool_timeout",
                 "Codex tool calls repeatedly hit "
                 f"{CODEX_TOOL_TIMEOUT_MARKER}; stopping after "
-                f"{timeout_count} occurrences instead of continuing without a result",
+                f"{timeout_count} occurrences (limit {spec.codex_tool_timeout_limit}) "
+                "instead of continuing without a result",
             ),
             next_scan_size,
             timeout_count,

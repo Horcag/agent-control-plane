@@ -221,6 +221,7 @@ path = "slots/reports-1"
             self.assertEqual(config.defaults.codex_disabled_mcp_servers, ())
             self.assertEqual(config.defaults.codex_forbidden_tool_markers, ())
             self.assertEqual(config.defaults.codex_no_progress_timeout_sec, 240)
+            self.assertEqual(config.defaults.codex_tool_timeout_limit, 6)
             self.assertEqual(config.defaults.codex_quality_tier, "deep")
             self.assertEqual(config.defaults.codex_mechanical_model, "gpt-5.6-luna")
             self.assertEqual(config.defaults.codex_mechanical_reasoning_effort, "low")
@@ -419,6 +420,64 @@ required_branch = "main"
             self.assertTrue(config.defaults.claude_bare)
             self.assertEqual(config.claude_model_catalog.models, ())
             self.assertEqual(config.claude_model_catalog.inventory, ())
+
+    def test_codex_tool_timeout_limit_parses_explicit_values(self) -> None:
+        for raw_value, expected in ((0, 0), (3, 3)):
+            with self.subTest(raw_value=raw_value), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                config_path = root / "config" / "workspaces.toml"
+                config_path.parent.mkdir(parents=True)
+                config_path.write_text(
+                    f"""
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+codex_tool_timeout_limit = {raw_value}
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                    encoding="utf-8",
+                )
+
+                config = load_config(config_path)
+
+                self.assertEqual(config.defaults.codex_tool_timeout_limit, expected)
+
+    def test_codex_tool_timeout_limit_rejects_negative_value(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[control.defaults]
+codex_tool_timeout_limit = -1
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "codex_tool_timeout_limit"):
+                load_config(config_path)
 
     def test_invalid_claude_permission_mode_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

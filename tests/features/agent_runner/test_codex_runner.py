@@ -18,10 +18,12 @@ from agent_control_plane.features.agent_runner.lib.codex_runner import (
 )
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     CODEX_INEFFICIENT_TOOL_USAGE_LIMIT,
+    CODEX_TOOL_TIMEOUT_LIMIT,
     dirty_file_markers_from_porcelain,
     is_known_temporary_patch_artifact,
     porcelain_changed_path,
     productive_log_activity_if_needed,
+    scan_tool_timeouts,
     updated_calls_without_durable_progress,
 )
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
@@ -502,7 +504,12 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 encoding="utf-8",
             )
             proc = _FakeProc()
-            spec = _spec(read_only=False, yolo=False, log_path=log_path)
+            spec = _spec(
+                read_only=False,
+                yolo=False,
+                log_path=log_path,
+                codex_tool_timeout_limit=2,
+            )
 
             result, scan_size, timeout_count = CodexProcessMonitor()._tool_timeout_result_if_needed(
                 proc,
@@ -515,9 +522,74 @@ class CodexRunnerCommandTest(unittest.TestCase):
             assert result is not None
             self.assertEqual(result.status, "tool_timeout")
             self.assertIn("Exit code: 124", result.message)
+            self.assertIn("limit 2", result.message)
             self.assertEqual(timeout_count, 2)
             self.assertGreater(scan_size, 0)
             self.assertTrue(proc.terminated)
+
+    def test_tool_timeout_uses_default_limit_when_spec_omits_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "attempt-001.log"
+            log_path.write_text(
+                "2026-07-02 ERROR codex_core::tools::router: error=Exit code: 124\n"
+                "2026-07-02 ERROR codex_core::tools::router: error=Exit code: 124\n",
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+            spec = _spec(read_only=False, yolo=False, log_path=log_path)
+
+            result, _scan_size, timeout_count = (
+                CodexProcessMonitor()._tool_timeout_result_if_needed(
+                    proc,
+                    spec,
+                    scan_size=0,
+                    timeout_count=0,
+                )
+            )
+
+            self.assertIsNone(result)
+            self.assertEqual(timeout_count, 2)
+            self.assertFalse(proc.terminated)
+
+    def test_scan_tool_timeouts_fires_on_configured_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "attempt-001.log"
+            log_path.write_text(
+                "Exit code: 124\nExit code: 124\n",
+                encoding="utf-8",
+            )
+
+            triggered, scan_size, timeout_count = scan_tool_timeouts(log_path, 0, 0, limit=3)
+            self.assertFalse(triggered)
+            self.assertEqual(timeout_count, 2)
+
+            log_path.write_text(
+                "Exit code: 124\nExit code: 124\nExit code: 124\n",
+                encoding="utf-8",
+            )
+            triggered, scan_size, timeout_count = scan_tool_timeouts(log_path, 0, 0, limit=3)
+            self.assertTrue(triggered)
+            self.assertEqual(timeout_count, 3)
+            self.assertGreater(scan_size, 0)
+
+    def test_scan_tool_timeouts_limit_zero_never_fires(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "attempt-001.log"
+            log_path.write_text(
+                "Exit code: 124\n" * 50,
+                encoding="utf-8",
+            )
+
+            triggered, _scan_size, timeout_count = scan_tool_timeouts(log_path, 0, 0, limit=0)
+
+            self.assertFalse(triggered)
+            self.assertEqual(timeout_count, 50)
+
+    def test_scan_tool_timeouts_default_limit_matches_constant(self) -> None:
+        import inspect
+
+        signature = inspect.signature(scan_tool_timeouts)
+        self.assertEqual(signature.parameters["limit"].default, CODEX_TOOL_TIMEOUT_LIMIT)
 
     def test_forbidden_web_search_stops_runner(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -749,6 +821,7 @@ def _spec(
     codex_sandbox_mode: str = "workspace-write",
     codex_disabled_mcp_servers: tuple[str, ...] = (),
     codex_no_progress_timeout_sec: int = 0,
+    codex_tool_timeout_limit: int = 6,
     codex_forbidden_tool_markers: tuple[str, ...] = (),
     codex_resume_thread_id: str | None = None,
     codex_tool_call_budget: int = 0,
@@ -765,6 +838,7 @@ def _spec(
         codex_sandbox_mode=codex_sandbox_mode,
         codex_disabled_mcp_servers=codex_disabled_mcp_servers,
         codex_no_progress_timeout_sec=codex_no_progress_timeout_sec,
+        codex_tool_timeout_limit=codex_tool_timeout_limit,
         codex_tool_call_budget=codex_tool_call_budget,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
         codex_resume_thread_id=codex_resume_thread_id,
