@@ -64,6 +64,13 @@ codex_tool_timeout_limit = 6
 # (budget + max(4, budget // 10) tool calls) terminates immediately even during the grace
 # window. 0 restores the legacy behavior of terminating the instant the budget is crossed.
 codex_tool_call_budget_grace_sec = 120
+# Grace window (seconds) after the monitor observes a done result with an INVALID
+# verification.json (present but failing schema/consistency checks) before the worker is
+# terminated as invalid_verification, naming the concrete validator error. A valid rewrite
+# landing within the window clears the timer and the job completes normally. Missing (not
+# yet written) verification.json is unaffected. 0 restores the legacy behavior where an
+# invalid file is only ever caught indirectly by an unrelated watchdog.
+codex_invalid_verification_grace_sec = 120
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.
 codex_quality_tier = "cheap-first"

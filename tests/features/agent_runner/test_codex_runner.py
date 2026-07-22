@@ -513,6 +513,134 @@ class CodexRunnerCommandTest(unittest.TestCase):
             assert state is not None
             self.assertEqual(state.status, "exited_without_result")
 
+    def test_writable_process_exit_with_invalid_verification_file_reports_invalid_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_invalid_verification(root)
+            proc = _FakeProc()
+            proc.terminate()
+
+            state = CodexProcessMonitor()._exited_result_if_dead(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    result_path=result_path,
+                    codex_invalid_verification_grace_sec=120,
+                ),
+                0.0,
+            )
+
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.status, "invalid_verification")
+            self.assertIn("unknown keys", state.message)
+
+    def test_invalid_verification_grace_window_expires_and_terminates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_invalid_verification(root)
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    codex_invalid_verification_grace_sec=1,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "invalid_verification")
+            self.assertTrue(proc.terminated)
+            self.assertIn("unknown keys", result.message)
+
+    def test_invalid_verification_grace_window_recovers_on_valid_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_invalid_verification(root)
+            log_path.with_suffix(".events.jsonl").write_text(
+                json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+
+            def _fix_verification() -> None:
+                time.sleep(0.3)
+                _write_verification(root, status="partial")
+
+            fixer = threading.Thread(target=_fix_verification, daemon=True)
+            fixer.start()
+            try:
+                result = CodexProcessMonitor().monitor(
+                    proc,
+                    _spec(
+                        read_only=False,
+                        yolo=False,
+                        log_path=log_path,
+                        result_path=result_path,
+                        codex_invalid_verification_grace_sec=5,
+                    ),
+                    started_wall=0.0,
+                    deadline_mono=time.monotonic() + 10,
+                    last_output_mono=time.monotonic(),
+                    last_log_size=0,
+                    log=io.StringIO(),
+                    cancel_requested=lambda: False,
+                )
+            finally:
+                fixer.join(timeout=5)
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(proc.terminated)
+
+    def test_invalid_verification_grace_disabled_keeps_legacy_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_invalid_verification(root)
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    codex_invalid_verification_grace_sec=0,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 0.3,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertNotEqual(result.status, "invalid_verification")
+            self.assertEqual(result.status, "timeout")
+
     def test_verification_mutation_after_terminal_observation_is_late_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -943,6 +1071,7 @@ def _spec(
     codex_resume_thread_id: str | None = None,
     codex_tool_call_budget: int = 0,
     codex_tool_call_budget_grace_sec: int = 0,
+    codex_invalid_verification_grace_sec: int = 0,
     log_path: Path | None = None,
     result_path: Path | None = None,
     workspace_access: str = "ide_mcp",
@@ -959,6 +1088,7 @@ def _spec(
         codex_tool_timeout_limit=codex_tool_timeout_limit,
         codex_tool_call_budget=codex_tool_call_budget,
         codex_tool_call_budget_grace_sec=codex_tool_call_budget_grace_sec,
+        codex_invalid_verification_grace_sec=codex_invalid_verification_grace_sec,
         codex_forbidden_tool_markers=codex_forbidden_tool_markers,
         codex_resume_thread_id=codex_resume_thread_id,
         prompt="secret task prompt",
@@ -995,6 +1125,22 @@ def _write_verification(root: Path, *, status: str) -> None:
                 "changed_files": [],
                 "checks": [],
                 "unverified": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_invalid_verification(root: Path) -> None:
+    (root / "verification.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": "partial",
+                "changed_files": [],
+                "checks": [],
+                "unverified": [],
+                "extra": "unexpected",
             }
         ),
         encoding="utf-8",

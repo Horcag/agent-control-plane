@@ -23,6 +23,7 @@ from agent_control_plane.features.agent_runner.lib.codex_watchdog import (
     updated_calls_without_durable_progress,
 )
 from agent_control_plane.features.agent_runner.lib.result_detector import (
+    ResultState,
     contains_capacity_marker,
     inspect_result,
     recover_result_from_last_message,
@@ -32,6 +33,7 @@ from agent_control_plane.features.agent_runner.lib.runner import (
     AgentRunSpec,
     BudgetLifecycleEvent,
 )
+from agent_control_plane.shared.verification_report import verification_path_for_result
 
 CODEX_COMPLETION_GRACE_SEC = 60.0
 
@@ -92,6 +94,8 @@ class CodexProcessMonitor:
         calls_without_durable_progress = 0
         budget_breach_mono: float | None = None
         budget_breach_message: str | None = None
+        invalid_verification_breach_mono: float | None = None
+        invalid_verification_marker: tuple[float | None, float | None, str | None] | None = None
 
         while True:
             log.flush()
@@ -247,6 +251,39 @@ class CodexProcessMonitor:
                     budget_scan.violation,
                     lifecycle_events=tuple(budget_events),
                 )
+
+            if not spec.read_only and spec.codex_invalid_verification_grace_sec > 0:
+                invalid_result_state = inspect_result(spec.result_path, started_wall)
+                if (
+                    invalid_result_state.done
+                    and invalid_result_state.verification_state == "invalid"
+                ):
+                    marker = _invalid_verification_marker(spec, invalid_result_state)
+                    if (
+                        invalid_verification_breach_mono is None
+                        or marker != invalid_verification_marker
+                    ):
+                        invalid_verification_breach_mono = now
+                        invalid_verification_marker = marker
+                    elif (
+                        now - invalid_verification_breach_mono
+                        >= spec.codex_invalid_verification_grace_sec
+                    ):
+                        terminate_spawned_process(proc)
+                        return replace(
+                            self._stopped_result(
+                                proc,
+                                "invalid_verification",
+                                _invalid_verification_message(
+                                    invalid_result_state,
+                                    spec.codex_invalid_verification_grace_sec,
+                                ),
+                            ),
+                            lifecycle_events=tuple(budget_events),
+                        )
+                else:
+                    invalid_verification_breach_mono = None
+                    invalid_verification_marker = None
 
             (
                 terminal_result,
@@ -488,6 +525,19 @@ class CodexProcessMonitor:
                 if spec.read_only
                 else inspect_result(spec.result_path, started_wall)
             )
+        if (
+            not spec.read_only
+            and spec.codex_invalid_verification_grace_sec > 0
+            and result_state.done
+            and result_state.verification_state == "invalid"
+        ):
+            return AgentRunResult(
+                status="invalid_verification",
+                completed=False,
+                exit_code=exit_code,
+                result_status=None,
+                message=f"verification.json invalid: {_invalid_verification_reason(result_state)}",
+            )
         if contains_capacity_marker(spec.log_path, last_message_path):
             return AgentRunResult(
                 status="capacity",
@@ -598,6 +648,34 @@ class CodexProcessMonitor:
                 return False
             time.sleep(0.1)
         return False
+
+
+def _optional_mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _invalid_verification_marker(
+    spec: AgentRunSpec, result_state: ResultState
+) -> tuple[float | None, float | None, str | None]:
+    return (
+        _optional_mtime(verification_path_for_result(spec.result_path)),
+        _optional_mtime(spec.result_path),
+        result_state.verification_error,
+    )
+
+
+def _invalid_verification_reason(result_state: ResultState) -> str:
+    return result_state.verification_error or "verification.json failed validation"
+
+
+def _invalid_verification_message(result_state: ResultState, grace_sec: int) -> str:
+    return (
+        f"verification.json invalid: {_invalid_verification_reason(result_state)}; "
+        f"grace of {grace_sec}s expired without a valid verification.json"
+    )
 
 
 def terminate_spawned_process(proc: TerminableProcess) -> None:
