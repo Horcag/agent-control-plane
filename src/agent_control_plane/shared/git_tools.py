@@ -10,7 +10,11 @@ class GitError(RuntimeError):
     pass
 
 
-GIT_TIMEOUT_SEC = 30
+# Generous on purpose. These calls include the guardrail's `git status` probe of a slot,
+# which can land while the worker's own quality gate is holding the index lock. In a repo
+# whose gate is `pre-commit run --all-files` over hundreds of files plus a full pytest run,
+# a 30s budget expired often enough to kill healthy jobs with a spurious guardrail failure.
+GIT_TIMEOUT_SEC = 180
 
 
 @dataclass(frozen=True)
