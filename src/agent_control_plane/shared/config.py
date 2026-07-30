@@ -396,9 +396,83 @@ def register_known_config(config_path: Path | str) -> Path:
 
 def resolve_config_for(cwd: Path | str | None = None) -> Path:
     resolved_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
+    norm_cwd_str = os.path.normcase(str(resolved_cwd))
+    norm_cwd = Path(norm_cwd_str)
 
-    # 1. Nearest config upwards
+    candidate_config_paths: list[Path] = []
+
+    def _add_config_path(p: Path) -> None:
+        try:
+            resolved_p = p.expanduser().resolve(strict=False)
+            if resolved_p.is_file() and resolved_p not in candidate_config_paths:
+                candidate_config_paths.append(resolved_p)
+        except OSError:
+            pass
+
+    # Collect known configs from index
+    cfg_file = known_configs_path()
+    if cfg_file.is_file():
+        try:
+            raw_index = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(raw_index, list):
+                for p in raw_index:
+                    if isinstance(p, str):
+                        _add_config_path(Path(p))
+        except (OSError, ValueError, KeyError):
+            pass
+
+    # Collect nearest config upwards
     curr: Path | None = resolved_cwd
+    while curr is not None:
+        candidate = curr / ".agent-work" / "workspaces.toml"
+        if candidate.is_file():
+            _add_config_path(candidate)
+            break
+        parent = curr.parent
+        if parent == curr:
+            break
+        curr = parent
+
+    # Collect default config
+    _add_config_path(default_config_path())
+
+    # Load candidate configs
+    loaded_configs: list[tuple[Path, ControlConfig]] = []
+    for cfg_path in candidate_config_paths:
+        try:
+            cfg = load_config(cfg_path)
+            loaded_configs.append((cfg_path, cfg))
+        except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError):
+            continue
+
+    # 1. Longest matching route path where route path equals cwd or cwd is a subdirectory
+    rule1_matches: list[tuple[tuple[int, int], str, Path]] = []
+    for cfg_path, cfg in loaded_configs:
+        norm_cfg_str = os.path.normcase(str(cfg_path))
+        best_score_for_cfg: tuple[int, int] | None = None
+        for route in cfg.routes.values():
+            try:
+                norm_route_str = os.path.normcase(str(route.path.resolve(strict=False)))
+            except OSError:
+                continue
+            norm_route = Path(norm_route_str)
+
+            if norm_cwd == norm_route or norm_route in norm_cwd.parents:
+                score = (len(norm_route.parts), len(norm_route_str))
+                if best_score_for_cfg is None or score > best_score_for_cfg:
+                    best_score_for_cfg = score
+
+        if best_score_for_cfg is not None:
+            rule1_matches.append((best_score_for_cfg, norm_cfg_str, cfg_path))
+
+    if rule1_matches:
+        best_score = max(m[0] for m in rule1_matches)
+        tied_configs = [m for m in rule1_matches if m[0] == best_score]
+        tied_configs.sort(key=lambda m: m[1])
+        return tied_configs[0][2]
+
+    # 2. Nearest .agent-work/workspaces.toml walking upwards from cwd
+    curr = resolved_cwd
     while curr is not None:
         candidate = curr / ".agent-work" / "workspaces.toml"
         if candidate.is_file():
@@ -408,59 +482,37 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
             break
         curr = parent
 
-    # 2. Known-config index
-    cfg_file = known_configs_path()
-    if cfg_file.is_file():
-        try:
-            raw_index = json.loads(cfg_file.read_text(encoding="utf-8"))
-            if isinstance(raw_index, list):
-                known_paths = [
-                    Path(p).expanduser().resolve(strict=False)
-                    for p in raw_index
-                    if isinstance(p, str)
-                ]
+    # 3. A config whose route path or coordination_root lies inside cwd (longest match first)
+    rule3_matches: list[tuple[tuple[int, int], str, Path]] = []
+    for cfg_path, cfg in loaded_configs:
+        norm_cfg_str = os.path.normcase(str(cfg_path))
+        best_rule3_score_for_cfg: tuple[int, int] | None = None
 
-                best_config: Path | None = None
-                best_match_score: tuple[int, int] = (-1, -1)
+        candidate_targets: list[Path] = [route.path for route in cfg.routes.values()]
+        candidate_targets.append(cfg.coordination_root)
 
-                norm_cwd_str = os.path.normcase(str(resolved_cwd))
-                norm_cwd = Path(norm_cwd_str)
+        for target in candidate_targets:
+            try:
+                norm_target_str = os.path.normcase(str(target.resolve(strict=False)))
+            except OSError:
+                continue
+            norm_target = Path(norm_target_str)
 
-                for known_p in known_paths:
-                    if not known_p.is_file():
-                        continue
-                    try:
-                        cfg = load_config(known_p)
-                    except (OSError, ValueError, KeyError):
-                        continue
+            if norm_cwd in norm_target.parents:
+                score = (len(norm_target.parts), len(norm_target_str))
+                if best_rule3_score_for_cfg is None or score > best_rule3_score_for_cfg:
+                    best_rule3_score_for_cfg = score
 
-                    candidate_paths: list[Path] = [
-                        cfg.config_path.parent.resolve(strict=False),
-                        cfg.coordination_root.resolve(strict=False),
-                    ]
-                    for route in cfg.routes.values():
-                        candidate_paths.append(route.path.resolve(strict=False))
+        if best_rule3_score_for_cfg is not None:
+            rule3_matches.append((best_rule3_score_for_cfg, norm_cfg_str, cfg_path))
 
-                    for cand in candidate_paths:
-                        norm_cand_str = os.path.normcase(str(cand))
-                        norm_cand = Path(norm_cand_str)
+    if rule3_matches:
+        best_score = max(m[0] for m in rule3_matches)
+        tied_configs = [m for m in rule3_matches if m[0] == best_score]
+        tied_configs.sort(key=lambda m: m[1])
+        return tied_configs[0][2]
 
-                        if (
-                            norm_cwd == norm_cand
-                            or norm_cand in norm_cwd.parents
-                            or norm_cwd in norm_cand.parents
-                        ):
-                            score = (len(norm_cand.parts), len(norm_cand_str))
-                            if score > best_match_score:
-                                best_match_score = score
-                                best_config = known_p
-
-                if best_config is not None:
-                    return best_config
-        except (OSError, ValueError, KeyError):
-            pass
-
-    # 3. Fallback
+    # 4. Fallback default config path
     return default_config_path()
 
 

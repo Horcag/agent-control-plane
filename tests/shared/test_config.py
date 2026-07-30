@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from agent_control_plane.shared.config import (
     CodexModelMetadataConfig,
+    default_config_path,
     ensure_mcp_server,
     find_enclosing_git_repo,
     load_config,
@@ -1550,6 +1551,128 @@ class ConfigDiscoveryTest(unittest.TestCase):
                 cwd_outside = root
                 res2 = resolve_config_for(cwd_outside)
                 self.assertEqual(res2, cfg2)
+
+    def test_resolve_config_for_discovery_precedence_by_specificity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            idx_file = root / "known-configs.json"
+
+            # 1. Outer repo (work) with its own .agent-work/workspaces.toml pointing route 'hhru' at work_dir
+            work_dir = root / "work"
+            work_dir.mkdir(parents=True)
+            work_cfg = work_dir / ".agent-work" / "workspaces.toml"
+            work_cfg.parent.mkdir(parents=True)
+            work_cfg.write_text(
+                f'[control]\ncoordination_root="{(work_cfg.parent).as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.hhru]\npath="{work_dir.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            # 2. Second config elsewhere (gvsu) whose route 'natively' points at a subdirectory of work_dir
+            natively_dir = work_dir / "sources" / "natively"
+            natively_dir.mkdir(parents=True)
+            gvsu_cfg_dir = root / "gvsu"
+            gvsu_cfg_dir.mkdir(parents=True)
+            gvsu_cfg = gvsu_cfg_dir / "workspaces.toml"
+
+            main_tiger_dir = root / "main-tiger"
+            main_tiger_dir.mkdir(parents=True)
+
+            gvsu_cfg.write_text(
+                f'[control]\ncoordination_root="{(gvsu_cfg_dir / ".agent-work").as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.natively]\npath="{natively_dir.as_posix()}"\nrequired_branch="main"\n'
+                f'[routes.main]\npath="{main_tiger_dir.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            # 3. Codar repo with its own .agent-work/workspaces.toml
+            codar_dir = root / "codar"
+            codar_dir.mkdir(parents=True)
+            codar_cfg = codar_dir / ".agent-work" / "workspaces.toml"
+            codar_cfg.parent.mkdir(parents=True)
+            codar_cfg.write_text(
+                f'[control]\ncoordination_root="{(codar_cfg.parent).as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.radar]\npath="{codar_dir.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            # 4. Unmentioned directory with no .agent-work above it
+            unmentioned_dir = root / "unmentioned"
+            unmentioned_dir.mkdir(parents=True)
+
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                register_known_config(work_cfg)
+                register_known_config(gvsu_cfg)
+                register_known_config(codar_cfg)
+
+                # Outcome 1: D:/Documents/work/sources/natively -> GVSU config (route natively matches exactly)
+                self.assertEqual(resolve_config_for(natively_dir), gvsu_cfg)
+
+                # Outcome 2: D:/Documents/work -> work config (route hhru matches exactly; GVSU is weaker Rule 3)
+                self.assertEqual(resolve_config_for(work_dir), work_cfg)
+
+                # Outcome 3: D:/Projects/VSCode/codar -> codar config
+                self.assertEqual(resolve_config_for(codar_dir), codar_cfg)
+
+                # Outcome 4: D:/Projects/VSCode/GVSU/main-tiger -> GVSU config
+                self.assertEqual(resolve_config_for(main_tiger_dir), gvsu_cfg)
+
+                # Outcome 5: Unmentioned dir -> default_config_path()
+                self.assertEqual(resolve_config_for(unmentioned_dir), default_config_path())
+
+    def test_resolve_config_for_tie_breaking_is_deterministic(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            idx_file = root / "known-configs.json"
+
+            target_dir = root / "shared_project"
+            target_dir.mkdir(parents=True)
+
+            cfg_a = root / "aaa" / "workspaces.toml"
+            cfg_a.parent.mkdir(parents=True)
+            cfg_a.write_text(
+                f'[control]\ncoordination_root="{(cfg_a.parent / ".agent-work").as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.main]\npath="{target_dir.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            cfg_b = root / "bbb" / "workspaces.toml"
+            cfg_b.parent.mkdir(parents=True)
+            cfg_b.write_text(
+                f'[control]\ncoordination_root="{(cfg_b.parent / ".agent-work").as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.main]\npath="{target_dir.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            # Test registration order A then B
+            idx_file.write_text(json.dumps([str(cfg_a), str(cfg_b)]), encoding="utf-8")
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                res1 = resolve_config_for(target_dir)
+
+            # Test registration order B then A
+            idx_file.write_text(json.dumps([str(cfg_b), str(cfg_a)]), encoding="utf-8")
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                res2 = resolve_config_for(target_dir)
+
+            self.assertEqual(res1, res2)
+            # Deterministic winner is cfg_a because str(cfg_a) < str(cfg_b)
+            self.assertEqual(res1, cfg_a)
 
     def test_port_for_properties(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
