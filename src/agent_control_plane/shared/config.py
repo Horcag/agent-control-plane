@@ -607,7 +607,7 @@ def ensure_mcp_server(
     config_path: Path | str | None = None,
     print_url: bool = False,
     no_start: bool = False,
-    timeout_sec: float = 30.0,
+    timeout_sec: float = 90.0,
 ) -> dict[str, Any]:
     if config_path is not None:
         target_config = Path(config_path).expanduser().resolve(strict=False)
@@ -688,8 +688,19 @@ def ensure_mcp_server(
                 }
             time.sleep(0.1)
 
+        if probe_mcp_health(target_port, timeout_sec=0.5):
+            return {
+                "ok": True,
+                "config_path": str(target_config),
+                "port": target_port,
+                "url": mcp_url,
+                "running": True,
+                "started": True,
+            }
+
         raise RuntimeError(
-            f"Timed out after {timeout_sec}s waiting for MCP server on port {target_port}"
+            f"Timed out after {timeout_sec}s waiting for MCP server on port {target_port} "
+            f"(config: {target_config}, log: {log_file})"
         )
 
 

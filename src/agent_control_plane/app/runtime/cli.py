@@ -473,7 +473,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mcp_ensure.add_argument(
         "--timeout",
         type=float,
-        default=30.0,
+        default=90.0,
         help="Timeout in seconds to wait for server start",
     )
 

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from agent_control_plane.app.runtime.cli import _build_parser
 from agent_control_plane.shared.config import (
     CodexModelMetadataConfig,
     default_config_path,
@@ -1718,6 +1720,94 @@ class ConfigDiscoveryTest(unittest.TestCase):
                 self.assertFalse(res["started"])
                 self.assertEqual(mock_popen.call_count, 0)
                 self.assertTrue(res["url"].startswith("http://127.0.0.1:"))
+
+    def test_mcp_ensure_default_wait_is_90s_and_overridable(self) -> None:
+        sig = inspect.signature(ensure_mcp_server)
+        self.assertEqual(sig.parameters["timeout_sec"].default, 90.0)
+
+        parser = _build_parser()
+        args = parser.parse_args(["mcp", "ensure"])
+        self.assertEqual(args.timeout, 90.0)
+
+        args_override = parser.parse_args(["mcp", "ensure", "--timeout", "15.0"])
+        self.assertEqual(args_override.timeout, 15.0)
+
+    def test_mcp_ensure_already_healthy_short_circuits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text(
+                '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
+                'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                '[routes.main]\npath="repo"\nrequired_branch="main"\n'
+            )
+            with (
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=True,
+                ),
+                patch("subprocess.Popen") as mock_popen,
+            ):
+                res = ensure_mcp_server(config_path=cfg)
+                self.assertTrue(res["ok"])
+                self.assertTrue(res["running"])
+                self.assertFalse(res["started"])
+                self.assertEqual(mock_popen.call_count, 0)
+
+    def test_mcp_ensure_final_reprobe_succeeds_after_loop_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text(
+                '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
+                'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                '[routes.main]\npath="repo"\nrequired_branch="main"\n'
+            )
+            probe_responses = [False, False, True]
+
+            def fake_probe(port: int, timeout_sec: float = 2.0) -> bool:
+                if probe_responses:
+                    return probe_responses.pop(0)
+                return True
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    side_effect=fake_probe,
+                ),
+                patch("subprocess.Popen") as mock_popen,
+            ):
+                mock_popen.return_value = None
+                res = ensure_mcp_server(config_path=cfg, timeout_sec=0.01)
+                self.assertTrue(res["ok"])
+                self.assertTrue(res["running"])
+                self.assertTrue(res["started"])
+                self.assertEqual(mock_popen.call_count, 1)
+
+    def test_mcp_ensure_timeout_reports_details_and_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text(
+                '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
+                'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                '[routes.main]\npath="repo"\nrequired_branch="main"\n'
+            )
+            with (
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=False,
+                ),
+                patch("subprocess.Popen") as mock_popen,
+            ):
+                mock_popen.return_value = None
+                with self.assertRaises(RuntimeError) as ctx:
+                    ensure_mcp_server(config_path=cfg, timeout_sec=0.05)
+                err_msg = str(ctx.exception)
+                self.assertIn("Timed out after 0.05s", err_msg)
+                self.assertIn("port", err_msg)
+                self.assertIn(str(cfg), err_msg)
+                self.assertIn("mcp-server-", err_msg)
 
 
 class WireMcpTest(unittest.TestCase):
