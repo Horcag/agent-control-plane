@@ -371,7 +371,7 @@ class AntigravityManagerAdapter:
             )
         stdout_text = proc.stdout.strip()
         if "{" in stdout_text:
-            stdout_text = stdout_text[stdout_text.index("{"):]
+            stdout_text = stdout_text[stdout_text.index("{") :]
         try:
             data = json.loads(stdout_text)
         except json.JSONDecodeError as exc:

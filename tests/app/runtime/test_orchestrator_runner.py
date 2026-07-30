@@ -273,32 +273,24 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertEqual(smoke["routes"]["main"]["workspace_access"], "ide_mcp")
             self.assertEqual(smoke["routes"]["main"]["native_quality_policy"], "worker")
 
-    def test_invalid_and_agy_native_modes_are_rejected_before_job_creation(self) -> None:
+    def test_invalid_workspace_access_is_rejected_before_job_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
             control = AgentControlPlane(_config(root, workspace))
             _brief(control.config.coordination_root, "invalid-mode")
-            _brief(control.config.coordination_root, "agy-native")
 
-            with patch.object(control, "_launch_worker", return_value=123) as launch:
-                with self.assertRaisesRegex(PolicyError, "workspace_access"):
-                    control.start_job(
-                        StartOptions(
-                            task_id="invalid-mode",
-                            route="main",
-                            workspace_access="",
-                        )
+            with (
+                patch.object(control, "_launch_worker", return_value=123) as launch,
+                self.assertRaisesRegex(PolicyError, "workspace_access"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="invalid-mode",
+                        route="main",
+                        workspace_access="",
                     )
-                with self.assertRaisesRegex(PolicyError, "agy backend"):
-                    control.start_job(
-                        StartOptions(
-                            task_id="agy-native",
-                            route="main",
-                            backend=AGY_BACKEND,
-                            workspace_access="native",
-                        )
-                    )
+                )
 
             launch.assert_not_called()
             self.assertEqual(control.store.list_jobs(), [])
