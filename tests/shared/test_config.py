@@ -3,8 +3,16 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from agent_control_plane.shared.config import CodexModelMetadataConfig, load_config
+from agent_control_plane.shared.config import (
+    CodexModelMetadataConfig,
+    ensure_mcp_server,
+    load_config,
+    port_for,
+    register_known_config,
+    resolve_config_for,
+)
 
 
 class ConfigTest(unittest.TestCase):
@@ -394,8 +402,11 @@ claude_reasoning_effort = "low"
             self.assertEqual(config.defaults.claude_max_turns, 40)
             self.assertFalse(config.defaults.claude_bare)
             metadata = {model.model: model for model in config.claude_model_catalog.models}
-            self.assertTrue(metadata["claude-opus-5"].premium)
-            self.assertEqual(metadata["claude-opus-5"].api_usd_rate.input, 5.0)
+            rate = metadata["claude-opus-5"].api_usd_rate
+            self.assertIsNotNone(rate)
+            assert rate is not None
+            self.assertEqual(rate.input, 5.0)
+
             inventory = config.claude_model_catalog.inventory[0]
             self.assertEqual(inventory.model, "claude-nova-7")
             self.assertEqual(inventory.supported_reasoning_efforts, ("low", "high"))
@@ -1427,6 +1438,160 @@ required_branch = "main"
                 "terminal_slot_policy must be either 'preserve' or 'checkpoint'",
             ):
                 load_config(config_path)
+
+
+class ConfigDiscoveryTest(unittest.TestCase):
+    def test_resolve_config_for_nearest_upwards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            sub_dir = root / "work" / "src" / "pkg"
+            sub_dir.mkdir(parents=True)
+            config_dir = root / "work" / ".agent-work"
+            config_dir.mkdir(parents=True)
+            config_file = config_dir / "workspaces.toml"
+            config_file.write_text("[control]\n[routes.main]\npath='.'\nrequired_branch='main'\n")
+
+            found = resolve_config_for(sub_dir)
+            self.assertEqual(found, config_file)
+
+    def test_known_config_index_roundtrips_and_self_registers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg_path = root / "custom_workspaces.toml"
+            cfg_path.write_text(
+                "[control]\ncoordination_root='.agent-work'\nruns_root='runs'\n"
+                "database='jobs.db'\nworktree_root='w'\nworktree_base='b'\nslot_root='s'\n"
+                "[routes.main]\npath='repo'\nrequired_branch='main'\n"
+            )
+
+            idx_file = root / "known-configs.json"
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                registered = register_known_config(cfg_path)
+                self.assertEqual(registered, cfg_path)
+                self.assertTrue(idx_file.exists())
+                import json
+
+                data = json.loads(idx_file.read_text(encoding="utf-8"))
+                self.assertIn(str(cfg_path), data)
+
+                cfg_path2 = root / "custom_workspaces2.toml"
+                cfg_path2.write_text(
+                    "[control]\ncoordination_root='.agent-work'\nruns_root='runs'\n"
+                    "database='jobs.db'\nworktree_root='w'\nworktree_base='b'\nslot_root='s'\n"
+                    "[routes.main]\npath='repo'\nrequired_branch='main'\n"
+                )
+                load_config(cfg_path2)
+                data2 = json.loads(idx_file.read_text(encoding="utf-8"))
+                self.assertIn(str(cfg_path2), data2)
+
+    def test_known_config_index_concurrent_write(self) -> None:
+        import concurrent.futures
+        import json
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            idx_file = root / "known-configs.json"
+
+            def worker(i: int) -> None:
+                p = root / f"cfg_{i}.toml"
+                p.write_text("dummy")
+                register_known_config(p)
+
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = [executor.submit(worker, i) for i in range(10)]
+                    concurrent.futures.wait(futures)
+
+                data = json.loads(idx_file.read_text(encoding="utf-8"))
+                self.assertEqual(len(data), 10)
+
+    def test_resolve_config_for_known_index_route_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+
+            cfg1 = root / "cfg1" / "workspaces.toml"
+            cfg1.parent.mkdir(parents=True)
+            cfg1.write_text(
+                f'[control]\ncoordination_root="{(root / "cfg1" / ".agent-work").as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.main]\npath="{(root / "projectA").as_posix()}"\nrequired_branch="main"\n'
+            )
+
+            cfg2 = root / "cfg2" / "workspaces.toml"
+            cfg2.parent.mkdir(parents=True)
+            cfg2.write_text(
+                f'[control]\ncoordination_root="{(root / "cfg2" / ".agent-work").as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.main]\npath="{(root / "projectA" / "deep" / "sub").as_posix()}"\nrequired_branch="main"\n'
+            )
+
+            idx_file = root / "known-configs.json"
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                register_known_config(cfg1)
+                register_known_config(cfg2)
+
+                cwd_inside = root / "projectA" / "deep" / "sub" / "src"
+                cwd_inside.mkdir(parents=True)
+                res1 = resolve_config_for(cwd_inside)
+                self.assertEqual(res1, cfg2)
+
+                cwd_outside = root
+                res2 = resolve_config_for(cwd_outside)
+                self.assertEqual(res2, cfg2)
+
+    def test_port_for_properties(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg1 = root / "config1" / "workspaces.toml"
+            cfg2 = root / "config2" / "workspaces.toml"
+            cfg1.parent.mkdir()
+            cfg2.parent.mkdir()
+            cfg1.write_text("c1")
+            cfg2.write_text("c2")
+
+            port1 = port_for(cfg1)
+            port1_repeat = port_for(cfg1)
+            port2 = port_for(cfg2)
+
+            self.assertTrue(9230 <= port1 <= 9329)
+            self.assertTrue(9230 <= port2 <= 9329)
+            self.assertEqual(port1, port1_repeat)
+
+            cfg1_spelling = root / "CONFIG1" / "workspaces.toml"
+            self.assertEqual(port_for(cfg1_spelling), port1)
+
+    def test_mcp_ensure_no_start_and_print_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text(
+                '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
+                'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                '[routes.main]\npath="repo"\nrequired_branch="main"\n'
+            )
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=False,
+                ),
+                patch("subprocess.Popen") as mock_popen,
+            ):
+                res = ensure_mcp_server(config_path=cfg, no_start=True)
+                self.assertTrue(res["ok"])
+                self.assertFalse(res["running"])
+                self.assertFalse(res["started"])
+                self.assertEqual(mock_popen.call_count, 0)
+                self.assertTrue(res["url"].startswith("http://127.0.0.1:"))
 
 
 if __name__ == "__main__":

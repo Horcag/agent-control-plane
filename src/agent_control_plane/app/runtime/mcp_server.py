@@ -22,7 +22,10 @@ from agent_control_plane.app.runtime.orchestrator import (
 from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS, normalize_backend
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
-from agent_control_plane.shared.config import default_config_path
+from agent_control_plane.shared.config import (
+    register_known_config,
+    resolve_config_for,
+)
 
 if sys.platform == "win32":
     import msvcrt
@@ -64,8 +67,13 @@ class ConfigFreshControl:
     """Refresh the control plane before each MCP tool invocation when config changes."""
 
     def __init__(self, config_path: str | None) -> None:
-        requested_path = Path(config_path).expanduser() if config_path else default_config_path()
+        if config_path:
+            requested_path = Path(config_path).expanduser()
+            register_known_config(requested_path)
+        else:
+            requested_path = resolve_config_for(Path.cwd())
         self._config_path = requested_path.resolve(strict=False)
+
         self._control, self._loaded_fingerprint = self._load_stable_control()
         self._config_reloaded = False
         self._lock = RLock()

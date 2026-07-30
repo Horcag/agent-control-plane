@@ -1,12 +1,28 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import socket
+import subprocess  # nosec B404
+import sys
+import tempfile
+import time
 import tomllib
-from collections.abc import Mapping
+import urllib.error
+import urllib.request
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Any, cast
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 
 from agent_control_plane.shared.agent_backends import (
     CODEX_BACKEND,
@@ -297,6 +313,334 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parents[3] / "config" / "workspaces.toml"
 
 
+_CONFIG_LOCK_TIMEOUT_SEC = 5.0
+_CONFIG_LOCK_RETRY_SEC = 0.02
+
+
+@contextmanager
+def _file_lock(lock_path: Path) -> Iterator[None]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as lock_file:
+        lock_file.seek(0)
+        lock_file.write(b"\0")
+        lock_file.truncate(1)
+        lock_file.flush()
+        deadline = time.monotonic() + _CONFIG_LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                if sys.platform == "win32":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"timed out after {_CONFIG_LOCK_TIMEOUT_SEC:.1f}s acquiring lock: {lock_path}"
+                    ) from exc
+                time.sleep(_CONFIG_LOCK_RETRY_SEC)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def interprocess_config_lock(config_path: Path) -> Iterator[None]:
+    canonical_path = os.path.normcase(str(Path(config_path).resolve(strict=False)))
+    fingerprint = hashlib.sha256(canonical_path.encode("utf-8")).hexdigest()
+    lock_path = (
+        Path(tempfile.gettempdir()) / "agent-control-plane" / "config-locks" / f"{fingerprint}.lock"
+    )
+    with _file_lock(lock_path):
+        yield
+
+
+_interprocess_config_lock = interprocess_config_lock
+
+
+def known_configs_path() -> Path:
+    return Path.home() / ".agent-control-plane" / "known-configs.json"
+
+
+def register_known_config(config_path: Path | str) -> Path:
+    path_obj = Path(config_path).expanduser().resolve(strict=False)
+    canonical = str(path_obj)
+
+    cfg_file = known_configs_path()
+    lock_file = cfg_file.with_suffix(".lock")
+
+    with _file_lock(lock_file):
+        existing: list[str] = []
+        if cfg_file.is_file():
+            try:
+                data = json.loads(cfg_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    existing = [str(item) for item in data if isinstance(item, str)]
+            except (OSError, ValueError, KeyError):
+                existing = []
+
+        if canonical not in existing:
+            existing.append(canonical)
+            tmp_file = cfg_file.with_suffix(".tmp")
+            tmp_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            os.replace(tmp_file, cfg_file)
+
+    return path_obj
+
+
+def resolve_config_for(cwd: Path | str | None = None) -> Path:
+    resolved_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
+
+    # 1. Nearest config upwards
+    curr: Path | None = resolved_cwd
+    while curr is not None:
+        candidate = curr / ".agent-work" / "workspaces.toml"
+        if candidate.is_file():
+            return candidate
+        parent = curr.parent
+        if parent == curr:
+            break
+        curr = parent
+
+    # 2. Known-config index
+    cfg_file = known_configs_path()
+    if cfg_file.is_file():
+        try:
+            raw_index = json.loads(cfg_file.read_text(encoding="utf-8"))
+            if isinstance(raw_index, list):
+                known_paths = [
+                    Path(p).expanduser().resolve(strict=False)
+                    for p in raw_index
+                    if isinstance(p, str)
+                ]
+
+                best_config: Path | None = None
+                best_match_score: tuple[int, int] = (-1, -1)
+
+                norm_cwd_str = os.path.normcase(str(resolved_cwd))
+                norm_cwd = Path(norm_cwd_str)
+
+                for known_p in known_paths:
+                    if not known_p.is_file():
+                        continue
+                    try:
+                        cfg = load_config(known_p)
+                    except (OSError, ValueError, KeyError):
+                        continue
+
+                    candidate_paths: list[Path] = [
+                        cfg.config_path.parent.resolve(strict=False),
+                        cfg.coordination_root.resolve(strict=False),
+                    ]
+                    for route in cfg.routes.values():
+                        candidate_paths.append(route.path.resolve(strict=False))
+
+                    for cand in candidate_paths:
+                        norm_cand_str = os.path.normcase(str(cand))
+                        norm_cand = Path(norm_cand_str)
+
+                        if (
+                            norm_cwd == norm_cand
+                            or norm_cand in norm_cwd.parents
+                            or norm_cwd in norm_cand.parents
+                        ):
+                            score = (len(norm_cand.parts), len(norm_cand_str))
+                            if score > best_match_score:
+                                best_match_score = score
+                                best_config = known_p
+
+                if best_config is not None:
+                    return best_config
+        except (OSError, ValueError, KeyError):
+            pass
+
+    # 3. Fallback
+    return default_config_path()
+
+
+def probe_mcp_health(port: int, timeout_sec: float = 2.0) -> bool:
+    url = f"http://127.0.0.1:{port}/mcp"
+    req_data = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "acp-probe", "version": "1.0.0"},
+            },
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        # The URL is always a http://127.0.0.1:<port>/mcp literal this code constructs
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:  # nosec B310
+            if response.status == 200:
+                body = response.read().decode("utf-8")
+                payload = json.loads(body)
+                return (
+                    isinstance(payload, dict)
+                    and payload.get("jsonrpc") == "2.0"
+                    and "result" in payload
+                )
+    except (urllib.error.URLError, OSError, ValueError, KeyError):
+        return False
+    return False
+
+
+def _is_port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def port_assignments_path() -> Path:
+    return Path.home() / ".agent-control-plane" / "port-assignments.json"
+
+
+def port_for(config_path: Path | str) -> int:
+    resolved = Path(config_path).expanduser().resolve(strict=False)
+    canonical = os.path.normcase(str(resolved))
+
+    assignments_file = port_assignments_path()
+    lock_file = assignments_file.with_suffix(".lock")
+
+    with _file_lock(lock_file):
+        assignments: dict[str, int] = {}
+        if assignments_file.is_file():
+            try:
+                data = json.loads(assignments_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    assignments = {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
+            except (OSError, ValueError, KeyError):
+                assignments = {}
+
+        if canonical in assignments:
+            remembered = assignments[canonical]
+            if 9230 <= remembered <= 9329 and (
+                not _is_port_open(remembered) or probe_mcp_health(remembered)
+            ):
+                return remembered
+
+        base_hash = int(hashlib.sha256(canonical.encode("utf-8")).hexdigest(), 16)
+        base_port = 9230 + (base_hash % 100)
+
+        for offset in range(100):
+            cand_port = 9230 + ((base_port - 9230 + offset) % 100)
+            if not _is_port_open(cand_port) or probe_mcp_health(cand_port):
+                assignments[canonical] = cand_port
+                tmp_file = assignments_file.with_suffix(".tmp")
+                tmp_file.write_text(json.dumps(assignments, indent=2), encoding="utf-8")
+                os.replace(tmp_file, assignments_file)
+                return cand_port
+
+    return base_port
+
+
+def ensure_mcp_server(
+    *,
+    cwd: Path | str | None = None,
+    config_path: Path | str | None = None,
+    print_url: bool = False,
+    no_start: bool = False,
+    timeout_sec: float = 30.0,
+) -> dict[str, Any]:
+    if config_path is not None:
+        target_config = Path(config_path).expanduser().resolve(strict=False)
+        register_known_config(target_config)
+    else:
+        target_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
+        target_config = resolve_config_for(target_cwd)
+
+    target_port = port_for(target_config)
+    mcp_url = f"http://127.0.0.1:{target_port}/mcp"
+
+    with interprocess_config_lock(target_config):
+        if probe_mcp_health(target_port):
+            return {
+                "ok": True,
+                "config_path": str(target_config),
+                "port": target_port,
+                "url": mcp_url,
+                "running": True,
+                "started": False,
+            }
+
+        if no_start:
+            return {
+                "ok": True,
+                "config_path": str(target_config),
+                "port": target_port,
+                "url": mcp_url,
+                "running": False,
+                "started": False,
+            }
+
+        log_dir = Path.home() / ".agent-control-plane" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"mcp-server-{target_port}.log"
+
+        out_handle = log_file.open("a", encoding="utf-8")
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "agent_control_plane.app.runtime.mcp_server",
+            "--transport",
+            "streamable-http",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(target_port),
+            "--config",
+            str(target_config),
+        ]
+
+        creationflags = 0
+        if sys.platform == "win32":
+            win32_detached_process = 0x00000008
+            win32_create_new_process_group = 0x00000200
+            creationflags = win32_detached_process | win32_create_new_process_group
+
+        # Argv is built from sys.executable and values resolved by ACP itself, never from caller-supplied strings
+        subprocess.Popen(  # nosec B603
+            cmd,
+            creationflags=creationflags,
+            stdout=out_handle,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if probe_mcp_health(target_port, timeout_sec=0.5):
+                return {
+                    "ok": True,
+                    "config_path": str(target_config),
+                    "port": target_port,
+                    "url": mcp_url,
+                    "running": True,
+                    "started": True,
+                }
+            time.sleep(0.1)
+
+        raise RuntimeError(
+            f"Timed out after {timeout_sec}s waiting for MCP server on port {target_port}"
+        )
+
+
 def load_config(
     path: str | os.PathLike[str] | None = None,
     *,
@@ -304,6 +648,9 @@ def load_config(
 ) -> ControlConfig:
     config_path = Path(path).expanduser() if path else default_config_path()
     config_path = config_path.resolve(strict=False)
+    if path is not None:
+        register_known_config(config_path)
+
     if config_contents is None and not config_path.exists():
         example_path = config_path.with_name("workspaces.example.toml")
         raise FileNotFoundError(

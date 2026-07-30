@@ -24,6 +24,7 @@ from agent_control_plane.app.runtime.review_cli import add_review_parser, handle
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
+from agent_control_plane.shared.config import ensure_mcp_server
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,6 +44,24 @@ def main(argv: list[str] | None = None) -> int:
         except OfflineDemoError as exc:
             print(str(exc), file=sys.stderr)
             return 2
+    if args.command == "mcp" and args.mcp_command == "ensure":
+        try:
+            payload = ensure_mcp_server(
+                cwd=args.cwd,
+                config_path=args.config,
+                print_url=args.print_url,
+                no_start=args.no_start,
+                timeout_sec=args.timeout,
+            )
+            if args.print_url:
+                print(payload["url"])
+            else:
+                _print_json(payload)
+            return 0
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     try:
         control = AgentControlPlane.from_config_path(args.config)
     except (FileNotFoundError, ValueError) as exc:
@@ -404,6 +423,32 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_demo_parser(subparsers)
+
+    mcp_parser = subparsers.add_parser("mcp", help="Manage MCP server")
+    mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)
+
+    mcp_ensure = mcp_subparsers.add_parser(
+        "ensure",
+        parents=[common],
+        help="Ensure MCP server is running for a workspace config",
+    )
+    mcp_ensure.add_argument("--cwd", help="Path to working directory")
+    mcp_ensure.add_argument(
+        "--print-url",
+        action="store_true",
+        help="Print derived MCP server URL",
+    )
+    mcp_ensure.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Only report status without starting server",
+    )
+    mcp_ensure.add_argument(
+        "--timeout",
+        type=float,
+        default=30.0,
+        help="Timeout in seconds to wait for server start",
+    )
 
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")
     subparsers.add_parser(
