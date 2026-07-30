@@ -25,7 +25,7 @@ class _FakeFastMCP:
 
     def tool(self):
         def register(function):
-            self.tools[function.__name__] = function
+            self.tools[function.__name__] = getattr(function, "__wrapped__", function)
             return function
 
         return register

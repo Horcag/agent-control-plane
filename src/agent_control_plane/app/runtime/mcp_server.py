@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import importlib
 import os
 import sys
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
@@ -182,25 +183,40 @@ def _release_config_lock(lock_file: Any) -> None:
 def build_server(config_path: str | None = None) -> Any:
     try:
         fast_mcp = importlib.import_module("mcp.server.fastmcp").FastMCP
+        anyio = importlib.import_module("anyio")
     except ImportError as exc:
         raise RuntimeError(
             'The MCP server dependency is missing. Install with: python -m pip install -e ".[mcp]"'
         ) from exc
 
+    def _offloaded(mcp: Any) -> Callable[[Callable[..., Any]], Callable[..., Awaitable[Any]]]:
+        """Register a blocking sync tool so its body runs off the event loop."""
+
+        def decorator(fn: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
+            @functools.wraps(fn)
+            async def offload(*args: Any, **kwargs: Any) -> Any:
+                return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+            mcp.tool()(offload)
+            return offload
+
+        return decorator
+
     control = ConfigFreshControl(config_path)
     mcp = fast_mcp("agent-control-plane")
+    register = _offloaded(mcp)
 
-    @mcp.tool()
+    @register
     def agent_smoke() -> dict[str, Any]:
         """Check configuration, database initialization, route paths, and agy availability."""
         return control.smoke()
 
-    @mcp.tool()
+    @register
     def agent_model_catalog() -> dict[str, Any]:
         """Return bounded Codex model catalog metadata without cache instruction blobs."""
         return control.model_catalog_inspection()
 
-    @mcp.tool()
+    @register
     def agent_model_routing_explain(policy: str, route: str) -> dict[str, Any]:
         """Explain bounded adaptive routing evidence for one named policy and route."""
         try:
@@ -208,7 +224,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (PolicyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_start_job(
         task_id: str,
         route: str,
@@ -322,7 +338,7 @@ def build_server(config_path: str | None = None) -> Any:
             )
         return response
 
-    @mcp.tool()
+    @register
     def agent_watch_job(
         job_id: str,
         poll_interval_sec: float = 5.0,
@@ -341,12 +357,12 @@ def build_server(config_path: str | None = None) -> Any:
             log_byte_limit=log_byte_limit,
         )
 
-    @mcp.tool()
+    @register
     def agent_status_job(job_id: str) -> dict[str, Any]:
         """Return job status, PID data, paths, and recent events."""
         return control.status_job(job_id)
 
-    @mcp.tool()
+    @register
     def agent_reconcile(
         job_id: str | None = None,
         terminate_verified_runners: bool = False,
@@ -357,12 +373,12 @@ def build_server(config_path: str | None = None) -> Any:
             terminate_verified_runners=terminate_verified_runners,
         )
 
-    @mcp.tool()
+    @register
     def agent_summary_job(job_id: str, lines: int = 20) -> dict[str, Any]:
         """Return compact status, guardrail state, dirty status, and a short log tail."""
         return control.summary_job(job_id, lines)
 
-    @mcp.tool()
+    @register
     def agent_analytics(
         limit: int = 100,
         model: str | None = None,
@@ -383,7 +399,7 @@ def build_server(config_path: str | None = None) -> Any:
             valid_only=valid_only,
         )
 
-    @mcp.tool()
+    @register
     def agent_plan_create(
         plan_id: str,
         title: str,
@@ -402,7 +418,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_add_task(
         plan_id: str,
         task_id: str,
@@ -422,7 +438,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_edit_task(
         plan_id: str,
         task_id: str,
@@ -486,7 +502,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_bind_job(plan_id: str, task_id: str, job_id: str) -> dict[str, Any]:
         """Bind an already-created job to a logical plan task."""
         try:
@@ -494,7 +510,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_snapshot(
         plan_id: str,
         since: int | None = None,
@@ -512,7 +528,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_watch(
         plan_id: str,
         since: int,
@@ -534,7 +550,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_accept_task(
         plan_id: str,
         task_id: str,
@@ -550,7 +566,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_reject_task(plan_id: str, task_id: str) -> dict[str, Any]:
         """Record root rejection without unlocking dependent tasks."""
         try:
@@ -558,7 +574,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_dispatch(plan_id: str, max_jobs: int = 1) -> dict[str, Any]:
         """Claim and start ready executable plan tasks in one durable dispatch pass."""
         try:
@@ -566,7 +582,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_run_until_review(
         plan_id: str,
         max_jobs: int = 1,
@@ -584,7 +600,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_retry_task(
         plan_id: str,
         task_id: str,
@@ -609,7 +625,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_cancel(plan_id: str) -> dict[str, Any]:
         """Stop future plan dispatch and cooperatively cancel unfinished jobs."""
         try:
@@ -617,7 +633,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_archive(plan_id: str) -> dict[str, Any]:
         """Mark one terminal, fully reviewed plan as retention-eligible."""
         try:
@@ -625,7 +641,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_plan_list(
         limit: int = 20,
         include_archived: bool = False,
@@ -633,7 +649,7 @@ def build_server(config_path: str | None = None) -> Any:
         """List recent durable plans with compact progress counts."""
         return control.list_plans(limit, include_archived=include_archived)
 
-    @mcp.tool()
+    @register
     def agent_retention_gc(
         older_than_days: int = 30,
         limit: int = 500,
@@ -649,7 +665,7 @@ def build_server(config_path: str | None = None) -> Any:
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_review_inbox_list(
         review_status: str | None = "pending",
         limit: int = 50,
@@ -674,7 +690,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (PolicyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_review_inbox_get(item_id: str) -> dict[str, Any]:
         """Return one durable job or Codex subagent handoff."""
         try:
@@ -682,7 +698,7 @@ def build_server(config_path: str | None = None) -> Any:
         except KeyError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_review_inbox_resolve(item_id: str, decision: str) -> dict[str, Any]:
         """Resolve an inbox item without implicitly accepting a plan task."""
         try:
@@ -693,7 +709,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_review_inbox_requalify(item_id: str) -> dict[str, Any]:
         """Re-run controller gates against a pending item's checkpoint and rebuild its bundle."""
         try:
@@ -704,7 +720,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, ValueError, RuntimeError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_accept_handoff(
         plan_id: str,
         task_id: str,
@@ -733,7 +749,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, PolicyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_sync_subagent_results(
         since_hours: float = 72.0,
         max_files: int = 500,
@@ -752,17 +768,17 @@ def build_server(config_path: str | None = None) -> Any:
         except (PolicyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_tail_job(job_id: str, lines: int = 80) -> str:
         """Return the end of the active attempt log."""
         return control.tail_job(job_id, lines)
 
-    @mcp.tool()
+    @register
     def agent_result_job(job_id: str) -> str:
         """Return the task result file content, or a not-ready message."""
         return control.result_job(job_id)
 
-    @mcp.tool()
+    @register
     def agent_cancel_job(job_id: str) -> dict[str, Any]:
         """Request cooperative cancellation for a running job."""
         job = control.cancel_job(job_id)
@@ -772,7 +788,7 @@ def build_server(config_path: str | None = None) -> Any:
             "cancel_requested": job.cancel_requested,
         }
 
-    @mcp.tool()
+    @register
     def agent_archive_jobs(
         older_than_days: int = 14,
         limit: int = 50,
@@ -785,12 +801,12 @@ def build_server(config_path: str | None = None) -> Any:
             apply=apply,
         )
 
-    @mcp.tool()
+    @register
     def agent_slots_sync() -> list[dict[str, Any]]:
         """Register configured slots in SQLite and return their current state."""
         return control.sync_slots()
 
-    @mcp.tool()
+    @register
     def agent_slots_list(
         route: str | None = None,
         all_routes: bool = False,
@@ -805,7 +821,7 @@ def build_server(config_path: str | None = None) -> Any:
             include_stale=include_stale,
         )
 
-    @mcp.tool()
+    @register
     def agent_slots_create(
         name: str,
         route: str | None = None,
@@ -826,7 +842,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_bootstrap(
         name: str,
         route: str | None = None,
@@ -859,7 +875,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (ConfigBootstrapError, SlotError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_delete(name: str, force: bool = False) -> dict[str, Any]:
         """Delete a slot worktree. Dirty or active slots require force."""
         try:
@@ -867,7 +883,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_checkout(
         name: str,
         branch: str,
@@ -882,7 +898,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_ensure_module(name: str) -> dict[str, Any]:
         """Ensure a configured slot is registered and marked loaded in IDEA workspace state."""
         try:
@@ -890,7 +906,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_ensure_root_module(
         remove_slot_modules: bool = False,
     ) -> dict[str, Any]:
@@ -905,7 +921,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_unload_module(name: str) -> dict[str, Any]:
         """Mark a configured slot module as unloaded without deleting its module entry."""
         try:
@@ -913,7 +929,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_unload_root_module() -> dict[str, Any]:
         """Mark the slot_root IDEA module as unloaded without deleting its module entry."""
         try:
@@ -921,7 +937,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_remove_module(name: str) -> dict[str, Any]:
         """Remove a configured legacy slot module from IDEA project and workspace state."""
         try:
@@ -929,7 +945,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_prepare(name: str) -> dict[str, Any]:
         """Run configured slot preparation commands when markers are missing."""
         try:
@@ -937,7 +953,7 @@ def build_server(config_path: str | None = None) -> Any:
         except SlotError as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_checkpoint(name: str, job_id: str) -> dict[str, Any]:
         """Checkpoint a terminal job's dirty slot, persist review metadata, and release it."""
         try:
@@ -945,7 +961,7 @@ def build_server(config_path: str | None = None) -> Any:
         except (KeyError, PolicyError, SlotError) as exc:
             return {"ok": False, "error": str(exc)}
 
-    @mcp.tool()
+    @register
     def agent_slots_cleanup(
         max_per_route: int,
         apply: bool = False,

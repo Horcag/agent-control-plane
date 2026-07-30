@@ -25,7 +25,7 @@ dependencies = [
 [project.optional-dependencies]
 # Pinned below 2 on purpose: mcp 2.0 renamed `mcp.server.fastmcp` to `mcp.server.mcpserver`,
 # which `build_server` imports by name. Lift the ceiling only together with that migration.
-mcp = ["mcp>=1.10,<2"]
+mcp = ["mcp>=1.10,<2", "anyio>=4"]
 dev = [
   "bandit[toml]>=1.8",
   "mypy>=1.11",
