@@ -24,7 +24,12 @@ from agent_control_plane.app.runtime.review_cli import add_review_parser, handle
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
-from agent_control_plane.shared.config import ensure_mcp_server, wire_mcp_servers
+from agent_control_plane.shared.config import (
+    default_config_path,
+    ensure_mcp_server,
+    resolve_config_for,
+    wire_mcp_servers,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -76,8 +81,16 @@ def main(argv: list[str] | None = None) -> int:
                 print(str(exc), file=sys.stderr)
                 return 2
 
+    if args.config:
+        config_path: Path | str = args.config
+    else:
+        cwd = Path.cwd()
+        config_path = resolve_config_for(cwd)
+        if config_path.resolve(strict=False) != default_config_path().resolve(strict=False):
+            print(f"Using discovered config {config_path} for {cwd}", file=sys.stderr)
+
     try:
-        control = AgentControlPlane.from_config_path(args.config)
+        control = AgentControlPlane.from_config_path(config_path)
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
