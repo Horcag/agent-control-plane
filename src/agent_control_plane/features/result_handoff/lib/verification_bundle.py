@@ -41,6 +41,20 @@ _STATUS_PATTERN = re.compile(
 _EMPTY_CLAIMS = frozenset({"none", "no files", "nothing", "n/a", "not applicable"})
 
 
+def normalize_repo_path(path: str) -> str:
+    """Normalize a repo-relative path using pure string operations.
+
+    Converts backslashes to forward slashes, drops '.' segments and
+    leading/trailing slashes, and collapses redundant separators while
+    preserving case.
+    """
+    if not path:
+        return ""
+    normalized = path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    return "/".join(parts)
+
+
 def parse_result_report(text: str) -> dict[str, Any]:
     """Parse the mandatory result envelope without treating worker claims as proof."""
     status: str | None = None
@@ -145,19 +159,27 @@ def build_verification_bundle(
         except (OSError, SlotCheckpointError) as exc:
             artifact_error = artifact_error or str(exc)
 
-    claimed = set(result["changed_files_claimed"])
-    actual = {change["path"] for change in actual_changes}
+    claimed = {normalize_repo_path(p) for p in result["changed_files_claimed"]}
+    actual = {normalize_repo_path(change["path"]) for change in actual_changes}
     worker_payload = worker_verification.get("payload")
     worker_changes = (
-        {change["path"] for change in worker_payload.get("changed_files", [])}
+        {
+            normalize_repo_path(change["path"])
+            for change in worker_payload.get("changed_files", [])
+            if isinstance(change, dict) and change.get("path")
+        }
         if isinstance(worker_payload, dict)
         else set()
     )
-    changed_paths = tuple(change["path"] for change in actual_changes)
+    changed_paths = tuple(normalize_repo_path(change["path"]) for change in actual_changes)
     if not changed_paths:
         changed_paths = tuple(sorted(worker_changes or claimed))
     command_paths = (
-        tuple(change["path"] for change in actual_changes if not change["status"].startswith("D"))
+        tuple(
+            normalize_repo_path(change["path"])
+            for change in actual_changes
+            if not change["status"].startswith("D")
+        )
         if actual_changes
         else changed_paths
     )
@@ -174,7 +196,9 @@ def build_verification_bundle(
         changed_paths=changed_paths,
         command_paths=command_paths,
         checkpoint_paths=(
-            tuple(change["path"] for change in actual_changes) if actual_changes else None
+            tuple(normalize_repo_path(change["path"]) for change in actual_changes)
+            if actual_changes
+            else None
         ),
         contract=contract,
         required=quality_required,
@@ -328,13 +352,17 @@ def _assess_worker_quality(
             "claims_trust": "worker_reported",
         }
     worker_paths = {
-        str(change.get("path", ""))
+        normalize_repo_path(str(change.get("path", "")))
         for change in payload.get("changed_files", [])
         if isinstance(change, dict) and change.get("path")
     }
-    expected_paths = set(checkpoint_paths or ())
+    worker_paths.discard("")
+    expected_paths = {normalize_repo_path(p) for p in (checkpoint_paths or ())}
+    expected_paths.discard("")
     changed_files_missing = sorted(expected_paths - worker_paths)
-    changed_files_unobserved = sorted(worker_paths - expected_paths) if checkpoint_paths else []
+    changed_files_unobserved = (
+        sorted(worker_paths - expected_paths) if checkpoint_paths is not None else []
+    )
     if changed_files_missing or changed_files_unobserved:
         selected = selected_native_quality_gates(
             contract,
@@ -461,5 +489,7 @@ def _claimed_files(values: list[str]) -> list[str]:
             if " -> " in candidate:
                 candidate = candidate.rsplit(" -> ", maxsplit=1)[1].strip()
             if candidate:
-                claimed.append(candidate.replace("\\", "/"))
+                normalized = normalize_repo_path(candidate)
+                if normalized:
+                    claimed.append(normalized)
     return list(dict.fromkeys(claimed))
