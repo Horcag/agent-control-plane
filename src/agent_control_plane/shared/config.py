@@ -516,6 +516,23 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
     return default_config_path()
 
 
+def _decode_initialize_payload(body: str) -> Any:
+    """`initialize` comes back either as plain JSON or as a text/event-stream `data:` frame."""
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        pass
+
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            try:
+                return json.loads(line[len("data:") :].strip())
+            except (ValueError, TypeError):
+                continue
+
+    return None
+
+
 def probe_mcp_health_detailed(port: int, timeout_sec: float = 2.0) -> tuple[bool, str]:
     url = f"http://127.0.0.1:{port}/mcp"
     req_data = json.dumps(
@@ -546,12 +563,12 @@ def probe_mcp_health_detailed(port: int, timeout_sec: float = 2.0) -> tuple[bool
             session_id = response.headers.get("Mcp-Session-Id")
             if response.status == 200:
                 body = response.read().decode("utf-8")
-                try:
-                    payload = json.loads(body)
-                except (ValueError, TypeError) as parse_err:
+                payload = _decode_initialize_payload(body)
+                if payload is None:
                     return (
                         False,
-                        f"something answered but not as an MCP server (invalid JSON: {parse_err})",
+                        "something answered but not as an MCP server "
+                        "(body is neither JSON nor an SSE data frame)",
                     )
                 if (
                     isinstance(payload, dict)

@@ -1868,6 +1868,37 @@ class ProbeMcpHealthTest(unittest.TestCase):
             self.assertEqual(detail, "healthy")
             self.assertTrue(probe_mcp_health(9256))
 
+    def test_probe_sse_framed_response_is_healthy(self) -> None:
+        result = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-06-18"}}
+        )
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {"Content-Type": "text/event-stream"}
+            mock_resp.read.return_value = f"event: message\ndata: {result}\n\n".encode()
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertTrue(healthy)
+            self.assertEqual(detail, "healthy")
+
+    def test_probe_unparsable_body_reported_as_not_an_mcp_server(self) -> None:
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {}
+            mock_resp.read.return_value = b"<html>hello</html>"
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertFalse(healthy)
+            self.assertIn("neither JSON nor an SSE data frame", detail)
+
     def test_probe_connection_error_reported_as_nothing_listening(self) -> None:
         err = urllib.error.URLError(reason="Connection refused")
         with patch("urllib.request.urlopen", side_effect=err):
