@@ -207,6 +207,7 @@ def build_server(
     *,
     host: str | None = None,
     port: int | None = None,
+    stateless_http: bool = False,
 ) -> Any:
     try:
         fast_mcp = importlib.import_module("mcp.server.fastmcp").FastMCP
@@ -235,6 +236,8 @@ def build_server(
         mcp_kwargs["host"] = host
     if port is not None:
         mcp_kwargs["port"] = port
+    if stateless_http:
+        mcp_kwargs["stateless_http"] = True
     mcp = fast_mcp("agent-control-plane", **mcp_kwargs)
     register = _offloaded(mcp)
 
@@ -1115,7 +1118,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Host address for HTTP transport")
     parser.add_argument("--port", type=int, default=8766, help="Port number for HTTP transport")
     args = parser.parse_args(argv)
-    build_server(args.config, host=args.host, port=args.port).run(transport=args.transport)
+    build_server(
+        args.config,
+        host=args.host,
+        port=args.port,
+        stateless_http=args.transport == "streamable-http",
+    ).run(transport=args.transport)
 
 
 if __name__ == "__main__":

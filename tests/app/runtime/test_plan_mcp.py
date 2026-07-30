@@ -575,7 +575,9 @@ def test_main_transport_and_host_port_parsing(monkeypatch) -> None:
         server_instance.reset_mock()
 
         mcp_server.main(["--transport", "streamable-http", "--host", "127.0.0.1", "--port", "8766"])
-        fake_fastmcp.assert_called_with("agent-control-plane", host="127.0.0.1", port=8766)
+        fake_fastmcp.assert_called_with(
+            "agent-control-plane", host="127.0.0.1", port=8766, stateless_http=True
+        )
         server_instance.run.assert_called_with(transport="streamable-http")
 
 
@@ -595,6 +597,10 @@ def test_build_server_without_host_port_preserves_defaults(monkeypatch) -> None:
     ):
         build_server()
         fake_fastmcp.assert_called_once_with("agent-control-plane")
+
+        fake_fastmcp.reset_mock()
+        build_server(stateless_http=True)
+        fake_fastmcp.assert_called_once_with("agent-control-plane", stateless_http=True)
 
 
 def test_wait_budget_clamping_for_all_four_tools(monkeypatch) -> None:
