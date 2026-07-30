@@ -717,9 +717,15 @@ def ensure_mcp_server(
 
         creationflags = 0
         if sys.platform == "win32":
-            win32_detached_process = 0x00000008
+            # CREATE_NO_WINDOW, not DETACHED_PROCESS: a detached server has no console at
+            # all, so the very next process in the chain — the venv launcher re-executing
+            # the real interpreter — makes Windows allocate a fresh one, which the default
+            # terminal turns into a window that pops up and steals focus. A windowless
+            # console is inherited down the chain instead, and the new process group still
+            # keeps the server clear of the caller's Ctrl+C.
+            win32_create_no_window = 0x08000000
             win32_create_new_process_group = 0x00000200
-            creationflags = win32_detached_process | win32_create_new_process_group
+            creationflags = win32_create_no_window | win32_create_new_process_group
 
         # Argv is built from sys.executable and values resolved by ACP itself, never from caller-supplied strings
         subprocess.Popen(  # nosec B603
