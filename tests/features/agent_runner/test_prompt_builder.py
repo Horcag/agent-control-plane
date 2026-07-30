@@ -544,10 +544,18 @@ class PromptBuilderTest(unittest.TestCase):
             self.assertIn("sorted final changed Python files", controller_prompt)
             self.assertIn("Applies to: *.py, **/*.py", controller_prompt)
             self.assertIn(
-                "Controller-executed gates (maximum 2 in parallel): affected-tests, ruff",
+                "Controller-stage gates (run after handoff against checkpoint; failure blocks "
+                "acceptance and forces a retry; run relevant ones before handoff):",
                 controller_prompt,
             )
-            self.assertNotIn("[affected-tests] cwd=", controller_prompt)
+            self.assertIn(
+                "[affected-tests] cwd=.: python scripts/run_affected_tests.py --worktree; Applies to: every changed file",
+                controller_prompt,
+            )
+            self.assertIn(
+                "[ruff] cwd=.: python -m ruff check '{changed_python_files}'; Applies to: *.py, **/*.py",
+                controller_prompt,
+            )
             self.assertIn("Do not write Status: completed", controller_prompt)
 
             # Assertions for native read-only
@@ -576,7 +584,7 @@ class PromptBuilderTest(unittest.TestCase):
             # Materially smaller check (e.g. less than half the size of IDE prompt)
             self.assertTrue(len(native_writable) < len(ide_prompt) * 0.6)
 
-    def test_prompt_lists_exact_worker_only_gate_command(self) -> None:
+    def test_prompt_lists_exact_worker_and_controller_gate_commands(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             _coordination_files(root, "task-1")
@@ -628,6 +636,12 @@ class PromptBuilderTest(unittest.TestCase):
                                     include_globs=("*.py", "**/*.py"),
                                     run_on="worker",
                                 ),
+                                NativeQualityGateConfig(
+                                    name="both-gate",
+                                    command=("python", "-m", "ruff", "check", "src"),
+                                    include_globs=("*.py", "**/*.py"),
+                                    run_on="both",
+                                ),
                             ),
                         )
                     }
@@ -648,15 +662,72 @@ class PromptBuilderTest(unittest.TestCase):
                 read_only=False,
             )
 
+            # Verification section rules assertion
+            self.assertIn("Paths must be repo-relative without a ./ prefix.", prompt)
+            self.assertIn(
+                "Record a check as passed only if you actually executed it in this attempt and it exited zero.",
+                prompt,
+            )
+
+            # Worker section asserts
+            self.assertIn("Worker-required gates", prompt)
             self.assertIn(
                 "[worker-only] cwd=.: python -m mypy --strict src; Applies to: *.py, **/*.py",
                 prompt,
             )
             self.assertIn(
-                "Controller-executed gates (maximum 1 in parallel): controller-only.",
+                "[both-gate] cwd=.: python -m ruff check src; Applies to: *.py, **/*.py",
                 prompt,
             )
-            self.assertNotIn("[controller-only] cwd=", prompt)
+            self.assertNotIn("[controller-only] cwd=", prompt.split("Controller-stage gates")[0])
+
+            # Controller section asserts
+            self.assertIn(
+                "Controller-stage gates (run after handoff against checkpoint; failure blocks "
+                "acceptance and forces a retry; run relevant ones before handoff):",
+                prompt,
+            )
+            self.assertIn(
+                "[controller-only] cwd=.: python scripts/run_affected_tests.py; Applies to: every changed file",
+                prompt,
+            )
+            self.assertIn(
+                "[both-gate] cwd=.: python -m ruff check src; Applies to: *.py, **/*.py",
+                prompt,
+            )
+
+            # Case: policy="worker" with all worker-stage gates renders NO controller section
+            worker_only_config = replace(
+                config,
+                routes=MappingProxyType(
+                    {
+                        "main": replace(
+                            config.routes["main"],
+                            native_quality_policy="worker",
+                            native_quality_gates=(
+                                NativeQualityGateConfig(
+                                    name="worker-only",
+                                    command=("python", "-m", "mypy", "--strict", "src"),
+                                    include_globs=("*.py", "**/*.py"),
+                                    run_on="worker",
+                                ),
+                            ),
+                        )
+                    }
+                ),
+            )
+            prompt_worker_only = build_task_prompt(
+                config=worker_only_config,
+                task_id="task-1",
+                route="main",
+                workspace_path=workspace,
+                expected_branch="review/pr",
+                result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                workspace_access="native",
+                read_only=False,
+            )
+            self.assertIn("Worker-required gates", prompt_worker_only)
+            self.assertNotIn("Controller-stage gates", prompt_worker_only)
 
 
 def _coordination_files(

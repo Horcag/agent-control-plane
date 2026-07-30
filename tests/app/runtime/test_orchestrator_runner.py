@@ -683,8 +683,14 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn('"max_parallel": 2', contract_text)
             self.assertIn('"run_on": "controller"', contract_text)
             prompt_text = job.prompt_path.read_text(encoding="utf-8")
-            self.assertIn("Controller-executed gates (maximum 2 in parallel): tests", prompt_text)
-            self.assertNotIn("python -m pytest", prompt_text)
+            self.assertIn(
+                "Controller-stage gates (run after handoff against checkpoint; failure blocks "
+                "acceptance and forces a retry; run relevant ones before handoff):",
+                prompt_text,
+            )
+            self.assertIn(
+                "[tests] cwd=.: python -m pytest; Applies to: every changed file", prompt_text
+            )
 
     def test_native_slot_skips_only_ide_module_provisioning(self) -> None:
         for workspace_access, expected_ide_calls in (("native", 0), ("ide_mcp", 1)):

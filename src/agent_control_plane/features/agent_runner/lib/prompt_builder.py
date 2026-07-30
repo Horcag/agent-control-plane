@@ -482,12 +482,14 @@ def _verification_rules(path: Path) -> str:
 The file must be JSON only, use schema_version 1, and contain exactly:
 - status: completed, partial, or blocked; it must match result.md.
 - changed_files: objects with path and change (added, modified, deleted, renamed, or untracked).
+  Paths must be repo-relative without a ./ prefix.
 - checks: objects with command, cwd, outcome (passed, failed, or not_run), exit_code, and summary.
   Record exactly ONE entry per check, holding that check's FINAL outcome and exit_code. If a check
   applies autofixes and exits non-zero on the first pass while making changes (e.g. pre-commit
   hooks), re-run it until it is stable and record ONLY the final run — do NOT record intermediate
   non-zero autofix runs. A recorded check with a non-zero exit_code (or outcome other than passed)
   is treated as a failed verification and blocks normal acceptance.
+  Record a check as passed only if you actually executed it in this attempt and it exited zero.
 - unverified: an array of concrete remaining risks or omitted checks.
 Example: {{"schema_version":1,"status":"completed","changed_files":[],"checks":[{{"command":"pytest -q","cwd":".","outcome":"passed","exit_code":0,"summary":"3 passed"}}],"unverified":[]}}
 Missing or malformed verification.json does not keep the worker alive, but it blocks normal acceptance."""
@@ -516,7 +518,7 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
             )
     else:
         lines.append("- Before completion, run at least one relevant check for the changed files.")
-    if any(CHANGED_PYTHON_FILES_PLACEHOLDER in gate.command for gate in worker_gates):
+    if any(CHANGED_PYTHON_FILES_PLACEHOLDER in gate.command for gate in contract.gates):
         lines.append(
             f"- Replace {CHANGED_PYTHON_FILES_PLACEHOLDER} with the sorted final changed Python "
             "files that still exist, using workspace-relative ./ paths."
@@ -529,17 +531,17 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
             "reported without evidence; use partial or blocked and name the gap.",
         )
     )
-    if contract.policy == "controller":
-        controller_names = ", ".join(gate.name for gate in controller_gates)
+    if controller_gates:
         lines.append(
-            f"- Controller-executed gates (maximum {contract.max_parallel} in parallel): "
-            f"{controller_names}."
+            "- Controller-stage gates (run after handoff against checkpoint; failure blocks "
+            "acceptance and forces a retry; run relevant ones before handoff):"
         )
-        lines.append(
-            "- ACP independently runs those matching controller gates against the exact "
-            "checkpoint before the handoff can become review-ready; worker-only gates are not "
-            "duplicated."
-        )
+        for gate in controller_gates:
+            applies_to = ", ".join(gate.include_globs) or "every changed file"
+            lines.append(
+                f"  - [{gate.name}] cwd={gate.working_dir.as_posix()}: "
+                f"{format_gate_command(gate)}; Applies to: {applies_to}"
+            )
     return "\n".join(lines)
 
 
