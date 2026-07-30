@@ -65,13 +65,19 @@ Run the server module directly with Python:
 python -m agent_control_plane.app.runtime.mcp_server --config .\config\workspaces.toml
 ```
 
-By default, the server runs with `stdio` transport. You can optionally start the HTTP transport using `--transport streamable-http`, which binds to loopback `127.0.0.1:8766` by default:
+`stdio` remains the default transport in all respects and is fully supported. You can optionally start the HTTP transport using `--transport streamable-http`:
 
 ```powershell
 python -m agent_control_plane.app.runtime.mcp_server --config .\config\workspaces.toml --transport streamable-http --host 127.0.0.1 --port 8766
 ```
 
-`stdio` remains the default transport in all respects. When running HTTP transport, host binding defaults to loopback `127.0.0.1`. Server-side long-polling wait budgets (`agent_watch_job`, `agent_plan_watch`, `agent_plan_run_until_review`, `agent_start_job` with `wait=True`) are capped at a ceiling of 300s (`timeout_clamped_to: 300.0`).
+ACP serves one MCP server instance per workspace config on a deterministic port derived from the config path. The config is discovered automatically from the working directory (walking up to `.agent-work/workspaces.toml` or checking the known-config index); when no discovery hit is found, `default_config_path()` (`config/workspaces.toml`) applies as fallback.
+
+To manage and wire the MCP server across client sessions and repositories:
+- `agent-control mcp ensure [--cwd PATH]` lazily starts or reports the HTTP MCP server for a working directory on session start.
+- `agent-control mcp wire [--config PATH] [--apply]` discovers all client repositories for a config (from `[routes.*] path` and `[control] coordination_root`) and generates or merges a project-scoped `.mcp.json` containing the derived HTTP server URL into each client repository.
+
+When running HTTP transport, host binding defaults to loopback `127.0.0.1`. Server-side long-polling wait budgets (`agent_watch_job`, `agent_plan_watch`, `agent_plan_run_until_review`, `agent_start_job` with `wait=True`) are capped at a ceiling of 300s (`timeout_clamped_to: 300.0`).
 
 
 ## Five-minute offline demo

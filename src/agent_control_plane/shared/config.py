@@ -641,6 +641,112 @@ def ensure_mcp_server(
         )
 
 
+def find_enclosing_git_repo(path: Path) -> Path:
+    resolved = path.resolve(strict=False)
+    curr: Path | None = resolved
+    while curr is not None:
+        if (curr / ".git").exists():
+            return curr
+        parent = curr.parent
+        if parent == curr:
+            break
+        curr = parent
+    return resolved
+
+
+def wire_mcp_servers(
+    *,
+    cwd: Path | str | None = None,
+    config_path: Path | str | None = None,
+    apply: bool = False,
+    print_output: bool = False,
+) -> dict[str, Any]:
+    if config_path is not None:
+        target_config = Path(config_path).expanduser().resolve(strict=False)
+        if not target_config.is_file():
+            raise FileNotFoundError(f"Config file not found: {target_config}")
+        register_known_config(target_config)
+    else:
+        target_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
+        target_config = resolve_config_for(target_cwd)
+        if not target_config.is_file():
+            raise FileNotFoundError(f"Config file not found: {target_config}")
+
+    cfg = load_config(target_config)
+    target_port = port_for(target_config)
+    mcp_url = f"http://127.0.0.1:{target_port}/mcp"
+
+    candidate_paths: list[Path] = [cfg.coordination_root]
+    for route in cfg.routes.values():
+        candidate_paths.append(route.path)
+
+    client_repos: list[Path] = []
+    seen_repos: set[Path] = set()
+    for cand in candidate_paths:
+        repo = find_enclosing_git_repo(cand)
+        if repo not in seen_repos:
+            seen_repos.add(repo)
+            client_repos.append(repo)
+
+    targets: list[dict[str, Any]] = []
+    for repo in client_repos:
+        mcp_json_path = repo / ".mcp.json"
+        existing_data: dict[str, Any] = {}
+        if mcp_json_path.is_file():
+            try:
+                content = mcp_json_path.read_text(encoding="utf-8")
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    existing_data = parsed
+            except (OSError, ValueError):
+                existing_data = {}
+
+        mcp_servers: dict[str, Any] = {}
+        if isinstance(existing_data.get("mcpServers"), dict):
+            mcp_servers = dict(existing_data["mcpServers"])
+
+        mcp_servers["agent_control_plane"] = {
+            "type": "http",
+            "url": mcp_url,
+        }
+
+        new_data = dict(existing_data)
+        new_data["mcpServers"] = mcp_servers
+
+        existed = mcp_json_path.is_file()
+        is_changed = new_data != existing_data
+
+        if not existed:
+            action = "created" if apply else "would_create"
+        elif is_changed:
+            action = "updated" if apply else "would_update"
+        else:
+            action = "unchanged" if apply else "would_keep"
+
+        if apply and (not existed or is_changed):
+            mcp_json_path.parent.mkdir(parents=True, exist_ok=True)
+            mcp_json_path.write_text(json.dumps(new_data, indent=2) + "\n", encoding="utf-8")
+
+        targets.append(
+            {
+                "repo_path": str(repo),
+                "mcp_json_path": str(mcp_json_path),
+                "action": action,
+                "mcp_json": new_data,
+            }
+        )
+
+    return {
+        "ok": True,
+        "config_path": str(target_config),
+        "port": target_port,
+        "url": mcp_url,
+        "apply": apply,
+        "print_output": print_output,
+        "targets": targets,
+    }
+
+
 def load_config(
     path: str | os.PathLike[str] | None = None,
     *,

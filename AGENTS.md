@@ -5,6 +5,7 @@
 - Every route whose repository differs from the one owning `[control] slot_root` must declare
   its own `slot_root`. Slot directories are named after the project they serve; never let one
   project's slots land in another project's slot directory.
+- An MCP control plane serves exactly the routes of the config it was started with, and the config is discovered from the working directory rather than assumed; run one instance per config, never one process per client session.
 - Preserve user changes. Refuse dirty task workspaces by default and record blockers instead of switching branches or cleaning files.
 - When `terminal_slot_policy = "checkpoint"`, clean terminal task changes only after the
   controller-owned Git ref and review-inbox record are verified durable. Never move the

@@ -24,7 +24,7 @@ from agent_control_plane.app.runtime.review_cli import add_review_parser, handle
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
-from agent_control_plane.shared.config import ensure_mcp_server
+from agent_control_plane.shared.config import ensure_mcp_server, wire_mcp_servers
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,23 +44,37 @@ def main(argv: list[str] | None = None) -> int:
         except OfflineDemoError as exc:
             print(str(exc), file=sys.stderr)
             return 2
-    if args.command == "mcp" and args.mcp_command == "ensure":
-        try:
-            payload = ensure_mcp_server(
-                cwd=args.cwd,
-                config_path=args.config,
-                print_url=args.print_url,
-                no_start=args.no_start,
-                timeout_sec=args.timeout,
-            )
-            if args.print_url:
-                print(payload["url"])
-            else:
+    if args.command == "mcp":
+        if args.mcp_command == "ensure":
+            try:
+                payload = ensure_mcp_server(
+                    cwd=args.cwd,
+                    config_path=args.config,
+                    print_url=args.print_url,
+                    no_start=args.no_start,
+                    timeout_sec=args.timeout,
+                )
+                if args.print_url:
+                    print(payload["url"])
+                else:
+                    _print_json(payload)
+                return 0
+            except (RuntimeError, ValueError, OSError, FileNotFoundError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+        if args.mcp_command == "wire":
+            try:
+                payload = wire_mcp_servers(
+                    cwd=args.cwd,
+                    config_path=args.config,
+                    apply=args.apply,
+                    print_output=args.print_output,
+                )
                 _print_json(payload)
-            return 0
-        except (RuntimeError, ValueError, OSError) as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
+                return 0
+            except (RuntimeError, ValueError, OSError, FileNotFoundError) as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
 
     try:
         control = AgentControlPlane.from_config_path(args.config)
@@ -448,6 +462,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="Timeout in seconds to wait for server start",
+    )
+
+    mcp_wire = mcp_subparsers.add_parser(
+        "wire",
+        parents=[common],
+        help="Emit or update .mcp.json in client repositories for a workspace config",
+    )
+    mcp_wire.add_argument("--cwd", help="Path to working directory")
+    mcp_wire.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write .mcp.json files to client repositories (default is dry-run)",
+    )
+    mcp_wire.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_output",
+        help="Print derived .mcp.json changes",
     )
 
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")

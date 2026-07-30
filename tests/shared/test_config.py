@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,10 +9,12 @@ from unittest.mock import patch
 from agent_control_plane.shared.config import (
     CodexModelMetadataConfig,
     ensure_mcp_server,
+    find_enclosing_git_repo,
     load_config,
     port_for,
     register_known_config,
     resolve_config_for,
+    wire_mcp_servers,
 )
 
 
@@ -1592,6 +1595,148 @@ class ConfigDiscoveryTest(unittest.TestCase):
                 self.assertFalse(res["started"])
                 self.assertEqual(mock_popen.call_count, 0)
                 self.assertTrue(res["url"].startswith("http://127.0.0.1:"))
+
+
+class WireMcpTest(unittest.TestCase):
+    def test_find_enclosing_git_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            repo = root / "my_repo"
+            sub_dir = repo / "src" / "pkg"
+            sub_dir.mkdir(parents=True)
+            (repo / ".git").mkdir()
+
+            found = find_enclosing_git_repo(sub_dir)
+            self.assertEqual(found, repo)
+
+            outside = root / "other"
+            outside.mkdir()
+            self.assertEqual(find_enclosing_git_repo(outside), outside)
+
+    def test_wire_computes_client_repos_and_dry_runs_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+
+            # Client repo 1 (owns coordination_root and route r1)
+            repo1 = root / "repo1"
+            (repo1 / ".git").mkdir(parents=True)
+            coord_root = repo1 / ".agent-work"
+            r1_path = repo1 / "sub_r1"
+            coord_root.mkdir(parents=True)
+            r1_path.mkdir(parents=True)
+
+            # Client repo 2 (owns route r2)
+            repo2 = root / "repo2"
+            (repo2 / ".git").mkdir(parents=True)
+
+            cfg_file = coord_root / "workspaces.toml"
+            cfg_file.write_text(
+                f'[control]\ncoordination_root="{coord_root.as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.r1]\npath="{r1_path.as_posix()}"\nrequired_branch="main"\n'
+                f'[routes.r2]\npath="{repo2.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            res = wire_mcp_servers(config_path=cfg_file, apply=False)
+
+            self.assertTrue(res["ok"])
+            self.assertFalse(res["apply"])
+            self.assertEqual(len(res["targets"]), 2)
+
+            target_repos = {t["repo_path"] for t in res["targets"]}
+            self.assertIn(str(repo1), target_repos)
+            self.assertIn(str(repo2), target_repos)
+
+            for t in res["targets"]:
+                self.assertEqual(t["action"], "would_create")
+                mcp_json_p = Path(t["mcp_json_path"])
+                self.assertFalse(
+                    mcp_json_p.exists(), f"File {mcp_json_p} should not exist in dry run"
+                )
+
+    def test_wire_writes_only_with_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+
+            repo1 = root / "repo1"
+            (repo1 / ".git").mkdir(parents=True)
+            coord_root = repo1 / ".agent-work"
+            coord_root.mkdir(parents=True)
+
+            cfg_file = coord_root / "workspaces.toml"
+            cfg_file.write_text(
+                f'[control]\ncoordination_root="{coord_root.as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.r1]\npath="{repo1.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            res = wire_mcp_servers(config_path=cfg_file, apply=True)
+
+            self.assertTrue(res["ok"])
+            self.assertTrue(res["apply"])
+            self.assertEqual(len(res["targets"]), 1)
+
+            t = res["targets"][0]
+            self.assertEqual(t["action"], "created")
+            mcp_json_p = Path(t["mcp_json_path"])
+            self.assertTrue(mcp_json_p.is_file())
+
+            data = json.loads(mcp_json_p.read_text(encoding="utf-8"))
+            self.assertIn("mcpServers", data)
+            self.assertIn("agent_control_plane", data["mcpServers"])
+            self.assertEqual(data["mcpServers"]["agent_control_plane"]["type"], "http")
+            self.assertEqual(data["mcpServers"]["agent_control_plane"]["url"], res["url"])
+
+    def test_wire_merges_into_existing_mcp_json_without_disturbing_other_servers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+
+            repo1 = root / "repo1"
+            (repo1 / ".git").mkdir(parents=True)
+            coord_root = repo1 / ".agent-work"
+            coord_root.mkdir(parents=True)
+
+            mcp_json_p = repo1 / ".mcp.json"
+            initial_content = {
+                "custom_key": "hello",
+                "mcpServers": {
+                    "other_server": {
+                        "command": "node",
+                        "args": ["server.js"],
+                    }
+                },
+            }
+            mcp_json_p.write_text(json.dumps(initial_content, indent=2), encoding="utf-8")
+
+            cfg_file = coord_root / "workspaces.toml"
+            cfg_file.write_text(
+                f'[control]\ncoordination_root="{coord_root.as_posix()}"\nruns_root="runs"\n'
+                f'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                f'[routes.r1]\npath="{repo1.as_posix()}"\nrequired_branch="main"\n',
+                encoding="utf-8",
+            )
+
+            res = wire_mcp_servers(config_path=cfg_file, apply=True)
+
+            self.assertTrue(res["ok"])
+            t = res["targets"][0]
+            self.assertEqual(t["action"], "updated")
+
+            data = json.loads(mcp_json_p.read_text(encoding="utf-8"))
+            self.assertEqual(data.get("custom_key"), "hello")
+            self.assertIn("other_server", data.get("mcpServers", {}))
+            self.assertEqual(data["mcpServers"]["other_server"]["command"], "node")
+            self.assertIn("agent_control_plane", data["mcpServers"])
+            self.assertEqual(data["mcpServers"]["agent_control_plane"]["url"], res["url"])
+
+    def test_wire_fails_cleanly_when_no_config_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            non_existent_cfg = root / "non_existent.toml"
+            with self.assertRaises(FileNotFoundError):
+                wire_mcp_servers(config_path=non_existent_cfg)
 
 
 if __name__ == "__main__":

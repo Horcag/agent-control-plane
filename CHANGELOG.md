@@ -6,6 +6,7 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Added
 
+- Added `agent-control mcp wire [--config PATH] [--apply] [--print]` command to discover client repositories for a workspace configuration (from `[routes.*] path` and `[control] coordination_root`) and generate or merge a project-scoped `.mcp.json` containing the derived HTTP server URL into each client repository. Documented the one-instance-per-config MCP model, working-directory discovery, deterministic ports, and lazy server management via `mcp ensure`.
 - Added optional `streamable-http` transport support to the MCP server (`--transport streamable-http`, `--host`, `--port`), defaulting to `stdio` and binding `127.0.0.1:8766` by default. HTTP transport runs FastMCP in `stateless_http` mode (`stateless_http=True`) to prevent per-session transport accumulation.
 - Added a server-side ceiling on long-polling wait budgets across `agent_watch_job`, `agent_plan_watch`, `agent_plan_run_until_review`, and `agent_start_job(wait=True)`, clamping timeouts above 300.0s down to 300.0s (`timeout_clamped_to: 300.0`), enforcing minimum poll intervals of 0.5s for non-zero timeouts, and resolving `agent_plan_run_until_review(timeout_sec=None)` to 300.0s.
 
