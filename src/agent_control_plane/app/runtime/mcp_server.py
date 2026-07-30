@@ -33,6 +33,28 @@ _CONFIG_LOAD_ATTEMPTS = 2
 _CONFIG_LOCK_TIMEOUT_SEC = 2.0
 _CONFIG_LOCK_RETRY_SEC = 0.02
 
+_MAX_LONG_POLL_SEC = 300.0
+_MIN_POLL_INTERVAL_SEC = 0.5
+
+
+def _normalize_poll_params(
+    timeout_sec: float | None,
+    poll_interval_sec: float,
+) -> tuple[float, float, bool]:
+    if timeout_sec is None or timeout_sec > _MAX_LONG_POLL_SEC:
+        effective_timeout = _MAX_LONG_POLL_SEC
+        clamped = True
+    else:
+        effective_timeout = float(timeout_sec)
+        clamped = False
+
+    if effective_timeout > 0 and poll_interval_sec < _MIN_POLL_INTERVAL_SEC:
+        effective_poll_interval = _MIN_POLL_INTERVAL_SEC
+    else:
+        effective_poll_interval = float(poll_interval_sec)
+
+    return effective_timeout, effective_poll_interval, clamped
+
 
 class ConfigFreshnessError(RuntimeError):
     """Raised when config freshness cannot be preserved during an MCP call."""
@@ -180,7 +202,12 @@ def _release_config_lock(lock_file: Any) -> None:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def build_server(config_path: str | None = None) -> Any:
+def build_server(
+    config_path: str | None = None,
+    *,
+    host: str | None = None,
+    port: int | None = None,
+) -> Any:
     try:
         fast_mcp = importlib.import_module("mcp.server.fastmcp").FastMCP
         anyio = importlib.import_module("anyio")
@@ -203,7 +230,12 @@ def build_server(config_path: str | None = None) -> Any:
         return decorator
 
     control = ConfigFreshControl(config_path)
-    mcp = fast_mcp("agent-control-plane")
+    mcp_kwargs: dict[str, Any] = {}
+    if host is not None:
+        mcp_kwargs["host"] = host
+    if port is not None:
+        mcp_kwargs["port"] = port
+    mcp = fast_mcp("agent-control-plane", **mcp_kwargs)
     register = _offloaded(mcp)
 
     @register
@@ -328,14 +360,22 @@ def build_server(config_path: str | None = None) -> Any:
             "plan_task_id": plan_task_id or (task_id if plan_id else None),
         }
         if wait:
-            response["watch"] = control.watch_job(
+            eff_timeout, eff_poll, clamped = _normalize_poll_params(
+                wait_timeout_sec, poll_interval_sec
+            )
+            watch_res = control.watch_job(
                 job.job_id,
-                poll_interval_sec=poll_interval_sec,
-                timeout_sec=wait_timeout_sec,
+                poll_interval_sec=eff_poll,
+                timeout_sec=eff_timeout,
                 log_lines=lines,
                 log_cursor=log_cursor,
                 log_byte_limit=log_byte_limit,
             )
+            if clamped:
+                if isinstance(watch_res, dict):
+                    watch_res["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
+                response["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
+            response["watch"] = watch_res
         return response
 
     @register
@@ -348,14 +388,18 @@ def build_server(config_path: str | None = None) -> Any:
         log_byte_limit: int = 2048,
     ) -> dict[str, Any]:
         """Poll compact status; pass next_log_cursor back to receive only new log bytes."""
-        return control.watch_job(
+        eff_timeout, eff_poll, clamped = _normalize_poll_params(timeout_sec, poll_interval_sec)
+        result = control.watch_job(
             job_id,
-            poll_interval_sec=poll_interval_sec,
-            timeout_sec=timeout_sec,
+            poll_interval_sec=eff_poll,
+            timeout_sec=eff_timeout,
             log_lines=lines,
             log_cursor=log_cursor,
             log_byte_limit=log_byte_limit,
         )
+        if clamped and isinstance(result, dict):
+            result["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
+        return result
 
     @register
     def agent_status_job(job_id: str) -> dict[str, Any]:
@@ -538,15 +582,19 @@ def build_server(config_path: str | None = None) -> Any:
         item_limit: int = 20,
     ) -> dict[str, Any]:
         """Long-poll until the plan cursor advances, without returning worker logs."""
+        eff_timeout, eff_poll, clamped = _normalize_poll_params(timeout_sec, poll_interval_sec)
         try:
-            return control.watch_plan(
+            result = control.watch_plan(
                 plan_id,
                 since=since,
-                poll_interval_sec=poll_interval_sec,
-                timeout_sec=timeout_sec,
+                poll_interval_sec=eff_poll,
+                timeout_sec=eff_timeout,
                 event_limit=event_limit,
                 item_limit=item_limit,
             )
+            if clamped and isinstance(result, dict):
+                result["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
+            return result
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -590,13 +638,17 @@ def build_server(config_path: str | None = None) -> Any:
         timeout_sec: float | None = 25.0,
     ) -> dict[str, Any]:
         """Dispatch, watch, and reconcile until root review or another safe stop boundary."""
+        eff_timeout, eff_poll, clamped = _normalize_poll_params(timeout_sec, poll_interval_sec)
         try:
-            return control.run_plan_until_review(
+            result = control.run_plan_until_review(
                 plan_id,
                 max_jobs=max_jobs,
-                poll_interval_sec=poll_interval_sec,
-                timeout_sec=timeout_sec,
+                poll_interval_sec=eff_poll,
+                timeout_sec=eff_timeout,
             )
+            if clamped and isinstance(result, dict):
+                result["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
+            return result
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1054,8 +1106,16 @@ def _optional_text(value: Any) -> str | None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run the Agent Control Plane MCP server.")
     parser.add_argument("--config", help="Path to workspaces.toml")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable-http"],
+        default="stdio",
+        help="MCP transport protocol (stdio or streamable-http)",
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="Host address for HTTP transport")
+    parser.add_argument("--port", type=int, default=8766, help="Port number for HTTP transport")
     args = parser.parse_args(argv)
-    build_server(args.config).run()
+    build_server(args.config, host=args.host, port=args.port).run(transport=args.transport)
 
 
 if __name__ == "__main__":

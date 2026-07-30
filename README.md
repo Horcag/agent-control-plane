@@ -57,6 +57,23 @@ To register the ACP MCP server in a coordinating agent, use the templates in
 [docs/codex-mcp.example.toml](docs/codex-mcp.example.toml) (Codex `config.toml`) or
 [docs/claude-mcp.example.json](docs/claude-mcp.example.json) (Claude Code `mcpServers`).
 
+### Running the MCP server
+
+Run the server module directly with Python:
+
+```powershell
+python -m agent_control_plane.app.runtime.mcp_server --config .\config\workspaces.toml
+```
+
+By default, the server runs with `stdio` transport. You can optionally start the HTTP transport using `--transport streamable-http`, which binds to loopback `127.0.0.1:8766` by default:
+
+```powershell
+python -m agent_control_plane.app.runtime.mcp_server --config .\config\workspaces.toml --transport streamable-http --host 127.0.0.1 --port 8766
+```
+
+`stdio` remains the default transport in all respects. When running HTTP transport, host binding defaults to loopback `127.0.0.1`. Server-side long-polling wait budgets (`agent_watch_job`, `agent_plan_watch`, `agent_plan_run_until_review`, `agent_start_job` with `wait=True`) are capped at a ceiling of 300s (`timeout_clamped_to: 300.0`).
+
+
 ## Five-minute offline demo
 
 The demo uses local fixtures and does not call an agent, IDEA, or the network. Run it,

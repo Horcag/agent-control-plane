@@ -548,3 +548,234 @@ def test_mcp_start_rejects_invalid_controller_contract(monkeypatch) -> None:
 
     assert response["ok"] is False
     control.start_job.assert_not_called()
+
+
+def test_main_transport_and_host_port_parsing(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fake_fastmcp = Mock()
+    fastmcp_module.FastMCP = fake_fastmcp  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    server_instance = Mock()
+    fake_fastmcp.return_value = server_instance
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=Mock(),
+    ):
+        mcp_server.main([])
+        fake_fastmcp.assert_called_with("agent-control-plane", host="127.0.0.1", port=8766)
+        server_instance.run.assert_called_with(transport="stdio")
+
+        fake_fastmcp.reset_mock()
+        server_instance.reset_mock()
+
+        mcp_server.main(["--transport", "streamable-http", "--host", "127.0.0.1", "--port", "8766"])
+        fake_fastmcp.assert_called_with("agent-control-plane", host="127.0.0.1", port=8766)
+        server_instance.run.assert_called_with(transport="streamable-http")
+
+
+def test_build_server_without_host_port_preserves_defaults(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fake_fastmcp = Mock()
+    fastmcp_module.FastMCP = fake_fastmcp  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=Mock(),
+    ):
+        build_server()
+        fake_fastmcp.assert_called_once_with("agent-control-plane")
+
+
+def test_wait_budget_clamping_for_all_four_tools(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.watch_job.return_value = {"status": "running"}
+    control.watch_plan.return_value = {"cursor": 10}
+    control.run_plan_until_review.return_value = {"status": "review"}
+    control.start_job.return_value = SimpleNamespace(
+        job_id="j1",
+        status="queued",
+        expected_result_status="completed",
+        controller_gate_mode="full",
+        run_dir=Path("runs/j1"),
+        result_path=Path("tasks/j1/result.md"),
+        backend="codex",
+        agy_model=None,
+        codex_model="gpt-5",
+        codex_reasoning_effort="low",
+        codex_quality_tier="mechanical",
+        codex_premium_override_reason=None,
+        workspace_access="native",
+        worker_pid=100,
+        runner_pid=None,
+        read_only=False,
+        slot_name="app-1",
+    )
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+
+        res1 = server.tools["agent_watch_job"]("j1", timeout_sec=500.0)
+        assert res1["timeout_clamped_to"] == 300.0
+        assert control.watch_job.call_args.kwargs["timeout_sec"] == 300.0
+
+        res2 = server.tools["agent_plan_watch"]("p1", 0, timeout_sec=600.0)
+        assert res2["timeout_clamped_to"] == 300.0
+        assert control.watch_plan.call_args.kwargs["timeout_sec"] == 300.0
+
+        res3 = server.tools["agent_plan_run_until_review"]("p1", timeout_sec=400.0)
+        assert res3["timeout_clamped_to"] == 300.0
+        assert control.run_plan_until_review.call_args.kwargs["timeout_sec"] == 300.0
+
+        res4 = server.tools["agent_start_job"]("t1", "acp", wait=True, wait_timeout_sec=450.0)
+        assert res4["timeout_clamped_to"] == 300.0
+        assert res4["watch"]["timeout_clamped_to"] == 300.0
+        assert control.watch_job.call_args.kwargs["timeout_sec"] == 300.0
+
+
+def test_agent_plan_run_until_review_none_timeout(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.run_plan_until_review.return_value = {"status": "review"}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        res = server.tools["agent_plan_run_until_review"]("p1", timeout_sec=None)
+
+    assert res["timeout_clamped_to"] == 300.0
+    assert control.run_plan_until_review.call_args.kwargs["timeout_sec"] == 300.0
+
+
+def test_default_timeouts_unclamped(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.watch_job.return_value = {"status": "running"}
+    control.watch_plan.return_value = {"cursor": 10}
+    control.run_plan_until_review.return_value = {"status": "review"}
+    control.start_job.return_value = SimpleNamespace(
+        job_id="j1",
+        status="queued",
+        expected_result_status="completed",
+        controller_gate_mode="full",
+        run_dir=Path("runs/j1"),
+        result_path=Path("tasks/j1/result.md"),
+        backend="codex",
+        agy_model=None,
+        codex_model="gpt-5",
+        codex_reasoning_effort="low",
+        codex_quality_tier="mechanical",
+        codex_premium_override_reason=None,
+        workspace_access="native",
+        worker_pid=100,
+        runner_pid=None,
+        read_only=False,
+        slot_name="app-1",
+    )
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+
+        res1 = server.tools["agent_watch_job"]("j1", timeout_sec=25.0)
+        assert "timeout_clamped_to" not in res1
+        assert control.watch_job.call_args.kwargs["timeout_sec"] == 25.0
+
+        res2 = server.tools["agent_plan_watch"]("p1", 0, timeout_sec=25.0)
+        assert "timeout_clamped_to" not in res2
+        assert control.watch_plan.call_args.kwargs["timeout_sec"] == 25.0
+
+        res3 = server.tools["agent_plan_run_until_review"]("p1", timeout_sec=25.0)
+        assert "timeout_clamped_to" not in res3
+        assert control.run_plan_until_review.call_args.kwargs["timeout_sec"] == 25.0
+
+        res4 = server.tools["agent_start_job"]("t1", "acp", wait=True, wait_timeout_sec=25.0)
+        assert "timeout_clamped_to" not in res4
+        assert "timeout_clamped_to" not in res4["watch"]
+        assert control.watch_job.call_args.kwargs["timeout_sec"] == 25.0
+
+
+def test_zero_snapshot_poll_interval_preserved(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.watch_job.return_value = {"status": "running"}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        res = server.tools["agent_watch_job"]("j1", timeout_sec=0.0, poll_interval_sec=0.0)
+
+    assert "timeout_clamped_to" not in res
+    assert control.watch_job.call_args.kwargs["timeout_sec"] == 0.0
+    assert control.watch_job.call_args.kwargs["poll_interval_sec"] == 0.0
+
+
+def test_low_poll_interval_raised_when_timeout_positive(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.watch_job.return_value = {"status": "running"}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        server.tools["agent_watch_job"]("j1", timeout_sec=10.0, poll_interval_sec=0.1)
+
+    assert control.watch_job.call_args.kwargs["timeout_sec"] == 10.0
+    assert control.watch_job.call_args.kwargs["poll_interval_sec"] == 0.5
