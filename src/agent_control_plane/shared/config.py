@@ -617,6 +617,22 @@ def port_assignments_path() -> Path:
     return Path.home() / ".agent-control-plane" / "port-assignments.json"
 
 
+def _probe_mcp_health_while_booting(port: int, grace_sec: float = 5.0) -> bool:
+    """A server that has just bound its port does not answer yet.
+
+    Callers that do not hold the config lock — `mcp wire`, `mcp ensure --no-start` —
+    must not conclude from that silence that the port belongs to somebody else, or they
+    move the config to a second port while its own server is still starting up.
+    """
+    deadline = time.monotonic() + grace_sec
+    while True:
+        if probe_mcp_health(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
 def port_for(config_path: Path | str) -> int:
     resolved = Path(config_path).expanduser().resolve(strict=False)
     canonical = os.path.normcase(str(resolved))
@@ -637,7 +653,7 @@ def port_for(config_path: Path | str) -> int:
         if canonical in assignments:
             remembered = assignments[canonical]
             if 9230 <= remembered <= 9329 and (
-                not _is_port_open(remembered) or probe_mcp_health(remembered)
+                not _is_port_open(remembered) or _probe_mcp_health_while_booting(remembered)
             ):
                 return remembered
 
@@ -671,10 +687,14 @@ def ensure_mcp_server(
         target_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
         target_config = resolve_config_for(target_cwd)
 
-    target_port = port_for(target_config)
-    mcp_url = f"http://127.0.0.1:{target_port}/mcp"
-
+    # The port is resolved under the same lock that starts the server: resolving it
+    # first lets a second session read the port while the first is still booting on it,
+    # decide the port is taken, and give the same config a second port and a second
+    # server. One instance per config only holds if both steps happen under one lock.
     with interprocess_config_lock(target_config):
+        target_port = port_for(target_config)
+        mcp_url = f"http://127.0.0.1:{target_port}/mcp"
+
         if probe_mcp_health(target_port):
             return {
                 "ok": True,

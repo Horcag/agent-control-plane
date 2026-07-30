@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
+import os
 import tempfile
 import unittest
 import urllib.error
+from collections.abc import Iterator
 from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
@@ -1700,6 +1703,104 @@ class ConfigDiscoveryTest(unittest.TestCase):
 
             cfg1_spelling = root / "CONFIG1" / "workspaces.toml"
             self.assertEqual(port_for(cfg1_spelling), port1)
+
+    def test_port_for_keeps_a_remembered_port_that_is_still_booting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text("c")
+            assignments = root / "port-assignments.json"
+            canonical = os.path.normcase(str(cfg))
+            assignments.write_text(json.dumps({canonical: 9260}), encoding="utf-8")
+
+            # A server that has just bound the port answers only on the third probe.
+            probes = [False, False, True]
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.port_assignments_path",
+                    return_value=assignments,
+                ),
+                patch("agent_control_plane.shared.config._is_port_open", return_value=True),
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    side_effect=lambda *_a, **_k: probes.pop(0) if probes else True,
+                ),
+                patch("time.sleep"),
+            ):
+                self.assertEqual(port_for(cfg), 9260)
+
+    def test_port_for_gives_up_a_remembered_port_held_by_something_else(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text("c")
+            assignments = root / "port-assignments.json"
+            canonical = os.path.normcase(str(cfg))
+            assignments.write_text(json.dumps({canonical: 9260}), encoding="utf-8")
+
+            def open_ports(port: int) -> bool:
+                return port == 9260
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.port_assignments_path",
+                    return_value=assignments,
+                ),
+                patch(
+                    "agent_control_plane.shared.config._is_port_open",
+                    side_effect=open_ports,
+                ),
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=False,
+                ),
+                patch("time.sleep"),
+            ):
+                moved = port_for(cfg)
+
+            self.assertNotEqual(moved, 9260)
+            self.assertTrue(9230 <= moved <= 9329)
+            self.assertEqual(json.loads(assignments.read_text(encoding="utf-8"))[canonical], moved)
+
+    def test_mcp_ensure_resolves_the_port_under_the_config_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text(
+                '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
+                'database="db"\nworktree_root="w"\nworktree_base="b"\nslot_root="s"\n'
+                '[routes.main]\npath="repo"\nrequired_branch="main"\n'
+            )
+            events: list[str] = []
+
+            @contextlib.contextmanager
+            def recording_lock(config_path: Path) -> Iterator[None]:
+                events.append("lock")
+                try:
+                    yield
+                finally:
+                    events.append("unlock")
+
+            def recording_port_for(config_path: Path | str) -> int:
+                events.append("port_for")
+                return 9260
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.interprocess_config_lock",
+                    recording_lock,
+                ),
+                patch("agent_control_plane.shared.config.port_for", recording_port_for),
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=True,
+                ),
+            ):
+                result = ensure_mcp_server(config_path=cfg)
+
+            self.assertEqual(result["port"], 9260)
+            self.assertEqual(events, ["lock", "port_for", "unlock"])
 
     def test_mcp_ensure_no_start_and_print_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
