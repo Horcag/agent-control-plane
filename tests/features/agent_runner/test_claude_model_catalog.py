@@ -27,7 +27,7 @@ def test_builtin_inventory_is_loaded_with_stable_identity() -> None:
 
 def test_default_selector_resolves_to_highest_priority_visible_model() -> None:
     profile = claude_ladder_for_explicit_model(_catalog(), "default", "high")[0]
-    assert profile.model == "claude-opus-4-8"
+    assert profile.model == "claude-opus-5"
     assert profile.reasoning_effort == "high"
 
 
@@ -82,7 +82,7 @@ def test_metadata_rate_card_reprices_claude_usage() -> None:
         ClaudeModelCatalogConfig(
             models=(
                 CodexModelMetadataConfig(
-                    model="claude-opus-4-8",
+                    model="claude-opus-5",
                     premium=True,
                     quota_domain=None,
                     capacity_units=(),
@@ -99,12 +99,12 @@ def test_metadata_rate_card_reprices_claude_usage() -> None:
         )
     )
     estimate = catalog.reprice(
-        "claude-opus-4-8",
+        "claude-opus-5",
         input_tokens=1_000_000,
         cached_input_tokens=400_000,
         output_tokens=100_000,
     )
     assert estimate.estimated_api_usd == pytest.approx(600_000 * 5.0 / 1e6 + 0.2 + 2.5)
     assert estimate.rate_card_version == "2026-07"
-    metadata = catalog.rate_metadata_for("claude-opus-4-8")
+    metadata = catalog.rate_metadata_for("claude-opus-5")
     assert metadata is not None and metadata.premium is True

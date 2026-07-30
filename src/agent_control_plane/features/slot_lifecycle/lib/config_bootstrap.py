@@ -76,7 +76,13 @@ def bootstrap_slot_config(
     if not branch:
         raise ConfigBootstrapError(f"Could not infer required branch for route {route_name}")
 
-    target_slot_path = (slot_path or (config.slot_root / slot_name)).resolve(strict=False)
+    # A brand-new route gets its own sibling slot directory instead of inheriting the
+    # global slot_root, so unrelated repositories never materialize slots inside
+    # another project's slot directory.
+    default_slot_root = (
+        config.slot_root_for(route_name) if route_config is not None else _sibling_slot_root(repo)
+    )
+    target_slot_path = (slot_path or (default_slot_root / slot_name)).resolve(strict=False)
     layout = (
         RepoLayout(
             source_roots=route_config.source_roots,
@@ -107,7 +113,8 @@ def bootstrap_slot_config(
                 route_name=route_name,
                 repo_path=repo,
                 required_branch=branch,
-                worktree_root=config.worktree_root,
+                worktree_root=default_slot_root,
+                slot_root=default_slot_root,
                 source_roots=layout.source_roots,
                 test_roots=layout.test_roots,
                 exclude_dirs=layout.exclude_dirs,
@@ -164,6 +171,10 @@ def infer_repo_layout(repo_path: Path) -> RepoLayout:
     )
 
 
+def _sibling_slot_root(repo_path: Path) -> Path:
+    return repo_path.parent / f"{repo_path.name}-agent-slots"
+
+
 def _current_branch(repo_path: Path) -> str:
     try:
         return run_git(repo_path, "branch", "--show-current")
@@ -188,6 +199,7 @@ def _format_route_table(
     repo_path: Path,
     required_branch: str,
     worktree_root: Path,
+    slot_root: Path,
     source_roots: tuple[Path, ...],
     test_roots: tuple[Path, ...],
     exclude_dirs: tuple[Path, ...],
@@ -197,6 +209,7 @@ def _format_route_table(
         f'path = "{_toml_path(repo_path)}"',
         f'required_branch = "{_escape(required_branch)}"',
         f'worktree_root = "{_toml_path(worktree_root)}"',
+        f'slot_root = "{_toml_path(slot_root)}"',
         f'worktree_base = "{_toml_path(repo_path)}"',
     ]
     if source_roots:

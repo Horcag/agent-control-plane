@@ -18,7 +18,7 @@ only after a demonstrated failure — not preemptively for "hard-sounding" work:
   effort — this is the shipped `[control.defaults]` default. Use high effort for
   trickier work in the same lane.
 - **Hard cross-cutting implementation or architecture-sensitive repair:** try
-  `claude-sonnet-5` at xhigh effort first. Reach for `claude-opus-4-8` at high or
+  `claude-sonnet-5` at xhigh effort first. Reach for `claude-opus-5` at high or
   xhigh effort only when a sonnet attempt already produced a wrong or partial result
   for capability reasons (not for timeouts, tooling errors, or missing context, which
   a bigger model won't fix).
@@ -35,11 +35,13 @@ Sticker API rates, verify before relying on them for billing — per MTok
 | --- | --- | --- | --- |
 | claude-haiku-4-5 | $1 | $0.10 | $5 |
 | claude-sonnet-5 | $3 | $0.30 | $15 |
-| claude-opus-4-8 | $5 | $0.50 | $25 |
+| claude-opus-5 | $5 | $0.50 | $25 |
 | claude-fable-5 | $10 | $1.00 | $50 |
 
 Cache writes bill above the base input rate: 1.25x input for a 5-minute TTL, or 2x
-input for a 1-hour TTL (what Claude Code uses).
+input for a 1-hour TTL (what Claude Code uses). The claude-opus-5 row was confirmed on
+2026-07-25 against a CLI `total_cost_usd` probe: 32138 1h-TTL cache-write tokens plus 2
+input and 4 output tokens billed $0.32149, which the $5/$25 rates reproduce exactly.
 
 Measured worker jobs (agent-control-plane docs/fix tasks, `claude-sonnet-5` medium,
 before worker isolation) cost $1.61-$2.01 per job, around 3-4M input tokens each with
@@ -72,7 +74,7 @@ silent no-op.
 ### The `default` selector
 
 `claude_model = "default"` does not mean "cheap" — it resolves to the
-highest-priority visible model in the catalog, which is `claude-opus-4-8` in the
+highest-priority visible model in the catalog, which is `claude-opus-5` in the
 builtin inventory (priority 1, ahead of claude-sonnet-5 at priority 2). Operators who
 want a cheap default must set `claude_model` explicitly (route-level or
 `[control.defaults]`) rather than relying on `"default"`.
@@ -87,7 +89,7 @@ one fails before the job starts.
 
 ```toml
 [[control.claude_model_catalog.models]]
-model = "claude-opus-4-8"
+model = "claude-opus-5"
 premium = true
 api_usd_rate = { input = 5.0, cached_input = 0.5, output = 25.0 }
 rate_card_version = "2026-07-21"
@@ -112,7 +114,7 @@ Per-model supported reasoning efforts, from the builtin catalog
 
 | Model | Supported efforts |
 | --- | --- |
-| claude-opus-4-8 | low, medium, high, xhigh, max |
+| claude-opus-5 | low, medium, high, xhigh, max |
 | claude-sonnet-5 | low, medium, high, xhigh, max |
 | claude-fable-5 | low, medium, high, xhigh, max |
 | claude-opus-4-7 | low, medium, high, xhigh, max |

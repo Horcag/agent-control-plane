@@ -8,6 +8,9 @@ runs_root = "runs"
 database = "runs/jobs.sqlite3"
 worktree_root = "../agent-control-plane-worktrees"
 worktree_base = "../my-project"
+# Fallback slot directory for routes that do not declare their own slot_root.
+# Give every route that lives in a different repository its own [routes.<name>].slot_root
+# so unrelated projects never materialize slots inside another project's slot directory.
 slot_root = "../agent-control-plane-slots"
 agy_command = "agy"
 codex_command = "codex"
@@ -215,7 +218,7 @@ adaptive = { minimum_samples_per_candidate = 3, history_window = 20, quality_flo
 # Claude Code model catalog. Same shape as [[control.model_catalog.models]] above:
 # metadata overlays supplement the builtin catalog in
 # src/agent_control_plane/features/agent_runner/lib/claude_model_catalog.py
-# (claude-opus-4-8, claude-sonnet-5, claude-fable-5, claude-opus-4-7, claude-opus-4-6,
+# (claude-opus-5, claude-sonnet-5, claude-fable-5, claude-opus-4-7, claude-opus-4-6,
 # claude-sonnet-4-6, claude-haiku-4-5; efforts low/medium/high, plus xhigh/max where
 # supported). The rate below is an operator-supplied example, not an official or
 # guaranteed current rate; raw token counts remain authoritative when a rate card is
@@ -229,7 +232,7 @@ rate_card_source = "operator-supplied example rates; verify before use"
 # Inventory overrides adjust visibility, priority, and supported reasoning efforts
 # for a catalog entry without redefining its rate metadata.
 # [[control.claude_model_catalog.inventory]]
-# model = "claude-opus-4-8"
+# model = "claude-opus-5"
 # visible = true
 # priority = 0
 # default_reasoning_effort = "high"
@@ -242,7 +245,7 @@ required_branch = "main"
 # Codex and Claude Code support both modes; agy is ide_mcp only.
 # workspace_access = "native"
 # Optional route-specific Claude Code model and reasoning effort.
-# claude_model = "claude-opus-4-8"
+# claude_model = "claude-opus-5"
 # claude_reasoning_effort = "high"
 # Stable AgentBridge IDE/port ID. Codex reads it from ~/.codex/config.toml; claude
 # ide_mcp jobs resolve the same name via [control.claude_mcp_servers] or ~/.claude.json.
@@ -256,6 +259,9 @@ agy_model = "Gemini 3.5 Flash (High)"
 # This is the root returned by the selected server's get_project_info call.
 ide_mcp_project_root = "../my-project"
 worktree_root = "../agent-control-plane-worktrees"
+# Slot directory owned by this route. Dynamic `slots create` and `slots bootstrap`
+# place new slots here, and slot paths outside it are rejected.
+slot_root = "../my-project-agent-slots"
 worktree_base = "../my-project"
 source_roots = ["."]
 test_roots = ["tests"]

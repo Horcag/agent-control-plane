@@ -255,8 +255,7 @@ class JobLauncher:
             self.config.defaults.backend,
         )
         normalized_backend = normalize_backend(backend)
-        if normalized_backend == AGY_BACKEND and workspace_access == "native":
-            raise JobLaunchError("workspace_access=native is not supported with the agy backend")
+        # agy backend supports native workspace access mode
         if normalized_backend == CLAUDE_BACKEND and workspace_access != "native":
             # claude ide_mcp reaches the IDE the same way Codex does — through a per-route
             # MCP server — so it must resolve to a concrete endpoint before launch. Fail

@@ -121,7 +121,7 @@ class SlotManager:
         configured = self._config.slots.get(name)
         if configured is None:
             raise SlotError(f"Slot {name} is not configured in workspaces.toml")
-        self._ensure_slot_path_allowed(configured.path)
+        self._ensure_slot_path_allowed(configured.path, route=configured.route)
         record = self._store.get_slot(name)
         metadata_changed = record is not None and (
             record.route != configured.route
@@ -177,7 +177,7 @@ class SlotManager:
     def _is_valid_dynamic_record(self, record: SlotRecord) -> bool:
         return (
             record.route in self._config.routes
-            and is_same_or_child(record.path, self._config.slot_root)
+            and is_same_or_child(record.path, self._config.slot_root_for(record.route))
             and record.path.exists()
         )
 
@@ -218,8 +218,9 @@ class SlotManager:
                 problems.append("persisted path differs from current configuration")
         if slot_scope == "stale":
             problems.append("stale registry record")
-        if not is_same_or_child(path, self._config.slot_root):
-            problems.append(f"path is outside slot_root: {self._config.slot_root}")
+        route_slot_root = self._config.slot_root_for(route)
+        if not is_same_or_child(path, route_slot_root):
+            problems.append(f"path is outside slot_root: {route_slot_root}")
         if route not in self._config.routes:
             problems.append(f"unknown route: {route}")
         if status == "deleted":
@@ -293,9 +294,9 @@ class SlotManager:
             if route not in self._config.routes:
                 raise SlotError(f"Unknown route: {route}")
             slot_route = route
-            path = self._config.slot_root / _safe_slot_name(name)
+            path = self._config.slot_root_for(route) / _safe_slot_name(name)
 
-        self._ensure_slot_path_allowed(path)
+        self._ensure_slot_path_allowed(path, route=slot_route)
         route_key: str = str(slot_route)
         route_config = self._config.routes[route_key]
         worktree_base = route_config.worktree_base
@@ -319,7 +320,7 @@ class SlotManager:
                 create_worktree(
                     WorktreeSpec(
                         base_repo=worktree_base,
-                        worktree_root=self._config.slot_root,
+                        worktree_root=self._config.slot_root_for(route_key),
                         worktree_path=path,
                         branch=slot_branch,
                         start_point=slot_start_point,
@@ -336,7 +337,7 @@ class SlotManager:
         status = self.inspect_slot(name)
         if status.active_job_id and not force:
             raise SlotError(f"Slot {name} is active for job {status.active_job_id}")
-        self._ensure_slot_path_allowed(status.path)
+        self._ensure_slot_path_allowed(status.path, route=status.route)
 
         if status.exists and status.is_git_workspace:
             if status.dirty and not force:
@@ -561,8 +562,9 @@ class SlotManager:
                 decisions.append(_decision(status, "deleted", "exceeds route slot limit"))
         return decisions
 
-    def _ensure_slot_path_allowed(self, path: Path) -> None:
-        if not is_same_or_child(path, self._config.slot_root):
+    def _ensure_slot_path_allowed(self, path: Path, *, route: str | None = None) -> None:
+        slot_root = self._config.slot_root_for(route)
+        if not is_same_or_child(path, slot_root):
             raise SlotError(f"Slot path is outside slot_root: {path}")
 
     def _route_worktree_base(self, route: str) -> Path:

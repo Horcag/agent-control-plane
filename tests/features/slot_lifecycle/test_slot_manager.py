@@ -76,6 +76,38 @@ class SlotManagerTest(unittest.TestCase):
             self.assertEqual(status.branch, "slot/reports-1")
             self.assertEqual((status.path / "README.md").read_text(encoding="utf-8"), "reports\n")
 
+    def test_create_slot_uses_route_slot_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            slot_root = root / "slots"
+            reports_slot_root = root / "reports-slots"
+            _git_repo(root / "repo", "main", readme="main\n")
+            reports_repo = _git_repo(root / "reports", "release", readme="reports\n")
+            config = _config(
+                root,
+                slot_root,
+                reports_repo=reports_repo,
+                reports_slot_root=reports_slot_root,
+            )
+            store = SlotStore(root / "runs" / "jobs.sqlite3")
+            manager = SlotManager(config, store)
+
+            status = manager.create_slot(
+                "reports-1",
+                route="reports",
+                branch="slot/reports-1",
+                start_point="release",
+            )
+
+            self.assertEqual(status.path, reports_slot_root / "reports-1")
+            self.assertFalse((slot_root / "reports-1").exists())
+            self.assertEqual(tuple(status.problems), ())
+
+            # A dynamic record under the route's own slot root stays valid, not stale.
+            listed = manager.list_slots(route="reports")
+            self.assertEqual([item.name for item in listed], ["reports-1"])
+            self.assertEqual(listed[0].scope, "dynamic")
+
     def test_prepare_slot_skips_prepare_commands_for_other_routes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -371,6 +403,7 @@ def _config(
     root: Path,
     slot_root: Path,
     reports_repo: Path | None = None,
+    reports_slot_root: Path | None = None,
     slot_prepare: tuple[SlotPrepareCommand, ...] = (),
     route_names: tuple[str, ...] = ("main",),
     slots: dict[str, SlotConfig] | None = None,
@@ -395,6 +428,7 @@ def _config(
             required_branch="release",
             worktree_root=root / "worktrees",
             worktree_base=reports_repo,
+            slot_root=reports_slot_root,
             source_roots=(Path("backend/src"), Path("frontend/src")),
             test_roots=(Path("backend/tests"), Path("frontend/tests")),
             exclude_dirs=(),

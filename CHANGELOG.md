@@ -6,6 +6,13 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Added
 
+- Routes can declare their own `slot_root`. Dynamic `slots create`, `slots bootstrap`, and
+  the slot-path guardrail now resolve the slot directory per route instead of always using
+  the global `[control] slot_root`, so an unrelated repository never materializes slots
+  inside another project's slot directory. Bootstrapping a brand-new route no longer
+  inherits the global roots either: it defaults to a sibling `<repo>-agent-slots` directory
+  and writes both `worktree_root` and `slot_root` into the generated route table.
+
 - The claude backend now supports `workspace_access = "ide_mcp"` (previously native-only),
   reaching the route's IDEA/AgentBridge MCP server the same way Codex does. ACP writes a
   per-job `runs/<job-id>/claude-mcp-config.json` with exactly that one server and passes it
@@ -39,10 +46,11 @@ All notable changes are recorded here. This project follows Keep a Changelog.
   alongside `codex` and `agy`, driven by a headless `claude -p --output-format
   stream-json` runner with `--effort`, `--permission-mode`, and `--session-id`/`--resume`
   support.
-- Added a builtin Claude model catalog (claude-opus-4-8, claude-sonnet-5, claude-fable-5,
+- Added a builtin Claude model catalog (claude-opus-5, claude-sonnet-5, claude-fable-5,
   claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6, claude-haiku-4-5) with reasoning
   efforts low/medium/high, plus xhigh/max where supported, and a `default` selector that
-  resolves to claude-opus-4-8.
+  resolves to claude-opus-5. claude-opus-4-8 is no longer a catalog entry; an explicit
+  launch of it still passes through unvalidated and ungated, like any unknown model.
 - Added Claude token accounting: ACP `input_tokens` combines Anthropic input, cache-read,
   and cache-creation tokens; `cached_input_tokens` tracks cache-read tokens;
   `reasoning_output_tokens` is always 0; CLI-reported `total_cost_usd` is stored as

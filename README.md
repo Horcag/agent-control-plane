@@ -129,10 +129,14 @@ slot_root = "../acp-slots"
 [routes.app]
 path = "../my-project"
 required_branch = "main"
+# Slot directory owned by this route. Without it the route falls back to
+# [control] slot_root; declare it for every route that lives in a different
+# repository so unrelated projects never share one slot directory.
+slot_root = "../my-project-agent-slots"
 
 [slots."app-1"]
 route = "app"
-path = "../acp-slots/app-1"
+path = "../my-project-agent-slots/app-1"
 ```
 
 Validate the config, then synchronize declared slots:

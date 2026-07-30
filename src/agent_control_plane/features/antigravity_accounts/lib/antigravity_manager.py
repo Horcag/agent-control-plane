@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_ELECTRON_COMMAND = ("cmd", "/c", "npx", "--no-install", "electron")
+DEFAULT_ELECTRON_COMMAND = ("cmd", "/c", "npx", "-y", "electron")
 ACTIVE_ACCOUNT_PREFIX = "active_cloud_account."
 AGY_TARGET = "agy"
 
@@ -369,8 +369,11 @@ class AntigravityManagerAdapter:
             raise AntigravityManagerError(
                 f"Manager helper failed with exit code {proc.returncode}: {detail}"
             )
+        stdout_text = proc.stdout.strip()
+        if "{" in stdout_text:
+            stdout_text = stdout_text[stdout_text.index("{"):]
         try:
-            data = json.loads(proc.stdout)
+            data = json.loads(stdout_text)
         except json.JSONDecodeError as exc:
             raise AntigravityManagerError(
                 f"Manager helper returned invalid JSON: {proc.stdout[:500]}"

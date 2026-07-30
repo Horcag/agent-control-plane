@@ -2734,7 +2734,7 @@ class OrchestratorClaudeBackendTest(unittest.TestCase):
                     )
                 )
 
-            self.assertEqual(job.codex_model, "claude-opus-4-8")
+            self.assertEqual(job.codex_model, "claude-opus-5")
             self.assertEqual(job.codex_reasoning_effort, "medium")
 
     def test_claude_ide_mcp_blocks_when_ide_server_unresolvable(self) -> None:
@@ -2911,7 +2911,7 @@ class OrchestratorClaudeBackendTest(unittest.TestCase):
                         task_id="task-claude-effort",
                         route="main",
                         backend=CLAUDE_BACKEND,
-                        claude_model="claude-opus-4-8",
+                        claude_model="claude-opus-5",
                         claude_reasoning_effort="ultra",
                         workspace_access="native",
                     )

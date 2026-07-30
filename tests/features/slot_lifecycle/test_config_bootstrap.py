@@ -77,6 +77,32 @@ class ConfigBootstrapTest(unittest.TestCase):
             self.assertIn('worktree_base = "', updated)
             self.assertIn('source_roots = ["backend/src", "frontend/src"]', updated)
             self.assertIn('[slots."reports-1"]', updated)
+            # A new route never inherits another project's slot directory.
+            sibling_root = (root / "reports-agent-slots").as_posix()
+            self.assertEqual(result.slot_path, root / "reports-agent-slots" / "reports-1")
+            self.assertIn(f'slot_root = "{sibling_root}"', updated)
+            self.assertIn(f'worktree_root = "{sibling_root}"', updated)
+            self.assertNotIn(f'"{(root / "slots").as_posix()}/reports-1"', updated)
+
+    def test_bootstrap_uses_route_slot_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = _write_base_config(root)
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                + f"""
+[routes.other]
+path = "{(root / "repo").as_posix()}"
+required_branch = "main"
+slot_root = "{(root / "other-slots").as_posix()}"
+""",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            result = bootstrap_slot_config(config, slot_name="other-1", route_name="other")
+
+            self.assertEqual(result.slot_path, root / "other-slots" / "other-1")
 
 
 def _write_base_config(root: Path) -> Path:

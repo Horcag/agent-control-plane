@@ -109,6 +109,30 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_config(config_contents=(base + route + b"dirty_diff_max_changed_lines = -1\n"))
 
+    def test_route_slot_root_overrides_global_slot_root(self) -> None:
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+            b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+        )
+
+        config = load_config(config_contents=base)
+        self.assertIsNone(config.routes["main"].slot_root)
+        self.assertEqual(config.slot_root_for("main"), config.slot_root)
+        self.assertEqual(config.slot_root_for(None), config.slot_root)
+        self.assertEqual(config.slot_root_for("unknown"), config.slot_root)
+
+        config = load_config(config_contents=base + b'slot_root = "main-slots"\n')
+        expected = config.project_root / "main-slots"
+        self.assertEqual(config.routes["main"].slot_root, expected)
+        self.assertEqual(config.slot_root_for("main"), expected)
+        self.assertNotEqual(config.slot_root_for("main"), config.slot_root)
+
     def test_loads_slot_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -330,7 +354,7 @@ claude_max_turns = 40
 claude_bare = false
 
 [[control.claude_model_catalog.models]]
-model = "claude-opus-4-8"
+model = "claude-opus-5"
 premium = true
 rate_card_version = "2026-07"
 rate_card_source = "operator"
@@ -370,8 +394,8 @@ claude_reasoning_effort = "low"
             self.assertEqual(config.defaults.claude_max_turns, 40)
             self.assertFalse(config.defaults.claude_bare)
             metadata = {model.model: model for model in config.claude_model_catalog.models}
-            self.assertTrue(metadata["claude-opus-4-8"].premium)
-            self.assertEqual(metadata["claude-opus-4-8"].api_usd_rate.input, 5.0)
+            self.assertTrue(metadata["claude-opus-5"].premium)
+            self.assertEqual(metadata["claude-opus-5"].api_usd_rate.input, 5.0)
             inventory = config.claude_model_catalog.inventory[0]
             self.assertEqual(inventory.model, "claude-nova-7")
             self.assertEqual(inventory.supported_reasoning_efforts, ("low", "high"))

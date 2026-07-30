@@ -23,7 +23,7 @@ _BASIC_EFFORTS = ("low", "medium", "high")
 # controller-owned and must stay byte-stable for routing-evidence identity.
 CLAUDE_BUILTIN_MODELS: tuple[CatalogModel, ...] = (
     CatalogModel(
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         visible=True,
         priority=1,
         default_reasoning_effort="high",

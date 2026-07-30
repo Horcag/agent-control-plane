@@ -127,6 +127,9 @@ class RouteConfig:
     source_roots: tuple[Path, ...]
     test_roots: tuple[Path, ...]
     exclude_dirs: tuple[Path, ...]
+    # Where slot worktrees for this route live. None falls back to control.slot_root;
+    # set it per route so unrelated projects never share one project's slot directory.
+    slot_root: Path | None = None
     ide_sdk_name: str | None = None
     ide_sdk_type: str = "Python SDK"
     ide_mcp_server: str | None = None
@@ -277,6 +280,17 @@ class ControlConfig:
     claude_model_catalog: ClaudeModelCatalogConfig = field(default_factory=ClaudeModelCatalogConfig)
     claude_mcp_servers: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     claude_config_path: Path | None = None
+
+    def slot_root_for(self, route: str | None) -> Path:
+        """Slot directory that owns this route's worktrees.
+
+        Routes may declare their own ``slot_root`` so an unrelated project never
+        materializes slots inside another project's slot directory.
+        """
+        route_config = self.routes.get(route) if route else None
+        if route_config is not None and route_config.slot_root is not None:
+            return route_config.slot_root
+        return self.slot_root
 
 
 def default_config_path() -> Path:
@@ -556,6 +570,7 @@ def load_config(
             required_branch=str(_required(value, "required_branch")),
             worktree_root=route_worktree_root or global_worktree_root,
             worktree_base=_optional_path(value, "worktree_base", project_root) or route_path,
+            slot_root=_optional_path(value, "slot_root", project_root),
             source_roots=_relative_path_tuple(
                 value.get("source_roots", ["backend", "frontend/src"])
             ),

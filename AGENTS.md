@@ -2,6 +2,9 @@
 
 - Keep this project independent of configured target repositories. It controls jobs; it does not contain task work.
 - Do not edit target repositories from this project. The runner must keep every delegated agent inside the declared task workspace. `workspace_access = "ide_mcp"` uses the selected IDEA MCP; `workspace_access = "native"` uses Codex-native shell/search/file tools and must not depend on AgentBridge.
+- Every route whose repository differs from the one owning `[control] slot_root` must declare
+  its own `slot_root`. Slot directories are named after the project they serve; never let one
+  project's slots land in another project's slot directory.
 - Preserve user changes. Refuse dirty task workspaces by default and record blockers instead of switching branches or cleaning files.
 - When `terminal_slot_policy = "checkpoint"`, clean terminal task changes only after the
   controller-owned Git ref and review-inbox record are verified durable. Never move the
