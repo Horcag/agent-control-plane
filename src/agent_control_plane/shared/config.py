@@ -516,7 +516,7 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
     return default_config_path()
 
 
-def probe_mcp_health(port: int, timeout_sec: float = 2.0) -> bool:
+def probe_mcp_health_detailed(port: int, timeout_sec: float = 2.0) -> tuple[bool, str]:
     url = f"http://127.0.0.1:{port}/mcp"
     req_data = json.dumps(
         {
@@ -533,23 +533,61 @@ def probe_mcp_health(port: int, timeout_sec: float = 2.0) -> bool:
     req = urllib.request.Request(
         url,
         data=req_data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
         method="POST",
     )
+    session_id: str | None = None
     try:
         # The URL is always a http://127.0.0.1:<port>/mcp literal this code constructs
         with urllib.request.urlopen(req, timeout=timeout_sec) as response:  # nosec B310
+            session_id = response.headers.get("Mcp-Session-Id")
             if response.status == 200:
                 body = response.read().decode("utf-8")
-                payload = json.loads(body)
-                return (
+                try:
+                    payload = json.loads(body)
+                except (ValueError, TypeError) as parse_err:
+                    return (
+                        False,
+                        f"something answered but not as an MCP server (invalid JSON: {parse_err})",
+                    )
+                if (
                     isinstance(payload, dict)
                     and payload.get("jsonrpc") == "2.0"
-                    and "result" in payload
+                    and ("result" in payload or "protocolVersion" in payload)
+                ):
+                    return True, "healthy"
+                return (
+                    False,
+                    "something answered but not as an MCP server (payload missing result or protocolVersion)",
                 )
-    except (urllib.error.URLError, OSError, ValueError, KeyError):
-        return False
-    return False
+            return False, f"something answered but not as an MCP server (HTTP {response.status})"
+    except urllib.error.HTTPError as err:
+        session_id = err.headers.get("Mcp-Session-Id") if err.headers else None
+        return False, f"something answered but not as an MCP server (HTTP {err.code})"
+    except (urllib.error.URLError, OSError) as err:
+        return False, f"nothing is listening ({err})"
+    except (ValueError, TypeError) as err:
+        return False, f"probe error ({err})"
+    finally:
+        if session_id:
+            try:
+                delete_req = urllib.request.Request(
+                    url,
+                    headers={"Mcp-Session-Id": session_id},
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(delete_req, timeout=timeout_sec):  # nosec B310
+                    pass
+            except (urllib.error.URLError, OSError, ValueError):
+                pass
+
+
+def probe_mcp_health(port: int, timeout_sec: float = 2.0) -> bool:
+    healthy, _reason = probe_mcp_health_detailed(port, timeout_sec=timeout_sec)
+    return healthy
 
 
 def _is_port_open(port: int) -> bool:

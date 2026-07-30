@@ -4,6 +4,8 @@ import inspect
 import json
 import tempfile
 import unittest
+import urllib.error
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +17,8 @@ from agent_control_plane.shared.config import (
     find_enclosing_git_repo,
     load_config,
     port_for,
+    probe_mcp_health,
+    probe_mcp_health_detailed,
     register_known_config,
     resolve_config_for,
     wire_mcp_servers,
@@ -1808,6 +1812,89 @@ class ConfigDiscoveryTest(unittest.TestCase):
                 self.assertIn("port", err_msg)
                 self.assertIn(str(cfg), err_msg)
                 self.assertIn("mcp-server-", err_msg)
+
+
+class ProbeMcpHealthTest(unittest.TestCase):
+    def test_probe_sends_accept_header(self) -> None:
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {}
+            mock_resp.read.return_value = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+            ).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertTrue(healthy)
+            self.assertEqual(detail, "healthy")
+            self.assertTrue(mock_urlopen.called)
+
+            req = mock_urlopen.call_args[0][0]
+            self.assertEqual(req.headers.get("Accept"), "application/json, text/event-stream")
+            self.assertEqual(req.headers.get("Content-type"), "application/json")
+
+    def test_probe_406_response_reported_as_unhealthy_with_distinguishable_reason(self) -> None:
+        err = urllib.error.HTTPError(
+            url="http://127.0.0.1:9256/mcp",
+            code=406,
+            msg="Not Acceptable",
+            hdrs=Message(),
+            fp=None,
+        )
+        with patch("urllib.request.urlopen", side_effect=err):
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertFalse(healthy)
+            self.assertIn("something answered but not as an MCP server", detail)
+            self.assertIn("406", detail)
+            self.assertFalse(probe_mcp_health(9256))
+
+    def test_probe_200_valid_response_is_healthy(self) -> None:
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {}
+            mock_resp.read.return_value = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+            ).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertTrue(healthy)
+            self.assertEqual(detail, "healthy")
+            self.assertTrue(probe_mcp_health(9256))
+
+    def test_probe_connection_error_reported_as_nothing_listening(self) -> None:
+        err = urllib.error.URLError(reason="Connection refused")
+        with patch("urllib.request.urlopen", side_effect=err):
+            healthy, detail = probe_mcp_health_detailed(9256)
+            self.assertFalse(healthy)
+            self.assertIn("nothing is listening", detail)
+            self.assertFalse(probe_mcp_health(9256))
+
+    def test_probe_session_cleanup_sends_delete_request(self) -> None:
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = unittest.mock.MagicMock()
+            mock_resp.status = 200
+            mock_resp.headers = {"Mcp-Session-Id": "sess-xyz789"}
+            mock_resp.read.return_value = json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+            ).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            healthy, _ = probe_mcp_health_detailed(9256)
+            self.assertTrue(healthy)
+
+            self.assertEqual(mock_urlopen.call_count, 2)
+            delete_req = mock_urlopen.call_args_list[1][0][0]
+            self.assertEqual(delete_req.get_method(), "DELETE")
+            self.assertEqual(delete_req.headers.get("Mcp-session-id"), "sess-xyz789")
 
 
 class WireMcpTest(unittest.TestCase):
