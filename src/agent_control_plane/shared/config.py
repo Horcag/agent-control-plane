@@ -662,14 +662,23 @@ def port_for(config_path: Path | str) -> int:
 
         for offset in range(100):
             cand_port = 9230 + ((base_port - 9230 + offset) % 100)
-            if not _is_port_open(cand_port) or probe_mcp_health(cand_port):
+            owner = next((cfg for cfg, p in assignments.items() if p == cand_port), None)
+            if owner is not None and owner != canonical:
+                continue
+
+            if not _is_port_open(cand_port) or (owner == canonical and probe_mcp_health(cand_port)):
                 assignments[canonical] = cand_port
                 tmp_file = assignments_file.with_suffix(".tmp")
                 tmp_file.write_text(json.dumps(assignments, indent=2), encoding="utf-8")
                 os.replace(tmp_file, assignments_file)
                 return cand_port
 
-    return base_port
+        # If every candidate port in 9230-9329 is exhausted (recorded for other configs
+        # or occupied by non-own servers), raise RuntimeError rather than returning
+        # the un-scanned base_port which would reintroduce the collision.
+        raise RuntimeError(
+            f"All control plane candidate ports in range 9230-9329 are exhausted or occupied for {canonical}"
+        )
 
 
 def ensure_mcp_server(
