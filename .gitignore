@@ -19,8 +19,10 @@ runs/*
 .worktrees/
 
 # Machine-local configuration. Commit config/workspaces.example.toml instead.
-config/workspaces.toml
-config/*.local.toml
+# Every config here names absolute paths on one operator's machine, and there is one
+# per controlled project, not just workspaces.toml.
+config/*.toml
+!config/workspaces.example.toml
 *.sqlite3
 *.sqlite3-*
 
