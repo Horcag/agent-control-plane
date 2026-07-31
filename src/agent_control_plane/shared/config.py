@@ -12,7 +12,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
@@ -644,11 +644,37 @@ def port_for(config_path: Path | str) -> int:
         assignments: dict[str, int] = {}
         if assignments_file.is_file():
             try:
-                data = json.loads(assignments_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
+                raw_text = assignments_file.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to read port assignments file {assignments_file}: {exc}"
+                ) from exc
+
+            if raw_text.strip():
+                try:
+                    data = json.loads(raw_text)
+                    if not isinstance(data, dict):
+                        raise ValueError(
+                            f"Expected dict in {assignments_file}, got {type(data).__name__}"
+                        )
                     assignments = {str(k): int(v) for k, v in data.items() if isinstance(v, int)}
-            except (OSError, ValueError, KeyError):
-                assignments = {}
+                except (ValueError, KeyError, TypeError) as exc:
+                    timestamp = time.strftime("%Y%m%d-%H%M%S")
+                    corrupt_path = assignments_file.with_name(
+                        f"{assignments_file.name}.corrupt-{timestamp}"
+                    )
+                    if corrupt_path.exists():
+                        corrupt_path = assignments_file.with_name(
+                            f"{assignments_file.name}.corrupt-{timestamp}-{os.getpid()}"
+                        )
+                    moved = False
+                    with suppress(OSError):
+                        os.replace(assignments_file, corrupt_path)
+                        moved = True
+                    kept = f"; its contents were kept at {corrupt_path}" if moved else ""
+                    raise RuntimeError(
+                        f"Failed to parse port assignments file {assignments_file}: {exc}{kept}"
+                    ) from exc
 
         if canonical in assignments:
             remembered = assignments[canonical]

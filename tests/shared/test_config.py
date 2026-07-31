@@ -1869,6 +1869,64 @@ class ConfigDiscoveryTest(unittest.TestCase):
             data = json.loads(assignments.read_text(encoding="utf-8"))
             self.assertEqual(data[canonical], assigned)
 
+    def test_port_for_corrupt_file_is_preserved_and_raises_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg_new = root / "config_new" / "workspaces.toml"
+            cfg_new.parent.mkdir()
+            cfg_new.write_text("c_new")
+
+            assignments = root / "port-assignments.json"
+            corrupt_content = '{"/path/to/other/config": 9250, "corrupt": '
+            assignments.write_text(corrupt_content, encoding="utf-8")
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.port_assignments_path",
+                    return_value=assignments,
+                ),
+                patch("agent_control_plane.shared.config._is_port_open", return_value=False),
+                self.assertRaises(RuntimeError) as ctx,
+            ):
+                port_for(cfg_new)
+
+            self.assertIn("Failed to parse port assignments file", str(ctx.exception))
+            if assignments.exists():
+                data = assignments.read_text(encoding="utf-8")
+                self.assertNotIn(os.path.normcase(str(cfg_new)), data)
+
+            corrupt_files = list(root.glob("port-assignments.json.corrupt-*"))
+            self.assertEqual(len(corrupt_files), 1)
+            self.assertEqual(corrupt_files[0].read_text(encoding="utf-8"), corrupt_content)
+
+    def test_port_for_empty_file_cold_starts_and_persists(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            cfg = root / "workspaces.toml"
+            cfg.write_text("c")
+
+            assignments = root / "port-assignments.json"
+            assignments.write_text("   \n", encoding="utf-8")
+            canonical = os.path.normcase(str(cfg))
+
+            with (
+                patch(
+                    "agent_control_plane.shared.config.port_assignments_path",
+                    return_value=assignments,
+                ),
+                patch("agent_control_plane.shared.config._is_port_open", return_value=False),
+                patch(
+                    "agent_control_plane.shared.config.probe_mcp_health",
+                    return_value=False,
+                ),
+            ):
+                assigned = port_for(cfg)
+
+            self.assertTrue(9230 <= assigned <= 9329)
+            self.assertTrue(assignments.is_file())
+            data = json.loads(assignments.read_text(encoding="utf-8"))
+            self.assertEqual(data[canonical], assigned)
+
     def test_mcp_ensure_resolves_the_port_under_the_config_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
