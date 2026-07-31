@@ -11,7 +11,9 @@ from agent_control_plane.shared.config import load_config
 class ConfigBootstrapTest(unittest.TestCase):
     def test_bootstrap_adds_slot_for_existing_route(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # Resolved: on Windows the temp dir can be handed back in 8.3 form
+            # (C:/Users/RUNNER~1/...) while the code under test reports the long name.
+            root = Path(temp).resolve()
             config_path = _write_base_config(root)
             config = load_config(config_path)
 
@@ -33,7 +35,9 @@ class ConfigBootstrapTest(unittest.TestCase):
 
     def test_bootstrap_adds_new_route_from_repo_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # Resolved: on Windows the temp dir can be handed back in 8.3 form
+            # (C:/Users/RUNNER~1/...) while the code under test reports the long name.
+            root = Path(temp).resolve()
             config_path = _write_base_config(root)
             repo = root / "reports"
             (repo / "backend" / "src").mkdir(parents=True)
@@ -86,7 +90,9 @@ class ConfigBootstrapTest(unittest.TestCase):
 
     def test_bootstrap_uses_route_slot_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
+            # Resolved: on Windows the temp dir can be handed back in 8.3 form
+            # (C:/Users/RUNNER~1/...) while the code under test reports the long name.
+            root = Path(temp).resolve()
             config_path = _write_base_config(root)
             config_path.write_text(
                 config_path.read_text(encoding="utf-8")

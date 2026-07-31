@@ -1701,8 +1701,12 @@ class ConfigDiscoveryTest(unittest.TestCase):
             self.assertTrue(9230 <= port2 <= 9329)
             self.assertEqual(port1, port1_repeat)
 
-            cfg1_spelling = root / "CONFIG1" / "workspaces.toml"
-            self.assertEqual(port_for(cfg1_spelling), port1)
+            # Only a case-insensitive filesystem may fold the two spellings into one
+            # config; on Linux `CONFIG1` and `config1` are genuinely different paths and
+            # must keep their own ports.
+            if os.path.normcase("A") == os.path.normcase("a"):
+                cfg1_spelling = root / "CONFIG1" / "workspaces.toml"
+                self.assertEqual(port_for(cfg1_spelling), port1)
 
     def test_port_for_keeps_a_remembered_port_that_is_still_booting(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
