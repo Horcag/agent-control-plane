@@ -4,6 +4,8 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-31
+
 ### Added
 
 - Added `agent-control mcp wire [--config PATH] [--apply] [--print]` command to discover client repositories for a workspace configuration (from `[routes.*] path` and `[control] coordination_root`) and generate or merge a project-scoped `.mcp.json` containing the derived HTTP server URL into each client repository. Documented the one-instance-per-config MCP model, working-directory discovery, deterministic ports, and lazy server management via `mcp ensure`.
@@ -31,6 +33,32 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Fixed
 
+- Starting an MCP server no longer opens a terminal window on Windows. The server was
+  spawned with `DETACHED_PROCESS`, which leaves it with no console at all, so the venv
+  launcher's re-exec of the real interpreter made Windows allocate a fresh one and the
+  default terminal turned that into a visible window which stole focus and lived as long
+  as the server. It is spawned with `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP` now, so
+  a windowless console is inherited down the chain.
+- `mcp ensure` recognizes a healthy server again. The health probe parsed the response as
+  plain JSON, but the streamable transport answers `initialize` with a `text/event-stream`
+  frame, so every probe failed: each session start launched another server for a config
+  that already had one and then waited out its timeout. The probe reads both shapes.
+- `mcp ensure` resolves a config's port under the same lock that starts its server.
+  Reading the port outside the lock let a second session observe the first session's
+  server mid-boot, conclude the port was taken, and give the same config a second port and
+  a second server.
+- `port_for` never hands a config a port that the assignments file already records for a
+  different config, and accepts an occupied port only when it is this config's own server.
+  Exhausting 9230-9329 now raises instead of returning the un-scanned base port, which was
+  the collision it had just avoided.
+- `port_for` refuses to rewrite assignments it could not read. Any read or parse failure
+  used to reset the whole mapping to empty, and the next assignment wrote that back, so a
+  single transient failure erased every config's remembered port and stranded the
+  `.mcp.json` files written by `mcp wire`. A read error raises, an unparsable file is moved
+  aside intact and named in the error, and an empty file still cold-starts.
+- Running the test suite no longer disturbs the operator's control planes: tests reached
+  the real `~/.agent-control-plane/port-assignments.json` and reserved real ports in
+  9230-9329, and left MCP servers running after the run.
 - Read-only claude jobs now work. Headless `claude -p` cannot complete plan mode's
   ExitPlanMode approval, so read-only no longer uses `--permission-mode plan`; instead it
   runs under `default` prompting with the write-capable builtin tools (`Edit`, `Write`)
