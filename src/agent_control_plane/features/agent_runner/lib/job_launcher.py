@@ -354,12 +354,21 @@ class JobLauncher:
                     raise JobLaunchError(str(exc)) from exc
                 codex_model = explicit_profile.model
                 codex_reasoning_effort = explicit_profile.reasoning_effort
-                metadata = self.model_routing.catalog.rate_metadata_for(codex_model)
-                if metadata is not None and metadata.premium and not override_reason:
+                snapshot = self.model_routing.catalog.snapshot
+                disposition = snapshot.launch_disposition(
+                    codex_model,
+                    override_reason=override_reason,
+                )
+                if disposition == "require_override":
                     raise JobLaunchError(
                         "Explicit launch of premium Codex model requires a nonblank "
                         "codex_premium_override_reason"
                     )
+                elif disposition == "reject":
+                    raise JobLaunchError(
+                        f"Launch of model {codex_model!r} is rejected by model catalog policy"
+                    )
+                metadata = snapshot.rate_metadata_for(codex_model)
                 explicit_premium_launch = metadata is not None and metadata.premium
 
         if normalized_backend == CLAUDE_BACKEND:
@@ -383,12 +392,21 @@ class JobLauncher:
             # existing escalation, metrics, and status plumbing stay schema-stable.
             codex_model = claude_profile.model
             codex_reasoning_effort = claude_profile.reasoning_effort
-            metadata = self.claude_catalog.rate_metadata_for(claude_profile.model)
-            if metadata is not None and metadata.premium and not override_reason:
+            claude_snapshot = self.claude_catalog.snapshot
+            disposition = claude_snapshot.launch_disposition(
+                claude_profile.model,
+                override_reason=override_reason,
+            )
+            if disposition == "require_override":
                 raise JobLaunchError(
                     "Explicit launch of premium Claude model requires a nonblank "
                     "codex_premium_override_reason"
                 )
+            elif disposition == "reject":
+                raise JobLaunchError(
+                    f"Launch of model {claude_profile.model!r} is rejected by model catalog policy"
+                )
+            metadata = claude_snapshot.rate_metadata_for(claude_profile.model)
             explicit_premium_launch = metadata is not None and metadata.premium
 
         codex_tool_call_budget: int | None = None
@@ -518,6 +536,79 @@ class JobLauncher:
                 self.finish_job(job.job_id, "blocked", message)
                 raise JobLaunchError(message) from exc
 
+        resolved_model = codex_model or agy_model
+        if resolved_model:
+            try:
+                active_catalog = (
+                    self.claude_catalog
+                    if normalized_backend == CLAUDE_BACKEND
+                    else self.model_routing.catalog
+                )
+                cat_payload = (
+                    active_catalog.inspection_payload()
+                    if normalized_backend == CLAUDE_BACKEND
+                    else active_catalog.inspection_payload(routing=self.model_routing)
+                )
+                unknown_policy = active_catalog.snapshot.unknown_model_policy
+                resolved_norm = resolved_model.strip().lower()
+                model_entry = next(
+                    (
+                        m
+                        for m in cat_payload.get("models", [])
+                        if isinstance(m, dict)
+                        and m.get("model", "").strip().lower() == resolved_norm
+                    ),
+                    None,
+                )
+                launch_alerts: list[dict[str, Any]] = []
+                if (
+                    model_entry is None or model_entry.get("metadata_state") == "unconfigured"
+                ) and unknown_policy != "allow":
+                    unclass = [
+                        a
+                        for a in cat_payload.get("alerts", [])
+                        if isinstance(a, dict)
+                        and a.get("code") == "unclassified_model"
+                        and str(a.get("model", "")).strip().lower() == resolved_norm
+                    ]
+                    if unclass:
+                        launch_alerts.extend(unclass)
+                    else:
+                        launch_alerts.append(
+                            {
+                                "code": "unclassified_model",
+                                "message": f"Model {resolved_model!r} is in inventory but has no ACP metadata",
+                                "severity": "info",
+                                "model": resolved_model,
+                                "priority": model_entry.get("priority") if model_entry else None,
+                                "first_seen_at": cat_payload.get("fetched_at"),
+                            }
+                        )
+                inv_state = (
+                    model_entry.get("inventory_state") if model_entry else "absent_from_inventory"
+                )
+                if inv_state in ("absent_from_inventory", "last_seen"):
+                    launch_alerts.append(
+                        {
+                            "code": f"model_{inv_state}",
+                            "message": f"Launch resolved to model {resolved_model!r} whose inventory state is {inv_state!r}",
+                            "severity": "warning",
+                            "model": resolved_model,
+                            "inventory_state": inv_state,
+                        }
+                    )
+                if launch_alerts:
+                    self._current_launch_alerts = launch_alerts
+                    for alt in launch_alerts:
+                        self.store.add_event(
+                            job.job_id,
+                            "catalog_alert",
+                            json.dumps(alt, ensure_ascii=False),
+                        )
+                    object.__setattr__(job, "alerts", launch_alerts)
+            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                pass
+
         if options.plan_id:
             try:
                 if options.plan_dispatch_token:
@@ -596,7 +687,10 @@ class JobLauncher:
             worker_pid=worker_pid,
             worker_heartbeat_at=utc_now(),
         )
-        return self.store.get_job(job.job_id)
+        final_job = self.store.get_job(job.job_id)
+        if hasattr(self, "_current_launch_alerts") and self._current_launch_alerts:
+            object.__setattr__(final_job, "alerts", self._current_launch_alerts)
+        return final_job
 
 
 T = TypeVar("T")

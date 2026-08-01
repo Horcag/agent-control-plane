@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -161,6 +162,13 @@ class JobStore:
             checksum="job-store-launch-provenance-v6-20260719",
             migrate=self._migrate_launch_provenance,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=7,
+            checksum="job-store-model-observations-v7-20260801",
+            migrate=self._migrate_model_observations,
+        )
         # create_attempt_metrics_table is idempotent (CREATE TABLE IF NOT EXISTS +
         # pragma-guarded ALTERs), so calling it here unconditionally on every
         # initialize() is the only mechanism by which its guarded column adds
@@ -168,6 +176,23 @@ class JobStore:
         # migration above was already recorded and therefore never re-runs.
         with self._connect() as db:
             create_attempt_metrics_table(db)
+
+    @staticmethod
+    def _migrate_model_observations(db: sqlite3.Connection) -> None:
+        db.execute(
+            """
+            create table if not exists model_observations (
+                version text primary key,
+                content_hash text not null,
+                fetched_at text,
+                etag text,
+                client_version text,
+                observed_models_json text not null,
+                first_seen_at text not null,
+                last_seen_at text not null
+            )
+            """
+        )
 
     @staticmethod
     def _migrate_launch_provenance(db: sqlite3.Connection) -> None:
@@ -1182,3 +1207,135 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
 
 def format_events(events: Iterable[tuple[str, str, str]]) -> str:
     return "\n".join(f"{created_at} [{level}] {message}" for created_at, level, message in events)
+
+
+class ModelObservationStore:
+    def __init__(self, database_path: Path) -> None:
+        self.database_path = database_path
+
+    def initialize(self) -> None:
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=7,
+            checksum="job-store-model-observations-v7-20260801",
+            migrate=JobStore._migrate_model_observations,
+        )
+
+    def record_observation(
+        self,
+        *,
+        version: str,
+        content_hash: str,
+        fetched_at: str | None = None,
+        etag: str | None = None,
+        client_version: str | None = None,
+        observed_models: list[dict[str, Any]],
+        now: str | None = None,
+        retention_days: float = 30.0,
+        max_rows: int = 500,
+    ) -> None:
+        self.initialize()
+        now_ts = now or utc_now()
+        models_json = json.dumps(observed_models, ensure_ascii=False)
+        with control_database(self.database_path) as db:
+            db.execute("begin immediate")
+            existing = db.execute(
+                "select version from model_observations where version = ?", (version,)
+            ).fetchone()
+            if existing is not None:
+                db.execute(
+                    """
+                    update model_observations
+                    set last_seen_at = ?,
+                        fetched_at = coalesce(?, fetched_at),
+                        etag = coalesce(?, etag),
+                        client_version = coalesce(?, client_version)
+                    where version = ?
+                    """,
+                    (now_ts, fetched_at, etag, client_version, version),
+                )
+            else:
+                db.execute(
+                    """
+                    insert into model_observations (
+                        version, content_hash, fetched_at, etag, client_version,
+                        observed_models_json, first_seen_at, last_seen_at
+                    )
+                    values (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        version,
+                        content_hash,
+                        fetched_at,
+                        etag,
+                        client_version,
+                        models_json,
+                        now_ts,
+                        now_ts,
+                    ),
+                )
+            now_dt = datetime.fromisoformat(now_ts.replace("Z", "+00:00"))
+            cutoff_dt = now_dt - timedelta(days=retention_days)
+            cutoff_ts = cutoff_dt.isoformat(timespec="seconds")
+            db.execute("delete from model_observations where last_seen_at < ?", (cutoff_ts,))
+
+            if max_rows > 0:
+                db.execute(
+                    """
+                    delete from model_observations
+                    where version not in (
+                        select version from model_observations
+                        order by last_seen_at desc, rowid desc
+                        limit ?
+                    )
+                    """,
+                    (max_rows,),
+                )
+
+    def get_recent_observations(
+        self,
+        window_days: float = 7.0,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
+        self.initialize()
+        with control_database(self.database_path) as db:
+            if now is None:
+                max_row = db.execute(
+                    "select max(last_seen_at) as max_ts from model_observations"
+                ).fetchone()
+                now_ts = max_row["max_ts"] if max_row and max_row["max_ts"] else utc_now()
+            else:
+                now_ts = now
+            now_dt = datetime.fromisoformat(now_ts.replace("Z", "+00:00"))
+            cutoff_dt = now_dt - timedelta(days=window_days)
+            cutoff_ts = cutoff_dt.isoformat(timespec="seconds")
+            rows = db.execute(
+                """
+                select version, content_hash, fetched_at, etag, client_version,
+                       observed_models_json, first_seen_at, last_seen_at
+                from model_observations
+                where last_seen_at >= ?
+                order by last_seen_at desc
+                """,
+                (cutoff_ts,),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            try:
+                models = json.loads(r["observed_models_json"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                models = []
+            result.append(
+                {
+                    "version": r["version"],
+                    "content_hash": r["content_hash"],
+                    "fetched_at": r["fetched_at"],
+                    "etag": r["etag"],
+                    "client_version": r["client_version"],
+                    "models": models,
+                    "first_seen_at": r["first_seen_at"],
+                    "last_seen_at": r["last_seen_at"],
+                }
+            )
+        return result

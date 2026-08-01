@@ -101,7 +101,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(payload)
             return 1 if payload.get("status") == "failed" else 0
         if args.command == "model-catalog":
-            _print_json(control.model_catalog_inspection())
+            payload = control.model_catalog_inspection()
+            _print_json(payload)
+            if getattr(args, "check", False):
+                has_warning = any(a.get("severity") == "warning" for a in payload.get("alerts", []))
+                if has_warning:
+                    return 1
             return 0
         if args.command == "model-routing-explain":
             _print_json(control.model_routing_explain(args.policy, args.route))
@@ -496,10 +501,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")
-    subparsers.add_parser(
+    cat_parser = subparsers.add_parser(
         "model-catalog",
         parents=[common],
         help="Inspect the bounded Codex model catalog",
+    )
+    cat_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero when any alert of severity 'warning' is present",
     )
     routing_explain = subparsers.add_parser(
         "model-routing-explain",
@@ -1030,7 +1040,7 @@ def _print_json(value: Any) -> None:
 
 
 def _job_payload(job: Any) -> dict[str, Any]:
-    return {
+    payload = {
         "job_id": job.job_id,
         "status": job.status,
         "expected_result_status": job.expected_result_status,
@@ -1055,6 +1065,10 @@ def _job_payload(job: Any) -> dict[str, Any]:
         "read_only": job.read_only,
         "slot_name": job.slot_name,
     }
+    alerts = getattr(job, "alerts", None)
+    if alerts:
+        payload["alerts"] = alerts
+    return payload
 
 
 def _infer_route_from_slot_name(slot_name: str) -> str:

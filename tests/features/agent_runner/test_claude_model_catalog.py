@@ -9,6 +9,7 @@ from agent_control_plane.shared.config import (
     ClaudeModelCatalogConfig,
     ClaudeModelInventoryConfig,
     CodexModelMetadataConfig,
+    CodexModelRuleConfig,
     CodexTokenRateConfig,
 )
 
@@ -108,3 +109,25 @@ def test_metadata_rate_card_reprices_claude_usage() -> None:
     assert estimate.rate_card_version == "2026-07"
     metadata = catalog.rate_metadata_for("claude-opus-5")
     assert metadata is not None and metadata.premium is True
+
+
+def test_claude_model_rules_resolution() -> None:
+    catalog = build_claude_model_catalog(
+        ClaudeModelCatalogConfig(
+            model_rules=(
+                CodexModelRuleConfig(
+                    match="claude-opus-*",
+                    premium=True,
+                    rate_card_version="2026-07",
+                    rate_card_source="rule",
+                ),
+            ),
+        )
+    )
+    meta = catalog.rate_metadata_for("claude-opus-5")
+    assert meta is not None
+    assert meta.premium is True
+    payload = catalog.inspection_payload()
+    models_by_name = {m["model"]: m for m in payload["models"]}
+    assert models_by_name["claude-opus-5"]["metadata_state"] == "rule"
+    assert models_by_name["claude-opus-5"]["premium_state"] == "known"

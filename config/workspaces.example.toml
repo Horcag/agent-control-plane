@@ -148,6 +148,10 @@ forbidden_status_globs = [
 [control.model_catalog]
 cache_path = "${USERPROFILE}/.codex/models_cache.json"
 max_cache_age_sec = 86400
+# unknown_model_policy governs explicit launches of models with no exact entry and no matching rule.
+# Values: "allow" (proceed silently), "warn" (default: proceed with unclassified_model alert),
+# "require_override" (fail-safe option for cost: requires codex_premium_override_reason).
+unknown_model_policy = "warn"
 
 # Quota domains are independent capacity and provider-rate-limit pools. "spark" is
 # only an example name; define any additional domain needed by the configured models.
@@ -200,6 +204,14 @@ rate_card_source = "operator-supplied example rates; verify before use"
 model = "gpt-5.3-codex-spark"
 quota_domain = "spark"
 
+# Model rules match unclassified models by glob pattern in declaration order.
+# An exact [[control.model_catalog.models]] entry wins over any matching rule.
+# [[control.model_catalog.model_rules]]
+# match = "gpt-5.6-*"
+# premium = true # Keeps unclassified future family members from launching unguarded
+# quota_domain = "primary"
+# capacity_units = { none = 5, low = 5, medium = 10, high = 15, xhigh = 15 }
+
 # Preferred named-policy form. The first configured candidate is the initial worker
 # profile; later candidates form the escalation ladder. Replace model IDs with slugs
 # from the operator's model cache as needed.
@@ -223,11 +235,23 @@ adaptive = { minimum_samples_per_candidate = 3, history_window = 20, quality_flo
 # supported). The rate below is an operator-supplied example, not an official or
 # guaranteed current rate; raw token counts remain authoritative when a rate card is
 # missing or changes.
+# unknown_model_policy governs explicit launches of unclassified Claude models ("allow", "warn", "require_override").
+# [control.claude_model_catalog]
+# unknown_model_policy = "warn"
+
 [[control.claude_model_catalog.models]]
 model = "claude-sonnet-5"
 api_usd_rate = { input = 3.0, cached_input = 0.3, output = 15.0 }
 rate_card_version = "2026-07-09"
 rate_card_source = "operator-supplied example rates; verify before use"
+
+# Model rules match unclassified Claude models by glob pattern in declaration order.
+# An exact [[control.claude_model_catalog.models]] entry wins over any matching rule.
+# [[control.claude_model_catalog.model_rules]]
+# match = "claude-*"
+# api_usd_rate = { input = 3.0, cached_input = 0.3, output = 15.0 }
+# rate_card_version = "2026-07-09"
+# rate_card_source = "operator-supplied example rates; verify before use"
 
 # Inventory overrides adjust visibility, priority, and supported reasoning efforts
 # for a catalog entry without redefining its rate metadata.

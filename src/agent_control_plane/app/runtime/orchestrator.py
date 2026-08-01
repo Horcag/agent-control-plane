@@ -15,6 +15,7 @@ from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
 from agent_control_plane.entities.job import (
     JobRecord,
     JobStore,
+    ModelObservationStore,
     ReviewMetricsStore,
     format_events,
 )
@@ -157,7 +158,10 @@ class AgentControlPlane:
         self.slots = SlotManager(config, self.slot_store)
         self.policy = WorkspacePolicy(config)
         defaults = config.defaults
-        self.model_catalog = ModelCatalog.from_config(config.model_catalog)
+        self.model_observation_store = ModelObservationStore(config.database_path)
+        self.model_catalog = ModelCatalog.from_config(
+            config.model_catalog, observation_store=self.model_observation_store
+        )
         self.claude_model_catalog = build_claude_model_catalog(config.claude_model_catalog)
         self.model_routing = ModelRoutingPolicy(
             policies=_configured_routing_policies(config),
@@ -279,7 +283,8 @@ class AgentControlPlane:
         return cls(load_config(config_path, config_contents=config_contents))
 
     def model_catalog_inspection(self) -> dict[str, Any]:
-        return self.model_catalog.inspection_payload()
+        routing = getattr(self, "model_routing", None)
+        return self.model_catalog.inspection_payload(routing=routing)
 
     def model_routing_explain(self, policy: str, route: str) -> dict[str, Any]:
         if self.config.routes.get(route) is None:
@@ -541,6 +546,16 @@ class AgentControlPlane:
                         ],
                     }
                 )
+        catalog_payload = self.model_catalog.inspection_payload(routing=self.model_routing)
+        alerts_list: list[dict[str, Any]] = []
+        for raw_alert in catalog_payload.get("alerts", []):
+            alert_entry = dict(raw_alert)
+            alert_entry["config_keys"] = [
+                "control.model_catalog.models",
+                "control.model_routing.policies",
+            ]
+            alerts_list.append(alert_entry)
+
         return {
             "advertised_default": advertised,
             "effective_default_policy": default_policy,
@@ -549,6 +564,7 @@ class AgentControlPlane:
             "initial_models": initial_models,
             "coordinator_scope": COORDINATOR_SCOPE,
             "failures": failures,
+            "alerts": alerts_list,
         }
 
     def reconcile_jobs(

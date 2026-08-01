@@ -22,7 +22,28 @@ model with no ACP overlay entry is discoverable without an ACP release, but its 
 premium metadata is unknown and is reported as `premium = null` /
 `premium_state = "unknown"` until an operator adds and configures an overlay entry.
 
-Automatic quality-tier routing accepts only visible, current-cache candidates. It rejects
+Pattern rules (`[[control.model_catalog.model_rules]]`) allow glob-matching (e.g. `match = "gpt-5.6-*"`) to assign ACP policy metadata such as `premium = true`, quota domain, and capacity units to entire model families. Entries matched by a rule report `metadata_state = "rule"` and never fabricate a rate card. Exact model metadata entries always take precedence over pattern rules.
+
+The catalog inspection payload combines current cache inventory, durable history observations, and metadata overlays into a union payload reporting:
+- `inventory_state`: `listed` (visible in cache), `hidden` (invisible in cache), `last_seen` (historical observation), or `absent_from_inventory`.
+- `metadata_state`: `configured` (explicit metadata overlay entry), `rule` (matched by a pattern rule), or `unconfigured`.
+- `launch_disposition`: `allow`, `require_override`, or `reject`.
+- `provenance`: metadata block with catalog `version`, `fetched_at`, `etag`, `client_version`, `snapshot_state` (`current` vs `drifted`), and `on_disk_version`.
+
+`unknown_model_policy` (under `[control.model_catalog]` and mirrored in `[control.claude_model_catalog]`) governs launch disposition for models with no exact entry and no matching rule:
+- `allow`: Launch proceeds silently.
+- `warn` (default): Launch proceeds and surfaces the `unclassified_model` alert in the response.
+- `require_override`: Fail-safe option for cost. Explicit launches of unclassified models require a nonblank `codex_premium_override_reason` and `launch_disposition` returns `require_override`.
+
+Catalog alert codes include `unclassified_model`, `outranks_configured_ladder`, `metadata_without_inventory`, `inventory_shrank`, `client_version_regressed`, and `snapshot_drifted`. The CLI command `agent-control model-catalog --check` exits with code 1 when any warning-severity alert is present and 0 when only info-severity alerts exist.
+
+> [!IMPORTANT]
+> **Operator Note**: Existing running ACP MCP servers must be restarted before they benefit from model catalog configuration or inventory changes.
+
+> [!WARNING]
+> **`default`-Resolution Behavior Change**: Routes or explicit requests pinned to `codex_model = "default"` resolve through `resolve_automatic_profile` to the priority-1 visible candidate in the current inventory (e.g. `gpt-5.6-terra`). In the explicit-profile launch path, if priority 1 resolves to a premium model, the launch will fail closed with `require_override` unless a nonblank `codex_premium_override_reason` is supplied.
+
+Automatic quality-tier routing revalidates candidates at use time against the live catalog, accepting only visible, current-cache candidates. It rejects
 an invalid effort with the catalog's declared choices, including newly declared `max` or
 `ultra`. Missing, invalid, or stale cache input therefore blocks automatic routing rather
 than selecting a phantom model. Explicit `--codex-model` and reasoning-effort choices are

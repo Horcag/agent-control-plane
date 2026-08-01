@@ -65,6 +65,18 @@ class CodexModelMetadataConfig:
 
 
 @dataclass(frozen=True)
+class CodexModelRuleConfig:
+    match: str
+    quota_domain: str | None = None
+    capacity_units: tuple[tuple[str, int], ...] = ()
+    credit_rate: CodexTokenRateConfig | None = None
+    api_usd_rate: CodexTokenRateConfig | None = None
+    rate_card_version: str | None = None
+    rate_card_source: str | None = None
+    premium: bool = False
+
+
+@dataclass(frozen=True)
 class CodexQuotaDomainConfig:
     name: str
     max_concurrent_jobs: int
@@ -78,6 +90,9 @@ class CodexModelCatalogConfig:
     max_cache_age_sec: float
     models: tuple[CodexModelMetadataConfig, ...]
     quota_domains: tuple[CodexQuotaDomainConfig, ...]
+    model_rules: tuple[CodexModelRuleConfig, ...] = ()
+    newness_window_days: float = 7.0
+    unknown_model_policy: str = "warn"
 
 
 @dataclass(frozen=True)
@@ -96,7 +111,9 @@ class ClaudeModelCatalogConfig:
     """Claude Code has no CLI-owned cache file, so the inventory is builtin plus overrides."""
 
     models: tuple[CodexModelMetadataConfig, ...] = ()
+    model_rules: tuple[CodexModelRuleConfig, ...] = ()
     inventory: tuple[ClaudeModelInventoryConfig, ...] = ()
+    unknown_model_policy: str = "warn"
 
 
 @dataclass(frozen=True)
@@ -263,6 +280,7 @@ def _default_model_catalog_config() -> CodexModelCatalogConfig:
         cache_path=Path.home() / ".codex" / "models_cache.json",
         max_cache_age_sec=86_400.0,
         models=(),
+        model_rules=(),
         quota_domains=(
             CodexQuotaDomainConfig(
                 name="primary",
@@ -1356,6 +1374,10 @@ def _model_catalog_config(
         raw.get("max_cache_age_sec", 86_400.0),
         "control.model_catalog.max_cache_age_sec",
     )
+    newness_window_days = _positive_float(
+        raw.get("newness_window_days", 7.0),
+        "control.model_catalog.newness_window_days",
+    )
     configured_domains = raw.get("quota_domains", [])
     if not isinstance(configured_domains, list):
         raise ValueError("control.model_catalog.quota_domains must be an array of tables")
@@ -1373,6 +1395,13 @@ def _model_catalog_config(
     if not isinstance(configured_models, list):
         raise ValueError("control.model_catalog.models must be an array of tables")
     models = [_model_metadata_config(value) for value in configured_models]
+    configured_rules = raw.get("model_rules", [])
+    if not isinstance(configured_rules, list):
+        raise ValueError("control.model_catalog.model_rules must be an array of tables")
+    model_rules = [_model_rule_config(value) for value in configured_rules]
+    rule_matches = [rule.match.lower() for rule in model_rules]
+    if len(rule_matches) != len(set(rule_matches)):
+        raise ValueError("control.model_catalog.model_rules contains duplicate match patterns")
     configured_model_ids = {model.model.lower() for model in models}
     for legacy_model in legacy_secondary_models:
         if legacy_model.lower() not in configured_model_ids:
@@ -1397,11 +1426,28 @@ def _model_catalog_config(
             raise ValueError(
                 f"Model catalog metadata references unknown quota domain: {model.quota_domain}"
             )
+    for rule in model_rules:
+        if rule.quota_domain is not None and rule.quota_domain not in configured_domains_by_name:
+            raise ValueError(
+                f"Model catalog rule references unknown quota domain: {rule.quota_domain}"
+            )
+    unknown_model_policy = raw.get("unknown_model_policy", "warn")
+    if not isinstance(unknown_model_policy, str) or unknown_model_policy not in (
+        "allow",
+        "warn",
+        "require_override",
+    ):
+        raise ValueError(
+            "control.model_catalog.unknown_model_policy must be one of: allow, warn, require_override"
+        )
     return CodexModelCatalogConfig(
         cache_path=cache_path,
         max_cache_age_sec=max_cache_age_sec,
         models=tuple(models),
+        model_rules=tuple(model_rules),
         quota_domains=quota_domains,
+        newness_window_days=newness_window_days,
+        unknown_model_policy=unknown_model_policy,
     )
 
 
@@ -1415,6 +1461,15 @@ def _claude_model_catalog_config(raw: Any) -> ClaudeModelCatalogConfig:
     model_ids = [model.model.lower() for model in models]
     if len(model_ids) != len(set(model_ids)):
         raise ValueError("control.claude_model_catalog.models contains duplicate model IDs")
+    configured_rules = raw.get("model_rules", [])
+    if not isinstance(configured_rules, list):
+        raise ValueError("control.claude_model_catalog.model_rules must be an array of tables")
+    model_rules = tuple(_model_rule_config(value) for value in configured_rules)
+    rule_matches = [rule.match.lower() for rule in model_rules]
+    if len(rule_matches) != len(set(rule_matches)):
+        raise ValueError(
+            "control.claude_model_catalog.model_rules contains duplicate match patterns"
+        )
     configured_inventory = raw.get("inventory", [])
     if not isinstance(configured_inventory, list):
         raise ValueError("control.claude_model_catalog.inventory must be an array of tables")
@@ -1422,7 +1477,21 @@ def _claude_model_catalog_config(raw: Any) -> ClaudeModelCatalogConfig:
     inventory_ids = [entry.model.lower() for entry in inventory]
     if len(inventory_ids) != len(set(inventory_ids)):
         raise ValueError("control.claude_model_catalog.inventory contains duplicate model IDs")
-    return ClaudeModelCatalogConfig(models=models, inventory=inventory)
+    unknown_model_policy = raw.get("unknown_model_policy", "warn")
+    if not isinstance(unknown_model_policy, str) or unknown_model_policy not in (
+        "allow",
+        "warn",
+        "require_override",
+    ):
+        raise ValueError(
+            "control.claude_model_catalog.unknown_model_policy must be one of: allow, warn, require_override"
+        )
+    return ClaudeModelCatalogConfig(
+        models=models,
+        model_rules=model_rules,
+        inventory=inventory,
+        unknown_model_policy=unknown_model_policy,
+    )
 
 
 def _claude_inventory_config(raw: Any) -> ClaudeModelInventoryConfig:
@@ -1618,6 +1687,67 @@ def _model_metadata_config(raw: Any) -> CodexModelMetadataConfig:
     return CodexModelMetadataConfig(
         model=model,
         premium=_boolean_value(raw.get("premium", False), f"Model catalog premium: {model}"),
+        quota_domain=quota_domain,
+        capacity_units=capacity_units,
+        credit_rate=credit_rate,
+        api_usd_rate=api_usd_rate,
+        rate_card_version=rate_card_version,
+        rate_card_source=rate_card_source,
+    )
+
+
+_ALLOWED_RULE_KEYS = {
+    "match",
+    "quota_domain",
+    "capacity_units",
+    "credit_rate",
+    "api_usd_rate",
+    "rate_card_version",
+    "rate_card_source",
+    "premium",
+}
+
+
+def _model_rule_config(raw: Any) -> CodexModelRuleConfig:
+    if not isinstance(raw, dict):
+        raise ValueError("Each model catalog rule entry must be a table")
+    unknown_keys = set(raw.keys()) - _ALLOWED_RULE_KEYS
+    if unknown_keys:
+        raise ValueError(
+            f"Model catalog rule contains unknown field(s): {', '.join(sorted(unknown_keys))}"
+        )
+    match_val = _optional_string_value(_required(raw, "match"))
+    if match_val is None:
+        raise ValueError("Model catalog rule match pattern must not be empty")
+    match = match_val.strip()
+    quota_domain = _optional_string_value(raw.get("quota_domain"))
+    if quota_domain is not None:
+        quota_domain = quota_domain.lower()
+    capacity_raw = raw.get("capacity_units", {})
+    if not isinstance(capacity_raw, dict):
+        raise ValueError(f"Model catalog capacity_units must be a table: match {match}")
+    capacity_units = tuple(
+        sorted(
+            (
+                _string_value(effort).lower(),
+                _positive_int(units, f"Model catalog capacity_units.{effort}"),
+            )
+            for effort, units in capacity_raw.items()
+        )
+    )
+    if len({effort for effort, _ in capacity_units}) != len(capacity_units):
+        raise ValueError(f"Model catalog capacity_units contains duplicate efforts: match {match}")
+    credit_rate = _catalog_rate(raw, match, "credit")
+    api_usd_rate = _catalog_rate(raw, match, "api_usd")
+    rate_card_version = _optional_string_value(raw.get("rate_card_version"))
+    rate_card_source = _optional_string_value(raw.get("rate_card_source"))
+    if (credit_rate is not None or api_usd_rate is not None) and (
+        rate_card_version is None or rate_card_source is None
+    ):
+        raise ValueError(f"Model catalog rate metadata needs version and source: match {match}")
+    return CodexModelRuleConfig(
+        match=match,
+        premium=_boolean_value(raw.get("premium", False), f"Model catalog premium: match {match}"),
         quota_domain=quota_domain,
         capacity_units=capacity_units,
         credit_rate=credit_rate,

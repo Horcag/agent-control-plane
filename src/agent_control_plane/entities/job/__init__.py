@@ -7,6 +7,7 @@ from agent_control_plane.entities.job.model.review_metrics import (
 from agent_control_plane.entities.job.model.store import (
     JobRecord,
     JobStore,
+    ModelObservationStore,
     format_events,
     new_job_id,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "AttemptMetrics",
     "JobRecord",
     "JobStore",
+    "ModelObservationStore",
     "ReviewMetricsStore",
     "format_events",
     "new_job_id",

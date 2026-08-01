@@ -1093,6 +1093,165 @@ required_branch = "main"
             self.assertEqual(model.rate_card_source, "operator-verified")
             self.assertFalse(model.premium)
 
+    def test_loads_model_rules_in_model_catalog_and_claude_model_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[[control.model_catalog.model_rules]]
+match = "gpt-5.6-*"
+premium = true
+quota_domain = "primary"
+capacity_units = { low = 5, high = 15 }
+
+[[control.claude_model_catalog.model_rules]]
+match = "claude-*"
+api_usd_rate = { input = 3.0, cached_input = 0.3, output = 15.0 }
+rate_card_version = "2026-07-09"
+rate_card_source = "operator-supplied"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            self.assertEqual(len(config.model_catalog.model_rules), 1)
+            rule = config.model_catalog.model_rules[0]
+            self.assertEqual(rule.match, "gpt-5.6-*")
+            self.assertTrue(rule.premium)
+            self.assertEqual(rule.quota_domain, "primary")
+            self.assertEqual(rule.capacity_units, (("high", 15), ("low", 5)))
+
+            self.assertEqual(len(config.claude_model_catalog.model_rules), 1)
+            claude_rule = config.claude_model_catalog.model_rules[0]
+            self.assertEqual(claude_rule.match, "claude-*")
+            self.assertIsNotNone(claude_rule.api_usd_rate)
+            self.assertEqual(claude_rule.rate_card_version, "2026-07-09")
+
+    def test_rejects_model_rule_without_version_and_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[[control.model_catalog.model_rules]]
+match = "gpt-5.6-*"
+credit_rate = { input = 25.0, cached_input = 2.5, output = 150.0 }
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as cm:
+                load_config(config_path)
+            self.assertIn("needs version and source", str(cm.exception))
+
+    def test_rejects_model_rule_with_empty_match_or_unknown_field_or_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "config" / "workspaces.toml"
+            config_path.parent.mkdir(parents=True)
+
+            # 1. Empty match
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[[control.model_catalog.model_rules]]
+match = "  "
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as cm1:
+                load_config(config_path)
+            self.assertIn("match pattern must not be empty", str(cm1.exception))
+
+            # 2. Unknown field
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[[control.model_catalog.model_rules]]
+match = "gpt-*"
+invalid_field = 123
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as cm2:
+                load_config(config_path)
+            self.assertIn("unknown field(s)", str(cm2.exception))
+
+            # 3. Duplicate match patterns
+            config_path.write_text(
+                """
+[control]
+coordination_root = ".agent-work"
+runs_root = "runs"
+database = "runs/jobs.sqlite3"
+worktree_root = "worktrees"
+worktree_base = "repo"
+slot_root = "slots"
+
+[[control.model_catalog.model_rules]]
+match = "gpt-5.6-*"
+
+[[control.model_catalog.model_rules]]
+match = "gpt-5.6-*"
+
+[routes.main]
+path = "repo"
+required_branch = "main"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as cm3:
+                load_config(config_path)
+            self.assertIn("duplicate match patterns", str(cm3.exception))
+
     def test_loads_codex_spark_max_concurrent_jobs_override(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

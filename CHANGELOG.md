@@ -4,6 +4,22 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+
+- Added live candidate revalidation at use time across model catalog and model routing policies.
+- Added model catalog union inspection payload containing `inventory_state` (`listed`, `hidden`, `last_seen`, `absent_from_inventory`), `metadata_state` (`configured`, `rule`, `unconfigured`), and `launch_disposition` (`allow`, `require_override`, `reject`).
+- Added catalog `provenance` metadata block reporting `version`, `fetched_at`, `etag`, `client_version`, `snapshot_state` (`current` vs `drifted`), and `on_disk_version`.
+- Added durable catalog observations in SQLite (`ModelObservationStore`) supporting historical retention and sticky inventory tracking.
+- Added catalog alert detection and reporting for `unclassified_model`, `outranks_configured_ladder`, `metadata_without_inventory`, `inventory_shrank`, `client_version_regressed`, and `snapshot_drifted`.
+- Added `agent-control model-catalog --check` CLI flag, returning exit code 1 when any warning-severity alert is present.
+- Added pattern rules (`[[control.model_catalog.model_rules]]` and `[[control.claude_model_catalog.model_rules]]`) matching unclassified models by glob, setting `metadata_state = "rule"`, and allowing `premium = true`, quota domain, and capacity units for model families without fabricating rate cards.
+- Added `unknown_model_policy` configuration under `[control.model_catalog]` and `[control.claude_model_catalog]` (`allow`, `warn` default, `require_override` fail-safe). Under `require_override`, explicit launches of unclassified models require a nonblank `codex_premium_override_reason`.
+
+### Changed
+
+- Routes or explicit launches pinned to `codex_model = "default"` (or Claude `claude_model = "default"`) resolve to the priority 1 candidate in current inventory; if priority 1 is a premium model, explicit-profile launch requires an override reason and will fail closed without it.
+- **Operator Note**: Existing running ACP MCP servers must be restarted before they benefit from model catalog updates.
+
 ## [0.2.0] - 2026-07-31
 
 ### Added

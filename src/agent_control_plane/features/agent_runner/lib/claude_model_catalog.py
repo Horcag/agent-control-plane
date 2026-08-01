@@ -6,6 +6,7 @@ import json
 from agent_control_plane.features.agent_runner.lib.model_catalog import (
     CatalogModel,
     CatalogModelMetadata,
+    CatalogModelRule,
     CatalogRate,
     ModelCatalog,
 )
@@ -126,13 +127,44 @@ def build_claude_model_catalog(config: ClaudeModelCatalogConfig) -> ModelCatalog
         )
         for item in config.models
     }
+    model_rules = tuple(
+        CatalogModelRule(
+            match=item.match,
+            premium=item.premium,
+            quota_domain=item.quota_domain,
+            capacity_units=item.capacity_units,
+            credit_rate=(
+                CatalogRate(
+                    item.credit_rate.input,
+                    item.credit_rate.cached_input,
+                    item.credit_rate.output,
+                )
+                if item.credit_rate is not None
+                else None
+            ),
+            api_usd_rate=(
+                CatalogRate(
+                    item.api_usd_rate.input,
+                    item.api_usd_rate.cached_input,
+                    item.api_usd_rate.output,
+                )
+                if item.api_usd_rate is not None
+                else None
+            ),
+            rate_card_version=item.rate_card_version,
+            rate_card_source=item.rate_card_source,
+        )
+        for item in config.model_rules
+    )
     return ModelCatalog(
         models=models,
         metadata=metadata,
+        model_rules=model_rules,
         cache_status="loaded",
         source=CLAUDE_CATALOG_SOURCE,
         version=_inventory_version(models),
         label=CLAUDE_CATALOG_LABEL,
+        unknown_model_policy=getattr(config, "unknown_model_policy", "warn"),
     )
 
 
