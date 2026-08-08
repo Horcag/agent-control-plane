@@ -15,6 +15,10 @@ DEFAULT_READ_RETRIES = 3
 DEFAULT_READ_RETRY_BACKOFF_SEC = 0.05
 DEFAULT_ERROR_SURFACE_THRESHOLD = 3
 
+# finalization_status values that mean the checkpoint/gate battery has been decided,
+# as opposed to "not_started"/"pending" which are still in flight.
+FINALIZATION_SETTLED_STATUSES = frozenset({"completed", "failed"})
+
 START = "start"
 TRANSITION = "transition"
 TERMINAL = "terminal"
@@ -58,7 +62,6 @@ class WatchEvent:
     status: str
     expected_result_status: str
     finalization_status: str
-    result_status: str | None = None
     on_contract: bool | None = None
     last_error: str | None = None
     heartbeat_age_sec: float | None = None
@@ -71,9 +74,18 @@ def is_on_contract(job: JobRecord) -> bool:
     return job.status == job.expected_result_status and job.finalization_status == "completed"
 
 
+def is_settled(job: JobRecord) -> bool:
+    """A job is done, for watch purposes, once its status is terminal and finalization
+    has been decided (not still "not_started"/"pending")."""
+    return (
+        job.status in TERMINAL_STATUSES and job.finalization_status in FINALIZATION_SETTLED_STATUSES
+    )
+
+
 @dataclass
 class _JobWatchState:
     last_status: str | None = None
+    settled: bool = False
     stale_emitted_heartbeat: str | None = None
     consecutive_failures: int = 0
 
@@ -128,10 +140,8 @@ class WatchEventStream:
     def job_ids(self) -> frozenset[str]:
         return frozenset(self._states)
 
-    def all_terminal(self) -> bool:
-        return bool(self._states) and all(
-            state.last_status in TERMINAL_STATUSES for state in self._states.values()
-        )
+    def all_settled(self) -> bool:
+        return bool(self._states) and all(state.settled for state in self._states.values())
 
     def tick(self) -> list[WatchEvent]:
         """Poll every watched job once and return the events observed this tick."""
@@ -154,7 +164,7 @@ class WatchEventStream:
         self,
         *,
         poll_interval_sec: float,
-        stop_when_all_terminal: bool = True,
+        stop_when_all_settled: bool = True,
         max_ticks: int | None = None,
     ) -> Iterator[WatchEvent]:
         """Convenience generator: tick, yield, sleep, repeat until done."""
@@ -164,7 +174,7 @@ class WatchEventStream:
         while True:
             yield from self.tick()
             ticks += 1
-            if stop_when_all_terminal and self.all_terminal():
+            if stop_when_all_settled and self.all_settled():
                 return
             if max_ticks is not None and ticks >= max_ticks:
                 return
@@ -180,13 +190,22 @@ class WatchEventStream:
             return []
         state.consecutive_failures = 0
         events: list[WatchEvent] = []
+        is_terminal_status = job.status in TERMINAL_STATUSES
+        settled_now = is_settled(job)
         if state.last_status is None:
-            events.append(self._event(START, job))
-        if job.status != state.last_status:
-            kind = TERMINAL if job.status in TERMINAL_STATUSES else TRANSITION
+            kind = TERMINAL if is_terminal_status else START
             events.append(self._event(kind, job))
+        elif job.status != state.last_status:
+            kind = TERMINAL if is_terminal_status else TRANSITION
+            events.append(self._event(kind, job))
+        elif settled_now and not state.settled:
+            # Status already went terminal on an earlier tick; finalization has just
+            # been decided. That's the fact the exit code is actually based on.
+            events.append(self._event(TERMINAL, job))
         state.last_status = job.status
-        if job.status not in TERMINAL_STATUSES:
+        if settled_now:
+            state.settled = True
+        if not is_terminal_status:
             events.extend(self._heartbeat_events(job, state))
         return events
 
@@ -210,10 +229,10 @@ class WatchEventStream:
     def _heartbeat_age_sec(self, heartbeat_at: str) -> float | None:
         try:
             beat = datetime.fromisoformat(heartbeat_at.replace("Z", "+00:00"))
-        except ValueError:
+            now = self._clock()
+            age: timedelta = now - beat
+        except (TypeError, ValueError):
             return None
-        now = self._clock()
-        age: timedelta = now - beat
         return max(0.0, age.total_seconds())
 
     def _read_job_with_retry(self, job_id: str) -> JobRecord:
@@ -255,6 +274,7 @@ class WatchEventStream:
         *,
         heartbeat_age_sec: float | None = None,
     ) -> WatchEvent:
+        settled = is_settled(job)
         return WatchEvent(
             kind=kind,
             job_id=job.job_id,
@@ -262,8 +282,7 @@ class WatchEventStream:
             status=job.status,
             expected_result_status=job.expected_result_status,
             finalization_status=job.finalization_status,
-            result_status=job.status if kind == TERMINAL else None,
-            on_contract=is_on_contract(job) if kind == TERMINAL else None,
+            on_contract=is_on_contract(job) if settled else None,
             last_error=job.last_error,
             heartbeat_age_sec=heartbeat_age_sec,
         )

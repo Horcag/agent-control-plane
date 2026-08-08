@@ -1,6 +1,7 @@
 from agent_control_plane.features.job_watch.lib import (
     DEFAULT_STALE_AFTER_SEC,
     EVENT_KINDS,
+    FINALIZATION_SETTLED_STATUSES,
     RESUMED,
     STALE,
     START,
@@ -12,11 +13,13 @@ from agent_control_plane.features.job_watch.lib import (
     WatchEventStream,
     WatchSelection,
     is_on_contract,
+    is_settled,
 )
 
 __all__ = [
     "DEFAULT_STALE_AFTER_SEC",
     "EVENT_KINDS",
+    "FINALIZATION_SETTLED_STATUSES",
     "RESUMED",
     "STALE",
     "START",
@@ -28,4 +31,5 @@ __all__ = [
     "WatchEventStream",
     "WatchSelection",
     "is_on_contract",
+    "is_settled",
 ]

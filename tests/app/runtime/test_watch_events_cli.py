@@ -14,10 +14,12 @@ from agent_control_plane.app.runtime.cli import (
     _handle_watch_events,
     _print_statuses,
     _statuses_payload,
+    _write_event_line,
 )
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
 from agent_control_plane.entities.job import JobStore
 from agent_control_plane.entities.plan import PlanStore, PlanTaskDefinition
+from agent_control_plane.features.job_watch import RESUMED, STALE, WatchEvent
 from agent_control_plane.shared.config import (
     CodexModelCatalogConfig,
     CodexQuotaDomainConfig,
@@ -207,6 +209,88 @@ def test_events_timeout_with_running_job_exits_three(tmp_path: Path) -> None:
     assert "non_terminal=1" in lines[-1]
 
 
+def test_events_terminal_status_pending_finalization_does_not_stop_the_watch(
+    tmp_path: Path,
+) -> None:
+    # A job reaches a terminal status before finalization (checkpointing, the
+    # controller gate battery) has run. The watch must keep polling instead of
+    # judging the contract against a decision that has not been made yet.
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(job.job_id, "completed")
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "3"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    assert rc == 3
+    lines = out.getvalue().splitlines()
+    assert any(" TERMINAL " in line and "status=completed" in line for line in lines)
+    assert "timed_out=true" in lines[-1]
+    assert "on_contract=0" in lines[-1]
+
+
+def test_events_finalization_settling_after_terminal_status_exits_zero(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(job.job_id, "completed")
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    calls = {"count": 0}
+
+    def _settle_finalization() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            control.store.mark_finalization_completed(job.job_id)
+
+    fake = _FakeMonotonic(on_sleep=_settle_finalization)
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    lines = out.getvalue().splitlines()
+    assert rc == 0
+    assert sum(1 for line in lines if " TERMINAL " in line) == 2
+    assert "on_contract=1" in lines[-1]
+    assert "timed_out=false" in lines[-1]
+
+
+def test_events_terminal_with_failed_finalization_exits_one(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(job.job_id, "completed")
+    control.store.mark_finalization_failed(job.job_id, "checkpoint gate failed")
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    assert rc == 1
+    lines = out.getvalue().splitlines()
+    assert "off_contract=1" in lines[-1]
+    assert "timed_out=false" in lines[-1]
+
+
+def test_events_no_line_ever_contains_a_result_token(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    job.result_path.parent.mkdir(parents=True, exist_ok=True)
+    job.result_path.write_text("Status: completed\n", encoding="utf-8")
+    control.store.mark_finished(job.job_id, "completed")
+    control.store.mark_finalization_completed(job.job_id)
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    assert rc == 0
+    lines = out.getvalue().splitlines()
+    assert lines  # sanity: the run actually produced output
+    assert not any("result=" in line for line in lines)
+
+
 def test_events_selector_matching_nothing_exits_four_not_zero(tmp_path: Path) -> None:
     control = AgentControlPlane(_config(tmp_path))
     args = _parse_watch(["--events", "--task-glob", "no-such-task-*", "--timeout-sec", "1"])
@@ -244,10 +328,103 @@ def test_events_one_line_per_state_change_no_duplicates(tmp_path: Path) -> None:
     lines = out.getvalue().splitlines()
     kinds = [line.split()[1] for line in lines]
     assert rc == 0
-    assert kinds == ["START", "TRANSITION", "TRANSITION", "TERMINAL", "SUMMARY"]
-    assert len(kinds) == len(set(kinds)) or kinds.count("TRANSITION") == 2
+    # One line per distinct state observed (created -> running -> completed), plus
+    # the summary -- the first observation must not also emit a redundant TRANSITION.
+    assert kinds == ["START", "TRANSITION", "TERMINAL", "SUMMARY"]
     # No duplicate lines at all -- every printed line is distinct.
     assert len(lines) == len(set(lines))
+
+
+def test_events_job_first_observed_terminal_emits_single_line(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(job.job_id, "completed")
+    control.store.mark_finalization_completed(job.job_id)
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    lines = out.getvalue().splitlines()
+    kinds = [line.split()[1] for line in lines]
+    assert rc == 0
+    assert kinds == ["TERMINAL", "SUMMARY"]
+
+
+def test_events_successful_job_has_no_error_field(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(
+        job.job_id, "completed", last_error="Result file completed with status completed"
+    )
+    control.store.mark_finalization_completed(job.job_id)
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    assert rc == 0
+    lines = out.getvalue().splitlines()
+    assert any(" TERMINAL " in line and "status=completed" in line for line in lines)
+    assert not any("error=" in line for line in lines)
+
+
+def test_events_failed_job_has_error_field(tmp_path: Path) -> None:
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "job-1")
+    control.store.mark_finished(job.job_id, "failed", last_error="worker crashed: boom")
+    control.store.mark_finalization_completed(job.job_id)
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+
+    rc = _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep)
+
+    assert rc == 1
+    lines = out.getvalue().splitlines()
+    terminal_line = next(line for line in lines if " TERMINAL " in line)
+    assert "error=worker crashed: boom" in terminal_line
+
+
+def test_stale_and_resumed_lines_are_rendered() -> None:
+    # STALE/RESUMED formatting is driven directly rather than through the full poll
+    # loop: the stream's heartbeat clock is real wall time (not the injected
+    # poll-loop clock), so pinning the rendered line here is the deterministic way
+    # to cover it.
+    stale_event = WatchEvent(
+        kind=STALE,
+        job_id="job-1",
+        task_id="task-job-1",
+        status="running",
+        expected_result_status="completed",
+        finalization_status="not_started",
+        heartbeat_age_sec=305.0,
+        at="2026-08-09T20:00:00+00:00",
+    )
+    resumed_event = WatchEvent(
+        kind=RESUMED,
+        job_id="job-1",
+        task_id="task-job-1",
+        status="running",
+        expected_result_status="completed",
+        finalization_status="not_started",
+        heartbeat_age_sec=12.0,
+        at="2026-08-09T20:05:00+00:00",
+    )
+    out = io.StringIO()
+
+    _write_event_line(out, stale_event)
+    _write_event_line(out, resumed_event)
+
+    lines = out.getvalue().splitlines()
+    assert lines[0] == (
+        "2026-08-09T20:00:00+00:00 STALE job=task-job-1 status=running finalization=not_started"
+    )
+    assert lines[1] == (
+        "2026-08-09T20:05:00+00:00 RESUMED job=task-job-1 status=running finalization=not_started"
+    )
 
 
 def test_events_plan_selection_watches_bound_job(tmp_path: Path) -> None:

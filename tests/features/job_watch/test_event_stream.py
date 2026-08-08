@@ -116,36 +116,53 @@ def test_start_then_transition_then_terminal_dedup(tmp_path: Path) -> None:
     stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
 
     first = stream.tick()
-    assert [event.kind for event in first] == [START, TRANSITION]
+    assert [event.kind for event in first] == [START]
     assert first[0].status == "created"
 
     # No change -> no events.
     assert stream.tick() == []
 
-    store.update_job(job.job_id, status="running", started_at="2026-08-09T00:00:00+00:00")
+    store.update_job(job.job_id, status="running", started_at="2020-01-01T00:00:00+00:00")
     running_events = stream.tick()
     assert [event.kind for event in running_events] == [TRANSITION]
     assert running_events[0].status == "running"
 
+    job.result_path.parent.mkdir(parents=True, exist_ok=True)
+    job.result_path.write_text("Status: completed\n", encoding="utf-8")
     store.mark_finished(job.job_id, "completed")
     store.mark_finalization_completed(job.job_id)
     terminal_events = stream.tick()
     assert [event.kind for event in terminal_events] == [TERMINAL]
     terminal_event = terminal_events[0]
     assert terminal_event.status == "completed"
-    assert terminal_event.result_status == "completed"
     assert terminal_event.on_contract is True
 
     # Terminal status is stable -> stream goes quiet and reports done.
     assert stream.tick() == []
-    assert stream.all_terminal() is True
+    assert stream.all_settled() is True
+
+
+def test_job_first_observed_already_terminal_emits_one_line(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-1b")
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_completed(job.job_id)
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
+
+    first = stream.tick()
+
+    assert [event.kind for event in first] == [TERMINAL]
+    assert first[0].status == "completed"
+
+    # Terminal on first sight -> stable, no further events.
+    assert stream.tick() == []
 
 
 def test_off_contract_terminal_reports_on_contract_false(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs.sqlite3")
     job = _create_job(store, tmp_path, "job-2", expected_result_status="completed")
     stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
-    stream.tick()  # consume start/transition for "created"
+    stream.tick()  # consume start for "created"
 
     store.mark_finished(job.job_id, "partial")
     store.mark_finalization_completed(job.job_id)
@@ -155,6 +172,56 @@ def test_off_contract_terminal_reports_on_contract_false(tmp_path: Path) -> None
     assert events[0].status == "partial"
     assert events[0].expected_result_status == "completed"
     assert events[0].on_contract is False
+
+
+def test_terminal_status_with_pending_finalization_does_not_settle(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-2b")
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
+    stream.tick()  # consume start for "created"
+
+    # status turns terminal, but finalization -- checkpointing and the controller
+    # gate battery -- has not run yet.
+    store.mark_finished(job.job_id, "completed")
+    events = stream.tick()
+
+    assert [event.kind for event in events] == [TERMINAL]
+    assert events[0].status == "completed"
+    assert events[0].finalization_status == "pending"
+    assert events[0].on_contract is None
+    assert stream.all_settled() is False
+
+    # Still pending on the next poll -> quiet, still not settled.
+    assert stream.tick() == []
+    assert stream.all_settled() is False
+
+    # Finalization is decided -> a settle line fires and the watch is done.
+    store.mark_finalization_completed(job.job_id)
+    settled_events = stream.tick()
+
+    assert [event.kind for event in settled_events] == [TERMINAL]
+    assert settled_events[0].finalization_status == "completed"
+    assert settled_events[0].on_contract is True
+    assert stream.all_settled() is True
+
+    # Settled and stable -> stream goes quiet.
+    assert stream.tick() == []
+
+
+def test_terminal_status_with_failed_finalization_settles_off_contract(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-2c")
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
+    stream.tick()  # consume start for "created"
+
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_failed(job.job_id, "checkpoint gate failed")
+    events = stream.tick()
+
+    assert [event.kind for event in events] == [TERMINAL]
+    assert events[0].finalization_status == "failed"
+    assert events[0].on_contract is False
+    assert stream.all_settled() is True
 
 
 def test_is_on_contract_matches_expected_result_status_and_finalization(tmp_path: Path) -> None:
@@ -182,7 +249,7 @@ def test_stale_then_resumed_heartbeat(tmp_path: Path) -> None:
 
     clock = _FakeClock(now)
     stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})), clock=clock)
-    stream.tick()  # consume start/transition
+    stream.tick()  # consume start
 
     # Not stale yet.
     clock.advance(100)
@@ -209,6 +276,26 @@ def test_stale_then_resumed_heartbeat(tmp_path: Path) -> None:
     clock.advance(400)
     stale_again = stream.tick()
     assert [event.kind for event in stale_again] == [STALE]
+
+
+@pytest.mark.parametrize("garbage_heartbeat", ["not-a-timestamp", "2026-08-09T00:00:00"])
+def test_unusable_heartbeat_degrades_to_age_unknown(tmp_path: Path, garbage_heartbeat: str) -> None:
+    # "not-a-timestamp" raises ValueError from fromisoformat; a naive timestamp like
+    # "2026-08-09T00:00:00" parses fine but raises TypeError when subtracted from the
+    # aware clock the stream uses. Neither may escape tick() and kill the watch.
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-4b")
+    store.update_job(job.job_id, status="running", worker_heartbeat_at=garbage_heartbeat)
+
+    clock = _FakeClock(datetime.now(UTC))
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})), clock=clock)
+    stream.tick()  # consume start
+
+    clock.advance(10_000)
+    events = stream.tick()
+
+    assert events == []
+    assert stream.all_settled() is False
 
 
 def test_watch_error_after_consecutive_store_failures(

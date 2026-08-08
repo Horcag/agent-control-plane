@@ -1106,12 +1106,12 @@ def _run_watch_events(
     while True:
         for event in stream.tick():
             _write_event_line(out, event)
-            if event.kind == TERMINAL:
+            if event.on_contract is not None:
                 if event.on_contract:
                     on_contract += 1
                 else:
                     off_contract += 1
-        if stream.all_terminal():
+        if stream.all_settled():
             break
         elapsed = clock() - started
         if timeout_sec is not None and elapsed >= timeout_sec:
@@ -1144,14 +1144,25 @@ def _write_event_line(out: TextIO, event: WatchEvent) -> None:
     parts = [event.at, label, f"job={event.task_id or event.job_id or '-'}"]
     if event.status:
         parts.append(f"status={event.status}")
-    if event.result_status is not None:
-        parts.append(f"result={event.result_status}")
     if event.finalization_status:
         parts.append(f"finalization={event.finalization_status}")
-    error_text = event.message or event.last_error
+    error_text = _error_text_for_event(event)
     if error_text:
         parts.append(f"error={_compact_multiline(error_text, limit=_WATCH_ERROR_MAX_LEN)}")
     print(" ".join(parts), file=out, flush=True)
+
+
+def _error_text_for_event(event: WatchEvent) -> str | None:
+    """Only surface `error=` where it means something: a real failure or a watch fault.
+
+    A completed job's ``last_error`` can carry informational text, and printing it
+    unconditionally trains readers to ignore the field on jobs that are fine.
+    """
+    if event.kind == WATCH_ERROR:
+        return event.message or event.last_error
+    if event.kind == TERMINAL and event.on_contract is False:
+        return event.last_error
+    return None
 
 
 def _write_watch_error_line(out: TextIO, message: str) -> None:
