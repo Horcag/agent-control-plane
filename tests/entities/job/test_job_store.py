@@ -165,6 +165,13 @@ class JobStoreTest(unittest.TestCase):
             job = _create_job(store, root, "job-1")
             self.assertEqual(job.workspace_access, "ide_mcp")
 
+    def test_create_job_finalization_status_defaults_not_started_on_fresh_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = JobStore(root / "jobs.sqlite3")
+            job = _create_job(store, root, "job-1")
+            self.assertEqual(job.finalization_status, "not_started")
+
     def test_workspace_access_explicit_native(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -520,6 +527,103 @@ class JobStoreTest(unittest.TestCase):
             store = JobStore(db_path)
             job = store.get_job("old-job")
             self.assertEqual(job.workspace_access, "ide_mcp")
+
+    def test_migrated_schema_preserves_completed_finalization_status_for_old_rows(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "jobs.sqlite3"
+
+            # Manually create the table shape from before finalization_status existed
+            # and seed a row the way a job that predates the column would look.
+            conn = sqlite3.connect(db_path)
+            conn.execute(_OLD_JOBS_TABLE_SQL)
+            conn.execute(_OLD_JOB_INSERT_SQL, ("old-job", "old-task"))
+            conn.commit()
+            conn.close()
+
+            # initialize() runs the alter table that backfills finalization_status
+            # for rows that predate the column with the historically correct 'completed'.
+            store = JobStore(db_path)
+            old_job = store.get_job("old-job")
+            self.assertEqual(old_job.finalization_status, "completed")
+
+    def test_create_job_finalization_status_defaults_not_started_on_migrated_schema(
+        self,
+    ) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db_path = root / "jobs.sqlite3"
+
+            conn = sqlite3.connect(db_path)
+            conn.execute(_OLD_JOBS_TABLE_SQL)
+            conn.execute(_OLD_JOB_INSERT_SQL, ("old-job", "old-task"))
+            conn.commit()
+            conn.close()
+
+            store = JobStore(db_path)
+            store.initialize()
+
+            # A job created after the migration must not inherit the migrated
+            # column's backfill default; it must start its own lifecycle.
+            new_job = _create_job(store, root, "job-after-migration")
+            self.assertEqual(new_job.finalization_status, "not_started")
+
+            # The pre-existing row must be unaffected by the new job's creation.
+            self.assertEqual(store.get_job("old-job").finalization_status, "completed")
+
+
+_OLD_JOBS_TABLE_SQL = """
+    create table jobs (
+        job_id                 text primary key,
+        task_id                text    not null,
+        route                  text    not null,
+        workspace_path         text    not null,
+        expected_branch        text    not null,
+        status                 text    not null,
+        config_path            text    not null,
+        run_dir                text    not null,
+        prompt_path            text    not null,
+        result_path            text    not null,
+        log_path               text,
+        worker_pid             integer,
+        runner_pid             integer,
+        agy_pid                integer,
+        backend                text    not null default 'agy',
+        agy_model              text,
+        codex_model            text,
+        codex_reasoning_effort text,
+        codex_quality_tier     text,
+        codex_tool_call_budget integer,
+        archived_at            text,
+        created_at             text    not null,
+        updated_at             text    not null,
+        started_at             text,
+        finished_at            text,
+        timeout_sec            integer not null,
+        idle_timeout_sec       integer not null,
+        print_timeout          text    not null,
+        max_restarts           integer not null,
+        yolo                   integer not null,
+        allow_dirty            integer not null,
+        read_only              integer not null default 0,
+        slot_name              text,
+        last_error             text,
+        cancel_requested       integer not null default 0
+    )
+"""
+
+_OLD_JOB_INSERT_SQL = """
+    insert into jobs (job_id, task_id, route, workspace_path, expected_branch, status,
+                      config_path, run_dir, prompt_path, result_path,
+                      created_at, updated_at, timeout_sec, idle_timeout_sec,
+                      print_timeout, max_restarts, yolo, allow_dirty)
+    values (?, ?, 'main', 'wp', 'branch', 'created',
+            'cp', 'rd', 'pp', 'rp', 'now', 'now', 10, 5, '10s', 0, 0, 0)
+"""
 
 
 def _create_job(store: JobStore, root: Path, job_id: str):

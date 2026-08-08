@@ -411,9 +411,10 @@ class JobStore:
                     codex_tool_call_budget, workspace_access,
                     launch_base_sha, brief_sha256, effective_scope_json, retry_override_reason,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
-                    print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name
+                    print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name,
+                    finalization_status
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -450,6 +451,7 @@ class JobStore:
                     int(allow_dirty),
                     int(read_only),
                     slot_name,
+                    "not_started",
                 ),
             )
         return self.get_job(job_id)
