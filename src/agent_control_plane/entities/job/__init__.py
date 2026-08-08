@@ -5,6 +5,7 @@ from agent_control_plane.entities.job.model.review_metrics import (
     ReviewMetricsStore,
 )
 from agent_control_plane.entities.job.model.store import (
+    TERMINAL_STATUSES,
     JobRecord,
     JobStore,
     ModelObservationStore,
@@ -15,6 +16,7 @@ from agent_control_plane.entities.job.model.store import (
 __all__ = [
     "REVIEW_OUTCOMES",
     "REVIEW_PHASES",
+    "TERMINAL_STATUSES",
     "AttemptMetrics",
     "JobRecord",
     "JobStore",

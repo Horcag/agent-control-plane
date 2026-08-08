@@ -13,6 +13,7 @@ from agent_control_plane.app.runtime.finalization_service import FinalizationSer
 from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
 from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
 from agent_control_plane.entities.job import (
+    TERMINAL_STATUSES,
     JobRecord,
     JobStore,
     ModelObservationStore,
@@ -128,22 +129,6 @@ _ROUTING_HISTORY_LIMIT = 200
 COORDINATOR_SCOPE = (
     "ACP controls delegated worker profiles only; the parent/coordinating Codex thread is "
     "external and cannot be selected, downgraded, or escalated by ACP."
-)
-
-
-TERMINAL_STATUSES = frozenset(
-    {
-        "completed",
-        "partial",
-        "blocked",
-        "contract_mismatch",
-        "failed",
-        "cancelled",
-        "guardrail_violation",
-        "inefficient_tool_usage",
-        "worker_error",
-        "stopped_dirty_after_failure",
-    }
 )
 
 

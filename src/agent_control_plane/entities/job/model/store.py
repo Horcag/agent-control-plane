@@ -51,6 +51,21 @@ JOB_COLUMNS = {
     "finalized_at",
 }
 
+TERMINAL_STATUSES = frozenset(
+    {
+        "completed",
+        "partial",
+        "blocked",
+        "contract_mismatch",
+        "failed",
+        "cancelled",
+        "guardrail_violation",
+        "inefficient_tool_usage",
+        "worker_error",
+        "stopped_dirty_after_failure",
+    }
+)
+
 WORKSPACE_DISPOSITIONS = frozenset({"unknown", "clean", "dirty_after_failure", "dirty_after_job"})
 CHECKPOINT_DISPOSITIONS = frozenset(
     ["none", "salvage", "contaminated", "continuation_verified", "final_accepted"]
