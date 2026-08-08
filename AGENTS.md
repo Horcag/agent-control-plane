@@ -18,6 +18,9 @@
 - Codex-facing job starts must support supervised completion: use `start --wait`,
   `watch`, or heartbeat monitoring instead of ending a handoff while a job is only
   `queued` or `running`.
+- To watch delegated work, use `agent-control watch <job-id>... --events` (see
+  `docs/operations.md#watching-jobs-as-an-event-stream`) and read its exit code; do not
+  write a hand-rolled status poll loop.
 - Represent multi-job epics as durable plans. Coordinating agents should use plan
   snapshots/watch cursors and bounded result excerpts instead of replaying full worker
   logs. Executable tasks must be claimed through the one-shot plan dispatcher; dispatch

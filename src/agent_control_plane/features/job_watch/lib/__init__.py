@@ -1,4 +1,5 @@
 from agent_control_plane.features.job_watch.lib.event_stream import (
+    DEFAULT_STALE_AFTER_SEC,
     EVENT_KINDS,
     RESUMED,
     STALE,
@@ -14,6 +15,7 @@ from agent_control_plane.features.job_watch.lib.event_stream import (
 )
 
 __all__ = [
+    "DEFAULT_STALE_AFTER_SEC",
     "EVENT_KINDS",
     "RESUMED",
     "STALE",

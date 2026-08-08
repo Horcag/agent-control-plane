@@ -4,8 +4,9 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from agent_control_plane.app.runtime.cli_commands import add_demo_parser, add_plan_parser
 from agent_control_plane.app.runtime.demo import (
@@ -21,9 +22,24 @@ from agent_control_plane.app.runtime.orchestrator import (
 )
 from agent_control_plane.app.runtime.plan_cli import handle_plan_command
 from agent_control_plane.app.runtime.review_cli import add_review_parser, handle_review_command
+from agent_control_plane.entities.job import TERMINAL_STATUSES
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
+from agent_control_plane.features.job_watch import (
+    DEFAULT_STALE_AFTER_SEC,
+    RESUMED,
+    STALE,
+    START,
+    TERMINAL,
+    TRANSITION,
+    WATCH_ERROR,
+    EmptySelectionError,
+    WatchEvent,
+    WatchEventStream,
+    WatchSelection,
+)
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
+from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import (
     default_config_path,
     ensure_mcp_server,
@@ -31,10 +47,29 @@ from agent_control_plane.shared.config import (
     wire_mcp_servers,
 )
 
+# The only values a job may declare as expected_result_status (see
+# entities/job/model/store.py:_validate_controller_contract). A terminal status outside this
+# set can never satisfy is_on_contract, no matter what a job expects.
+_ON_CONTRACT_CAPABLE_STATUSES = frozenset({"completed", "partial", "blocked"})
+
+_WATCH_EVENT_KIND_LABELS = {
+    START: "START",
+    TRANSITION: "TRANSITION",
+    TERMINAL: "TERMINAL",
+    STALE: "STALE",
+    RESUMED: "RESUMED",
+    WATCH_ERROR: "WATCH-ERROR",
+}
+
+_WATCH_ERROR_MAX_LEN = 240
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "statuses":
+        _print_statuses(json_output=args.json)
+        return 0
     if args.command == "demo":
         try:
             if args.demo_command == "run":
@@ -265,27 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "watch":
-            if args.live:
-                _print_json(
-                    _watch_job_live(
-                        control,
-                        args.job_id,
-                        poll_interval_sec=args.poll_interval_sec,
-                        timeout_sec=args.timeout_sec,
-                        log_lines=args.lines,
-                    )
-                )
-            else:
-                _print_json(
-                    control.watch_job(
-                        args.job_id,
-                        poll_interval_sec=args.poll_interval_sec,
-                        timeout_sec=args.timeout_sec,
-                        log_lines=args.lines,
-                        include_details=True,
-                    )
-                )
-            return 0
+            return _handle_watch_command(control, args)
         if args.command == "tail":
             print(control.tail_job(args.job_id, args.lines))
             return 0
@@ -500,6 +515,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print derived .mcp.json changes",
     )
 
+    statuses_parser = subparsers.add_parser(
+        "statuses",
+        help="Print the job status vocabulary: terminal statuses and which are on-contract-capable",
+    )
+    statuses_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
     subparsers.add_parser("smoke", parents=[common], help="Check config and local prerequisites")
     cat_parser = subparsers.add_parser(
         "model-catalog",
@@ -708,16 +729,51 @@ def _build_parser() -> argparse.ArgumentParser:
     watch = subparsers.add_parser(
         "watch",
         parents=[common],
-        help="Poll a job until terminal status or timeout",
+        help="Poll one or more jobs until terminal status or timeout",
+        description=(
+            "Without --events, watch takes exactly one job_id and prints one JSON payload "
+            "(unchanged from prior releases). With --events, it accepts multiple job_ids "
+            "and/or --plan/--task-glob, and streams one line per event to stdout instead. "
+            "Exit codes: 0 every watched job ended on-contract; 1 at least one job ended "
+            "terminal but off-contract; 3 timed out with a job still non-terminal; 4 the "
+            "selection matched no jobs or job state could not be read; 2 is argparse usage "
+            "error. See `agent-control statuses` for the terminal status vocabulary."
+        ),
     )
-    watch.add_argument("job_id")
+    watch.add_argument(
+        "job_id", nargs="*", help="Job id(s) to watch (exactly one without --events)"
+    )
     watch.add_argument("--poll-interval-sec", type=float, default=30.0)
     watch.add_argument("--timeout-sec", type=float)
     watch.add_argument("--lines", type=int, default=80)
     watch.add_argument(
         "--live",
         action="store_true",
-        help="Print status and new log tail updates to stderr while waiting",
+        help="Print status and new log tail updates to stderr while waiting (no --events)",
+    )
+    watch.add_argument(
+        "--events",
+        action="store_true",
+        help=(
+            "Stream one line per event to stdout instead of a single JSON payload; "
+            "supports multiple job ids and --plan/--task-glob selection"
+        ),
+    )
+    watch.add_argument(
+        "--plan",
+        dest="plan_id",
+        help="Watch every job currently bound to this plan (requires --events)",
+    )
+    watch.add_argument(
+        "--task-glob",
+        dest="task_id_glob",
+        help="Watch jobs whose task_id matches this SQLite GLOB pattern (requires --events)",
+    )
+    watch.add_argument(
+        "--stale-after-sec",
+        type=float,
+        default=DEFAULT_STALE_AFTER_SEC,
+        help="Heartbeat age in seconds before a running job is reported STALE (--events only)",
     )
 
     tail = subparsers.add_parser(
@@ -947,6 +1003,201 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def _handle_watch_command(control: AgentControlPlane, args: argparse.Namespace) -> int:
+    job_ids: list[str] = args.job_id
+    if args.events:
+        return _handle_watch_events(control, args)
+    if args.plan_id or args.task_id_glob:
+        print("watch: --plan and --task-glob require --events", file=sys.stderr)
+        return 2
+    if len(job_ids) != 1:
+        print("watch: exactly one job_id is required without --events", file=sys.stderr)
+        return 2
+    job_id = job_ids[0]
+    try:
+        if args.live:
+            payload = _watch_job_live(
+                control,
+                job_id,
+                poll_interval_sec=args.poll_interval_sec,
+                timeout_sec=args.timeout_sec,
+                log_lines=args.lines,
+            )
+        else:
+            payload = control.watch_job(
+                job_id,
+                poll_interval_sec=args.poll_interval_sec,
+                timeout_sec=args.timeout_sec,
+                log_lines=args.lines,
+                include_details=True,
+            )
+    except KeyError as exc:
+        print(str(exc), file=sys.stderr)
+        return 4
+    _print_json(payload)
+    return _exit_code_for_watch_payload(payload)
+
+
+def _exit_code_for_watch_payload(payload: dict[str, Any]) -> int:
+    if payload.get("timed_out"):
+        return 3
+    on_contract = (
+        payload.get("status") == payload.get("expected_result_status")
+        and payload.get("finalization_status") == "completed"
+    )
+    return 0 if on_contract else 1
+
+
+def _handle_watch_events(
+    control: AgentControlPlane,
+    args: argparse.Namespace,
+    *,
+    out: TextIO = sys.stdout,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    selection = WatchSelection(
+        job_ids=frozenset(args.job_id),
+        plan_id=args.plan_id,
+        task_id_glob=args.task_id_glob,
+    )
+    try:
+        stream = WatchEventStream(
+            control.store,
+            selection,
+            stale_after_sec=args.stale_after_sec,
+        )
+    except EmptySelectionError as exc:
+        _write_watch_error_line(out, str(exc))
+        _write_summary_line(out, on_contract=0, off_contract=0, non_terminal=0, timed_out=False)
+        return 4
+    return _run_watch_events(
+        stream,
+        timeout_sec=args.timeout_sec,
+        poll_interval_sec=args.poll_interval_sec,
+        out=out,
+        clock=clock,
+        sleep=sleep,
+    )
+
+
+def _run_watch_events(
+    stream: WatchEventStream,
+    *,
+    timeout_sec: float | None,
+    poll_interval_sec: float,
+    out: TextIO,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> int:
+    if poll_interval_sec < 0:
+        raise ValueError("poll_interval_sec must be non-negative")
+    if timeout_sec is not None and timeout_sec < 0:
+        raise ValueError("timeout_sec must be non-negative")
+    if poll_interval_sec == 0 and timeout_sec is None:
+        raise ValueError("poll_interval_sec=0 requires a timeout_sec")
+
+    started = clock()
+    on_contract = 0
+    off_contract = 0
+    timed_out = False
+    while True:
+        for event in stream.tick():
+            _write_event_line(out, event)
+            if event.kind == TERMINAL:
+                if event.on_contract:
+                    on_contract += 1
+                else:
+                    off_contract += 1
+        if stream.all_terminal():
+            break
+        elapsed = clock() - started
+        if timeout_sec is not None and elapsed >= timeout_sec:
+            timed_out = True
+            break
+        sleep_for = poll_interval_sec
+        if timeout_sec is not None:
+            sleep_for = min(sleep_for, max(0.0, timeout_sec - elapsed))
+        if sleep_for <= 0:
+            continue
+        sleep(sleep_for)
+
+    non_terminal = len(stream.job_ids) - on_contract - off_contract
+    _write_summary_line(
+        out,
+        on_contract=on_contract,
+        off_contract=off_contract,
+        non_terminal=non_terminal,
+        timed_out=timed_out,
+    )
+    if timed_out:
+        return 3
+    if off_contract:
+        return 1
+    return 0
+
+
+def _write_event_line(out: TextIO, event: WatchEvent) -> None:
+    label = _WATCH_EVENT_KIND_LABELS[event.kind]
+    parts = [event.at, label, f"job={event.task_id or event.job_id or '-'}"]
+    if event.status:
+        parts.append(f"status={event.status}")
+    if event.result_status is not None:
+        parts.append(f"result={event.result_status}")
+    if event.finalization_status:
+        parts.append(f"finalization={event.finalization_status}")
+    error_text = event.message or event.last_error
+    if error_text:
+        parts.append(f"error={_compact_multiline(error_text, limit=_WATCH_ERROR_MAX_LEN)}")
+    print(" ".join(parts), file=out, flush=True)
+
+
+def _write_watch_error_line(out: TextIO, message: str) -> None:
+    line = (
+        f"{utc_now()} WATCH-ERROR job=- "
+        f"error={_compact_multiline(message, limit=_WATCH_ERROR_MAX_LEN)}"
+    )
+    print(line, file=out, flush=True)
+
+
+def _write_summary_line(
+    out: TextIO,
+    *,
+    on_contract: int,
+    off_contract: int,
+    non_terminal: int,
+    timed_out: bool,
+) -> None:
+    total = on_contract + off_contract + non_terminal
+    print(
+        f"{utc_now()} SUMMARY jobs={total} on_contract={on_contract} "
+        f"off_contract={off_contract} non_terminal={non_terminal} timed_out={str(timed_out).lower()}",
+        file=out,
+        flush=True,
+    )
+
+
+def _statuses_payload() -> dict[str, Any]:
+    on_contract_capable = sorted(TERMINAL_STATUSES & _ON_CONTRACT_CAPABLE_STATUSES)
+    always_off_contract = sorted(TERMINAL_STATUSES - _ON_CONTRACT_CAPABLE_STATUSES)
+    return {
+        "terminal_statuses": sorted(TERMINAL_STATUSES),
+        "on_contract_capable_statuses": on_contract_capable,
+        "always_off_contract_statuses": always_off_contract,
+    }
+
+
+def _print_statuses(*, json_output: bool) -> None:
+    payload = _statuses_payload()
+    if json_output:
+        _print_json(payload)
+        return
+    capable = set(payload["on_contract_capable_statuses"])
+    for status in payload["terminal_statuses"]:
+        label = "on_contract_capable" if status in capable else "always_off_contract"
+        print(f"{status:<28} {label}")
 
 
 def _watch_job_live(

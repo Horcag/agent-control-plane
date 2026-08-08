@@ -40,6 +40,48 @@ item, verifies both, then cleans the slot back to its prior branch. It never pus
 merges, moves the branch, or accepts the change. Any late edit or verification failure
 keeps the slot dirty and quarantined.
 
+## Watching jobs as an event stream
+
+Do not write a hand-rolled status poll loop against `status`/`summary`. Use `watch
+--events` and read the exit code:
+
+```powershell
+agent-control watch <job-id>... --events --config .\config\workspaces.toml
+agent-control watch --plan <plan-id> --events --config .\config\workspaces.toml
+agent-control watch --task-glob 'acp-watch-*' --events --config .\config\workspaces.toml
+```
+
+`--events` accepts multiple positional job ids plus `--plan`/`--task-glob` selection, and
+streams one line per event to stdout (flushed immediately), instead of the single JSON
+payload the plain `watch <job-id>` form still prints:
+
+```
+<ISO8601> <KIND> job=<task_id> status=<s> [result=<r>] [finalization=<f>] [error=<truncated>]
+```
+
+`KIND` is one of `START`, `TRANSITION`, `TERMINAL`, `STALE`, `RESUMED`, `WATCH-ERROR`,
+`SUMMARY` — uppercase and first after the timestamp so a consumer can filter with a
+single grep alternation. A `SUMMARY` line is always printed last. `--stale-after-sec`
+(default 300) controls how long a running job may go without a heartbeat before it is
+reported `STALE`.
+
+The exit code is the point: it tells a caller what happened without parsing output.
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0`  | Every watched job ended on-contract (its final `status` matched its declared `expected_result_status`, with finalization `completed`). |
+| `1`  | At least one job ended terminal but off-contract (includes `failed`, `guardrail_violation`, and `contract_mismatch`). |
+| `3`  | `--timeout-sec` expired with at least one job still non-terminal. |
+| `4`  | The selection (job ids / `--plan` / `--task-glob`) matched no jobs, or job state could not be read. |
+| `2`  | Argparse usage error. |
+
+This applies to the plain `watch <job-id>` form too (its single JSON payload is
+unchanged for existing callers, but its exit code is now meaningful in the same way).
+
+Run `agent-control statuses` (or `--json`) to print the full terminal-status vocabulary
+and which statuses are capable of being on-contract, instead of guessing at status
+strings.
+
 ## Plans, dispatch, and review
 
 Create a JSON manifest with executable tasks and dependencies, then run:
