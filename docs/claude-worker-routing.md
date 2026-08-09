@@ -137,6 +137,48 @@ the worker's own login/session intact. This is the source of the roughly 2x cost
 reduction noted above (per-request static context drops from ~90K to ~42K tokens) —
 it removes prompt overhead the worker never needed, not capability.
 
+## Backgrounded Bash calls are denied, not just discouraged
+
+`claude_allowed_tools` deliberately excludes `Monitor` (see `AGENTS.md`): workers
+don't get watchers, and watching delegated jobs is the root's job via
+`agent-control watch --events`. But `run_in_background` lives inside the `Bash` tool
+itself, so excluding `Monitor` alone does not stop a worker from starting background
+work it can never be notified about — a headless `claude -p` process has no channel
+to deliver a background-task completion event, so a model that backgrounds a `Bash`
+call and ends its turn to wait leaves the job hung until `timeout_sec` kills it
+(`runner_failure=exited_without_result`). The mandatory-rules block in
+`prompt_builder.py` says as much, but a rule this easy to violate under normal
+Claude Code instincts (backgrounding a long test run is the *correct* move in an
+interactive session) needs to be enforced, not restated.
+
+`ClaudeExecRunner._build_command` always appends an inline `--settings` JSON payload
+(built by `_background_bash_guard_settings`) defining a `PreToolUse` hook, matched on
+the `Bash` tool, that denies any call whose `tool_input.run_in_background` is truthy.
+The hook itself is `scripts/claude_deny_background_bash.py`, invoked by absolute path
+with the controller's own Python interpreter (`sys.executable`) so it does not depend
+on the worker's `PATH`.
+
+Two deliberate choices behind this shape:
+
+- **Inline `--settings`, not a committed `.claude/settings.json`.** Slots are git
+  worktrees of this repository, so a rule committed to `.claude/settings.json` and
+  loaded via `--setting-sources project` would also bind a human working in that
+  worktree interactively — and an interactive session *can* legitimately background
+  work, because it gets a real completion notification. Passing the hook as an inline
+  `--settings` value on the worker's own command line scopes the deny rule to spawned
+  worker processes only; it is never present for a `claude` session a human launches
+  directly.
+- **Applies unconditionally, `yolo` included.** `--dangerously-skip-permissions`
+  bypasses the permission system, not hooks — verified empirically: a `claude -p`
+  session launched with `--dangerously-skip-permissions` and this hook still had its
+  backgrounded `Bash` call denied with the hook's `permissionDecisionReason`. The
+  guard does not weaken or depend on `claude_allowed_tools`, `claude_permission_mode`,
+  or `claude_bare`.
+
+A missing `result.md` still ends the job in a failure status; this closes off the one
+documented way a worker reliably produced that outcome, it does not change what
+happens if a worker leaves without a result for some other reason.
+
 ## Workspace access (`ide_mcp`)
 
 The claude backend supports both `native` and `ide_mcp` workspace access. In `native`
@@ -173,3 +215,6 @@ Raw token counts remain authoritative if pricing changes.
   (`estimated_api_usd`, `claude-code-cli` rate card)
 - `config/workspaces.example.toml` (annotated `claude_model_catalog` example)
 - `docs/codex-worker-routing.md` (shared handoff, quota, and quality-gate mechanics)
+- `src/agent_control_plane/features/agent_runner/lib/claude_runner.py`
+  (`_background_bash_guard_settings`, the `--settings` hook wiring)
+- `scripts/claude_deny_background_bash.py` (the `PreToolUse` hook itself)

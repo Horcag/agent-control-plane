@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess  # nosec B404
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -173,6 +175,8 @@ class ClaudeExecRunner:
             "--output-format",
             "stream-json",
             "--verbose",
+            "--settings",
+            _background_bash_guard_settings(),
         ]
         if spec.claude_bare:
             command.extend(["--strict-mcp-config", "--setting-sources", "project"])
@@ -227,6 +231,39 @@ def _materialize_claude_last_message(spec: AgentRunSpec) -> None:
     if final is None:
         return
     last_message_path.write_text(final, encoding="utf-8")
+
+
+def _background_bash_guard_settings() -> str:
+    """Inline ``--settings`` JSON: a ``PreToolUse`` hook denying backgrounded Bash calls.
+
+    ``Monitor`` is deliberately absent from ``claude_allowed_tools`` (see ``AGENTS.md``),
+    but ``run_in_background`` lives inside the ``Bash`` tool itself, so that exclusion
+    alone does not stop a worker from starting background work it can never be notified
+    about. Passing this as an inline ``--settings`` value (rather than a committed
+    ``.claude/settings.json``) scopes the deny rule to spawned worker processes only --
+    slots are git worktrees of this repository, and a human working in one interactively
+    launches ``claude`` directly, never through this command builder. Verified empirically
+    to apply under ``--dangerously-skip-permissions`` (yolo): hooks are a layer separate
+    from the permission system, so bypassing permissions does not bypass this hook.
+    """
+
+    hook_script = Path(__file__).resolve().parents[5] / "scripts" / "claude_deny_background_bash.py"
+    settings = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f'"{sys.executable}" "{hook_script}"',
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    return json.dumps(settings)
 
 
 def _default_claude_sessions_root() -> Path:

@@ -116,6 +116,22 @@ def test_yolo_bypasses_permissions_instead_of_permission_mode() -> None:
     assert "--permission-mode" not in command
 
 
+def test_background_bash_guard_hook_is_always_wired_in() -> None:
+    # run_in_background lives inside the Bash tool, so excluding Monitor from
+    # claude_allowed_tools does not stop a worker from starting background work it can
+    # never be notified about; this must be present for every worker invocation, yolo
+    # included, since --dangerously-skip-permissions bypasses the permission system, not
+    # hooks.
+    for spec in (_spec(), _spec(yolo=True), _spec(read_only=True), _spec(claude_bare=False)):
+        command = _command(spec)
+        settings = json.loads(command[command.index("--settings") + 1])
+        hooks = settings["hooks"]["PreToolUse"]
+        assert len(hooks) == 1
+        assert hooks[0]["matcher"] == "Bash"
+        hook_command = hooks[0]["hooks"][0]["command"]
+        assert "claude_deny_background_bash.py" in hook_command
+
+
 def test_allowed_tools_and_max_turns_are_forwarded() -> None:
     command = _command(_spec(claude_allowed_tools=("Read", "Bash"), claude_max_turns=7))
     assert command[command.index("--allowedTools") + 1] == "Read,Bash"
