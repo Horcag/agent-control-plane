@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "agent-control-plane"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "pywinpty", marker = "sys_platform == 'win32'" },
@@ -27,13 +27,15 @@ dev = [
     { name = "ruff" },
 ]
 mcp = [
+    { name = "anyio" },
     { name = "mcp" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", marker = "extra == 'mcp'", specifier = ">=4" },
     { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=1.8" },
-    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.10" },
+    { name = "mcp", marker = "extra == 'mcp'", specifier = ">=1.10,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-fsd", marker = "extra == 'dev'", specifier = ">=0.2.1" },
