@@ -21,6 +21,10 @@
 - To watch delegated work, use `agent-control watch <job-id>... --events` (see
   `docs/operations.md#watching-jobs-as-an-event-stream`) and read its exit code; do not
   write a hand-rolled status poll loop.
+- Workers run verification synchronously and do not get background watchers; `Monitor` is
+  deliberately absent from `claude_allowed_tools`. Watching delegated jobs is the root's job via
+  `agent-control watch --events`. Widening the worker allowlist is an operator configuration
+  decision, not a code change.
 - Represent multi-job epics as durable plans. Coordinating agents should use plan
   snapshots/watch cursors and bounded result excerpts instead of replaying full worker
   logs. Executable tasks must be claimed through the one-shot plan dispatcher; dispatch

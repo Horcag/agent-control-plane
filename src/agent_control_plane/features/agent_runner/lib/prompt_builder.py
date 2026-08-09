@@ -85,6 +85,7 @@ Mandatory execution rules:
 - You are FORBIDDEN from using or discovering AgentBridge, IntelliJ IDEA, or DataSpell MCP servers or tools.
 - Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
 - Preserve user changes. Keep changes narrow, task-scoped, and minimal.
+- Run verification (tests, linters, long checks) synchronously and wait for it to finish; backgrounding it and ending your turn ends the session and reports exited_without_result. Workers do not get background watchers — watching delegated jobs is the root's job via `agent-control watch --events`.
 {_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
 {native_quality_rules}
 - Inspect the final diff before claiming completion.

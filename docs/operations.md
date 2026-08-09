@@ -82,6 +82,27 @@ Run `agent-control statuses` (or `--json`) to print the full terminal-status voc
 and which statuses are capable of being on-contract, instead of guessing at status
 strings.
 
+### Why a worker can't watch anything
+
+`watch --events` is a root tool. A worker's allowlist (`claude_allowed_tools` in
+`shared/config.py`) is `Read, Edit, Write, Glob, Grep, Bash`; `Monitor` is deliberately
+absent, so a worker's `Monitor` call falls through to Bash permission checking and is
+denied. That denial is correct: a worker does bounded work inside one slot and cannot
+start jobs, so it has nothing legitimate to watch.
+
+Two failures get misdiagnosed as this permissions issue:
+
+- A worker that backgrounds a long check and ends its turn is reported
+  `exited_without_result`, because ending the turn ends the session. Run verification
+  synchronously instead.
+- A long synchronous run with no tracked-file write can trip the no-progress watchdog
+  (`no_progress_timeout_sec`). Prefer light, targeted worker self-checks — the controller
+  re-runs the full battery after checkpoint — or raise `no_progress_timeout_sec` if the
+  run genuinely needs longer. A watcher is not the fix for either failure.
+
+If an operator decides workers should have watchers anyway, that is a one-line addition
+of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
+
 ## Plans, dispatch, and review
 
 Create a JSON manifest with executable tasks and dependencies, then run:
