@@ -78,6 +78,44 @@ class WatchJobTest(unittest.TestCase):
             self.assertFalse(summary["timed_out"])
             self.assertEqual(summary["status"], "completed")
 
+    def test_watch_reports_no_verdict_for_unsettled_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            _create_job(control, root, "job-unsettled")
+            control.store.update_job("job-unsettled", status="running")
+
+            summary = control.watch_job("job-unsettled", poll_interval_sec=0, timeout_sec=0)
+
+            self.assertFalse(summary["settled"])
+            self.assertIsNone(summary["on_contract"])
+
+    def test_watch_reports_true_verdict_for_settled_on_contract_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-on-contract")
+            self.assertEqual(job.expected_result_status, "completed")
+            control.finish_job(job.job_id, "completed", None)
+
+            summary = control.watch_job(job.job_id, poll_interval_sec=0, timeout_sec=10)
+
+            self.assertTrue(summary["settled"])
+            self.assertTrue(summary["on_contract"])
+
+    def test_watch_reports_false_verdict_for_settled_off_contract_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-off-contract")
+            self.assertEqual(job.expected_result_status, "completed")
+            control.finish_job(job.job_id, "failed", "boom")
+
+            summary = control.watch_job(job.job_id, poll_interval_sec=0, timeout_sec=10)
+
+            self.assertTrue(summary["settled"])
+            self.assertFalse(summary["on_contract"])
+
     def test_watch_times_out_for_running_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -112,6 +112,66 @@ Two failures get misdiagnosed as this permissions issue:
 If an operator decides workers should have watchers anyway, that is a one-line addition
 of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
 
+### MCP coordinators: watch parity and its limits
+
+`watch --events` is deliberately CLI-only. It streams because a shell process can hold a
+connection open and print lines as they arrive; MCP has no equivalent streaming
+transport, so `agent_watch_job` can only be a blocking long poll for one job, and
+`agent_start_job(..., wait=True)` folds one such poll into the start call. That
+asymmetry is intentional: the CLI event stream stays the primary watcher surface, and
+`AGENTS.md` still tells root agents to watch via `agent-control watch <job-id>...
+--events`. This section documents what an MCP-only coordinator gets instead, not a
+recommendation to prefer it.
+
+`agent_watch_job` and `agent_start_job(wait=True)` now carry the same settled/on-contract
+verdict the CLI exit code encodes, reusing `is_settled`/`is_on_contract` from
+`features/job_watch`:
+
+- `settled`: `true` once the job's status is terminal **and** finalization has been
+  decided (`completed`/`failed`, not `not_started`/`pending`). A job can be terminal
+  before it is settled — finalization runs after the worker exits.
+- `on_contract`: `null` while `settled` is `false` (the verdict is not yet decided, which
+  is a different fact from "decided against"); once settled, `true` when the job's final
+  `status` matches its declared `expected_result_status`, else `false` — the same rule
+  the CLI's exit-code table above uses per job.
+
+Every MCP long poll is capped at `_MAX_LONG_POLL_SEC` (300 s) regardless of the
+`timeout_sec`/`wait_timeout_sec` argument passed; a longer value is silently clamped and
+echoed back as `timeout_clamped_to`. That cap is not raised for this task and should not
+be raised in general: it exists so one MCP call cannot hold a request open indefinitely.
+Jobs run up to `timeout_sec = 3600` by default, so a single `agent_watch_job` call cannot
+observe a whole job — in the worst case a coordinator needs a dozen sequential blocking
+calls per job, each re-quoting `job_id`, to reach a settled verdict, and gets no push
+notification in between.
+
+Concretely, an MCP-only coordinator should:
+
+- Call `agent_watch_job` (or `agent_start_job(wait=True)`) in a loop, checking `settled`
+  first and `on_contract` only once `settled` is `true`; treat `timed_out` (not an error)
+  as "call again".
+- For several jobs at once, prefer `agent_plan_snapshot`/`agent_plan_watch` with the
+  `since` cursor when the jobs are plan tasks, rather than polling each job id
+  individually — it already returns only the deltas since the caller's last cursor.
+- Not attempt to raise `timeout_sec` past the cap to reduce call volume; budget for
+  repeated calls instead.
+
+**Multi-job, non-blocking, cursor-style polling for arbitrary job selections (mirroring
+the CLI's `WatchSelection` — job ids, `plan_id`, `task_id_glob` — over
+`WatchEventStream.tick()`) was investigated for this task and deliberately not built.**
+Unlike plan events, which are backed by a durable, replayable event log that a `since`
+cursor can index into, `WatchEventStream`'s START/TRANSITION/TERMINAL/STALE/RESUMED
+events are computed by diffing each tick against in-memory state (`_JobWatchState`) held
+by one long-lived stream instance. A stateless MCP call has no such instance to diff
+against. Making a cursor meaningful across calls would require either keeping one
+`WatchEventStream` alive per caller-chosen selection inside the MCP server process
+(new, unbounded session state with no natural eviction point, and state that a server
+restart silently drops) or fabricating a cursor with no real event log behind it, which
+would report a full `START` snapshot on every call rather than genuine deltas. Both are a
+materially larger feature than this task's scope and risk exactly the kind of
+half-finished addition this project's conventions warn against. If a future task wants
+this, the event log needs to become durable (comparable to `plan_tasks`/plan events)
+before a cursor can mean what it means for `agent_plan_watch`.
+
 ## Plans, dispatch, and review
 
 Create a JSON manifest with executable tasks and dependencies, then run:

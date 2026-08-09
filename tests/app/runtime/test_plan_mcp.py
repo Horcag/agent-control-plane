@@ -728,6 +728,66 @@ def test_wait_budget_clamping_for_all_four_tools(monkeypatch) -> None:
         assert control.watch_job.call_args.kwargs["timeout_sec"] == 300.0
 
 
+def test_agent_watch_job_and_start_job_wait_pass_through_settled_verdict(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.watch_job.return_value = {"status": "running", "settled": False, "on_contract": None}
+    control.start_job.return_value = SimpleNamespace(
+        job_id="j1",
+        status="queued",
+        expected_result_status="completed",
+        controller_gate_mode="full",
+        run_dir=Path("runs/j1"),
+        result_path=Path("tasks/j1/result.md"),
+        backend="codex",
+        agy_model=None,
+        codex_model="gpt-5",
+        codex_reasoning_effort="low",
+        codex_quality_tier="mechanical",
+        codex_premium_override_reason=None,
+        workspace_access="native",
+        worker_pid=100,
+        runner_pid=None,
+        read_only=False,
+        slot_name="app-1",
+    )
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+
+        unsettled = server.tools["agent_watch_job"]("j1")
+        assert unsettled["settled"] is False
+        assert unsettled["on_contract"] is None
+
+        control.watch_job.return_value = {
+            "status": "completed",
+            "settled": True,
+            "on_contract": True,
+        }
+        settled_on_contract = server.tools["agent_watch_job"]("j1")
+        assert settled_on_contract["settled"] is True
+        assert settled_on_contract["on_contract"] is True
+
+        control.watch_job.return_value = {
+            "status": "failed",
+            "settled": True,
+            "on_contract": False,
+        }
+        settled_off_contract = server.tools["agent_start_job"]("t1", "acp", wait=True)
+        assert settled_off_contract["watch"]["settled"] is True
+        assert settled_off_contract["watch"]["on_contract"] is False
+
+
 def test_agent_plan_run_until_review_none_timeout(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")

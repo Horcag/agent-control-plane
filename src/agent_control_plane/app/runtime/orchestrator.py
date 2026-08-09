@@ -63,6 +63,7 @@ from agent_control_plane.features.agent_runner import (
     terminate_verified_process,
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
+from agent_control_plane.features.job_watch import is_on_contract, is_settled
 from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
 from agent_control_plane.features.plan_supervision import PlanService
 from agent_control_plane.features.result_handoff import (
@@ -1045,11 +1046,14 @@ class AgentControlPlane:
     ) -> dict[str, Any]:
         job = self._refresh_stale_worker_if_needed(job_id)
         result_state = inspect_result(job.result_path, _job_start_timestamp(job))
+        settled = is_settled(job)
         payload: dict[str, Any] = {
             "job_id": job.job_id,
             "task_id": job.task_id,
             "status": job.status,
             "terminal": self._is_terminal(job),
+            "settled": settled,
+            "on_contract": is_on_contract(job) if settled else None,
             "last_error": job.last_error,
             "backend": job.backend,
             "agy_model": job.agy_model,
