@@ -33,6 +33,10 @@ from agent_control_plane.features.agent_runner.lib.runner import (
     AgentRunSpec,
     BudgetLifecycleEvent,
 )
+from agent_control_plane.shared.result_envelope import (
+    result_envelope_expected_headings,
+    result_envelope_missing_headings,
+)
 from agent_control_plane.shared.verification_report import verification_path_for_result
 
 CODEX_COMPLETION_GRACE_SEC = 60.0
@@ -100,6 +104,8 @@ class CodexProcessMonitor:
         budget_breach_message: str | None = None
         invalid_verification_breach_mono: float | None = None
         invalid_verification_marker: tuple[float | None, float | None, str | None] | None = None
+        result_envelope_breach_mono: float | None = None
+        result_envelope_marker: tuple[float | None, tuple[str, ...]] | None = None
 
         while True:
             log.flush()
@@ -258,12 +264,10 @@ class CodexProcessMonitor:
                 )
 
             if not spec.read_only and spec.invalid_verification_grace_sec > 0:
-                invalid_result_state = inspect_result(spec.result_path, started_wall)
-                if (
-                    invalid_result_state.done
-                    and invalid_result_state.verification_state == "invalid"
-                ):
-                    marker = _invalid_verification_marker(spec, invalid_result_state)
+                handoff_state = inspect_result(spec.result_path, started_wall)
+
+                if handoff_state.done and handoff_state.verification_state == "invalid":
+                    marker = _invalid_verification_marker(spec, handoff_state)
                     if (
                         invalid_verification_breach_mono is None
                         or marker != invalid_verification_marker
@@ -280,7 +284,7 @@ class CodexProcessMonitor:
                                 proc,
                                 "invalid_verification",
                                 _invalid_verification_message(
-                                    invalid_result_state,
+                                    handoff_state,
                                     spec.invalid_verification_grace_sec,
                                 ),
                             ),
@@ -289,6 +293,49 @@ class CodexProcessMonitor:
                 else:
                     invalid_verification_breach_mono = None
                     invalid_verification_marker = None
+
+                # A worker can also hand off a terminal Status: with a well-formed
+                # verification.json but a result.md that is missing one of its four
+                # mandatory sections (see parse_result_report). Left unchecked here, that
+                # only surfaces after the run ends, the slot is checkpointed, and cleaned
+                # -- by which point the only recovery is a human hand-editing result.md.
+                # Give the still-running worker the same kind of grace window Codex and
+                # Claude both get for an invalid verification.json.
+                if handoff_state.done and handoff_state.missing_sections:
+                    envelope_marker = _result_envelope_marker(spec, handoff_state)
+                    if (
+                        result_envelope_breach_mono is None
+                        or envelope_marker != result_envelope_marker
+                    ):
+                        if result_envelope_breach_mono is None:
+                            budget_events.append(
+                                BudgetLifecycleEvent(
+                                    "result_envelope_grace",
+                                    tool_call_count,
+                                    _result_envelope_breach_message(
+                                        handoff_state,
+                                        spec.invalid_verification_grace_sec,
+                                    ),
+                                )
+                            )
+                        result_envelope_breach_mono = now
+                        result_envelope_marker = envelope_marker
+                    elif now - result_envelope_breach_mono >= spec.invalid_verification_grace_sec:
+                        terminate_spawned_process(proc)
+                        return replace(
+                            self._stopped_result(
+                                proc,
+                                "invalid_result_envelope",
+                                _result_envelope_expired_message(
+                                    handoff_state,
+                                    spec.invalid_verification_grace_sec,
+                                ),
+                            ),
+                            lifecycle_events=tuple(budget_events),
+                        )
+                else:
+                    result_envelope_breach_mono = None
+                    result_envelope_marker = None
 
             (
                 terminal_result,
@@ -473,9 +520,7 @@ class CodexProcessMonitor:
         cancel_requested: Callable[[], bool] | None = None,
     ) -> AgentRunResult | None:
         result_state = inspect_result(spec.result_path, started_wall)
-        if not result_state.done or not self._valid_terminal_handoff(
-            spec, result_state.verification_state
-        ):
+        if not result_state.done or not self._valid_terminal_handoff(spec, result_state):
             return None
         terminal_signature, _ = progress_signature(spec)
         if terminate:
@@ -487,10 +532,7 @@ class CodexProcessMonitor:
                 # handoff was written) can change the tree without invalidating the result.
                 # Only fail as a late edit when the handoff is no longer a valid completion.
                 post_state = inspect_result(spec.result_path, started_wall)
-                if not (
-                    post_state.done
-                    and self._valid_terminal_handoff(spec, post_state.verification_state)
-                ):
+                if not (post_state.done and self._valid_terminal_handoff(spec, post_state)):
                     return self._stopped_result(
                         proc,
                         "late_edit",
@@ -519,7 +561,7 @@ class CodexProcessMonitor:
         )
         for _ in range(10):
             if result_state.done and CodexProcessMonitor._valid_terminal_handoff(
-                spec, result_state.verification_state
+                spec, result_state
             ):
                 return CodexProcessMonitor._completed_result(
                     proc, result_state.status, result_state.escalation_classification
@@ -530,19 +572,27 @@ class CodexProcessMonitor:
                 if spec.read_only
                 else inspect_result(spec.result_path, started_wall)
             )
-        if (
-            not spec.read_only
-            and spec.invalid_verification_grace_sec > 0
-            and result_state.done
-            and result_state.verification_state == "invalid"
-        ):
-            return AgentRunResult(
-                status="invalid_verification",
-                completed=False,
-                exit_code=exit_code,
-                result_status=None,
-                message=f"verification.json invalid: {_invalid_verification_reason(result_state)}",
-            )
+        if not spec.read_only and spec.invalid_verification_grace_sec > 0 and result_state.done:
+            if result_state.verification_state == "invalid":
+                return AgentRunResult(
+                    status="invalid_verification",
+                    completed=False,
+                    exit_code=exit_code,
+                    result_status=None,
+                    message=(
+                        f"verification.json invalid: {_invalid_verification_reason(result_state)}"
+                    ),
+                )
+            if result_state.missing_sections:
+                return AgentRunResult(
+                    status="invalid_result_envelope",
+                    completed=False,
+                    exit_code=exit_code,
+                    result_status=None,
+                    message=_result_envelope_expired_message(
+                        result_state, spec.invalid_verification_grace_sec
+                    ),
+                )
         if contains_capacity_marker(spec.log_path, last_message_path):
             return AgentRunResult(
                 status="capacity",
@@ -595,8 +645,10 @@ class CodexProcessMonitor:
         return None
 
     @staticmethod
-    def _valid_terminal_handoff(spec: AgentRunSpec, verification_state: str | None) -> bool:
-        return spec.read_only or verification_state == "valid"
+    def _valid_terminal_handoff(spec: AgentRunSpec, result_state: ResultState) -> bool:
+        if spec.read_only:
+            return True
+        return result_state.verification_state == "valid" and not result_state.missing_sections
 
     @staticmethod
     def _completed_result(
@@ -680,6 +732,32 @@ def _invalid_verification_message(result_state: ResultState, grace_sec: int) -> 
     return (
         f"verification.json invalid: {_invalid_verification_reason(result_state)}; "
         f"grace of {grace_sec}s expired without a valid verification.json"
+    )
+
+
+def _result_envelope_marker(
+    spec: AgentRunSpec, result_state: ResultState
+) -> tuple[float | None, tuple[str, ...]]:
+    return (_optional_mtime(spec.result_path), result_state.missing_sections)
+
+
+def _result_envelope_missing_reason(result_state: ResultState) -> str:
+    missing = ", ".join(result_envelope_missing_headings(result_state.missing_sections))
+    expected = ", ".join(result_envelope_expected_headings())
+    return f"result.md is missing required section(s): {missing}; expected headings: {expected}"
+
+
+def _result_envelope_breach_message(result_state: ResultState, grace_sec: int) -> str:
+    return (
+        f"{_result_envelope_missing_reason(result_state)}; granting a {grace_sec}s grace "
+        "window to finish the terminal handoff"
+    )
+
+
+def _result_envelope_expired_message(result_state: ResultState, grace_sec: int) -> str:
+    return (
+        f"{_result_envelope_missing_reason(result_state)}; grace of {grace_sec}s expired "
+        "without a fix"
     )
 
 

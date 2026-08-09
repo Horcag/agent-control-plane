@@ -19,20 +19,17 @@ from agent_control_plane.shared.native_quality import (
     format_gate_command,
     selected_native_quality_gates,
 )
+from agent_control_plane.shared.result_envelope import (
+    RESULT_ENVELOPE_SECTION_PATTERN as _SECTION_PATTERN,
+)
+from agent_control_plane.shared.result_envelope import (
+    RESULT_ENVELOPE_SECTIONS as _SECTION_LABELS,
+)
+from agent_control_plane.shared.result_envelope import (
+    result_envelope_section_key as _section_key,
+)
 from agent_control_plane.shared.verification_report import inspect_verification_report
 
-_SECTION_LABELS = {
-    "changed_files": "Changed files",
-    "what_changed": "What changed",
-    "verification_performed": "Verification performed",
-    "remaining_risks": "Not verified / remaining risks",
-}
-_SECTION_PATTERN = re.compile(
-    r"^\s*(?:[-*]\s*)?(?:#{1,6}\s*)?(?:\*\*)?"
-    r"(Changed files|What changed|Verification performed|"
-    r"Not verified\s*/\s*remaining risks)(?:\*\*)?\s*:?[ \t]*(.*)$",
-    re.IGNORECASE,
-)
 _STATUS_PATTERN = re.compile(
     r"^\s*(?:[-*]\s*)?(?:\*\*)?Status(?:\*\*)?\s*:\s*"
     r"(?:\*\*)?(completed|success|partial|blocked)(?:\*\*)?\s*$",
@@ -454,17 +451,6 @@ def _reported_gate_matches(
         )
     except OSError:
         return False
-
-
-def _section_key(label: str) -> str:
-    normalized = " ".join(label.lower().split())
-    if normalized.startswith("changed files"):
-        return "changed_files"
-    if normalized.startswith("what changed"):
-        return "what_changed"
-    if normalized.startswith("verification performed"):
-        return "verification_performed"
-    return "remaining_risks"
 
 
 def _clean_claim(value: str) -> str:

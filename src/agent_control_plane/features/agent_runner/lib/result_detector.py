@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_control_plane.shared.result_envelope import missing_result_envelope_sections
 from agent_control_plane.shared.verification_report import inspect_verification_report
 
 STATUS_PATTERNS = (
@@ -53,6 +54,7 @@ class ResultState:
     verification_error: str | None = None
     verification_sha256: str | None = None
     escalation_classification: str | None = None
+    missing_sections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ def inspect_result(path: Path, started_at: float) -> ResultState:
                 verification_error=verification.error,
                 verification_sha256=verification.sha256,
                 escalation_classification=parse_escalation_classification(text),
+                missing_sections=missing_result_envelope_sections(text),
             )
     return ResultState(done=False, status=None, reason="result status marker is missing")
 

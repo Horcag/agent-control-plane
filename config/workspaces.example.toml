@@ -72,12 +72,15 @@ tool_timeout_limit = 6
 # (budget + max(4, budget // 10) tool calls) terminates immediately even during the grace
 # window. 0 restores the legacy behavior of terminating the instant the budget is crossed.
 tool_call_budget_grace_sec = 120
-# Grace window (seconds) after the monitor observes a done result with an INVALID
-# verification.json (present but failing schema/consistency checks) before the worker is
-# terminated as invalid_verification, naming the concrete validator error. A valid rewrite
-# landing within the window clears the timer and the job completes normally. Missing (not
-# yet written) verification.json is unaffected. 0 restores the legacy behavior where an
-# invalid file is only ever caught indirectly by an unrelated watchdog.
+# Grace window (seconds) after the monitor observes a done result with either (a) an
+# INVALID verification.json (present but failing schema/consistency checks) or (b) a
+# result.md that carries a terminal Status but is missing one of its four mandatory
+# sections (Changed files / What changed / Verification performed / Not verified), before
+# the worker is terminated as invalid_verification or invalid_result_envelope respectively
+# -- naming the concrete validator error or the missing section headings. A fix landing
+# within the window clears the timer and the job completes normally. Missing (not yet
+# written) verification.json is unaffected. 0 restores the legacy behavior where these are
+# only ever caught indirectly, after the run has already ended.
 invalid_verification_grace_sec = 120
 # Compatibility-only legacy mechanical/balanced/deep model, effort, and budget keys.
 # Prefer the named-policy example under [control.model_routing] for new configurations.

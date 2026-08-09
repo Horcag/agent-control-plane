@@ -210,7 +210,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
                 log_path = root / "attempt-001.log"
                 _write_budget_events(log_path, count=2)
                 result_path = root / "result.md"
-                result_path.write_text("Status: partial\n", encoding="utf-8")
+                _write_well_formed_result(result_path, status="partial")
                 if verified:
                     _write_verification(root, status="partial")
                 proc = _FakeProc()
@@ -241,7 +241,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             log_path = root / "attempt-001.log"
             _write_budget_events(log_path, count=2)
             result_path = root / "result.md"
-            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_well_formed_result(result_path, status="partial")
             _write_verification(root, status="partial")
             proc = _FakeProc()
 
@@ -580,7 +580,7 @@ class CodexRunnerCommandTest(unittest.TestCase):
             root = Path(temp)
             log_path = root / "attempt-001.log"
             result_path = root / "result.md"
-            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_well_formed_result(result_path, status="partial")
             _write_invalid_verification(root)
             log_path.with_suffix(".events.jsonl").write_text(
                 json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
@@ -646,13 +646,179 @@ class CodexRunnerCommandTest(unittest.TestCase):
             self.assertNotEqual(result.status, "invalid_verification")
             self.assertEqual(result.status, "timeout")
 
+    def test_running_worker_missing_section_is_not_a_valid_terminal_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            result_path = root / "result.md"
+            _write_result_missing_changed_files(result_path, status="completed")
+            _write_verification(root, status="completed")
+
+            state = CodexProcessMonitor()._completed_result_if_ready(
+                _FakeProc(),
+                _spec(read_only=False, yolo=False, result_path=result_path),
+                0.0,
+                terminate=False,
+            )
+
+            self.assertIsNone(state)
+
+    def test_result_envelope_grace_window_expires_and_names_missing_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            _write_result_missing_changed_files(result_path, status="partial")
+            _write_verification(root, status="partial")
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    invalid_verification_grace_sec=1,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "invalid_result_envelope")
+            self.assertTrue(proc.terminated)
+            self.assertIn("## Changed files", result.message)
+            self.assertIn("## What changed", result.message)
+            self.assertIn("## Verification performed", result.message)
+            self.assertIn("## Not verified / remaining risks", result.message)
+            self.assertIn("grace of 1s expired", result.message)
+
+    def test_result_envelope_grace_window_recovers_when_worker_adds_the_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            _write_result_missing_changed_files(result_path, status="partial")
+            _write_verification(root, status="partial")
+            log_path.with_suffix(".events.jsonl").write_text(
+                json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+
+            def _fix_envelope() -> None:
+                time.sleep(0.3)
+                _write_well_formed_result(result_path, status="partial")
+
+            fixer = threading.Thread(target=_fix_envelope, daemon=True)
+            fixer.start()
+            try:
+                result = CodexProcessMonitor().monitor(
+                    proc,
+                    _spec(
+                        read_only=False,
+                        yolo=False,
+                        log_path=log_path,
+                        result_path=result_path,
+                        invalid_verification_grace_sec=5,
+                    ),
+                    started_wall=0.0,
+                    deadline_mono=time.monotonic() + 10,
+                    last_output_mono=time.monotonic(),
+                    last_log_size=0,
+                    log=io.StringIO(),
+                    cancel_requested=lambda: False,
+                )
+            finally:
+                fixer.join(timeout=5)
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(proc.terminated)
+            self.assertTrue(
+                any(event.kind == "result_envelope_grace" for event in result.lifecycle_events)
+            )
+
+    def test_well_formed_result_envelope_completes_without_grace_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            _write_well_formed_result(result_path, status="partial")
+            _write_verification(root, status="partial")
+            log_path.with_suffix(".events.jsonl").write_text(
+                json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=False,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    invalid_verification_grace_sec=120,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(proc.terminated)
+            self.assertFalse(
+                any(event.kind == "result_envelope_grace" for event in result.lifecycle_events)
+            )
+
+    def test_read_only_worker_is_exempt_from_result_envelope_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            log_path = root / "attempt-001.log"
+            result_path = root / "result.md"
+            result_path.write_text("Status: completed\n", encoding="utf-8")
+            log_path.with_suffix(".events.jsonl").write_text(
+                json.dumps({"type": "turn.completed", "usage": {}}) + "\n",
+                encoding="utf-8",
+            )
+            proc = _FakeProc()
+
+            result = CodexProcessMonitor().monitor(
+                proc,
+                _spec(
+                    read_only=True,
+                    yolo=False,
+                    log_path=log_path,
+                    result_path=result_path,
+                    invalid_verification_grace_sec=1,
+                ),
+                started_wall=0.0,
+                deadline_mono=time.monotonic() + 10,
+                last_output_mono=time.monotonic(),
+                last_log_size=0,
+                log=io.StringIO(),
+                cancel_requested=lambda: False,
+            )
+
+            self.assertEqual(result.status, "completed")
+            self.assertFalse(proc.terminated)
+            self.assertFalse(
+                any(event.kind == "result_envelope_grace" for event in result.lifecycle_events)
+            )
+
     def test_verification_mutation_after_terminal_observation_is_late_edit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             log_path = root / "attempt-001.log"
             _write_budget_events(log_path, count=0)
             result_path = root / "result.md"
-            result_path.write_text("Status: partial\n", encoding="utf-8")
+            _write_well_formed_result(result_path, status="partial")
             _write_verification(root, status="partial")
             proc = _FakeProc()
             spec = _spec(read_only=False, yolo=False, log_path=log_path, result_path=result_path)
@@ -1117,6 +1283,35 @@ def _write_budget_events(log_path: Path, *, count: int) -> None:
         )
         + json.dumps({"type": "turn.completed", "usage": {}})
         + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_well_formed_result(path: Path, *, status: str) -> None:
+    path.write_text(
+        f"Status: {status}\n\n"
+        "## Changed files\n"
+        "- none\n\n"
+        "## What changed\n"
+        "- nothing yet\n\n"
+        "## Verification performed\n"
+        "- none\n\n"
+        "## Not verified / remaining risks\n"
+        "- none\n",
+        encoding="utf-8",
+    )
+
+
+def _write_result_missing_changed_files(path: Path, *, status: str) -> None:
+    """A real 2026-08-09 incident: every section but ``## Changed files`` was present."""
+    path.write_text(
+        f"Status: {status}\n\n"
+        "## What changed\n"
+        "- nothing yet\n\n"
+        "## Verification performed\n"
+        "- none\n\n"
+        "## Not verified / remaining risks\n"
+        "- none\n",
         encoding="utf-8",
     )
 

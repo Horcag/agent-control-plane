@@ -232,6 +232,39 @@ class ResultDetectorTest(unittest.TestCase):
 
             self.assertTrue(contains_capacity_marker(log))
 
+    def test_terminal_status_with_missing_section_reports_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.md"
+            result.write_text(
+                "Status: completed\n\n"
+                "## What changed\n- did stuff\n\n"
+                "## Verification performed\n- ran tests\n\n"
+                "## Not verified / remaining risks\n- none\n",
+                encoding="utf-8",
+            )
+
+            state = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.missing_sections, ("changed_files",))
+
+    def test_terminal_status_with_all_sections_reports_no_missing_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            result = Path(temp) / "result.md"
+            result.write_text(
+                "Status: completed\n\n"
+                "## Changed files\n- src/app.py\n\n"
+                "## What changed\n- did stuff\n\n"
+                "## Verification performed\n- ran tests\n\n"
+                "## Not verified / remaining risks\n- none\n",
+                encoding="utf-8",
+            )
+
+            state = inspect_result(result, started_at=0.0)
+
+            self.assertTrue(state.done)
+            self.assertEqual(state.missing_sections, ())
+
     def test_placeholder_is_not_done(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             result = Path(temp) / "result.md"

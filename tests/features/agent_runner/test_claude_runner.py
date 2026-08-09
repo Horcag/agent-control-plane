@@ -26,6 +26,7 @@ def _spec(
     claude_mcp_config_path: Path | None = None,
     tool_call_budget: int = 0,
     tool_call_budget_grace_sec: int = 0,
+    invalid_verification_grace_sec: int = 0,
     log_path: Path | None = None,
     result_path: Path | None = None,
 ) -> AgentRunSpec:
@@ -40,6 +41,7 @@ def _spec(
         codex_resume_thread_id=codex_resume_thread_id,
         tool_call_budget=tool_call_budget,
         tool_call_budget_grace_sec=tool_call_budget_grace_sec,
+        invalid_verification_grace_sec=invalid_verification_grace_sec,
         prompt="secret task prompt",
         workspace_path=Path("D:/repo/workspace"),
         result_path=result_path or Path("D:/repo/.agent-work/tasks/task-1/result.md"),
@@ -194,6 +196,21 @@ def _write_claude_tool_calls(log_path: Path, *, count: int) -> None:
     )
 
 
+def _write_well_formed_result(path: Path, *, status: str) -> None:
+    path.write_text(
+        f"Status: {status}\n\n"
+        "## Changed files\n"
+        "- none\n\n"
+        "## What changed\n"
+        "- nothing yet\n\n"
+        "## Verification performed\n"
+        "- none\n\n"
+        "## Not verified / remaining risks\n"
+        "- none\n",
+        encoding="utf-8",
+    )
+
+
 def _write_verification(root: Path, *, status: str) -> None:
     (root / "verification.json").write_text(
         json.dumps(
@@ -246,7 +263,7 @@ def test_claude_budget_breach_grace_window_completes_normally_when_handoff_lands
         log_path = root / "attempt-001.log"
         _write_claude_tool_calls(log_path, count=2)
         result_path = root / "result.md"
-        result_path.write_text("Status: partial\n", encoding="utf-8")
+        _write_well_formed_result(result_path, status="partial")
         _write_verification(root, status="partial")
         proc = _FakeProc()
 
@@ -363,6 +380,86 @@ def test_claude_budget_breach_runaway_cap_terminates_immediately_during_grace() 
         assert result.status == "tool_call_budget"
         assert proc.terminated
         assert "runaway cap" in result.message
+
+
+def _write_result_missing_changed_files(path: Path, *, status: str) -> None:
+    path.write_text(
+        f"Status: {status}\n\n"
+        "## What changed\n"
+        "- nothing yet\n\n"
+        "## Verification performed\n"
+        "- none\n\n"
+        "## Not verified / remaining risks\n"
+        "- none\n",
+        encoding="utf-8",
+    )
+
+
+def test_claude_result_envelope_grace_window_expires_and_names_missing_sections() -> None:
+    # A naive fix could key the grace loop on Codex-worded messages and silently skip
+    # Claude workers -- this asserts the same mechanism reaches ClaudeProcessMonitor.
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        result_path = root / "result.md"
+        _write_result_missing_changed_files(result_path, status="partial")
+        _write_verification(root, status="partial")
+        proc = _FakeProc()
+
+        result = ClaudeProcessMonitor().monitor(
+            proc,
+            _spec(
+                read_only=False,
+                log_path=log_path,
+                result_path=result_path,
+                invalid_verification_grace_sec=1,
+            ),
+            started_wall=0.0,
+            deadline_mono=time.monotonic() + 10,
+            last_output_mono=time.monotonic(),
+            last_log_size=0,
+            log=io.StringIO(),
+            cancel_requested=lambda: False,
+        )
+
+        assert result.status == "invalid_result_envelope"
+        assert proc.terminated
+        assert "## Changed files" in result.message
+        assert "grace of 1s expired" in result.message
+
+
+def test_claude_well_formed_result_envelope_completes_without_grace_trace() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        log_path = root / "attempt-001.log"
+        result_path = root / "result.md"
+        _write_well_formed_result(result_path, status="partial")
+        _write_verification(root, status="partial")
+        log_path.with_suffix(".events.jsonl").write_text(
+            json.dumps({"type": "result", "subtype": "success", "is_error": False}) + "\n",
+            encoding="utf-8",
+        )
+        proc = _FakeProc()
+
+        result = ClaudeProcessMonitor().monitor(
+            proc,
+            _spec(
+                read_only=False,
+                log_path=log_path,
+                result_path=result_path,
+                invalid_verification_grace_sec=120,
+            ),
+            started_wall=0.0,
+            deadline_mono=time.monotonic() + 10,
+            last_output_mono=time.monotonic(),
+            last_log_size=0,
+            log=io.StringIO(),
+            cancel_requested=lambda: False,
+        )
+
+        assert result.status == "completed"
+        assert not proc.terminated
+        assert not any(event.kind == "result_envelope_grace" for event in result.lifecycle_events)
 
 
 if __name__ == "__main__":
