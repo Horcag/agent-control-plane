@@ -541,11 +541,27 @@ class FinalizationService:
             contract, contract_error = self._native_quality_contract(job)
             result_text = _read_result_text(job.result_path, fallback=None)
             result_report = parse_result_report(result_text) if result_text is not None else None
+            # A worker that exits 0 with a dirty workspace and never writes result.md
+            # leaves candidate work behind with no verdict on it. Run controller gates
+            # against the checkpoint for this exact shape even though the job did not
+            # complete, so the checkpoint carries gate evidence instead of only a diff.
+            # Scoped tightly to this one runner_failure/job_status pair so every other
+            # dirty-after-failure path (timeout, guardrail violation, tool_call_budget,
+            # ...) keeps its current no-gates behaviour.
+            missing_result_salvage = (
+                job.runner_failure == "exited_without_result"
+                and job_status == "stopped_dirty_after_failure"
+            )
             if (
-                job_status == "completed"
-                and job.expected_result_status == "completed"
-                and result_report is not None
-                and result_report["status"] == "completed"
+                (
+                    missing_result_salvage
+                    or (
+                        job_status == "completed"
+                        and job.expected_result_status == "completed"
+                        and result_report is not None
+                        and result_report["status"] == "completed"
+                    )
+                )
                 and job.workspace_access == "native"
                 and not job.read_only
                 and contract.policy == "controller"
@@ -569,8 +585,16 @@ class FinalizationService:
                         contract=contract,
                         controller_gate_mode=job.controller_gate_mode,
                     )
+                    if missing_result_salvage:
+                        self.store.add_event(
+                            job.job_id,
+                            "info",
+                            "Controller gates evaluated against the checkpoint for a "
+                            "missing-result salvage",
+                        )
             self._upsert_job_review(
                 job,
+                salvage_gate_evidence=missing_result_salvage,
                 delivery_status=delivery_status,
                 checkpoint=checkpoint,
                 slot_released=False,
@@ -616,6 +640,7 @@ class FinalizationService:
             delivery_status=delivery_status,
             checkpoint=checkpoint,
             slot_released=released,
+            salvage_gate_evidence=missing_result_salvage,
         )
         if released:
             self.store.add_event(
@@ -757,6 +782,7 @@ class FinalizationService:
         checkpoint_error: str | None = None,
         clean_tree_sha: str | None = None,
         slot_released: bool,
+        salvage_gate_evidence: bool = False,
     ) -> ReviewInboxItem:
         result_text = _read_result_text(job.result_path, fallback=job.last_error)
         quality_contract, quality_contract_error = self._native_quality_contract(job)
@@ -777,6 +803,7 @@ class FinalizationService:
             quality_contract_error=quality_contract_error,
             expected_result_status=job.expected_result_status,
             controller_gate_mode=job.controller_gate_mode,
+            salvage_gate_evidence=salvage_gate_evidence,
         )
         return self.review_inbox.upsert(
             ReviewInboxDraft(

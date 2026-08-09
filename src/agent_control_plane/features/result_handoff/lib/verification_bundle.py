@@ -110,7 +110,16 @@ def build_verification_bundle(
     quality_contract_error: str | None = None,
     expected_result_status: str | None = None,
     controller_gate_mode: str = "full",
+    salvage_gate_evidence: bool = False,
 ) -> dict[str, Any]:
+    """Assemble durable evidence for a review-inbox item.
+
+    `salvage_gate_evidence` surfaces controller gate results even when the
+    job/result status is not "completed" (a missing-result salvage checkpoint).
+    It only widens `quality_required`/`controller_required`; `review_ready`
+    still hard-requires `result["status"] == "completed"` independently, so
+    this flag can never launder a non-completed outcome into review-ready.
+    """
     contract = quality_contract or NativeQualityContract(policy="off")
     result_error: str | None = None
     try:
@@ -184,7 +193,7 @@ def build_verification_bundle(
     effective_status = source_status or result["status"]
     quality_required = bool(
         contract.policy != "off"
-        and effective_status == "completed"
+        and (salvage_gate_evidence or effective_status == "completed")
         and (has_changes or clean_tree_sha is not None)
     )
     worker_quality = _assess_worker_quality(
@@ -204,9 +213,8 @@ def build_verification_bundle(
         quality_required
         and contract.policy == "controller"
         and controller_gate_mode != "none"
-        and result_contract_matches
-        and expected_status == "completed"
         and not temporary_patch_artifacts
+        and (salvage_gate_evidence or (result_contract_matches and expected_status == "completed"))
     )
     if controller_required and run_dir is not None and checkpoint is not None:
         controller_quality = inspect_native_quality_report(

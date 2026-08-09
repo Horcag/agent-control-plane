@@ -218,6 +218,109 @@ def test_dirty_runner_failure_is_preserved_when_checkpointed(tmp_path: Path) -> 
     assert causal.root_acceptance == "pending"
 
 
+def test_missing_result_salvage_runs_controller_gates_against_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """A worker that exits 0, never writes result.md, and leaves a dirty workspace
+    must still get controller gate evidence bound to its checkpoint, so the job
+    still fails but a root reviewer can decide from gate verdicts instead of by
+    hand-running the checks themselves."""
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller gate ran')")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-missing-result",
+        status_result="blocked",
+        workspace_access="native",
+    )
+    control.store.set_runner_failure(job.job_id, "exited_without_result")
+    (slot / "worker.txt").write_text("candidate work with no result.md\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "stopped_dirty_after_failure")
+
+    causal = control.store.get_job(job.job_id)
+    assert causal.runner_failure == "exited_without_result"
+    assert causal.workspace_disposition == "dirty_after_failure"
+    assert causal.checkpoint_disposition == "salvage"
+    assert causal.root_acceptance == "pending"
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert item.checkpoint_ref is not None
+    assert item.checkpoint_sha is not None
+    assert item.checkpoint_tree_sha is not None
+    assert item.base_sha is not None
+    assert item.delivery_status == "salvage_checkpointed"
+
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["controller_quality"]["state"] == "valid"
+    assert bundle["controller_quality"]["payload"]["status"] == "passed"
+    # Missing result.md is a real contract breach; gate evidence must never launder
+    # the job into review-ready.
+    assert bundle["review_ready"] is False
+    assert bundle["result"]["status"] == "blocked"
+
+    assert (job.run_dir / "native-quality.json").exists()
+    assert workspace_state(slot).porcelain == ""
+    slot_state = control.slots.inspect_slot("app-1")
+    assert slot_state.status == "available"
+
+
+def test_dirty_after_other_failure_still_skips_controller_gates(tmp_path: Path) -> None:
+    """Every other runner failure must keep its current no-gates behaviour: only the
+    exact exited_without_result + stopped_dirty_after_failure shape gets controller
+    gates run against its checkpoint."""
+    route = _committed_repo(tmp_path / "repo")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    command = (sys.executable, "-c", "print('controller gate ran')")
+    control = AgentControlPlane(
+        _config(
+            tmp_path,
+            route,
+            slot,
+            terminal_slot_policy="checkpoint",
+            native_quality_policy="controller",
+            native_quality_gates=(NativeQualityGateConfig(name="controller", command=command),),
+        )
+    )
+    job = _active_slot_job(
+        control,
+        tmp_path,
+        slot,
+        "job-other-failure",
+        status_result="blocked",
+        workspace_access="native",
+    )
+    control.store.set_runner_failure(job.job_id, "tool_call_budget")
+    (slot / "worker.txt").write_text("candidate work from a different failure\n", encoding="utf-8")
+
+    control.finish_job(job.job_id, "stopped_dirty_after_failure")
+
+    causal = control.store.get_job(job.job_id)
+    assert causal.runner_failure == "tool_call_budget"
+    assert causal.checkpoint_disposition == "salvage"
+
+    item = control.review_inbox.get(f"agent_job:{job.job_id}")
+    bundle = item.verification_bundle
+    assert bundle is not None
+    assert bundle["controller_quality"]["state"] == "not_required"
+    assert bundle["review_ready"] is False
+    assert not (job.run_dir / "native-quality.json").exists()
+
+
 def test_scoped_patch_does_not_contaminate_checkpoint(tmp_path: Path) -> None:
     route = _committed_repo(tmp_path / "repo")
     slot = _committed_repo(tmp_path / "slots" / "app-1")
