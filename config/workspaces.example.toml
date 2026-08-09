@@ -304,6 +304,15 @@ exclude_dirs = [
 ]
 codex_forbidden_tool_markers = []
 
+# Optional: forward-slash globs of route-root paths the route-root guard skips
+# when deciding whether a slot job touched files outside its workspace. Use
+# this for operator-owned paths inside the route root (e.g. a kanban board)
+# that legitimately change while jobs are in flight. Excluded from violation
+# determination only -- dirty-state preservation and preserved status/patch
+# artifacts still cover everything. A pattern that would match the whole tree
+# (a bare "**", for example) is rejected at config load.
+# route_root_ignore_globs = ["kanban/**"]
+
 # Optional strict native-mode contract. Controller mode requires checkpointed slot jobs.
 # Gate commands run without a shell, must already be installed in the prepared slot,
 # and should be read-only checks. Empty include_globs means every changed file.

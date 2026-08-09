@@ -255,6 +255,105 @@ class RouteRootGuardTest(unittest.TestCase):
             self.assertEqual(baseline.guard.entries, {})
             self.assertTrue(any("tolerated as operator commit" in line for line in logs.output))
 
+    def test_ignored_path_changing_alone_is_not_a_violation(self) -> None:
+        guard = RouteRootGuard(head="head-a", entries={}, ignore_globs=("kanban/**",))
+
+        changed = guard.evaluate(
+            _snapshot(
+                head="head-a",
+                entries={"kanban/activity.jsonl": (" M", "file:changed")},
+            ),
+            now=10.0,
+            staged_grace_sec=5.0,
+        )
+
+        self.assertEqual(changed, ())
+
+    def test_non_ignored_path_changing_alongside_ignored_path_is_still_a_violation(self) -> None:
+        guard = RouteRootGuard(head="head-a", entries={}, ignore_globs=("kanban/**",))
+
+        changed = guard.evaluate(
+            _snapshot(
+                head="head-a",
+                entries={
+                    "kanban/activity.jsonl": (" M", "file:changed"),
+                    "tracked.py": (" M", "file:changed"),
+                },
+            ),
+            now=10.0,
+            staged_grace_sec=5.0,
+        )
+
+        self.assertEqual(changed, ("tracked.py",))
+
+    def test_ignored_changed_paths_reports_the_excluded_diagnostics(self) -> None:
+        guard = RouteRootGuard(head="head-a", entries={}, ignore_globs=("kanban/**",))
+        snapshot = _snapshot(
+            head="head-a",
+            entries={
+                "kanban/activity.jsonl": (" M", "file:changed"),
+                "tracked.py": (" M", "file:changed"),
+            },
+        )
+
+        guard.evaluate(snapshot, now=10.0, staged_grace_sec=5.0)
+
+        self.assertEqual(guard.ignored_changed_paths(snapshot), ("kanban/activity.jsonl",))
+
+    def test_no_ignore_globs_reproduces_default_behaviour(self) -> None:
+        guard = RouteRootGuard(head="head-a", entries={})
+
+        changed = guard.evaluate(
+            _snapshot(
+                head="head-a",
+                entries={"kanban/activity.jsonl": (" M", "file:changed")},
+            ),
+            now=10.0,
+            staged_grace_sec=5.0,
+        )
+
+        self.assertEqual(changed, ("kanban/activity.jsonl",))
+        self.assertEqual(guard.ignored_changed_paths(_snapshot(head="head-a", entries={})), ())
+
+    def test_route_root_violation_message_lists_ignored_paths_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            route_root = root / "repo"
+            route_root.mkdir()
+            _run(["git", "init"], route_root)
+            tracked = route_root / "tracked.py"
+            tracked.write_text("before\n", encoding="utf-8")
+            (route_root / "kanban").mkdir()
+            board = route_root / "kanban" / "activity.jsonl"
+            board.write_text("before\n", encoding="utf-8")
+            _run(["git", "add", "tracked.py", "kanban/activity.jsonl"], route_root)
+            _commit(route_root, "seed")
+
+            guardrails = JobGuardrails(())
+            initial = guardrails.route_root_snapshot(route_root)
+            baseline = WorkspaceDirtyBaseline(
+                path=route_root,
+                guard=RouteRootGuard(
+                    head=initial.head,
+                    entries=dict(initial.entries),
+                    ignore_globs=("kanban/**",),
+                ),
+            )
+            job = Mock()
+            job.workspace_path = root / "slot"
+            job.run_dir = root / "run"
+            job.run_dir.mkdir()
+
+            tracked.write_text("after\n", encoding="utf-8")
+            board.write_text("after\n", encoding="utf-8")
+
+            message = guardrails.route_root_violation(job, baseline)
+
+            self.assertIsNotNone(message)
+            assert message is not None
+            self.assertIn("changed route-root paths: tracked.py", message)
+            self.assertIn("Ignored (route_root_ignore_globs): kanban/activity.jsonl", message)
+
     def test_route_root_snapshot_reports_full_path_for_lone_unstaged_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -29,6 +29,7 @@ from agent_control_plane.shared.agent_backends import (
     SUPPORTED_BACKENDS,
     normalize_backend,
 )
+from agent_control_plane.shared.path_rules import glob_matches_whole_tree
 
 
 @dataclass(frozen=True)
@@ -180,6 +181,7 @@ class RouteConfig:
     native_quality_max_parallel: int = 1
     native_quality_gates: tuple[NativeQualityGateConfig, ...] = ()
     monitor_route_root: bool = True
+    route_root_ignore_globs: tuple[str, ...] = ()
     dirty_diff_max_changed_lines: int | None = None
 
 
@@ -1249,6 +1251,10 @@ def load_config(
             native_quality_max_parallel=native_quality_max_parallel,
             native_quality_gates=native_quality_gates,
             monitor_route_root=bool(value.get("monitor_route_root", True)),
+            route_root_ignore_globs=_route_root_ignore_globs(
+                name,
+                value.get("route_root_ignore_globs", []),
+            ),
             dirty_diff_max_changed_lines=_optional_non_negative_int(
                 value.get("dirty_diff_max_changed_lines"),
                 f"routes.{name}.dirty_diff_max_changed_lines",
@@ -2124,6 +2130,18 @@ def _optional_string_tuple(value: Any) -> tuple[str, ...] | None:
     if value is None:
         return None
     return _string_tuple(value)
+
+
+def _route_root_ignore_globs(route_name: str, value: Any) -> tuple[str, ...]:
+    globs = _string_tuple(value)
+    for pattern in globs:
+        if glob_matches_whole_tree(pattern):
+            raise ValueError(
+                f"routes.{route_name}.route_root_ignore_globs entry {pattern!r} matches the "
+                "whole tree; the route root guard would be silenced entirely. Use a narrower "
+                "pattern that only covers operator-owned paths."
+            )
+    return globs
 
 
 def _relative_path_tuple(value: Any) -> tuple[Path, ...]:

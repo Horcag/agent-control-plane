@@ -130,6 +130,55 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_config(config_contents=(base + route + b"dirty_diff_max_changed_lines = -1\n"))
 
+    def test_route_root_ignore_globs_default_empty(self) -> None:
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+        )
+        route = b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+
+        config = load_config(config_contents=base + route)
+
+        self.assertEqual(config.routes["main"].route_root_ignore_globs, ())
+
+    def test_route_root_ignore_globs_parses_configured_list(self) -> None:
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+            b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+            b'route_root_ignore_globs = ["kanban/**"]\n'
+        )
+
+        config = load_config(config_contents=base)
+
+        self.assertEqual(config.routes["main"].route_root_ignore_globs, ("kanban/**",))
+
+    def test_route_root_ignore_globs_rejects_whole_tree_pattern(self) -> None:
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+            b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+            b'route_root_ignore_globs = ["**"]\n'
+        )
+
+        with self.assertRaises(ValueError):
+            load_config(config_contents=base)
+
     def test_route_slot_root_overrides_global_slot_root(self) -> None:
         base = (
             b"[control]\n"

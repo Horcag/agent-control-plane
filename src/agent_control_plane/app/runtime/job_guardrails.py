@@ -104,11 +104,19 @@ class JobGuardrails:
         except GitError:
             return WorkspaceDirtyBaseline(
                 path=route_root,
-                guard=RouteRootGuard(head=None, entries={}),
+                guard=RouteRootGuard(
+                    head=None,
+                    entries={},
+                    ignore_globs=route_config.route_root_ignore_globs,
+                ),
             )
         return WorkspaceDirtyBaseline(
             path=route_root,
-            guard=RouteRootGuard(head=snapshot.head, entries=dict(snapshot.entries)),
+            guard=RouteRootGuard(
+                head=snapshot.head,
+                entries=dict(snapshot.entries),
+                ignore_globs=route_config.route_root_ignore_globs,
+            ),
         )
 
     def route_root_snapshot(self, route_root: Path) -> RouteRootSnapshot:
@@ -164,11 +172,18 @@ class JobGuardrails:
         preview = "; ".join(changed[:8])
         if len(changed) > 8:
             preview += f"; ... ({len(changed) - 8} more)"
-        return (
+        message = (
             "Slot job modified route root outside assigned workspace. "
             f"Assigned workspace: {job.workspace_path}; route root: {baseline.path}; "
             f"changed route-root paths: {preview}. Preserved status in {status_path}"
         )
+        ignored = baseline.guard.ignored_changed_paths(snapshot)
+        if ignored:
+            ignored_preview = "; ".join(ignored[:8])
+            if len(ignored) > 8:
+                ignored_preview += f"; ... ({len(ignored) - 8} more)"
+            message += f". Ignored (route_root_ignore_globs): {ignored_preview}"
+        return message
 
     def workspace_violation(
         self,
