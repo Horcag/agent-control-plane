@@ -906,7 +906,14 @@ class PlanStore:
         codex_tool_call_budget: Any = _UNSET,
         retry_override_reason: Any = _UNSET,
     ) -> dict[str, Any]:
-        """Edit a never-dispatched task's fields in place (partial update, sentinel-gated)."""
+        """Edit a task's fields in place (partial update, sentinel-gated).
+
+        Allowed for a task that has never been claimed (pending/ready, attempt_no == 0,
+        no job or dispatch token) and for a `dispatch_failed` task with no job, since
+        `mark_dispatch_failed` guarantees no work exists for it either. Editing a
+        `dispatch_failed` task also clears its stale dispatch_token/dispatch_error,
+        resets attempt_no to 0, and returns it to `ready`/`pending` per its dependencies.
+        """
         self.initialize()
         execution_overrides = {
             "brief": brief,
@@ -932,17 +939,23 @@ class PlanStore:
             db.execute("begin immediate")
             self._require_active_plan(db, plan_id)
             task = self._require_task(db, plan_id, task_id)
-            if (
-                task["job_id"] is not None
-                or task["dispatch_token"] is not None
+            if task["job_id"] is not None:
+                raise ValueError(
+                    f"Plan task {task_id} is not editable in state {task['state']}: "
+                    f"a job already exists ({task['job_id']})"
+                )
+            recovering_dispatch_failure = task["state"] == "dispatch_failed"
+            if not recovering_dispatch_failure and (
+                task["dispatch_token"] is not None
                 or task["state"] not in {"pending", "ready"}
                 or int(task["attempt_no"]) != 0
             ):
                 raise ValueError(
                     f"Plan task {task_id} is not editable in state {task['state']} "
                     f"(attempt_no={int(task['attempt_no'])}); only a task that has never been "
-                    "claimed (pending/ready, attempt_no == 0, no job or dispatch token) can be "
-                    "edited (use `plan retry --brief-file` for a task that has already run)"
+                    "claimed (pending/ready, attempt_no == 0, no job or dispatch token) or a "
+                    "dispatch_failed task with no job can be edited (use `plan retry "
+                    "--brief-file` for a task that has already run)"
                 )
             changed_fields: list[str] = []
             new_title = task["title"]
@@ -1028,19 +1041,27 @@ class PlanStore:
                 raise ValueError(f"Plan task edit requires at least one changed field: {task_id}")
 
             now = utc_now()
-            db.execute(
-                """
-                update plan_tasks set title = ?, execution_json = ?, updated_at = ?
-                where plan_id = ? and task_id = ?
-                """,
-                (
-                    new_title,
-                    _execution_json(execution) if execution is not None else task["execution_json"],
-                    now,
-                    plan_id,
-                    task_id,
-                ),
+            new_execution_json = (
+                _execution_json(execution) if execution is not None else task["execution_json"]
             )
+            if recovering_dispatch_failure:
+                db.execute(
+                    """
+                    update plan_tasks set title = ?, execution_json = ?, state = 'pending',
+                        dispatch_token = null, dispatch_error = null, attempt_no = 0,
+                        updated_at = ?
+                    where plan_id = ? and task_id = ?
+                    """,
+                    (new_title, new_execution_json, now, plan_id, task_id),
+                )
+            else:
+                db.execute(
+                    """
+                    update plan_tasks set title = ?, execution_json = ?, updated_at = ?
+                    where plan_id = ? and task_id = ?
+                    """,
+                    (new_title, new_execution_json, now, plan_id, task_id),
+                )
             if depends_on_changed:
                 db.execute(
                     "delete from plan_task_dependencies where plan_id = ? and task_id = ?",
@@ -1054,14 +1075,17 @@ class PlanStore:
                         """,
                         (plan_id, task_id, dependency),
                     )
+            event_payload: dict[str, Any] = {"changed_fields": changed_fields}
+            if recovering_dispatch_failure:
+                event_payload["previous_state"] = "dispatch_failed"
             self._add_event(
                 db,
                 plan_id,
                 "task_edited",
-                {"changed_fields": changed_fields},
+                event_payload,
                 task_id=task_id,
             )
-            if depends_on_changed:
+            if depends_on_changed or recovering_dispatch_failure:
                 self._refresh_ready_states(db, plan_id)
             updated = self._require_task(db, plan_id, task_id)
             return {

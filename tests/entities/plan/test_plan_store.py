@@ -1436,6 +1436,180 @@ def test_edit_task_after_edit_can_be_dispatched_with_new_brief(tmp_path: Path) -
     assert claims[0].attempt_no == 1
 
 
+def test_edit_task_dispatch_failed_with_no_job_is_editable(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    claims = plans.claim_ready_tasks("edit", limit=1)
+    plans.mark_dispatch_failed(
+        "edit",
+        "task",
+        dispatch_token=claims[0].dispatch_token,
+        error="premium model needs an override reason",
+    )
+    assert plans.get_task("edit", "task")["state"] == "dispatch_failed"
+
+    edited = plans.edit_task(
+        "edit", "task", brief="Repaired brief", codex_premium_override_reason="approved"
+    )
+
+    assert edited["execution"]["brief_sha256"] == hashlib.sha256(b"Repaired brief").hexdigest()
+    task = plans.get_task("edit", "task")
+    assert task["execution"] is not None
+    assert task["execution"].brief == "Repaired brief"
+    assert task["execution"].codex_premium_override_reason == "approved"
+
+
+def test_edit_task_dispatch_failed_returns_to_ready_and_clears_dispatch_state(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    claims = plans.claim_ready_tasks("edit", limit=1)
+    plans.mark_dispatch_failed(
+        "edit", "task", dispatch_token=claims[0].dispatch_token, error="boom"
+    )
+
+    edited = plans.edit_task("edit", "task", brief="Repaired")
+
+    assert edited["state"] == "ready"
+    assert edited["attempt_no"] == 0
+    with sqlite3.connect(database) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "select dispatch_token, dispatch_error, attempt_no, state from plan_tasks "
+            "where plan_id = ? and task_id = ?",
+            ("edit", "task"),
+        ).fetchone()
+    assert row["dispatch_token"] is None
+    assert row["dispatch_error"] is None
+    assert int(row["attempt_no"]) == 0
+    assert row["state"] == "ready"
+
+    claims_again = plans.claim_ready_tasks("edit", limit=1)
+    assert len(claims_again) == 1
+    assert claims_again[0].execution.brief == "Repaired"
+    assert claims_again[0].attempt_no == 1
+
+
+def test_edit_task_dispatch_failed_with_unmet_dependency_returns_to_pending(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "api", "Transfer API", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+            PlanTaskDefinition(
+                "schema", "Transfer schema", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    claims = plans.claim_ready_tasks("edit", limit=1)
+    assert claims[0].task_id == "api"
+    plans.mark_dispatch_failed("edit", "api", dispatch_token=claims[0].dispatch_token, error="boom")
+    assert plans.get_task("edit", "api")["state"] == "dispatch_failed"
+    assert plans.get_task("edit", "schema")["state"] == "ready"
+
+    # The repair discovers "api" actually needs "schema" to run first, and adds the
+    # dependency as part of the same edit that fixes the brief.
+    edited = plans.edit_task("edit", "api", brief="Repaired api", depends_on=("schema",))
+
+    assert edited["state"] == "pending"
+    assert [task["task_id"] for task in plans.snapshot("edit")["ready_next"]] == ["schema"]
+
+
+def test_edit_task_with_job_id_is_refused_in_every_state(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+            # Keeps the plan "active" once "task" completes, so the completed-state
+            # assertion below exercises the task-level guard rather than the
+            # plan-level "not active" guard.
+            PlanTaskDefinition(
+                "other", "Other", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="job-1", task_id="task-run")
+    plans.bind_job("edit", "task", "job-1")
+
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Nope")
+
+    jobs.mark_finished("job-1", "completed")
+    jobs.mark_finalization_completed("job-1")
+    assert plans.snapshot("edit")["awaiting_review"][0]["task_id"] == "task"
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Nope")
+
+    plans.accept_task("edit", "task", accepted_sha="deadbeef")
+    assert plans.get_task("edit", "task")["state"] == "completed"
+    with pytest.raises(ValueError, match="not editable in state"):
+        plans.edit_task("edit", "task", brief="Nope")
+
+
+def test_edit_task_dispatch_failed_recovery_appears_in_event_history(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    JobStore(database).initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="edit",
+        title="Edit",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Draft")
+            ),
+        ),
+    )
+    claims = plans.claim_ready_tasks("edit", limit=1)
+    plans.mark_dispatch_failed(
+        "edit", "task", dispatch_token=claims[0].dispatch_token, error="boom"
+    )
+    cursor = plans.snapshot("edit")["cursor"]
+
+    plans.edit_task("edit", "task", brief="Repaired")
+
+    changes = plans.snapshot("edit", since=cursor)["changes"]
+    edited_events = [event for event in changes if event["event"] == "task_edited"]
+    assert len(edited_events) == 1
+    assert edited_events[0]["task_id"] == "task"
+    assert edited_events[0]["previous_state"] == "dispatch_failed"
+    assert "brief" in edited_events[0]["changed_fields"]
+
+
 def test_edit_task_depends_on_revalidates_graph_and_refreshes_ready_states(
     tmp_path: Path,
 ) -> None:
