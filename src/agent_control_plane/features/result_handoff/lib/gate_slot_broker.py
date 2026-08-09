@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from agent_control_plane.features.agent_runner.lib.quota_broker import _pid_alive
+from agent_control_plane.shared.process_liveness import process_is_alive
 from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 DEFAULT_POLL_INTERVAL_SEC = 0.5
@@ -120,7 +120,9 @@ class NativeQualityGateSlotBroker:
     @staticmethod
     def _reclaim_dead_slots(db: sqlite3.Connection) -> None:
         rows = db.execute("select slot_token, holder_pid from native_quality_gate_slots").fetchall()
-        dead = [str(row["slot_token"]) for row in rows if not _pid_alive(int(row["holder_pid"]))]
+        dead = [
+            str(row["slot_token"]) for row in rows if not process_is_alive(int(row["holder_pid"]))
+        ]
         if dead:
             db.executemany(
                 "delete from native_quality_gate_slots where slot_token = ?",
