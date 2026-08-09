@@ -1907,6 +1907,7 @@ codex_command = "codex"
 timeout_sec = 10
 idle_timeout_sec = 5
 print_timeout = "10s"
+workspace_access = "native"
 
 [control.model_catalog]
 cache_path = "{cache_path.as_posix()}"
