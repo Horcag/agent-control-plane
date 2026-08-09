@@ -46,7 +46,7 @@ def build_task_prompt(
     )
 
     if workspace_access == "native":
-        _required_file(brief_path)
+        _required_brief(brief_path)
         if read_only:
             coordination_rules = f"""- This is a READ-ONLY job.
 - You are FORBIDDEN from editing any files in the workspace or updating the progress file.
@@ -97,7 +97,7 @@ Mandatory execution rules:
 """
     protocol_path = _protocol_path(config.coordination_root)
     routing_path = _required_file(config.coordination_root / "workspace-routing.md")
-    _required_file(brief_path)
+    _required_brief(brief_path)
     idea_edit_path = workspace_path.resolve(strict=False)
     idea_edit_root = str(idea_edit_path)
     idea_project_root = config.coordination_root.parent.resolve(strict=False)
@@ -549,4 +549,13 @@ def _native_quality_rules(contract: NativeQualityContract) -> str:
 def _required_file(path: Path) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"Required coordination file not found: {path}")
+    return path
+
+
+def _required_brief(path: Path) -> Path:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Required brief not found: {path}. Place a brief.md there, or pass "
+            "`agent-control start --brief-file <path>` to install one before launch."
+        )
     return path

@@ -60,6 +60,31 @@ def test_cli_omitted_config_discovers_config_and_prints_stderr_notice(
     assert captured.out.strip() == "[]"
 
 
+def test_cli_statuses_alone_works_with_no_config_present(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["statuses", "--json"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert '"terminal_statuses"' in captured.out
+
+
+def test_cli_statuses_accepts_and_ignores_config(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main(["statuses", "--json"])
+    assert exit_code == 0
+    without_config = capsys.readouterr().out
+
+    exit_code = main(["statuses", "--json", "--config", "/does/not/exist.toml"])
+    assert exit_code == 0
+    with_nonexistent_config = capsys.readouterr()
+
+    assert with_nonexistent_config.err == ""
+    assert with_nonexistent_config.out == without_config
+
+
 def test_cli_omitted_config_fallback_to_default_prints_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

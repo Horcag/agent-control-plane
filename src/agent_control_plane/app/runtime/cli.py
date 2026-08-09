@@ -167,6 +167,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "start":
+            if args.brief_file:
+                _install_brief_file(
+                    coordination_root=control.config.coordination_root,
+                    task_id=args.task_id,
+                    brief_file=Path(args.brief_file),
+                    overwrite=args.overwrite_brief,
+                )
             job = control.start_job(
                 StartOptions(
                     task_id=args.task_id,
@@ -262,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 0
-            if args.inbox_command == "show":
+            if args.inbox_command in ("show", "get"):
                 _print_json(control.get_review_inbox_item(args.item_id))
                 return 0
             if args.inbox_command == "resolve":
@@ -517,6 +524,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     statuses_parser = subparsers.add_parser(
         "statuses",
+        parents=[common],
         help="Print the job status vocabulary: terminal statuses and which are on-contract-capable",
     )
     statuses_parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
@@ -590,6 +598,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--codex-tool-call-budget",
         type=int,
         help="Hard per-attempt Codex tool-call budget; overrides the routing-policy default",
+    )
+    start.add_argument(
+        "--brief-file",
+        help=(
+            "Install this file as the brief at the conventional path "
+            "<coordination_root>/tasks/<task-id>/brief.md before launch"
+        ),
+    )
+    start.add_argument(
+        "--overwrite-brief",
+        action="store_true",
+        help=(
+            "With --brief-file, replace an existing brief at the conventional path "
+            "even when its contents differ"
+        ),
     )
     start.add_argument("--slot", help="Use a managed IDE-indexed slot by name")
     start.add_argument(
@@ -694,8 +717,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     inbox_show = inbox_subparsers.add_parser(
         "show",
+        aliases=["get"],
         parents=[common],
-        help="Show one durable review item",
+        help="Show one durable review item (MCP name: agent_review_inbox_get)",
     )
     inbox_show.add_argument("item_id")
 
@@ -1331,6 +1355,40 @@ def _job_payload(job: Any) -> dict[str, Any]:
     if alerts:
         payload["alerts"] = alerts
     return payload
+
+
+def _install_brief_file(
+    *,
+    coordination_root: Path,
+    task_id: str,
+    brief_file: Path,
+    overwrite: bool,
+) -> None:
+    """Install ``brief_file`` at the conventional brief path for ``task_id``.
+
+    Refuses to silently clobber an operator's existing brief: a conventional path
+    that already holds different content is a hard error unless ``overwrite`` was
+    explicitly requested.
+    """
+    try:
+        content = brief_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"Could not read --brief-file {brief_file}: {exc}") from exc
+
+    conventional_path = coordination_root / "tasks" / task_id / "brief.md"
+    if conventional_path.is_file():
+        existing = conventional_path.read_text(encoding="utf-8")
+        if existing == content:
+            return
+        if not overwrite:
+            raise ValueError(
+                f"A brief already exists at {conventional_path} and differs from "
+                f"--brief-file {brief_file}. Pass --overwrite-brief to replace it, "
+                "or resolve the conflict manually."
+            )
+
+    conventional_path.parent.mkdir(parents=True, exist_ok=True)
+    conventional_path.write_text(content, encoding="utf-8")
 
 
 def _infer_route_from_slot_name(slot_name: str) -> str:

@@ -368,7 +368,11 @@ class PromptBuilderTest(unittest.TestCase):
                 "# Routing\n",
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(FileNotFoundError, "brief.md"):
+            expected_brief_path = coordination_root / "tasks" / "task-1" / "brief.md"
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                r"Required brief not found: .*brief\.md.*--brief-file",
+            ) as raised:
                 build_task_prompt(
                     config=config,
                     task_id="task-1",
@@ -377,6 +381,7 @@ class PromptBuilderTest(unittest.TestCase):
                     expected_branch="main",
                     result_path=root / ".agent-work" / "tasks" / "task-1" / "result.md",
                 )
+            self.assertIn(str(expected_brief_path), str(raised.exception))
 
     def test_native_mode_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

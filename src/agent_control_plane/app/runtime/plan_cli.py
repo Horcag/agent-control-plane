@@ -44,7 +44,7 @@ def handle_plan_command(control: Any, args: argparse.Namespace) -> Any:
         return control.accept_plan_task(args.plan_id, args.task_id, accepted_sha=args.sha)
     if args.plan_command == "reject":
         return control.reject_plan_task(args.plan_id, args.task_id)
-    if args.plan_command == "summary":
+    if args.plan_command in ("summary", "snapshot"):
         return control.plan_snapshot(
             args.plan_id,
             since=args.since,

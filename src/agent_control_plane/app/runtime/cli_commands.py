@@ -128,8 +128,12 @@ def add_plan_parser(
 
     plan_summary = plan_subparsers.add_parser(
         "summary",
+        aliases=["snapshot"],
         parents=[common],
-        help="Return compact plan state and optionally only changes after a cursor",
+        help=(
+            "Return compact plan state and optionally only changes after a cursor "
+            "(MCP name: agent_plan_snapshot)"
+        ),
     )
     plan_summary.add_argument("plan_id")
     plan_summary.add_argument("--since", type=int)

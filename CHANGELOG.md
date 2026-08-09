@@ -6,6 +6,8 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Added
 
+- Added `agent-control start --brief-file <path>` to install a brief at the conventional `<coordination_root>/tasks/<task-id>/brief.md` path before launch, matching `plan add-task`/`plan edit-task`. A brief already present at the conventional path with different content blocks the launch and names both paths instead of being silently overwritten; pass `--overwrite-brief` to replace it deliberately. Identical content is a no-op. The error raised when no brief is present now names the conventional path and mentions `--brief-file`.
+- Added CLI aliases so the CLI accepts the same names MCP tools use for the same operation: `plan snapshot` for `plan summary` (MCP `agent_plan_snapshot`) and `inbox get` for `inbox show` (MCP `agent_review_inbox_get`). The existing name remains primary and is what `--help` shows. Added `tests/architecture/test_architecture.py::test_cli_mcp_command_parity`, a pinned MCP-tool-to-CLI-command-path mapping that fails if a new MCP tool ships without a CLI mapping entry, if a mapped CLI path stops parsing, or if a mapping entry goes stale.
 - Added live candidate revalidation at use time across model catalog and model routing policies.
 - Added model catalog union inspection payload containing `inventory_state` (`listed`, `hidden`, `last_seen`, `absent_from_inventory`), `metadata_state` (`configured`, `rule`, `unconfigured`), and `launch_disposition` (`allow`, `require_override`, `reject`).
 - Added catalog `provenance` metadata block reporting `version`, `fetched_at`, `etag`, `client_version`, `snapshot_state` (`current` vs `drifted`), and `on_disk_version`.
@@ -17,6 +19,10 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 - `plan retry`/`agent_plan_retry_task` now accept the same execution overrides as `plan edit-task`/`agent_plan_edit_task` (`--route`, `--slot`, `--backend`, `--workspace-access`, `--read-only`, `--codex-quality-tier`, `--codex-model`, `--codex-reasoning-effort`, `--claude-model`, `--claude-reasoning-effort`, `--codex-premium-override-reason`, `--expected-result-status`, `--controller-gate-mode`), applied to the new attempt only, so a task that failed because of a bad execution config (wrong model, wrong route, a premium model with no override reason) can be repaired instead of requiring the plan to be cancelled and recreated. The circuit-breaker fingerprint check now runs against the fully overridden spec, and `task_retry_requested` events record `changed_fields` when the retry changes the execution config.
 - Added missing-result checkpoint salvage: when a worker exits 0 with a dirty workspace and never writes `result.md` (`runner_failure == "exited_without_result"`), terminal checkpointing now runs the route's controller quality gates against that checkpoint before cleanup, on native/`controller`-policy routes, so the durable review-inbox record carries gate verdicts instead of only a diff. The job still ends failed and `review_ready` still requires a `Status: completed` result, so gate evidence alone can never reach root acceptance. Every other dirty-after-failure cause (timeout, guardrail violation, tool-call budget, ...) is unaffected. See `docs/recovery-matrix.md`.
 )
+
+### Fixed
+
+- `agent-control statuses` no longer rejects `--config`. It still requires no config and never loads or validates the path it is handed; scripts that pass `--config` uniformly to every invocation no longer need to special-case `statuses`.
 
 ### Changed
 

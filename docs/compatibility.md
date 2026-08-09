@@ -17,7 +17,10 @@ not a promise that every future feature will remain alpha-stable.
 
 Within 0.1.x, maintainers should preserve documented CLI command names, options, TOML
 keys, and accepted-value meanings. Additive changes are preferred. Invalid
-configuration must fail closed.
+configuration must fail closed. Additive CLI aliases (an extra name for an existing
+subcommand, such as `plan snapshot` for `plan summary` or `inbox get` for `inbox show`)
+are within the 0.1.x promise: the primary name and its documented behavior are
+unchanged, and the alias only widens what the CLI accepts.
 
 The promise covers the codex, agy, and claude (Claude Code CLI; `claude-code` is a
 legacy alias) backends, subject to the installed external CLI. `native` uses native

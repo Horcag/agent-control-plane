@@ -35,6 +35,13 @@ are read-only inspection commands; `cancel` requests cooperative cancellation. A
 terminal writable job must leave `result.md` with a plain `Status:` line and a valid
 schema-v1 `verification.json`. A completed changed job needs successful checks.
 
+`start` requires a brief at `<coordination_root>/tasks/<task-id>/brief.md` before
+launch. Pass `--brief-file <path>` to install one from an arbitrary path in the same
+call, mirroring `plan add-task`/`plan edit-task`. If a brief already exists at the
+conventional path with different content, `start` fails and names both paths instead
+of silently overwriting the operator's brief; pass `--overwrite-brief` to replace it
+deliberately. Identical content is always a no-op.
+
 With checkpoint policy, finalization records a controller-owned ref and review-inbox
 item, verifies both, then cleans the slot back to its prior branch. It never pushes,
 merges, moves the branch, or accepts the change. Any late edit or verification failure
@@ -80,7 +87,9 @@ unchanged for existing callers, but its exit code is now meaningful in the same 
 
 Run `agent-control statuses` (or `--json`) to print the full terminal-status vocabulary
 and which statuses are capable of being on-contract, instead of guessing at status
-strings.
+strings. `statuses` accepts `--config` (like every other subcommand) but ignores it,
+so scripts that pass `--config` uniformly to every invocation do not need to special-case
+this command; it never requires a config to be present.
 
 ### Why a worker can't watch anything
 
@@ -111,7 +120,7 @@ Create a JSON manifest with executable tasks and dependencies, then run:
 agent-control plan create --manifest .\plan.json --config .\config\workspaces.toml
 agent-control plan dispatch <plan-id> --max-jobs 2 --config .\config\workspaces.toml
 agent-control plan run <plan-id> --until-review --max-jobs 2 --config .\config\workspaces.toml
-agent-control plan summary <plan-id> --config .\config\workspaces.toml
+agent-control plan summary <plan-id> --config .\config\workspaces.toml   # alias: plan snapshot
 agent-control plan watch <plan-id> --since <cursor> --timeout-sec 25 --config .\config\workspaces.toml
 ```
 
@@ -147,9 +156,15 @@ scope, or tool-call budget does not by itself unblock an escalated task; use
 
 `accept-handoff` atomically validates verification, resolves the inbox item, records
 root acceptance, and unlocks dependants. Delivery is not acceptance. Use `inbox list`,
-`inbox show`, and `inbox sync-subagents` for bounded handoff inspection. Use `review
-start`, `review checkpoint`, `review attach`, and `review finish` to account for root
-review separately.
+`inbox show` (alias: `inbox get`), and `inbox sync-subagents` for bounded handoff
+inspection. Use `review start`, `review checkpoint`, `review attach`, and `review
+finish` to account for root review separately.
+
+The CLI and MCP surfaces name the same operations differently in a few spots for
+historical reasons (`plan summary` / MCP `agent_plan_snapshot`, `inbox show` / MCP
+`agent_review_inbox_get`). The CLI accepts the MCP name as an alias in these cases so
+either name works; run `agent-control plan --help` or `agent-control inbox --help` to
+see the primary (documented) name for each subcommand.
 
 ### Spark plan example (explicit model/effort)
 
