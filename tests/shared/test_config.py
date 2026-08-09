@@ -179,6 +179,47 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_config(config_contents=base)
 
+    def test_route_root_ignore_globs_rejects_every_blanket_spelling(self) -> None:
+        """Pins where the blanket-pattern heuristic starts and stops.
+
+        Rejected: patterns matching every path, or every path below the root --
+        those spare at most the handful of files sitting directly in the root, so
+        the guard is off in practice however the pattern is spelled.
+
+        Accepted: anything narrower, including deliberately broad patterns like
+        `src/**` or `**/**/*` (which needs two separators and so spares the root
+        and its immediate children). The check exists to stop an accidental total
+        silence, not to judge how wide a deliberate exclusion is -- an operator
+        can always write a broad-but-valid pattern, and refusing those would just
+        push people to disable `monitor_route_root` wholesale instead.
+        """
+        base = (
+            b"[control]\n"
+            b'coordination_root = ".agent-work"\n'
+            b'runs_root = "runs"\n'
+            b'database = "runs/jobs.sqlite3"\n'
+            b'worktree_root = "worktrees"\n'
+            b'worktree_base = "repo"\n'
+            b'slot_root = "slots"\n'
+            b'[routes.main]\npath = "repo"\nrequired_branch = "main"\n'
+        )
+
+        for pattern in (b"**", b"**/**", b"**/*"):
+            with self.subTest(pattern=pattern), self.assertRaises(ValueError):
+                load_config(
+                    config_contents=base + b"route_root_ignore_globs = [" + b'"' + pattern + b'"]\n'
+                )
+
+        for pattern in (b"kanban/**", b"docs/*.md", b"**/*.generated.py", b"*"):
+            with self.subTest(pattern=pattern):
+                config = load_config(
+                    config_contents=base + b"route_root_ignore_globs = [" + b'"' + pattern + b'"]\n'
+                )
+                self.assertEqual(
+                    config.routes["main"].route_root_ignore_globs,
+                    (pattern.decode(),),
+                )
+
     def test_route_slot_root_overrides_global_slot_root(self) -> None:
         base = (
             b"[control]\n"

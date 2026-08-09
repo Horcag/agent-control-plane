@@ -309,8 +309,9 @@ codex_forbidden_tool_markers = []
 # this for operator-owned paths inside the route root (e.g. a kanban board)
 # that legitimately change while jobs are in flight. Excluded from violation
 # determination only -- dirty-state preservation and preserved status/patch
-# artifacts still cover everything. A pattern that would match the whole tree
-# (a bare "**", for example) is rejected at config load.
+# artifacts still cover everything. A pattern that would blanket the tree -- one
+# matching every path ("**"), or every path below the root ("**/**", "**/*") --
+# is rejected at config load, so the guard cannot be silenced by accident.
 # route_root_ignore_globs = ["kanban/**"]
 
 # Optional strict native-mode contract. Controller mode requires checkpointed slot jobs.

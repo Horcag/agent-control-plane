@@ -8,13 +8,16 @@ from pathlib import Path
 # every one of them matches (for practical purposes) the whole tree, regardless of
 # how it is spelled -- this is what lets glob_matches_whole_tree() catch not just a
 # bare "**" but any equivalent.
-_WHOLE_TREE_CANARIES = (
+_TOP_LEVEL_CANARIES = (
     "a",
     "a.ext",
     ".hidden",
+)
+_NESTED_CANARIES = (
     "dir/file.ext",
     "very/deeply/nested/path/to/a/file.ext",
 )
+_WHOLE_TREE_CANARIES = _TOP_LEVEL_CANARIES + _NESTED_CANARIES
 
 
 def compile_forward_slash_glob(pattern: str) -> re.Pattern[str]:
@@ -54,12 +57,19 @@ def glob_matches_any(path: str, patterns: Sequence[str]) -> bool:
 
 
 def glob_matches_whole_tree(pattern: str) -> bool:
-    """Return whether `pattern` would match every plausible relative path.
+    """Return whether `pattern` would silence a path guard for practical purposes.
 
-    Used to reject ignore-list entries (e.g. a bare `**`) that would silence a
-    guard entirely instead of narrowly excluding operator-owned paths.
+    Used to reject ignore-list entries that blanket the tree instead of narrowly
+    excluding operator-owned paths. Two shapes qualify:
+
+    - it matches every canary, e.g. a bare `**`;
+    - it matches every *nested* canary, e.g. `**/**` or `**/*`. Such a pattern
+      spares only files sitting directly in the root, and no real repository
+      keeps its sources there, so the guard is effectively off.
     """
-    return all(glob_matches(canary, pattern) for canary in _WHOLE_TREE_CANARIES)
+    return all(glob_matches(canary, pattern) for canary in _WHOLE_TREE_CANARIES) or all(
+        glob_matches(canary, pattern) for canary in _NESTED_CANARIES
+    )
 
 
 def is_same_or_child(path: Path, parent: Path) -> bool:
