@@ -245,6 +245,53 @@ def test_awaiting_review_retry_requires_explicit_opt_in(tmp_path: Path) -> None:
     assert result["task"]["state"] in {"pending", "ready"}
 
 
+def test_retry_with_premium_override_reason_becomes_dispatchable(tmp_path: Path) -> None:
+    """The live 2026-08-09 failure: a task dispatched with a premium model and no
+    override reason fails dispatch; retrying with a corrected config must work."""
+
+    def _launch(claim):
+        raise AssertionError(f"dispatch should not be re-attempted in this test: {claim}")
+
+    service, job_store, plan_store = _service(tmp_path, launch=_launch)
+    service.create_plan(
+        plan_id="premium-fix",
+        title="Premium fix",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(
+                    route="acp",
+                    brief=BRIEF,
+                    backend="claude",
+                    claude_model="claude-premium",
+                    effective_scope=SCOPE,
+                    codex_tool_call_budget=BUDGET,
+                ),
+            ),
+        ),
+    )
+    _make_job(
+        job_store,
+        tmp_path,
+        "job-1",
+        status="dispatch_failed",
+        runner_failure="premium_override_required",
+    )
+    plan_store.bind_job("premium-fix", "task", "job-1")
+
+    result = service.retry_plan_task(
+        "premium-fix",
+        "task",
+        codex_premium_override_reason="approved for this attempt",
+    )
+
+    task = plan_store.get_task("premium-fix", "task")
+    assert result["task"]["state"] in {"pending", "ready"}
+    assert task["execution"].claude_model == "claude-premium"
+    assert task["execution"].codex_premium_override_reason == "approved for this attempt"
+
+
 def test_escalated_task_is_never_auto_dispatched(tmp_path: Path) -> None:
     service, job_store, plan_store = _service(tmp_path)
     _create_task(service, "plan-g")

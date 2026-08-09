@@ -76,6 +76,7 @@ def handle_plan_command(control: Any, args: argparse.Namespace) -> Any:
             brief_override=read_retry_brief(args.brief_file),
             retry_override_reason=args.retry_override_reason,
             allow_awaiting_review=args.allow_awaiting_review,
+            **cli_plan_execution_overrides(args),
         )
     if args.plan_command == "cancel":
         return control.cancel_plan(args.plan_id)
@@ -193,15 +194,10 @@ def cli_plan_execution_spec(args: argparse.Namespace) -> PlanExecutionSpec | Non
     )
 
 
-def cli_plan_edit_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """Build edit_plan_task kwargs from only the flags the operator actually provided."""
+def cli_plan_execution_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Build execution-spec kwargs (excluding brief) from only the flags the operator
+    actually provided. Shared by `plan edit-task` and `plan retry`."""
     overrides: dict[str, Any] = {}
-    if args.title is not None:
-        overrides["title"] = args.title
-    if args.depends_on is not None:
-        overrides["depends_on"] = tuple(args.depends_on)
-    if args.brief_file is not None:
-        overrides["brief"] = read_retry_brief(args.brief_file)
     if args.route is not None:
         overrides["route"] = args.route
     if args.slot is not None:
@@ -228,6 +224,19 @@ def cli_plan_edit_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["expected_result_status"] = args.expected_result_status
     if args.controller_gate_mode is not None:
         overrides["controller_gate_mode"] = args.controller_gate_mode
+    return overrides
+
+
+def cli_plan_edit_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Build edit_plan_task kwargs from only the flags the operator actually provided."""
+    overrides: dict[str, Any] = {}
+    if args.title is not None:
+        overrides["title"] = args.title
+    if args.depends_on is not None:
+        overrides["depends_on"] = tuple(args.depends_on)
+    if args.brief_file is not None:
+        overrides["brief"] = read_retry_brief(args.brief_file)
+    overrides.update(cli_plan_execution_overrides(args))
     return overrides
 
 

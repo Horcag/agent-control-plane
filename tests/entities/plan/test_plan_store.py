@@ -637,6 +637,93 @@ def test_failed_task_requires_explicit_retry_before_dispatch(tmp_path: Path) -> 
     assert claims[0].execution.retry_override_reason == "transient infrastructure failure"
 
 
+def test_retry_config_override_rewrites_execution_for_new_attempt_only(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="dispatch",
+        title="Dispatch",
+        tasks=(
+            PlanTaskDefinition(
+                "task",
+                "Task",
+                execution=PlanExecutionSpec(
+                    route="dev",
+                    brief="First attempt",
+                    backend="claude",
+                    claude_model="premium-model",
+                    codex_premium_override_reason=None,
+                    read_only=True,
+                ),
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="failed-job", task_id="failed-run")
+    plans.bind_job("dispatch", "task", "failed-job")
+    jobs.mark_finished("failed-job", "failed")
+    jobs.mark_finalization_completed("failed-job")
+    cursor = plans.snapshot("dispatch")["cursor"]
+
+    retried = plans.retry_task(
+        "dispatch",
+        "task",
+        claude_model="cheaper-model",
+        codex_premium_override_reason="approved after cost review",
+        read_only=False,
+    )
+    events = plans.snapshot("dispatch", since=cursor)["changes"]
+    claims = plans.claim_ready_tasks("dispatch", limit=1)
+
+    retried_event = next(event for event in events if event["event"] == "task_retry_requested")
+    assert set(retried_event["changed_fields"]) == {
+        "claude_model",
+        "codex_premium_override_reason",
+        "read_only",
+    }
+
+    assert retried["state"] == "ready"
+    assert claims[0].execution.claude_model == "cheaper-model"
+    assert claims[0].execution.codex_premium_override_reason == "approved after cost review"
+    assert claims[0].execution.read_only is False
+    # Unrelated fields carry forward untouched.
+    assert claims[0].execution.route == "dev"
+    assert claims[0].execution.brief == "First attempt"
+    assert claims[0].execution.backend == "claude"
+
+    # The old attempt's durable job record is untouched.
+    old_job = jobs.get_job("failed-job")
+    assert old_job.status == "failed"
+
+
+def test_retry_without_overrides_emits_no_changed_fields(tmp_path: Path) -> None:
+    database = tmp_path / "jobs.sqlite3"
+    jobs = JobStore(database)
+    jobs.initialize()
+    plans = PlanStore(database)
+    plans.create_plan(
+        plan_id="plain-retry",
+        title="Plain retry",
+        tasks=(
+            PlanTaskDefinition(
+                "task", "Task", execution=PlanExecutionSpec(route="dev", brief="Do it")
+            ),
+        ),
+    )
+    _create_job(jobs, tmp_path, job_id="failed-job", task_id="failed-run")
+    plans.bind_job("plain-retry", "task", "failed-job")
+    jobs.mark_finished("failed-job", "failed")
+    jobs.mark_finalization_completed("failed-job")
+    cursor = plans.snapshot("plain-retry")["cursor"]
+
+    plans.retry_task("plain-retry", "task")
+
+    events = plans.snapshot("plain-retry", since=cursor)["changes"]
+    retried_event = next(event for event in events if event["event"] == "task_retry_requested")
+    assert "changed_fields" not in retried_event
+
+
 def test_awaiting_review_retry_without_flag_is_rejected(tmp_path: Path) -> None:
     database = tmp_path / "jobs.sqlite3"
     jobs = JobStore(database)

@@ -124,6 +124,27 @@ agent-control plan retry <plan-id> <task-id> --config .\config\workspaces.toml
 agent-control accept-handoff <plan-id> <task-id> --review-span-id <span-id> --config .\config\workspaces.toml
 ```
 
+When an attempt failed *because of its execution config* (wrong model, wrong route,
+wrong slot, a premium model with no override reason), `plan retry` also accepts every
+override `plan edit-task` exposes, applied to the new attempt only: `--route`,
+`--slot`, `--backend`, `--workspace-access`, `--read-only`, `--codex-quality-tier`,
+`--codex-model`, `--codex-reasoning-effort`, `--claude-model`,
+`--claude-reasoning-effort`, `--codex-premium-override-reason`,
+`--expected-result-status`, and `--controller-gate-mode`. The durable record of the
+attempt that already ran is untouched; only the new attempt's execution spec changes,
+and the `task_retry_requested` event records which fields changed:
+
+```powershell
+agent-control plan retry <plan-id> <task-id> --codex-model gpt-5-mini `
+  --codex-premium-override-reason "approved after cost review" `
+  --config .\config\workspaces.toml
+```
+
+The circuit breaker still compares the fingerprint of the fully overridden attempt
+against the prior failure, so a config change that does not touch brief, effective
+scope, or tool-call budget does not by itself unblock an escalated task; use
+`--retry-override-reason` for that.
+
 `accept-handoff` atomically validates verification, resolves the inbox item, records
 root acceptance, and unlocks dependants. Delivery is not acceptance. Use `inbox list`,
 `inbox show`, and `inbox sync-subagents` for bounded handoff inspection. Use `review

@@ -4,6 +4,7 @@ from agent_control_plane.entities.plan.model.store import (
     PlanRecord,
     PlanStore,
     PlanTaskDefinition,
+    apply_execution_overrides,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "PlanRecord",
     "PlanStore",
     "PlanTaskDefinition",
+    "apply_execution_overrides",
 ]

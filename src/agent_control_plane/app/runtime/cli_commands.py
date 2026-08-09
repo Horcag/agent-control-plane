@@ -194,6 +194,68 @@ def add_plan_parser(
             "rejects the pending handoff first so accidental double-runs stay impossible"
         ),
     )
+    plan_retry.add_argument(
+        "--route",
+        help="Change the execution route for the new attempt only",
+    )
+    plan_retry.add_argument("--slot", help="Change the execution slot for the new attempt only")
+    plan_retry.add_argument(
+        "--backend",
+        choices=SUPPORTED_BACKENDS,
+        help="Change the execution backend for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--workspace-access",
+        choices=("ide_mcp", "native"),
+        help="Change workspace access for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--read-only",
+        dest="read_only",
+        action="store_true",
+        default=None,
+        help="Mark the new attempt read-only; omit to leave the existing setting unchanged",
+    )
+    plan_retry.add_argument(
+        "--codex-quality-tier",
+        help="Change the Codex quality tier for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--codex-model",
+        help="Change the model to use when --backend=codex for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--codex-reasoning-effort",
+        help=(
+            "Change the Codex reasoning effort for the new attempt only; known catalog "
+            "models must use an effort declared by the current cache"
+        ),
+    )
+    plan_retry.add_argument(
+        "--claude-model",
+        help="Change the model to use when --backend=claude for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--claude-reasoning-effort",
+        help=(
+            "Change the Claude reasoning effort for the new attempt only; known catalog "
+            "models must use an effort declared by the builtin Claude inventory"
+        ),
+    )
+    plan_retry.add_argument(
+        "--codex-premium-override-reason",
+        help="Change the premium-model override reason for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--expected-result-status",
+        choices=("partial", "completed", "blocked"),
+        help="Change the expected result status for the new attempt only",
+    )
+    plan_retry.add_argument(
+        "--controller-gate-mode",
+        choices=("focused", "full", "none"),
+        help="Change the controller gate mode for the new attempt only",
+    )
 
     plan_cancel = plan_subparsers.add_parser(
         "cancel",

@@ -334,6 +334,74 @@ def test_mcp_model_routing_explain_delegates_and_returns_clean_errors(monkeypatc
     control.model_routing_explain.assert_called_with("adaptive", "missing")
 
 
+def test_mcp_plan_retry_task_forwards_execution_overrides_to_control(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.retry_plan_task.return_value = {"task": {"state": "ready"}}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        result = server.tools["agent_plan_retry_task"](
+            "config-fix",
+            "task",
+            brief_override=None,
+            retry_override_reason=None,
+            allow_awaiting_review=False,
+            route="app",
+            codex_premium_override_reason="approved after cost review",
+        )
+
+    assert result == {"task": {"state": "ready"}}
+    control.retry_plan_task.assert_called_once_with(
+        "config-fix",
+        "task",
+        brief_override=None,
+        retry_override_reason=None,
+        allow_awaiting_review=False,
+        route="app",
+        codex_premium_override_reason="approved after cost review",
+    )
+
+
+def test_mcp_plan_retry_task_omits_unset_overrides_and_returns_clean_errors(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.retry_plan_task.side_effect = ValueError("Plan task is not eligible for retry")
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        result = server.tools["agent_plan_retry_task"]("config-fix", "task")
+
+    assert result == {"ok": False, "error": "Plan task is not eligible for retry"}
+    control.retry_plan_task.assert_called_once_with(
+        "config-fix",
+        "task",
+        brief_override=None,
+        retry_override_reason=None,
+        allow_awaiting_review=False,
+    )
+
+
 def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")

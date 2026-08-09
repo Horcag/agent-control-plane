@@ -526,32 +526,23 @@ def build_server(
             overrides["depends_on"] = tuple(depends_on)
         if brief is not None:
             overrides["brief"] = brief
-        if route is not None:
-            overrides["route"] = route
-        if slot is not None:
-            overrides["slot"] = slot
-        if backend is not None:
-            overrides["backend"] = backend
-        if workspace_access is not None:
-            overrides["workspace_access"] = workspace_access
-        if read_only is not None:
-            overrides["read_only"] = read_only
-        if codex_quality_tier is not None:
-            overrides["codex_quality_tier"] = codex_quality_tier
-        if codex_model is not None:
-            overrides["codex_model"] = codex_model
-        if codex_reasoning_effort is not None:
-            overrides["codex_reasoning_effort"] = codex_reasoning_effort
-        if claude_model is not None:
-            overrides["claude_model"] = claude_model
-        if claude_reasoning_effort is not None:
-            overrides["claude_reasoning_effort"] = claude_reasoning_effort
-        if codex_premium_override_reason is not None:
-            overrides["codex_premium_override_reason"] = codex_premium_override_reason
-        if expected_result_status is not None:
-            overrides["expected_result_status"] = expected_result_status
-        if controller_gate_mode is not None:
-            overrides["controller_gate_mode"] = controller_gate_mode
+        overrides.update(
+            _plan_execution_field_overrides(
+                route=route,
+                slot=slot,
+                backend=backend,
+                workspace_access=workspace_access,
+                read_only=read_only,
+                codex_quality_tier=codex_quality_tier,
+                codex_model=codex_model,
+                codex_reasoning_effort=codex_reasoning_effort,
+                claude_model=claude_model,
+                claude_reasoning_effort=claude_reasoning_effort,
+                codex_premium_override_reason=codex_premium_override_reason,
+                expected_result_status=expected_result_status,
+                controller_gate_mode=controller_gate_mode,
+            )
+        )
         try:
             return control.edit_plan_task(plan_id, task_id, **overrides)
         except (KeyError, ValueError) as exc:
@@ -670,13 +661,45 @@ def build_server(
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
         allow_awaiting_review: bool = False,
+        route: str | None = None,
+        slot: str | None = None,
+        backend: str | None = None,
+        workspace_access: str | None = None,
+        read_only: bool | None = None,
+        codex_quality_tier: str | None = None,
+        codex_model: str | None = None,
+        codex_reasoning_effort: str | None = None,
+        claude_model: str | None = None,
+        claude_reasoning_effort: str | None = None,
+        codex_premium_override_reason: str | None = None,
+        expected_result_status: str | None = None,
+        controller_gate_mode: str | None = None,
     ) -> dict[str, Any]:
         """Explicitly make a failed task eligible for a new dispatch attempt.
 
         `allow_awaiting_review` is an explicit opt-in to retry a task that is still
         `awaiting_review` (its pending handoff is rejected first) so accidental
         double-runs of a task the root has not decided on stay impossible by default.
+
+        The execution overrides (route through controller_gate_mode) apply only to the
+        new attempt being created; only fields explicitly passed here are changed, and
+        the durable record of the attempt that already ran is untouched.
         """
+        overrides = _plan_execution_field_overrides(
+            route=route,
+            slot=slot,
+            backend=backend,
+            workspace_access=workspace_access,
+            read_only=read_only,
+            codex_quality_tier=codex_quality_tier,
+            codex_model=codex_model,
+            codex_reasoning_effort=codex_reasoning_effort,
+            claude_model=claude_model,
+            claude_reasoning_effort=claude_reasoning_effort,
+            codex_premium_override_reason=codex_premium_override_reason,
+            expected_result_status=expected_result_status,
+            controller_gate_mode=controller_gate_mode,
+        )
         try:
             return control.retry_plan_task(
                 plan_id,
@@ -684,6 +707,7 @@ def build_server(
                 brief_override=brief_override,
                 retry_override_reason=retry_override_reason,
                 allow_awaiting_review=allow_awaiting_review,
+                **overrides,
             )
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -1075,6 +1099,42 @@ def _plan_task_definitions(payload: list[dict[str, Any]]) -> tuple[PlanTaskDefin
             )
         )
     return tuple(definitions)
+
+
+def _plan_execution_field_overrides(
+    *,
+    route: str | None,
+    slot: str | None,
+    backend: str | None,
+    workspace_access: str | None,
+    read_only: bool | None,
+    codex_quality_tier: str | None,
+    codex_model: str | None,
+    codex_reasoning_effort: str | None,
+    claude_model: str | None,
+    claude_reasoning_effort: str | None,
+    codex_premium_override_reason: str | None,
+    expected_result_status: str | None,
+    controller_gate_mode: str | None,
+) -> dict[str, Any]:
+    """Non-None execution-spec fields, shared by `agent_plan_edit_task` and
+    `agent_plan_retry_task` so the two surfaces cannot drift apart."""
+    candidates = {
+        "route": route,
+        "slot": slot,
+        "backend": backend,
+        "workspace_access": workspace_access,
+        "read_only": read_only,
+        "codex_quality_tier": codex_quality_tier,
+        "codex_model": codex_model,
+        "codex_reasoning_effort": codex_reasoning_effort,
+        "claude_model": claude_model,
+        "claude_reasoning_effort": claude_reasoning_effort,
+        "codex_premium_override_reason": codex_premium_override_reason,
+        "expected_result_status": expected_result_status,
+        "controller_gate_mode": controller_gate_mode,
+    }
+    return {key: value for key, value in candidates.items() if value is not None}
 
 
 def _plan_execution_spec(payload: Any) -> PlanExecutionSpec | None:

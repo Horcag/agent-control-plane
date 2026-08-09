@@ -378,6 +378,114 @@ def test_cli_edit_task_updates_brief_in_place_before_first_dispatch(tmp_path: Pa
     assert dispatched["claimed"] == 1
 
 
+def test_plan_retry_parser_exposes_the_same_execution_overrides_as_edit_task() -> None:
+    retry = _build_parser().parse_args(
+        [
+            "plan",
+            "retry",
+            "transfer",
+            "schema",
+            "--brief-file",
+            "repair.md",
+            "--route",
+            "app",
+            "--slot",
+            "acp-2",
+            "--backend",
+            "claude",
+            "--workspace-access",
+            "native",
+            "--read-only",
+            "--codex-quality-tier",
+            "premium",
+            "--codex-model",
+            "gpt-5.3-codex-spark",
+            "--codex-reasoning-effort",
+            "high",
+            "--claude-model",
+            "claude-cheap",
+            "--claude-reasoning-effort",
+            "low",
+            "--codex-premium-override-reason",
+            "approved after cost review",
+            "--expected-result-status",
+            "partial",
+            "--controller-gate-mode",
+            "focused",
+            "--retry-override-reason",
+            "config fix",
+        ]
+    )
+
+    assert retry.plan_command == "retry"
+    assert retry.route == "app"
+    assert retry.slot == "acp-2"
+    assert retry.backend == "claude"
+    assert retry.workspace_access == "native"
+    assert retry.read_only is True
+    assert retry.codex_quality_tier == "premium"
+    assert retry.codex_model == "gpt-5.3-codex-spark"
+    assert retry.codex_reasoning_effort == "high"
+    assert retry.claude_model == "claude-cheap"
+    assert retry.claude_reasoning_effort == "low"
+    assert retry.codex_premium_override_reason == "approved after cost review"
+    assert retry.expected_result_status == "partial"
+    assert retry.controller_gate_mode == "focused"
+    assert retry.retry_override_reason == "config fix"
+
+    bare = _build_parser().parse_args(["plan", "retry", "transfer", "schema"])
+    assert bare.route is None
+    assert bare.read_only is None
+
+
+def test_cli_retry_with_config_override_repairs_a_bad_execution_config(tmp_path: Path) -> None:
+    """The live 2026-08-09 case: a task dispatched with a premium model and no override
+    reason fails dispatch; `plan retry` must be able to repair the config, not just the
+    brief."""
+    config = tmp_path / "workspaces.toml"
+    config.write_text(_config_text(tmp_path), encoding="utf-8")
+    manifest = tmp_path / "plan.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "plan_id": "config-fix",
+                "title": "Config fix",
+                "tasks": [
+                    {
+                        "task_id": "task",
+                        "title": "Task",
+                        "execution": {"route": "missing", "brief": "Fail safely"},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _run_cli(tmp_path, "plan", "create", "--manifest", str(manifest), "--config", str(config))
+    _run_cli(tmp_path, "plan", "dispatch", "config-fix", "--config", str(config))
+    retried = _run_cli(
+        tmp_path,
+        "plan",
+        "retry",
+        "config-fix",
+        "task",
+        "--route",
+        "app",
+        "--codex-premium-override-reason",
+        "approved after cost review",
+        "--config",
+        str(config),
+    )
+
+    assert retried["task"]["state"] == "ready"
+    assert retried["task"]["execution"]["route"] == "app"
+    assert (
+        retried["task"]["execution"]["codex_premium_override_reason"]
+        == "approved after cost review"
+    )
+
+
 def test_plan_add_task_parser_rejects_invalid_controller_contract() -> None:
     with pytest.raises(SystemExit):
         _build_parser().parse_args(

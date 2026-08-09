@@ -12,6 +12,7 @@ from agent_control_plane.entities.plan import (
     PlanExecutionSpec,
     PlanStore,
     PlanTaskDefinition,
+    apply_execution_overrides,
 )
 from agent_control_plane.entities.review_inbox import ReviewInboxStore
 from agent_control_plane.features.plan_supervision.lib.dispatcher import (
@@ -154,12 +155,19 @@ class PlanService:
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
         allow_awaiting_review: bool = False,
+        **execution_overrides: Any,
     ) -> dict[str, Any]:
         task = self._plan_store.get_task(plan_id, task_id)
         execution = task["execution"]
         if execution is None:
             raise ValueError(f"Plan task has no execution specification: {plan_id}/{task_id}")
-        would_be_fingerprint = fingerprint_from_spec(execution, brief_override=brief_override)
+        would_be_execution, _ = apply_execution_overrides(
+            execution,
+            brief_override=brief_override,
+            retry_override_reason=retry_override_reason,
+            **execution_overrides,
+        )
+        would_be_fingerprint = fingerprint_from_spec(would_be_execution)
         needs_revision, escalated_fingerprint = circuit_breaker_state(
             self._plan_store, self._job_store, plan_id, task_id
         )
@@ -190,6 +198,7 @@ class PlanService:
             brief_override=brief_override,
             retry_override_reason=retry_override_reason,
             allow_awaiting_review=allow_awaiting_review,
+            **execution_overrides,
         )
         return {"task": retried, "snapshot": self._plan_store.snapshot(plan_id)}
 

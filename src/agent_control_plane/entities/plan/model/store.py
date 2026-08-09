@@ -796,12 +796,29 @@ class PlanStore:
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
         allow_awaiting_review: bool = False,
+        route: Any = _UNSET,
+        slot: Any = _UNSET,
+        backend: Any = _UNSET,
+        workspace_access: Any = _UNSET,
+        read_only: Any = _UNSET,
+        codex_quality_tier: Any = _UNSET,
+        codex_model: Any = _UNSET,
+        codex_reasoning_effort: Any = _UNSET,
+        claude_model: Any = _UNSET,
+        claude_reasoning_effort: Any = _UNSET,
+        codex_premium_override_reason: Any = _UNSET,
+        expected_result_status: Any = _UNSET,
+        controller_gate_mode: Any = _UNSET,
     ) -> dict[str, Any]:
         """Explicitly clear a failed/rejected attempt so it may be dispatched again.
 
         `awaiting_review` is only retryable when `allow_awaiting_review` is set: the
         pending handoff is rejected first (same transaction, reusing the reject path)
         so the inbox record and review_status stay consistent with a root decision.
+
+        The execution overrides (route through controller_gate_mode, sentinel-gated the
+        same way `edit_task` handles them) apply only to the new attempt being created;
+        the durable record of the attempt that already ran is untouched.
         """
         self.initialize()
         with self._connect() as db:
@@ -821,35 +838,24 @@ class PlanStore:
             execution = _execution_from_json(task["execution_json"])
             if execution is None:
                 raise ValueError(f"Plan task has no execution specification: {plan_id}/{task_id}")
-            if brief_override is not None or retry_override_reason is not None:
-                execution = PlanExecutionSpec(
-                    route=execution.route,
-                    brief=(
-                        _required("brief_override", brief_override)
-                        if brief_override is not None
-                        else execution.brief
-                    ),
-                    slot=execution.slot,
-                    backend=execution.backend,
-                    workspace_access=execution.workspace_access,
-                    read_only=execution.read_only,
-                    codex_quality_tier=execution.codex_quality_tier,
-                    codex_model=execution.codex_model,
-                    codex_reasoning_effort=execution.codex_reasoning_effort,
-                    claude_model=execution.claude_model,
-                    claude_reasoning_effort=execution.claude_reasoning_effort,
-                    codex_premium_override_reason=execution.codex_premium_override_reason,
-                    expected_result_status=execution.expected_result_status,
-                    controller_gate_mode=execution.controller_gate_mode,
-                    expected_base_sha=execution.expected_base_sha,
-                    effective_scope=execution.effective_scope,
-                    codex_tool_call_budget=execution.codex_tool_call_budget,
-                    retry_override_reason=(
-                        retry_override_reason
-                        if retry_override_reason is not None
-                        else execution.retry_override_reason
-                    ),
-                )
+            execution, changed_fields = apply_execution_overrides(
+                execution,
+                brief_override=brief_override,
+                retry_override_reason=retry_override_reason,
+                route=route,
+                slot=slot,
+                backend=backend,
+                workspace_access=workspace_access,
+                read_only=read_only,
+                codex_quality_tier=codex_quality_tier,
+                codex_model=codex_model,
+                codex_reasoning_effort=codex_reasoning_effort,
+                claude_model=claude_model,
+                claude_reasoning_effort=claude_reasoning_effort,
+                codex_premium_override_reason=codex_premium_override_reason,
+                expected_result_status=expected_result_status,
+                controller_gate_mode=controller_gate_mode,
+            )
             now = utc_now()
             db.execute(
                 """
@@ -863,11 +869,17 @@ class PlanStore:
                 """,
                 (_execution_json(execution), now, plan_id, task_id),
             )
+            event_payload: dict[str, Any] = {
+                "previous_state": task["state"],
+                "attempt_no": int(task["attempt_no"]),
+            }
+            if changed_fields:
+                event_payload["changed_fields"] = changed_fields
             self._add_event(
                 db,
                 plan_id,
                 "task_retry_requested",
-                {"previous_state": task["state"], "attempt_no": int(task["attempt_no"])},
+                event_payload,
                 task_id=task_id,
             )
             self._refresh_ready_states(db, plan_id)
@@ -1814,6 +1826,99 @@ class PlanStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         with control_database(self.database_path) as db:
             yield db
+
+
+def apply_execution_overrides(
+    execution: PlanExecutionSpec,
+    *,
+    brief_override: str | None = None,
+    retry_override_reason: str | None = None,
+    route: Any = _UNSET,
+    slot: Any = _UNSET,
+    backend: Any = _UNSET,
+    workspace_access: Any = _UNSET,
+    read_only: Any = _UNSET,
+    codex_quality_tier: Any = _UNSET,
+    codex_model: Any = _UNSET,
+    codex_reasoning_effort: Any = _UNSET,
+    claude_model: Any = _UNSET,
+    claude_reasoning_effort: Any = _UNSET,
+    codex_premium_override_reason: Any = _UNSET,
+    expected_result_status: Any = _UNSET,
+    controller_gate_mode: Any = _UNSET,
+) -> tuple[PlanExecutionSpec, list[str]]:
+    """Build the execution spec a retry with these overrides would produce.
+
+    Sentinel-gated the same way `edit_task` handles its overrides: an omitted field
+    (left at `_UNSET`) carries the stored value forward unchanged, so callers can
+    compute the exact spec a would-be retry attempt will run (for the circuit-breaker
+    fingerprint check) before committing it. Returns the resulting spec plus the list
+    of field names actually overridden, for the durable event trail.
+    """
+    field_overrides = {
+        "route": route,
+        "slot": slot,
+        "backend": backend,
+        "workspace_access": workspace_access,
+        "read_only": read_only,
+        "codex_quality_tier": codex_quality_tier,
+        "codex_model": codex_model,
+        "codex_reasoning_effort": codex_reasoning_effort,
+        "claude_model": claude_model,
+        "claude_reasoning_effort": claude_reasoning_effort,
+        "codex_premium_override_reason": codex_premium_override_reason,
+        "expected_result_status": expected_result_status,
+        "controller_gate_mode": controller_gate_mode,
+    }
+    changed_fields = [name for name, value in field_overrides.items() if value is not _UNSET]
+    if brief_override is not None:
+        changed_fields.append("brief")
+    if retry_override_reason is not None:
+        changed_fields.append("retry_override_reason")
+    if not changed_fields:
+        return execution, changed_fields
+    overridden = PlanExecutionSpec(
+        route=_pick(field_overrides["route"], execution.route),
+        brief=(
+            _required("brief_override", brief_override)
+            if brief_override is not None
+            else execution.brief
+        ),
+        slot=_pick(field_overrides["slot"], execution.slot),
+        backend=_pick(field_overrides["backend"], execution.backend),
+        workspace_access=_pick(field_overrides["workspace_access"], execution.workspace_access),
+        read_only=_pick(field_overrides["read_only"], execution.read_only),
+        codex_quality_tier=_pick(
+            field_overrides["codex_quality_tier"], execution.codex_quality_tier
+        ),
+        codex_model=_pick(field_overrides["codex_model"], execution.codex_model),
+        codex_reasoning_effort=_pick(
+            field_overrides["codex_reasoning_effort"], execution.codex_reasoning_effort
+        ),
+        claude_model=_pick(field_overrides["claude_model"], execution.claude_model),
+        claude_reasoning_effort=_pick(
+            field_overrides["claude_reasoning_effort"], execution.claude_reasoning_effort
+        ),
+        codex_premium_override_reason=_pick(
+            field_overrides["codex_premium_override_reason"],
+            execution.codex_premium_override_reason,
+        ),
+        expected_result_status=_pick(
+            field_overrides["expected_result_status"], execution.expected_result_status
+        ),
+        controller_gate_mode=_pick(
+            field_overrides["controller_gate_mode"], execution.controller_gate_mode
+        ),
+        expected_base_sha=execution.expected_base_sha,
+        effective_scope=execution.effective_scope,
+        codex_tool_call_budget=execution.codex_tool_call_budget,
+        retry_override_reason=(
+            retry_override_reason
+            if retry_override_reason is not None
+            else execution.retry_override_reason
+        ),
+    )
+    return overridden, changed_fields
 
 
 def _execution_json(execution: PlanExecutionSpec) -> str:

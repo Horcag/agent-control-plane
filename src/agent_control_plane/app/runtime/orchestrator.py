@@ -718,6 +718,7 @@ class AgentControlPlane:
         brief_override: str | None = None,
         retry_override_reason: str | None = None,
         allow_awaiting_review: bool = False,
+        **execution_overrides: Any,
     ) -> dict[str, Any]:
         return self.plan_service.retry_plan_task(
             plan_id,
@@ -725,6 +726,7 @@ class AgentControlPlane:
             brief_override=brief_override,
             retry_override_reason=retry_override_reason,
             allow_awaiting_review=allow_awaiting_review,
+            **execution_overrides,
         )
 
     def edit_plan_task(self, plan_id: str, task_id: str, **kwargs: Any) -> dict[str, Any]:
