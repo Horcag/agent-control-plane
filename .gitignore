@@ -28,3 +28,11 @@ config/*.toml
 
 # Generated reports and exports.
 /output/
+
+# The board is machine-local and deliberately never committed. Two reasons, and the
+# second one is not obvious: task text stays off the remote, and -- because this
+# directory sits inside the route root of the `acp` route -- ignored paths never
+# appear in `git status --porcelain`, which is what the route-root guard reads. A
+# versioned board made every board write during a job look like a slot worker
+# editing the route root, and killed the job.
+/kanban/
