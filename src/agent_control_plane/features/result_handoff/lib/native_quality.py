@@ -11,6 +11,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Protocol
 
+from agent_control_plane.features.result_handoff.lib.gate_slot_broker import (
+    NativeQualityGateSlotBroker,
+)
 from agent_control_plane.shared.config import NativeQualityGateConfig
 from agent_control_plane.shared.native_quality import (
     NativeQualityContract,
@@ -60,6 +63,9 @@ class _BinaryOutput(Protocol):
 class NativeQualityGateRunner:
     """Run configured, non-shell checks and persist controller-owned evidence."""
 
+    def __init__(self, *, slot_broker: NativeQualityGateSlotBroker | None = None) -> None:
+        self._slot_broker = slot_broker
+
     def run(
         self,
         *,
@@ -87,15 +93,13 @@ class NativeQualityGateRunner:
             max_parallel=contract.max_parallel,
             full_suite=full_suite,
         )
+        status: str
+        reason: str | None
         if not selected:
             status = "failed"
             reason = "no configured quality gate matched the changed files"
-        elif all(check["outcome"] == "passed" for check in checks):
-            status = "passed"
-            reason = None
         else:
-            status = "failed"
-            reason = "one or more controller quality gates failed"
+            status, reason = _aggregate_check_status(checks)
         report = {
             "schema_version": 3,
             "status": status,
@@ -166,6 +170,46 @@ class NativeQualityGateRunner:
                 output="quality gate working_dir does not exist",
                 command=command,
             )
+        if self._slot_broker is None:
+            return self._spawn_gate(gate, cwd, command, full_suite=full_suite, started=started)
+        remaining = gate.timeout_sec - (time.monotonic() - started)
+        wait_budget = max(0.0, remaining)
+        with self._slot_broker.acquire(holder_pid=os.getpid(), timeout_sec=wait_budget) as acquired:
+            if not acquired:
+                return _check_result(
+                    gate,
+                    cwd,
+                    outcome="timed_out",
+                    exit_code=None,
+                    duration_ms=_duration_ms(started),
+                    output=(
+                        "timed out waiting for a cross-job quality gate execution slot "
+                        f"(limit reached) within {gate.timeout_sec}s"
+                    ),
+                    command=command,
+                )
+            return self._spawn_gate(gate, cwd, command, full_suite=full_suite, started=started)
+
+    def _spawn_gate(
+        self,
+        gate: NativeQualityGateConfig,
+        cwd: Path,
+        command: tuple[str, ...],
+        *,
+        full_suite: bool,
+        started: float,
+    ) -> dict[str, Any]:
+        remaining_timeout_sec = gate.timeout_sec - (time.monotonic() - started)
+        if remaining_timeout_sec <= 0:
+            return _check_result(
+                gate,
+                cwd,
+                outcome="timed_out",
+                exit_code=None,
+                duration_ms=_duration_ms(started),
+                output=f"timed out after {gate.timeout_sec}s",
+                command=command,
+            )
         spawn_env = None
         if full_suite:
             spawn_env = os.environ.copy()
@@ -180,7 +224,7 @@ class NativeQualityGateRunner:
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     check=False,
-                    timeout=gate.timeout_sec,
+                    timeout=remaining_timeout_sec,
                     env=spawn_env,
                 )
             except subprocess.TimeoutExpired:
@@ -243,6 +287,24 @@ def _read_output_tail(output_file: _BinaryOutput) -> str:
     size = output_file.tell()
     output_file.seek(max(0, size - MAX_QUALITY_OUTPUT_CHARS * 4))
     return output_file.read().decode("utf-8", errors="replace")[-MAX_QUALITY_OUTPUT_CHARS:].strip()
+
+
+def _aggregate_check_status(checks: list[dict[str, Any]]) -> tuple[str, str | None]:
+    """Roll per-check outcomes into one report-level verdict.
+
+    A failed check always wins: a confirmed defect must never be masked by a
+    sibling gate that merely ran out of clock. Only when nothing actually
+    failed, but at least one gate timed out, does the report read as
+    ``timed_out`` -- distinct from ``failed`` so a reviewer can tell "we did
+    not find out" from "we found a problem" (both still block review_ready).
+    """
+    if all(check["outcome"] == "passed" for check in checks):
+        return "passed", None
+    if any(check["outcome"] == "failed" for check in checks):
+        return "failed", "one or more controller quality gates failed"
+    if any(check["outcome"] == "timed_out" for check in checks):
+        return "timed_out", "one or more controller quality gates timed out"
+    return "failed", "one or more controller quality gates failed"
 
 
 def _duration_ms(started: float) -> int:
@@ -408,13 +470,13 @@ def _validate_report(
         if not isinstance(check.get("output_tail"), str):
             raise ValueError(f"controller quality report output is invalid for gate {gate.name}")
     status = payload["status"]
-    if status not in {"passed", "failed"}:
-        raise ValueError("controller quality report status must be passed or failed")
-    all_passed = bool(checks) and all(check.get("outcome") == "passed" for check in checks)
-    if (status == "passed") != all_passed:
+    if status not in {"passed", "failed", "timed_out"}:
+        raise ValueError("controller quality report status must be passed, failed, or timed_out")
+    expected_status = "failed" if not checks else _aggregate_check_status(checks)[0]
+    if status != expected_status:
         raise ValueError("controller quality report status contradicts its checks")
     reason = payload["reason"]
     if status == "passed" and reason is not None:
         raise ValueError("passed controller quality report must not contain a failure reason")
-    if status == "failed" and (not isinstance(reason, str) or not reason.strip()):
-        raise ValueError("failed controller quality report requires a reason")
+    if status != "passed" and (not isinstance(reason, str) or not reason.strip()):
+        raise ValueError(f"{status} controller quality report requires a reason")

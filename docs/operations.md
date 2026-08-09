@@ -265,6 +265,24 @@ evidence blocks review readiness. Keep gates read-only and bounded; `run_on = "b
 is for cheap checks worth repeating. Deleted Python files are not passed to file-based
 linters, and `{changed_python_files}` is sorted and workspace-relative.
 
+A controller gate battery's report-level `status` is `passed`, `failed`, or
+`timed_out`: a failed check always wins the roll-up (a confirmed defect must never
+read as merely unresolved), and `timed_out` only appears when nothing failed but at
+least one gate ran out of its configured `timeout_sec`. Both `failed` and `timed_out`
+block `review_ready` identically -- neither can substitute for the other kind of
+evidence -- but the review-inbox item's `verification_bundle.review_blocked_reason`
+(also surfaced in `inbox list`'s `verification_summary`) names which one happened and
+which gates were involved, so a reviewer does not have to open `native-quality.json`
+to tell "we did not find out" from "we found a problem".
+
+`native_quality_max_parallel` (per route) only bounds gate processes *within* one
+job's battery. `[control.defaults] native_quality_global_max_parallel` (default `4`)
+bounds them *across* jobs finalizing at the same time, using the same cross-process
+SQLite lease pattern as the Codex quota broker (`GlobalQuotaBroker`) rather than an
+in-process semaphore, since finalization can happen in separate processes. A gate that
+cannot obtain a slot before its own `timeout_sec` elapses is recorded as `timed_out`
+rather than run past its budget or bypass the bound.
+
 After coordinator loss, run ordinary reconciliation first:
 
 ```powershell

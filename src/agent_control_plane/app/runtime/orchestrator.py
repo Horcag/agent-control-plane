@@ -69,6 +69,7 @@ from agent_control_plane.features.plan_supervision import PlanService
 from agent_control_plane.features.result_handoff import (
     HandoffAcceptanceService,
     NativeQualityGateRunner,
+    NativeQualityGateSlotBroker,
     scan_codex_subagent_completions,
 )
 from agent_control_plane.features.slot_lifecycle import (
@@ -199,6 +200,10 @@ class AgentControlPlane:
                     for domain in config.model_catalog.quota_domains
                 ),
             )
+        self._native_quality_slot_broker = NativeQualityGateSlotBroker(
+            config.database_path,
+            max_parallel=defaults.native_quality_global_max_parallel,
+        )
         self.finalization = FinalizationService(
             config=self.config,
             store=self.store,
@@ -206,7 +211,9 @@ class AgentControlPlane:
             slots=self.slots,
             review_inbox=self.review_inbox,
             quota_broker=self._quota_broker,
-            native_quality_runner=NativeQualityGateRunner(),
+            native_quality_runner=NativeQualityGateRunner(
+                slot_broker=self._native_quality_slot_broker
+            ),
             is_terminal=self._is_terminal,
         )
         self.job_guardrails = JobGuardrails(defaults.forbidden_status_globs)
@@ -337,6 +344,9 @@ class AgentControlPlane:
             "codex_quality_tier": self.config.defaults.codex_quality_tier,
             "workspace_access": self.config.defaults.workspace_access,
             "native_quality_policy": self.config.defaults.native_quality_policy,
+            "native_quality_global_max_parallel": (
+                self.config.defaults.native_quality_global_max_parallel
+            ),
             "terminal_slot_policy": self.config.defaults.terminal_slot_policy,
             "codex_tool_call_budgets": {
                 policy.name: policy.tool_call_budget
@@ -1560,6 +1570,7 @@ def _compact_review_item(
         artifact: dict[str, Any] = raw_artifact if isinstance(raw_artifact, dict) else {}
         payload["verification_summary"] = {
             "review_ready": bundle.get("review_ready"),
+            "review_blocked_reason": bundle.get("review_blocked_reason"),
             "format_valid": result.get("format_valid"),
             "status": result.get("status"),
             "verification_claim_count": len(result.get("verification_claims", [])),

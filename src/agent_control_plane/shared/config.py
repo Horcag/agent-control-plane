@@ -223,6 +223,7 @@ class ControlDefaults:
     codex_sandbox_mode: str = "workspace-write"
     workspace_access: str = "ide_mcp"
     native_quality_policy: str = "worker"
+    native_quality_global_max_parallel: int = 4
     terminal_slot_policy: str = "preserve"
     codex_disabled_mcp_servers: tuple[str, ...] = ()
     codex_forbidden_tool_markers: tuple[str, ...] = ()
@@ -1034,6 +1035,10 @@ def load_config(
         workspace_access=_workspace_access_value(defaults_raw.get("workspace_access", "ide_mcp")),
         native_quality_policy=_native_quality_policy_value(
             defaults_raw.get("native_quality_policy", "worker")
+        ),
+        native_quality_global_max_parallel=_positive_int(
+            defaults_raw.get("native_quality_global_max_parallel", 4),
+            "native_quality_global_max_parallel",
         ),
         terminal_slot_policy=_terminal_slot_policy_value(
             defaults_raw.get("terminal_slot_policy", "preserve")

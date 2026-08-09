@@ -255,23 +255,44 @@ def build_verification_bundle(
         and isinstance(controller_quality.get("payload"), dict)
         and controller_quality["payload"].get("status") == "passed"
     )
+    review_ready = bool(
+        result["format_valid"]
+        and result["status"] == "completed"
+        and expected_status == "completed"
+        and result_contract_matches
+        and controller_gate_mode == "full"
+        and effective_status == "completed"
+        and result_error is None
+        and artifact_error is None
+        and not temporary_patch_artifacts
+        and worker_verification["state"] == "valid"
+        and quality_contract_error is None
+        and worker_quality["status"] in {"passed", "not_required"}
+        and controller_passed
+    )
+    review_blocked_reason = (
+        None
+        if review_ready
+        else _review_blocked_reason(
+            result=result,
+            result_error=result_error,
+            expected_status=expected_status,
+            result_contract_matches=result_contract_matches,
+            controller_gate_mode=controller_gate_mode,
+            effective_status=effective_status,
+            artifact_error=artifact_error,
+            temporary_patch_artifacts=temporary_patch_artifacts,
+            worker_verification=worker_verification,
+            quality_contract_error=quality_contract_error,
+            worker_quality=worker_quality,
+            controller_passed=controller_passed,
+            controller_quality=controller_quality,
+        )
+    )
     return {
         "schema_version": 1,
-        "review_ready": bool(
-            result["format_valid"]
-            and result["status"] == "completed"
-            and expected_status == "completed"
-            and result_contract_matches
-            and controller_gate_mode == "full"
-            and effective_status == "completed"
-            and result_error is None
-            and artifact_error is None
-            and not temporary_patch_artifacts
-            and worker_verification["state"] == "valid"
-            and quality_contract_error is None
-            and worker_quality["status"] in {"passed", "not_required"}
-            and controller_passed
-        ),
+        "review_ready": review_ready,
+        "review_blocked_reason": review_blocked_reason,
         "result": result,
         "result_contract": {
             "expected_status": expected_status,
@@ -320,6 +341,83 @@ def build_verification_bundle(
             "error": artifact_error,
         },
     }
+
+
+def _review_blocked_reason(
+    *,
+    result: dict[str, Any],
+    result_error: str | None,
+    expected_status: str,
+    result_contract_matches: bool,
+    controller_gate_mode: str,
+    effective_status: str,
+    artifact_error: str | None,
+    temporary_patch_artifacts: tuple[str, ...],
+    worker_verification: dict[str, Any],
+    quality_contract_error: str | None,
+    worker_quality: dict[str, Any],
+    controller_passed: bool,
+    controller_quality: dict[str, Any],
+) -> str:
+    """Explain, in one sentence, why `review_ready` is false.
+
+    A reviewer scanning the inbox should not have to dig through nested
+    evidence to tell "we did not find out" (a gate ran out of clock) from
+    "we found a problem" (a gate failed) -- both still block review_ready,
+    but they read differently. Checked in the same order `review_ready`
+    itself evaluates its conjuncts, so the first thing that actually failed
+    is the thing reported.
+    """
+    if result_error is not None:
+        return f"worker result report could not be read: {result_error}"
+    if not result["format_valid"]:
+        return "worker result report is missing a Status line or a mandatory section"
+    if result["status"] != "completed":
+        return f"worker reported status {result['status']!r} instead of completed"
+    if expected_status != "completed" or not result_contract_matches:
+        return "worker result status does not match the expected job contract"
+    if controller_gate_mode != "full":
+        return f"controller gate mode is {controller_gate_mode!r}, not full"
+    if effective_status != "completed":
+        return f"job status is {effective_status!r}, not completed"
+    if artifact_error is not None:
+        return f"checkpoint artifact could not be verified: {artifact_error}"
+    if temporary_patch_artifacts:
+        return "checkpoint contains contaminated temporary patch artifacts"
+    if worker_verification["state"] != "valid":
+        return f"worker verification.json is {worker_verification['state']}"
+    if quality_contract_error is not None:
+        return f"native quality contract is invalid: {quality_contract_error}"
+    if worker_quality["status"] not in {"passed", "not_required"}:
+        reason = worker_quality.get("reason")
+        suffix = f": {reason}" if reason else ""
+        return f"worker quality gates {worker_quality['status']}{suffix}"
+    if not controller_passed:
+        return _controller_blocked_reason(controller_quality)
+    return "review readiness evidence is incomplete"
+
+
+def _controller_blocked_reason(controller_quality: dict[str, Any]) -> str:
+    state = controller_quality.get("state")
+    if state != "valid":
+        error = controller_quality.get("error")
+        suffix = f": {error}" if error else ""
+        return f"controller quality evidence is {state}{suffix}"
+    payload = controller_quality.get("payload")
+    payload_status = payload.get("status") if isinstance(payload, dict) else None
+    checks = payload.get("checks", []) if isinstance(payload, dict) else []
+    if payload_status == "timed_out":
+        names = [check["name"] for check in checks if check.get("outcome") == "timed_out"]
+        gates = ", ".join(names) if names else "a controller quality gate"
+        return (
+            f"{gates} timed out without completing; this is not a confirmed defect, "
+            "just an unresolved check"
+        )
+    if payload_status == "failed":
+        names = [check["name"] for check in checks if check.get("outcome") == "failed"]
+        gates = ", ".join(names) if names else "a controller quality gate"
+        return f"{gates} failed"
+    return f"controller quality gate evidence is inconclusive (status={payload_status!r})"
 
 
 def _assess_worker_quality(

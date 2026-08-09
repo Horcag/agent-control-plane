@@ -5,6 +5,9 @@ from agent_control_plane.features.result_handoff.lib.codex_rollouts import (
     CodexSubagentCompletion,
     scan_codex_subagent_completions,
 )
+from agent_control_plane.features.result_handoff.lib.gate_slot_broker import (
+    NativeQualityGateSlotBroker,
+)
 from agent_control_plane.features.result_handoff.lib.native_quality import (
     NativeQualityGateRunner,
     inspect_native_quality_report,
@@ -29,6 +32,7 @@ __all__ = [
     "CodexSubagentCompletion",
     "HandoffAcceptanceService",
     "NativeQualityGateRunner",
+    "NativeQualityGateSlotBroker",
     "SlotCheckpoint",
     "SlotCheckpointError",
     "build_verification_bundle",

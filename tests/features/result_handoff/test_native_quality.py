@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
 
 from agent_control_plane.features.result_handoff import (
     NativeQualityGateRunner,
+    NativeQualityGateSlotBroker,
     inspect_native_quality_report,
 )
 from agent_control_plane.features.result_handoff.lib.native_quality import (
@@ -377,7 +379,7 @@ def test_controller_quality_fails_closed_for_uncovered_or_failed_changes(
     assert failed["checks"][0]["exit_code"] == 7
 
 
-def test_controller_quality_timeout_is_recorded_as_failed_evidence(tmp_path: Path) -> None:
+def test_controller_quality_timeout_reads_distinctly_from_a_failed_gate(tmp_path: Path) -> None:
     workspace = tmp_path / "repo"
     workspace.mkdir()
     contract = NativeQualityContract(
@@ -399,9 +401,46 @@ def test_controller_quality_timeout_is_recorded_as_failed_evidence(tmp_path: Pat
         contract=contract,
     )
 
-    assert report["status"] == "failed"
+    assert report["status"] == "timed_out"
+    assert report["reason"] == "one or more controller quality gates timed out"
     assert report["checks"][0]["outcome"] == "timed_out"
     assert report["checks"][0]["exit_code"] is None
+
+
+def test_controller_quality_a_failed_gate_outranks_a_timed_out_sibling(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    contract = NativeQualityContract(
+        policy="controller",
+        max_parallel=2,
+        gates=(
+            NativeQualityGateConfig(
+                name="slow",
+                command=(sys.executable, "-c", "import time; time.sleep(5)"),
+                timeout_sec=1,
+                run_on="controller",
+            ),
+            NativeQualityGateConfig(
+                name="broken",
+                command=(sys.executable, "-c", "raise SystemExit(3)"),
+                timeout_sec=10,
+                run_on="controller",
+            ),
+        ),
+    )
+
+    report = NativeQualityGateRunner().run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "mixed",
+        checkpoint_tree_sha="tree-mixed",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+
+    assert report["status"] == "failed"
+    assert report["reason"] == "one or more controller quality gates failed"
+    outcomes = {check["name"]: check["outcome"] for check in report["checks"]}
+    assert outcomes == {"slow": "timed_out", "broken": "failed"}
 
 
 def test_controller_quality_inspection_rejects_contradictory_check_evidence(
@@ -550,3 +589,85 @@ def test_controller_quality_runs_workspace_relative_executable_gate(tmp_path: Pa
 
     assert report["checks"][0]["outcome"] == "passed"
     assert report["status"] == "passed"
+
+
+def test_native_quality_gate_slot_broker_bounds_cross_process_concurrency(tmp_path: Path) -> None:
+    broker = NativeQualityGateSlotBroker(tmp_path / "control.sqlite3", max_parallel=1)
+
+    with broker.acquire(holder_pid=os.getpid(), timeout_sec=5) as first:
+        assert first is True
+        with broker.acquire(holder_pid=os.getpid(), timeout_sec=0.2) as second:
+            assert second is False
+
+
+def test_native_quality_gate_slot_broker_reclaims_a_dead_holders_slot(tmp_path: Path) -> None:
+    broker = NativeQualityGateSlotBroker(tmp_path / "control.sqlite3", max_parallel=1)
+
+    stale_token = broker._try_acquire_once(999_999_999)
+    assert stale_token is not None
+
+    reclaimed_token = broker._try_acquire_once(os.getpid())
+
+    assert reclaimed_token is not None
+    assert reclaimed_token != stale_token
+
+
+def test_controller_quality_reports_timed_out_when_no_cross_job_slot_frees_up(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    broker = NativeQualityGateSlotBroker(
+        tmp_path / "control.sqlite3", max_parallel=1, poll_interval_sec=0.05
+    )
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(
+            NativeQualityGateConfig(
+                name="python",
+                command=(sys.executable, "-c", "print('ok')"),
+                timeout_sec=1,
+            ),
+        ),
+    )
+
+    with broker.acquire(holder_pid=os.getpid(), timeout_sec=5):
+        report = NativeQualityGateRunner(slot_broker=broker).run(
+            workspace_path=workspace,
+            run_dir=tmp_path / "runs" / "cross-job-blocked",
+            checkpoint_tree_sha="tree-cross-job-blocked",
+            changed_files=("src/app.py",),
+            contract=contract,
+        )
+
+    assert report["status"] == "timed_out"
+    assert report["checks"][0]["outcome"] == "timed_out"
+    assert report["checks"][0]["exit_code"] is None
+    assert "cross-job" in report["checks"][0]["output_tail"]
+
+
+def test_controller_quality_runs_normally_once_a_cross_job_slot_is_free(tmp_path: Path) -> None:
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    broker = NativeQualityGateSlotBroker(tmp_path / "control.sqlite3", max_parallel=2)
+    contract = NativeQualityContract(
+        policy="controller",
+        gates=(
+            NativeQualityGateConfig(
+                name="python",
+                command=(sys.executable, "-c", "print('ok')"),
+                timeout_sec=10,
+            ),
+        ),
+    )
+
+    report = NativeQualityGateRunner(slot_broker=broker).run(
+        workspace_path=workspace,
+        run_dir=tmp_path / "runs" / "cross-job-free",
+        checkpoint_tree_sha="tree-cross-job-free",
+        changed_files=("src/app.py",),
+        contract=contract,
+    )
+
+    assert report["status"] == "passed"
+    assert report["checks"][0]["outcome"] == "passed"
