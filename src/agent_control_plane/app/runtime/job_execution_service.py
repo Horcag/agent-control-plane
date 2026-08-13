@@ -612,13 +612,16 @@ class JobExecutionService:
         configured_ide_servers = tuple(
             route.ide_mcp_server for route in self.config.routes.values() if route.ide_mcp_server
         )
-        native_disabled = (
-            *configured_ide_servers,
-            "agentbridge_dataspell_8643",
-            "agentbridge_idea_64343",
-            "agentbridge_idea_8644",
-        )
-        return tuple(dict.fromkeys((*disabled, *native_disabled)))
+        # Only servers this config actually declares. Three AgentBridge names used to
+        # be hardcoded here; they were redundant on the machine they were written for,
+        # whose config already declared all three through codex_disabled_mcp_servers
+        # and the route ide_mcp_server keys, and fatal on every other machine. Codex
+        # rejects `-c mcp_servers.<name>.enabled=false` for a server its own config
+        # never defines: the override synthesizes a server table with no transport,
+        # and the CLI aborts with `invalid transport` before it reads the prompt, so
+        # every native job dies at launch. Operators name their bridges in
+        # codex_disabled_mcp_servers; the control plane does not guess them.
+        return tuple(dict.fromkeys((*disabled, *configured_ide_servers)))
 
     @staticmethod
     def _effective_forbidden_markers(

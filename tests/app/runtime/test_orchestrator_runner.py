@@ -743,7 +743,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIn("native read-only tools", progress)
             self.assertIn("must not update this progress file", progress)
 
-    def test_native_runner_spec_disables_agentbridge_and_allows_raw_exec(self) -> None:
+    def test_native_runner_spec_disables_declared_ide_servers_and_allows_raw_exec(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = _git_repo(root / "repo", "main")
@@ -798,8 +798,6 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                     "custom",
                     "agentbridge_idea_64343",
                     "agentbridge_idea_9999",
-                    "agentbridge_dataspell_8643",
-                    "agentbridge_idea_8644",
                 ),
             )
 
