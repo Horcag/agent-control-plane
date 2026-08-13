@@ -32,6 +32,7 @@ All notable changes are recorded here. This project follows Keep a Changelog.
 
 ### Fixed
 
+- The known-config index (`~/.agent-control-plane/known-configs.json`) no longer grows without bound, no longer collects throwaway test paths, and no longer lets a stray copy win config discovery. Measured on this machine: 7485 entries of which 7471 named files that no longer existed, and 6476 were pytest temp directories - the suite was writing into the operator's real index, which config discovery consults on every resolution. Three changes: `known_configs_path()` honours `ACP_KNOWN_CONFIGS_PATH`, and an autouse fixture points the test suite at a throwaway index through the environment rather than a patch, so tests that spawn a real server subprocess are covered too; `register_known_config` drops entries whose file is gone instead of appending forever (they are re-earned by being used); and a tie between configs whose routes match the working directory equally well is now broken by closeness to that directory before falling back to alphabetical order. That last one was the live bug: a scratchpad copy under `C:\...\Temp` outranked this repository's own `config/workspaces.toml` on `D:` by drive letter alone. Tie-breaking stays deterministic and registration order still does not matter.
 - `agent-control statuses` no longer rejects `--config`. It still requires no config and never loads or validates the path it is handed; scripts that pass `--config` uniformly to every invocation no longer need to special-case `statuses`.
 
 ### Changed

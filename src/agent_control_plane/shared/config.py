@@ -385,7 +385,21 @@ def interprocess_config_lock(config_path: Path) -> Iterator[None]:
 _interprocess_config_lock = interprocess_config_lock
 
 
+KNOWN_CONFIGS_ENV_VAR = "ACP_KNOWN_CONFIGS_PATH"
+
+
 def known_configs_path() -> Path:
+    """Where the known-config index lives.
+
+    Honours ``ACP_KNOWN_CONFIGS_PATH`` so a test run - including one that spawns a real
+    server subprocess, which an in-process patch cannot reach - can keep its throwaway
+    configs out of the operator's index. Config discovery reads this index on every
+    resolution, so anything that leaks into it changes which control plane real calls
+    talk to.
+    """
+    override = os.environ.get(KNOWN_CONFIGS_ENV_VAR)
+    if override:
+        return Path(override).expanduser()
     return Path.home() / ".agent-control-plane" / "known-configs.json"
 
 
@@ -406,10 +420,15 @@ def register_known_config(config_path: Path | str) -> Path:
             except (OSError, ValueError, KeyError):
                 existing = []
 
-        if canonical not in existing:
-            existing.append(canonical)
+        # Every resolution loads and parses each surviving entry, so a dead one is not
+        # free: it is a stat on every lookup, and a stale-but-present copy can win the
+        # match. Entries are cheap to re-earn - using a config registers it again.
+        surviving = [item for item in existing if Path(item).is_file()]
+        if canonical not in surviving:
+            surviving.append(canonical)
+        if surviving != existing:
             tmp_file = cfg_file.with_suffix(".tmp")
-            tmp_file.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+            tmp_file.write_text(json.dumps(surviving, indent=2), encoding="utf-8")
             os.replace(tmp_file, cfg_file)
 
     return path_obj
@@ -466,6 +485,21 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
         except (OSError, ValueError, KeyError, tomllib.TOMLDecodeError):
             continue
 
+    def _distance_from_cwd(norm_cfg_str: str) -> int:
+        """How unrelated a config's own location is to the working directory.
+
+        Used only to break a tie between configs whose routes match cwd equally well.
+        Without it the tie fell to plain alphabetical order, which let a throwaway copy
+        in a temp directory outrank the project's own config by drive letter alone.
+        Lower is closer.
+        """
+        shared = 0
+        for cfg_part, cwd_part in zip(Path(norm_cfg_str).parts, norm_cwd.parts, strict=False):
+            if cfg_part != cwd_part:
+                break
+            shared += 1
+        return -shared
+
     # 1. Longest matching route path where route path equals cwd or cwd is a subdirectory
     rule1_matches: list[tuple[tuple[int, int], str, Path]] = []
     for cfg_path, cfg in loaded_configs:
@@ -489,7 +523,7 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
     if rule1_matches:
         best_score = max(m[0] for m in rule1_matches)
         tied_configs = [m for m in rule1_matches if m[0] == best_score]
-        tied_configs.sort(key=lambda m: m[1])
+        tied_configs.sort(key=lambda m: (_distance_from_cwd(m[1]), m[1]))
         return tied_configs[0][2]
 
     # 2. Nearest .agent-work/workspaces.toml walking upwards from cwd
@@ -530,7 +564,7 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
     if rule3_matches:
         best_score = max(m[0] for m in rule3_matches)
         tied_configs = [m for m in rule3_matches if m[0] == best_score]
-        tied_configs.sort(key=lambda m: m[1])
+        tied_configs.sort(key=lambda m: (_distance_from_cwd(m[1]), m[1]))
         return tied_configs[0][2]
 
     # 4. Fallback default config path

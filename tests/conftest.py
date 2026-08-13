@@ -20,6 +20,22 @@ def isolate_port_assignments_path(tmp_path: Path) -> Generator[Path, None, None]
 
 
 @pytest.fixture(autouse=True)
+def isolate_known_configs_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Generator[Path, None, None]:
+    """Keep throwaway test configs out of the operator's real known-config index.
+
+    Set through the environment rather than by patching, because tests that spawn a
+    real server subprocess register their config from another process, which no
+    in-process patch can reach. Config discovery reads this index on every resolution,
+    so a leaked temp path does not just bloat a file - it can win a real lookup.
+    """
+    index_path = tmp_path / "known-configs.json"
+    monkeypatch.setenv("ACP_KNOWN_CONFIGS_PATH", str(index_path))
+    yield index_path
+
+
+@pytest.fixture(autouse=True)
 def cleanup_test_subprocesses() -> Generator[None, None, None]:
     tracked_processes: list[subprocess.Popen[Any]] = []
     orig_init = subprocess.Popen.__init__

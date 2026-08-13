@@ -1932,6 +1932,77 @@ class ConfigDiscoveryTest(unittest.TestCase):
             # Deterministic winner is cfg_a because str(cfg_a) < str(cfg_b)
             self.assertEqual(res1, cfg_a)
 
+    def test_index_path_follows_the_environment_override(self) -> None:
+        from agent_control_plane.shared.config import KNOWN_CONFIGS_ENV_VAR, known_configs_path
+
+        with tempfile.TemporaryDirectory() as temp:
+            redirected = Path(temp) / "elsewhere" / "known-configs.json"
+            with patch.dict(os.environ, {KNOWN_CONFIGS_ENV_VAR: str(redirected)}):
+                self.assertEqual(known_configs_path(), redirected)
+
+    def test_registering_drops_entries_whose_config_is_gone(self) -> None:
+        import json
+
+        from agent_control_plane.shared.config import register_known_config
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            idx_file = root / "known-configs.json"
+            live = root / "live" / "workspaces.toml"
+            live.parent.mkdir(parents=True)
+            live.write_text("", encoding="utf-8")
+            dead = root / "gone" / "workspaces.toml"
+            idx_file.write_text(json.dumps([str(dead), str(live)]), encoding="utf-8")
+
+            newcomer = root / "newcomer" / "workspaces.toml"
+            newcomer.parent.mkdir(parents=True)
+            newcomer.write_text("", encoding="utf-8")
+
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                register_known_config(newcomer)
+
+            entries = json.loads(idx_file.read_text(encoding="utf-8"))
+            # A dead entry is not free: every resolution stats and parses each survivor.
+            self.assertEqual(entries, [str(live), str(newcomer)])
+
+    def test_tie_breaking_prefers_the_config_nearest_the_working_directory(self) -> None:
+        import json
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            idx_file = root / "known-configs.json"
+            target_dir = root / "project"
+            target_dir.mkdir(parents=True)
+
+            def _write(cfg: Path) -> None:
+                cfg.parent.mkdir(parents=True, exist_ok=True)
+                cfg.write_text(
+                    f'[control]{chr(10)}coordination_root="{(cfg.parent / ".agent-work").as_posix()}"{chr(10)}'
+                    f'runs_root="runs"{chr(10)}database="db"{chr(10)}worktree_root="w"{chr(10)}'
+                    f'worktree_base="b"{chr(10)}slot_root="s"{chr(10)}'
+                    f'[routes.main]{chr(10)}path="{target_dir.as_posix()}"{chr(10)}'
+                    f'required_branch="main"{chr(10)}',
+                    encoding="utf-8",
+                )
+
+            # Both match the working directory equally well, so only the tie-break decides.
+            # The stray copy sorts first alphabetically; the project's own config does not.
+            near = target_dir / "config" / "workspaces.toml"
+            stray = root / "aaa-stray" / "workspaces.toml"
+            _write(near)
+            _write(stray)
+            self.assertLess(str(stray), str(near))
+
+            idx_file.write_text(json.dumps([str(stray), str(near)]), encoding="utf-8")
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=idx_file,
+            ):
+                self.assertEqual(resolve_config_for(target_dir), near)
+
     def test_port_for_properties(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()
