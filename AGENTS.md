@@ -20,7 +20,10 @@
   `queued` or `running`.
 - To watch delegated work, use `agent-control watch <job-id>... --events` (see
   `docs/operations.md#watching-jobs-as-an-event-stream`) and read its exit code; do not
-  write a hand-rolled status poll loop.
+  write a hand-rolled status poll loop. Without a shell, use the MCP tool
+  `agent_watch_events`, round-tripping its `cursor` and stopping on `done`. Never retype
+  the terminal-status list: it ships in every watch response and in
+  `agent_terminal_statuses`.
 - Workers run verification synchronously and do not get background watchers; `Monitor` is
   deliberately absent from `claude_allowed_tools`. Watching delegated jobs is the root's job via
   `agent-control watch --events`. Widening the worker allowlist is an operator configuration

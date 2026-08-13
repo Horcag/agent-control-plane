@@ -1,7 +1,9 @@
 from agent_control_plane.features.job_watch.lib.event_stream import (
+    CURSOR_VERSION,
     DEFAULT_STALE_AFTER_SEC,
     EVENT_KINDS,
     FINALIZATION_SETTLED_STATUSES,
+    FINALIZATION_SLACK_SEC,
     RESUMED,
     STALE,
     START,
@@ -14,12 +16,15 @@ from agent_control_plane.features.job_watch.lib.event_stream import (
     WatchSelection,
     is_on_contract,
     is_settled,
+    watch_command_for,
 )
 
 __all__ = [
+    "CURSOR_VERSION",
     "DEFAULT_STALE_AFTER_SEC",
     "EVENT_KINDS",
     "FINALIZATION_SETTLED_STATUSES",
+    "FINALIZATION_SLACK_SEC",
     "RESUMED",
     "STALE",
     "START",
@@ -32,4 +37,5 @@ __all__ = [
     "WatchSelection",
     "is_on_contract",
     "is_settled",
+    "watch_command_for",
 ]

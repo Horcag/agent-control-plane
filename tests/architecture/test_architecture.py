@@ -25,7 +25,7 @@ def test_project_architecture(monkeypatch) -> None:
 # that correspondence: the test below fails if a new MCP tool is added without extending
 # it, if a mapped CLI command path stops parsing, or if the mapping goes stale because a
 # tool was renamed or removed. It does not check the reverse direction (CLI commands with
-# no MCP mirror, e.g. `demo`, `review`, `manager`, `mcp`, `statuses`, `list`, `run-job`)
+# no MCP mirror, e.g. `demo`, `review`, `manager`, `mcp`, `list`, `run-job`)
 # because many CLI-only commands are intentionally local (offline demo, MCP server
 # lifecycle, root-review cost accounting) and a mechanical reverse mapping would just be
 # restating the CLI subcommand list.
@@ -75,8 +75,10 @@ MCP_TOOL_TO_CLI_COMMAND_PATH = {
     "agent_start_job": ("start",),
     "agent_status_job": ("status",),
     "agent_summary_job": ("summary",),
+    "agent_terminal_statuses": ("statuses",),
     "agent_sync_subagent_results": ("inbox", "sync-subagents"),
     "agent_tail_job": ("tail",),
+    "agent_watch_events": ("watch",),
     "agent_watch_job": ("watch",),
 }
 

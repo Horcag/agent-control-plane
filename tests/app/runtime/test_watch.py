@@ -5,14 +5,20 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import asyncio
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
+from agent_control_plane.entities.job import TERMINAL_STATUSES
 from agent_control_plane.entities.plan import PlanTaskDefinition
+from agent_control_plane.features.job_watch import (
+    FINALIZATION_SLACK_SEC,
+    EmptySelectionError,
+)
 from agent_control_plane.shared.config import (
     CodexModelCatalogConfig,
     CodexQuotaDomainConfig,
@@ -341,17 +347,17 @@ def _brief(coordination_root: Path, task_id: str) -> None:
     (task_dir / "brief.md").write_text("# Brief\n", encoding="utf-8")
 
 
-def _create_job(control: AgentControlPlane, root: Path, job_id: str):
+def _create_job(control: AgentControlPlane, root: Path, job_id: str, task_id: str = "task-1"):
     return control.store.create_job(
         job_id=job_id,
-        task_id="task-1",
+        task_id=task_id,
         route="main",
         workspace_path=root / "workspace",
         expected_branch="main",
         config_path=root / "workspaces.toml",
         run_dir=root / "runs" / job_id,
         prompt_path=root / "runs" / job_id / "prompt.md",
-        result_path=root / "tasks" / "task-1" / "result.md",
+        result_path=root / "tasks" / task_id / "result.md",
         timeout_sec=10,
         idle_timeout_sec=5,
         print_timeout="10s",
@@ -434,6 +440,172 @@ def _model_catalog(root: Path) -> CodexModelCatalogConfig:
         models=(),
         quota_domains=(CodexQuotaDomainConfig("primary", 2, 8, 75.0),),
     )
+
+
+class WatchEventsTest(unittest.TestCase):
+    """`watch_events` is the non-blocking pass an MCP client polls with a cursor."""
+
+    def _settle(self, control: AgentControlPlane, job) -> None:
+        job.result_path.parent.mkdir(parents=True, exist_ok=True)
+        job.result_path.write_text("Status: completed\n", encoding="utf-8")
+        control.store.mark_finished(job.job_id, "completed")
+        control.store.mark_finalization_completed(job.job_id)
+
+    def test_settled_job_reports_done_with_the_terminal_vocabulary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-events-1")
+            self._settle(control, job)
+
+            payload = control.watch_events(job_ids=[job.job_id])
+
+            self.assertTrue(payload["done"])
+            self.assertEqual(payload["pending"], [])
+            self.assertEqual([event["kind"] for event in payload["events"]], ["terminal"])
+            self.assertEqual(payload["events"][0]["status"], "completed")
+            # The response carries the vocabulary so a caller never retypes it.
+            self.assertEqual(payload["terminal_statuses"], sorted(TERMINAL_STATUSES))
+
+    def test_cursor_suppresses_replay_across_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-events-2")
+
+            first = control.watch_events(job_ids=[job.job_id])
+            self.assertEqual([event["kind"] for event in first["events"]], ["start"])
+            self.assertFalse(first["done"])
+
+            second = control.watch_events(job_ids=[job.job_id], cursor=first["cursor"])
+            self.assertEqual(second["events"], [])
+
+            self._settle(control, job)
+            third = control.watch_events(job_ids=[job.job_id], cursor=second["cursor"])
+            self.assertEqual([event["kind"] for event in third["events"]], ["terminal"])
+            self.assertTrue(third["done"])
+
+    def test_status_that_never_goes_terminal_is_surfaced_not_waited_on(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-events-3")
+            # cancel_requested is not terminal and can stay that way indefinitely.
+            # A watcher must be able to see that rather than poll until its timeout.
+            control.store.update_job(job.job_id, status="cancel_requested")
+
+            payload = control.watch_events(job_ids=[job.job_id])
+
+            self.assertFalse(payload["done"])
+            self.assertEqual(
+                payload["pending"],
+                [{"job_id": job.job_id, "status": "cancel_requested"}],
+            )
+            self.assertNotIn("cancel_requested", payload["terminal_statuses"])
+
+    def test_task_glob_selection_follows_every_matching_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            first = _create_job(control, root, "job-events-4a", task_id="task-4a")
+            second = _create_job(control, root, "job-events-4b", task_id="task-4b")
+
+            payload = control.watch_events(task_id_glob="task-4*")
+
+            self.assertEqual(sorted(payload["watched"]), sorted([first.job_id, second.job_id]))
+
+    def test_selection_matching_nothing_raises_instead_of_reporting_done(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+
+            with self.assertRaises(EmptySelectionError):
+                control.watch_events(task_id_glob="no-such-task-*")
+
+
+class SupervisionHandoffTest(unittest.TestCase):
+    """Launching supervises nothing, so every launch has to say how to supervise."""
+
+    def test_watch_command_covers_the_launched_job_and_outlives_finalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-supervise-1")
+
+            supervision = control.supervision_for([job.job_id])
+
+            self.assertFalse(supervision["supervised"])
+            command = supervision["watch_command"]
+            self.assertIn("watch --events", command)
+            self.assertIn(job.job_id, command)
+            self.assertIn(str(root / "workspaces.toml"), command)
+            # The job's own timeout plus finalization slack — not an invented number.
+            expected = int(job.timeout_sec + FINALIZATION_SLACK_SEC)
+            self.assertIn(f"--timeout-sec {expected}", command)
+
+    def test_unknown_job_ids_do_not_break_the_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+
+            supervision = control.supervision_for(["never-existed"])
+
+            self.assertIn("never-existed", supervision["watch_command"])
+            self.assertIn("--timeout-sec", supervision["watch_command"])
+
+
+class WatchEventsSnapshotNudgeTest(unittest.TestCase):
+    """A pass that is not done must not read as a subscription."""
+
+    def _call(self, payload: dict) -> dict:
+        from agent_control_plane.app.runtime.mcp_server import build_server
+
+        control = Mock()
+        control.watch_events.return_value = payload
+        control.supervision_for.return_value = {
+            "supervised": False,
+            "watch_command": "agent-control watch --events job-1",
+            "note": "n/a",
+        }
+        with patch(
+            "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+            return_value=control,
+        ):
+            server = build_server()
+        return asyncio.run(
+            server._tool_manager.call_tool("agent_watch_events", {"job_ids": ["job-1"]})
+        )
+
+    def test_unfinished_pass_says_nothing_will_notify_you(self) -> None:
+        result = self._call(
+            {
+                "watched": ["job-1"],
+                "events": [],
+                "cursor": {"v": 1, "jobs": {}},
+                "done": False,
+                "pending": [{"job_id": "job-1", "status": "running"}],
+                "terminal_statuses": [],
+            }
+        )
+
+        self.assertIn("snapshot_only", result)
+        self.assertIn("not a subscription", result["snapshot_only"])
+        self.assertEqual(result["watch_command"], "agent-control watch --events job-1")
+
+    def test_finished_pass_carries_no_nudge(self) -> None:
+        result = self._call(
+            {
+                "watched": ["job-1"],
+                "events": [],
+                "cursor": {"v": 1, "jobs": {}},
+                "done": True,
+                "pending": [],
+                "terminal_statuses": [],
+            }
+        )
+
+        self.assertNotIn("snapshot_only", result)
+        self.assertNotIn("watch_command", result)
 
 
 if __name__ == "__main__":

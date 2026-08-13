@@ -114,14 +114,13 @@ of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
 
 ### MCP coordinators: watch parity and its limits
 
-`watch --events` is deliberately CLI-only. It streams because a shell process can hold a
-connection open and print lines as they arrive; MCP has no equivalent streaming
-transport, so `agent_watch_job` can only be a blocking long poll for one job, and
-`agent_start_job(..., wait=True)` folds one such poll into the start call. That
-asymmetry is intentional: the CLI event stream stays the primary watcher surface, and
-`AGENTS.md` still tells root agents to watch via `agent-control watch <job-id>...
---events`. This section documents what an MCP-only coordinator gets instead, not a
-recommendation to prefer it.
+The CLI `watch --events` *streams*: a shell process holds a connection open and prints
+lines as they arrive. MCP has no equivalent streaming transport, so that exact shape
+cannot be mirrored. What MCP does have is `agent_watch_events`, the same event vocabulary
+and the same selection (`job_ids`, `plan_id`, `task_glob`) delivered one non-blocking
+pass at a time — see "Non-blocking event polling over MCP" below. A shell-capable root
+agent should still prefer the CLI, because it gets push-shaped output and an exit code;
+an MCP-only coordinator now has a first-class tool instead of a hand-rolled poll loop.
 
 `agent_watch_job` and `agent_start_job(wait=True)` now carry the same settled/on-contract
 verdict the CLI exit code encodes, reusing `is_settled`/`is_on_contract` from
@@ -144,33 +143,49 @@ observe a whole job — in the worst case a coordinator needs a dozen sequential
 calls per job, each re-quoting `job_id`, to reach a settled verdict, and gets no push
 notification in between.
 
-Concretely, an MCP-only coordinator should:
+### Non-blocking event polling over MCP
 
-- Call `agent_watch_job` (or `agent_start_job(wait=True)`) in a loop, checking `settled`
-  first and `on_contract` only once `settled` is `true`; treat `timed_out` (not an error)
-  as "call again".
-- For several jobs at once, prefer `agent_plan_snapshot`/`agent_plan_watch` with the
-  `since` cursor when the jobs are plan tasks, rather than polling each job id
-  individually — it already returns only the deltas since the caller's last cursor.
-- Not attempt to raise `timeout_sec` past the cap to reduce call volume; budget for
-  repeated calls instead.
+`agent_watch_events` takes one pass over a selection and returns immediately. Because it
+never holds a call open, job duration no longer bounds what a coordinator can follow: a
+60-minute job is as watchable as a 60-second one.
 
-**Multi-job, non-blocking, cursor-style polling for arbitrary job selections (mirroring
-the CLI's `WatchSelection` — job ids, `plan_id`, `task_id_glob` — over
-`WatchEventStream.tick()`) was investigated for this task and deliberately not built.**
-Unlike plan events, which are backed by a durable, replayable event log that a `since`
-cursor can index into, `WatchEventStream`'s START/TRANSITION/TERMINAL/STALE/RESUMED
-events are computed by diffing each tick against in-memory state (`_JobWatchState`) held
-by one long-lived stream instance. A stateless MCP call has no such instance to diff
-against. Making a cursor meaningful across calls would require either keeping one
-`WatchEventStream` alive per caller-chosen selection inside the MCP server process
-(new, unbounded session state with no natural eviction point, and state that a server
-restart silently drops) or fabricating a cursor with no real event log behind it, which
-would report a full `START` snapshot on every call rather than genuine deltas. Both are a
-materially larger feature than this task's scope and risk exactly the kind of
-half-finished addition this project's conventions warn against. If a future task wants
-this, the event log needs to become durable (comparable to `plan_tasks`/plan events)
-before a cursor can mean what it means for `agent_plan_watch`.
+```text
+agent_watch_events(job_ids=[...] | plan_id=... | task_glob=..., cursor=<previous cursor>)
+  -> { ok, watched, events, cursor, done, pending, terminal_statuses }
+```
+
+- `events` are the same typed, deduplicated `start`/`transition`/`terminal`/`stale`/
+  `resumed`/`watch_error` records the CLI prints, from the same `WatchEventStream`.
+- `cursor` is opaque: pass the one you got back on the next call and you receive only what
+  changed since. Omit it and you get a fresh baseline — chatty, never wrong.
+- `done` is `true` once every watched job is *settled* (terminal status **and**
+  finalization decided). It is the same predicate the CLI exit code uses, so a caller
+  stops on `done` rather than on a retyped status list.
+- `pending` lists each unsettled job with its last status, so a status that will never go
+  terminal on its own — `cancel_requested` is the known case — is visible instead of
+  silently waited on.
+- `terminal_statuses` ships in every response; `agent_terminal_statuses` returns the same
+  vocabulary standalone. A watcher must never retype this list.
+
+**Why a cursor is honest here without a durable event log.** The dedup state a tick needs
+is small and entirely per job: last status, whether it settled, and which heartbeat was
+last reported stale. `export_cursor`/`load_cursor` hand that state to the caller instead
+of keeping a `WatchEventStream` alive per selection inside the server. So the server stays
+stateless — no unbounded session state, nothing a restart silently drops — while deltas
+stay genuine rather than a full `START` snapshot on every call. A caller that loses its
+cursor degrades to one extra baseline snapshot, not to a wrong verdict. Cursor entries for
+jobs that have left the selection are dropped rather than re-added, so a stale cursor
+cannot keep a watch pending on a job nobody follows any more. `CURSOR_VERSION` guards the
+payload; a mismatch is a typed error, never a silent misread.
+
+What MCP still does not get is *push*: the coordinator decides when to call again. That is
+the remaining, deliberate asymmetry with the streaming CLI.
+
+`agent_watch_job` and `agent_start_job(wait=True)` remain the right call for a single job
+a coordinator wants to block on briefly. For several jobs, or any job that outlives one
+call, use `agent_watch_events`. For plan tasks specifically, `agent_plan_snapshot`/
+`agent_plan_watch` with the `since` cursor remain equivalent and are backed by the plan
+event log.
 
 ## Plans, dispatch, and review
 

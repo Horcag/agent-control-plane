@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any
 
 from agent_control_plane.entities.job import TERMINAL_STATUSES, JobRecord, JobStore
 from agent_control_plane.shared.clock import utc_now
@@ -27,6 +28,35 @@ RESUMED = "resumed"
 WATCH_ERROR = "watch_error"
 
 EVENT_KINDS = frozenset({START, TRANSITION, TERMINAL, STALE, RESUMED, WATCH_ERROR})
+
+# Bumped whenever the cursor payload stops being readable by the previous decoder.
+CURSOR_VERSION = 1
+
+
+# Slack added to the longest watched job timeout so the watch outlives finalization
+# (checkpoint plus the controller gate battery), which runs after the worker exits.
+FINALIZATION_SLACK_SEC = 600
+
+
+def watch_command_for(
+    job_ids: Iterable[str],
+    *,
+    config_path: str | None = None,
+    timeout_sec: float | None = None,
+) -> str:
+    """Build the exact shell invocation that supervises ``job_ids``.
+
+    Callers hand this to whatever turns stdout lines into notifications. It exists so
+    nobody has to assemble the flags — an assembled-by-hand watch is where the config
+    path gets guessed and the timeout gets invented.
+    """
+    parts = ["agent-control", "watch", "--events"]
+    if config_path:
+        parts += ["--config", f'"{config_path}"']
+    if timeout_sec is not None:
+        parts += ["--timeout-sec", str(int(timeout_sec))]
+    parts += sorted(job_ids)
+    return " ".join(parts)
 
 
 class EmptySelectionError(ValueError):
@@ -139,6 +169,56 @@ class WatchEventStream:
     @property
     def job_ids(self) -> frozenset[str]:
         return frozenset(self._states)
+
+    def export_cursor(self) -> dict[str, Any]:
+        """Serialize dedup state so a stateless caller can resume on the next call.
+
+        A process that cannot keep the stream alive between polls (an MCP tool
+        answering one request at a time) round-trips this payload instead of
+        re-deriving "have I already reported this?" from the job table.
+        """
+        return {
+            "v": CURSOR_VERSION,
+            "jobs": {
+                job_id: {
+                    "status": state.last_status,
+                    "settled": state.settled,
+                    "stale_beat": state.stale_emitted_heartbeat,
+                }
+                for job_id, state in sorted(self._states.items())
+            },
+        }
+
+    def load_cursor(self, cursor: Mapping[str, Any] | None) -> None:
+        """Restore dedup state produced by :meth:`export_cursor`.
+
+        Entries for jobs outside the current selection are dropped rather than
+        re-added: a job that left the selection must not keep a watch pending
+        forever.
+        """
+        if not cursor:
+            return
+        version = cursor.get("v")
+        if version != CURSOR_VERSION:
+            raise ValueError(
+                f"unsupported watch cursor version {version!r}; expected {CURSOR_VERSION}"
+            )
+        jobs = cursor.get("jobs")
+        if jobs is None:
+            return
+        if not isinstance(jobs, Mapping):
+            raise ValueError("watch cursor 'jobs' must be a mapping")
+        for raw_job_id, raw_state in jobs.items():
+            state = self._states.get(str(raw_job_id))
+            if state is None:
+                continue
+            if not isinstance(raw_state, Mapping):
+                raise ValueError(f"watch cursor entry for {str(raw_job_id)!r} must be a mapping")
+            last_status = raw_state.get("status")
+            state.last_status = None if last_status is None else str(last_status)
+            state.settled = bool(raw_state.get("settled", False))
+            stale_beat = raw_state.get("stale_beat")
+            state.stale_emitted_heartbeat = None if stale_beat is None else str(stale_beat)
 
     def all_settled(self) -> bool:
         return bool(self._states) and all(state.settled for state in self._states.values())

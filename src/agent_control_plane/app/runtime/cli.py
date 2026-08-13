@@ -224,7 +224,15 @@ def main(argv: list[str] | None = None) -> int:
                         log_lines=args.lines,
                         include_details=True,
                     )
+            supervision = control.supervision_for([job.job_id])
+            if args.wait and (payload.get("watch") or {}).get("settled"):
+                supervision = {"supervised": True}
+            payload["supervision"] = supervision
             _print_json(payload)
+            if not supervision.get("supervised"):
+                # stderr, so piping start's JSON stays clean while the operator still sees it.
+                print("not supervised - watch it with:", file=sys.stderr)
+                print(f"  {supervision['watch_command']}", file=sys.stderr)
             return 0
         if args.command == "run-job":
             job = control.run_job(args.job_id, args.worker_instance_id)

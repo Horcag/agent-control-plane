@@ -5,6 +5,8 @@ import shutil
 import subprocess  # nosec B404
 import sys
 import time
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -63,7 +65,15 @@ from agent_control_plane.features.agent_runner import (
     terminate_verified_process,
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
-from agent_control_plane.features.job_watch import is_on_contract, is_settled
+from agent_control_plane.features.job_watch import (
+    DEFAULT_STALE_AFTER_SEC,
+    FINALIZATION_SLACK_SEC,
+    WatchEventStream,
+    WatchSelection,
+    is_on_contract,
+    is_settled,
+    watch_command_for,
+)
 from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
 from agent_control_plane.features.plan_supervision import PlanService
 from agent_control_plane.features.result_handoff import (
@@ -989,6 +999,91 @@ class AgentControlPlane:
         if not job.result_path.exists():
             return f"Result file does not exist yet: {job.result_path}"
         return job.result_path.read_text(encoding="utf-8", errors="replace")
+
+    def supervision_for(self, job_ids: Sequence[str]) -> dict[str, Any]:
+        """Tell a caller that just launched ``job_ids`` how to actually supervise them.
+
+        Launching supervises nothing, and the caller then has to assemble a watch
+        invocation itself. Both ways of getting that wrong are silent: treating one
+        non-blocking pass as a subscription, and holding a blocking watch that reports
+        only once at the very end. Handing back the exact command removes the assembly
+        step, which is where the config path gets guessed and the timeout invented.
+        """
+        ids = list(job_ids)
+        longest = 0.0
+        for job_id in ids:
+            try:
+                job = self.store.get_job(job_id)
+            except KeyError:
+                continue
+            longest = max(longest, float(job.timeout_sec or 0))
+        if not longest:
+            longest = float(self.config.defaults.timeout_sec)
+        return {
+            "supervised": False,
+            "watch_command": watch_command_for(
+                ids,
+                config_path=str(self.config.config_path),
+                timeout_sec=longest + FINALIZATION_SLACK_SEC,
+            ),
+            "note": (
+                "Launching a job does not supervise it. Run watch_command in whatever turns "
+                "stdout lines into notifications: it streams one line per transition and exits "
+                "when every job is settled. A single agent_watch_events call is a snapshot of "
+                "right now, not a subscription - nothing will notify you afterwards."
+            ),
+        }
+
+    def watch_events(
+        self,
+        *,
+        job_ids: Sequence[str] | None = None,
+        plan_id: str | None = None,
+        task_id_glob: str | None = None,
+        cursor: Mapping[str, Any] | None = None,
+        stale_after_sec: float = DEFAULT_STALE_AFTER_SEC,
+    ) -> dict[str, Any]:
+        """Take one non-blocking pass over a watch selection and report what changed.
+
+        Unlike :meth:`watch_job` this never sleeps: it returns immediately with the
+        events observed since ``cursor``, so a caller that cannot hold a long poll
+        open (an MCP client) can follow jobs of any duration by calling again with
+        the returned cursor.
+
+        ``done`` is true once every watched job is *settled* - terminal status and
+        finalization decided - which is the same predicate the CLI exit code uses.
+        Jobs that are neither settled nor progressing are listed in ``pending`` with
+        their last status, so a caller can tell "still running" apart from a status
+        such as ``cancel_requested`` that will never become terminal on its own.
+
+        Raises:
+            EmptySelectionError: the selection matched no jobs.
+            ValueError: the cursor was produced by an incompatible version.
+        """
+        stream = WatchEventStream(
+            self.store,
+            WatchSelection(
+                job_ids=frozenset(job_ids or ()),
+                plan_id=plan_id,
+                task_id_glob=task_id_glob,
+            ),
+            stale_after_sec=stale_after_sec,
+        )
+        stream.load_cursor(cursor)
+        events = [asdict(event) for event in stream.tick()]
+        next_cursor = stream.export_cursor()
+        return {
+            "watched": list(next_cursor["jobs"]),
+            "events": events,
+            "cursor": next_cursor,
+            "done": stream.all_settled(),
+            "pending": [
+                {"job_id": job_id, "status": state["status"]}
+                for job_id, state in next_cursor["jobs"].items()
+                if not state["settled"]
+            ],
+            "terminal_statuses": sorted(TERMINAL_STATUSES),
+        }
 
     def watch_job(
         self,

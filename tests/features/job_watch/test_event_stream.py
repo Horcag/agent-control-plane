@@ -10,6 +10,8 @@ import pytest
 from agent_control_plane.entities.job import JobRecord, JobStore
 from agent_control_plane.entities.plan import PlanStore, PlanTaskDefinition
 from agent_control_plane.features.job_watch import (
+    CURSOR_VERSION,
+    FINALIZATION_SLACK_SEC,
     RESUMED,
     STALE,
     START,
@@ -21,6 +23,7 @@ from agent_control_plane.features.job_watch import (
     WatchEventStream,
     WatchSelection,
     is_on_contract,
+    watch_command_for,
 )
 
 
@@ -370,3 +373,114 @@ def test_watch_event_is_frozen_dataclass() -> None:
     )
     with pytest.raises(AttributeError):
         event.status = "running"  # type: ignore[misc]
+
+
+def test_cursor_round_trip_suppresses_already_reported_events(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-cursor-1")
+    selection = WatchSelection(job_ids=frozenset({job.job_id}))
+
+    first = _stream(store, selection)
+    assert [event.kind for event in first.tick()] == [START]
+    cursor = first.export_cursor()
+
+    # A brand new stream is what a stateless caller gets on the next request:
+    # with the cursor it must not replay the START it already reported.
+    resumed = _stream(store, selection)
+    resumed.load_cursor(cursor)
+    assert resumed.tick() == []
+
+    store.update_job(job.job_id, status="running", started_at="2020-01-01T00:00:00+00:00")
+    later = _stream(store, selection)
+    later.load_cursor(resumed.export_cursor())
+    events = later.tick()
+    assert [event.kind for event in events] == [TRANSITION]
+    assert events[0].status == "running"
+
+
+def test_cursor_round_trip_preserves_settled_without_replaying_terminal(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-cursor-2")
+    selection = WatchSelection(job_ids=frozenset({job.job_id}))
+
+    job.result_path.parent.mkdir(parents=True, exist_ok=True)
+    job.result_path.write_text("Status: completed\n", encoding="utf-8")
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_completed(job.job_id)
+
+    first = _stream(store, selection)
+    assert [event.kind for event in first.tick()] == [TERMINAL]
+    assert first.all_settled() is True
+
+    resumed = _stream(store, selection)
+    resumed.load_cursor(first.export_cursor())
+    assert resumed.tick() == []
+    # The caller stops on this, so it has to survive the round trip.
+    assert resumed.all_settled() is True
+
+
+def test_cursor_version_mismatch_is_rejected(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-cursor-3")
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
+
+    with pytest.raises(ValueError, match="unsupported watch cursor version"):
+        stream.load_cursor({"v": CURSOR_VERSION + 1, "jobs": {}})
+
+
+def test_cursor_entries_outside_the_selection_are_dropped(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    watched = _create_job(store, tmp_path, "job-cursor-4")
+    departed = _create_job(store, tmp_path, "job-cursor-5")
+
+    stream = _stream(store, WatchSelection(job_ids=frozenset({watched.job_id})))
+    # A job that left the selection must not be resurrected by the cursor: it would
+    # keep the watch pending forever on a job nobody is following any more.
+    stream.load_cursor(
+        {
+            "v": CURSOR_VERSION,
+            "jobs": {
+                watched.job_id: {"status": "running", "settled": False, "stale_beat": None},
+                departed.job_id: {"status": "running", "settled": False, "stale_beat": None},
+            },
+        }
+    )
+
+    assert stream.job_ids == frozenset({watched.job_id})
+    assert departed.job_id not in stream.export_cursor()["jobs"]
+
+
+def test_missing_or_empty_cursor_is_a_fresh_watch(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "job-cursor-6")
+    selection = WatchSelection(job_ids=frozenset({job.job_id}))
+
+    for empty in (None, {}):
+        stream = _stream(store, selection)
+        stream.load_cursor(empty)
+        assert [event.kind for event in stream.tick()] == [START]
+
+
+def test_watch_command_is_ready_to_run_without_assembly() -> None:
+    command = watch_command_for(
+        ["job-b", "job-a"],
+        config_path="D:/cfg/workspaces.toml",
+        timeout_sec=4200.5,
+    )
+
+    # Assembling this by hand is where the config path gets guessed and the timeout
+    # invented, so the builder emits every part and orders the ids deterministically.
+    assert command == (
+        'agent-control watch --events --config "D:/cfg/workspaces.toml" '
+        "--timeout-sec 4200 job-a job-b"
+    )
+
+
+def test_watch_command_omits_flags_it_was_not_given() -> None:
+    assert watch_command_for(["job-a"]) == "agent-control watch --events job-a"
+
+
+def test_finalization_slack_is_positive() -> None:
+    # A watch that stops at the worker's own timeout misses finalization, which runs
+    # after the worker exits — the window where the on-contract verdict is decided.
+    assert FINALIZATION_SLACK_SEC > 0

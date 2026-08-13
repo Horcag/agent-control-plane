@@ -19,8 +19,16 @@ from agent_control_plane.app.runtime.orchestrator import (
     PolicyError,
     StartOptions,
 )
+from agent_control_plane.entities.job import TERMINAL_STATUSES
 from agent_control_plane.entities.plan import PlanExecutionSpec, PlanTaskDefinition
 from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS, normalize_backend
+from agent_control_plane.features.job_watch import (
+    CURSOR_VERSION,
+    DEFAULT_STALE_AFTER_SEC,
+    EVENT_KINDS,
+    FINALIZATION_SETTLED_STATUSES,
+    EmptySelectionError,
+)
 from agent_control_plane.features.slot_lifecycle import ConfigBootstrapError, SlotError
 from agent_control_plane.shared.config import (
     register_known_config,
@@ -370,6 +378,7 @@ def build_server(
             "plan_id": plan_id,
             "plan_task_id": plan_task_id or (task_id if plan_id else None),
         }
+        supervision = control.supervision_for([job.job_id])
         if wait:
             eff_timeout, eff_poll, clamped = _normalize_poll_params(
                 wait_timeout_sec, poll_interval_sec
@@ -387,6 +396,11 @@ def build_server(
                     watch_res["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
                 response["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
             response["watch"] = watch_res
+            # A wait that returned a settled verdict *was* the supervision. A wait that
+            # timed out left a live job behind, so the nudge still applies.
+            if isinstance(watch_res, dict) and watch_res.get("settled"):
+                supervision = {"supervised": True}
+        response["supervision"] = supervision
         return response
 
     @register
@@ -411,6 +425,66 @@ def build_server(
         if clamped and isinstance(result, dict):
             result["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
         return result
+
+    @register
+    def agent_watch_events(
+        job_ids: list[str] | None = None,
+        plan_id: str | None = None,
+        task_glob: str | None = None,
+        cursor: dict[str, Any] | None = None,
+        stale_after_sec: float = DEFAULT_STALE_AFTER_SEC,
+    ) -> dict[str, Any]:
+        """Return one non-blocking pass of watch events for many jobs, a plan, or a task glob.
+
+        This is the MCP equivalent of `agent-control watch --events`. It never long-polls,
+        so it follows jobs that outlive a single tool call: pass the returned `cursor` back
+        on the next call to receive only what changed since. Stop when `done` is true.
+        `pending` lists every job that is not settled yet with its last status, so a status
+        that will never go terminal on its own is visible instead of silently waited on.
+        Never retype the terminal status list - `terminal_statuses` is in every response.
+        """
+        if not (job_ids or plan_id or task_glob):
+            return {
+                "ok": False,
+                "error": "agent_watch_events requires job_ids, plan_id, or task_glob",
+            }
+        try:
+            payload = control.watch_events(
+                job_ids=job_ids,
+                plan_id=plan_id,
+                task_id_glob=task_glob,
+                cursor=cursor,
+                stale_after_sec=stale_after_sec,
+            )
+        except EmptySelectionError as exc:
+            return {"ok": False, "error": str(exc), "done": False}
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not payload["done"]:
+            payload["snapshot_only"] = (
+                "This response is a single pass, not a subscription: nothing will notify you "
+                "about what happens next. Call again with `cursor` to poll, or run "
+                "`watch_command` in whatever turns stdout lines into notifications to be told "
+                "about every transition until the jobs settle."
+            )
+            payload["watch_command"] = control.supervision_for(payload["watched"])["watch_command"]
+        return {"ok": True, **payload}
+
+    @register
+    def agent_terminal_statuses() -> dict[str, Any]:
+        """Return the authoritative job status vocabulary, so a watcher never retypes it."""
+        return {
+            "terminal": sorted(TERMINAL_STATUSES),
+            "finalization_settled": sorted(FINALIZATION_SETTLED_STATUSES),
+            "event_kinds": sorted(EVENT_KINDS),
+            "cursor_version": CURSOR_VERSION,
+            "note": (
+                "A job is done when its status is in 'terminal' AND its finalization_status "
+                "is in 'finalization_settled'. Every other status is still in flight and may "
+                "never become terminal on its own - cancel_requested is the known case - so "
+                "treat an unrecognized status as in flight and surface it instead of waiting."
+            ),
+        }
 
     @register
     def agent_status_job(job_id: str) -> dict[str, Any]:
@@ -628,9 +702,15 @@ def build_server(
     def agent_plan_dispatch(plan_id: str, max_jobs: int = 1) -> dict[str, Any]:
         """Claim and start ready executable plan tasks in one durable dispatch pass."""
         try:
-            return control.dispatch_plan(plan_id, max_jobs=max_jobs)
+            payload = control.dispatch_plan(plan_id, max_jobs=max_jobs)
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+        started = [
+            entry["job_id"] for entry in payload.get("dispatched") or () if entry.get("job_id")
+        ]
+        if started:
+            payload["supervision"] = control.supervision_for(started)
+        return payload
 
     @register
     def agent_plan_run_until_review(
