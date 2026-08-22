@@ -115,12 +115,12 @@ of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
 ### MCP coordinators: watch parity and its limits
 
 Use exact ACP tool names rather than broad tool discovery. Scope a call to its route, job,
-or plan, consume only needed `structuredContent` fields, and keep the returned cursor for
-the next plan/watch call. Start with compact `agent_smoke`. Result, tail, summary, inbox,
-and checkpoint tools expose UTF-8-safe previews capped at 16 KiB of content by default;
-round-trip `next_offset` or `next_cursor` for another window. Request `full=True` only for
-deliberate legacy access to an unbounded payload. Do not re-request unchanged status or
-snapshot data, and do not print whole tool responses.
+or plan, consume only needed `structuredContent` fields (the authoritative payload), and
+keep the returned cursor for the next plan/watch call. `content` is only a short summary.
+Responses default to at most 48 KiB structured content and less than 64 KiB on the wire;
+oversized fields are guarded with identity, counts, and a follow-up. Request `full=True`
+only when a tool explicitly declares it. Do not re-request unchanged status or snapshot
+data, and do not print whole tool responses.
 
 ```text
 agent_plan_snapshot(plan_id="release") -> { cursor, ready_next, running, ... }

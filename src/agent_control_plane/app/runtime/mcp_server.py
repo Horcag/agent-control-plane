@@ -4,6 +4,7 @@ import argparse
 import functools
 import hashlib
 import importlib
+import inspect
 import os
 import sys
 import tempfile
@@ -12,7 +13,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, get_type_hints
 
 from pydantic import StrictBool, StrictInt
 
@@ -48,6 +49,7 @@ from agent_control_plane.app.runtime.mcp_mutation_payloads import (
     slots_sync_payload,
 )
 from agent_control_plane.app.runtime.mcp_payloads import compact_checkpoint, compact_review_item
+from agent_control_plane.app.runtime.mcp_response_budget import MCP_TOOL_POLICIES, response_for
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
     PolicyError,
@@ -283,7 +285,16 @@ def build_server(
         def decorator(fn: Callable[..., Any]) -> Callable[..., Awaitable[Any]]:
             @functools.wraps(fn)
             async def offload(*args: Any, **kwargs: Any) -> Any:
-                return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+                value = await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+                arguments = inspect.signature(fn).bind_partial(*args, **kwargs).arguments
+                return response_for(fn.__name__, value, arguments)
+
+            signature = inspect.signature(fn, eval_str=True)
+            offload.__signature__ = signature.replace(  # type: ignore[attr-defined]
+                return_annotation=importlib.import_module("mcp.types").CallToolResult
+            )
+            offload.__annotations__ = get_type_hints(fn)
+            offload.__annotations__["return"] = importlib.import_module("mcp.types").CallToolResult
 
             mcp.tool()(offload)
             return offload
@@ -1433,7 +1444,54 @@ def build_server(
         except (SlotError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    _validate_tool_policies(mcp)
     return mcp
+
+
+def _validate_tool_policies(mcp: Any) -> None:
+    """Fail closed when a registered agent tool lacks an explicit wire policy."""
+    try:
+        tools = {tool.name: tool for tool in mcp._tool_manager.list_tools()}
+    except (AttributeError, TypeError):
+        try:
+            tools = {name: function for name, function in mcp.tools.items()}
+        except TypeError:
+            # Minimal mocks used by CLI argument parsing do not emulate registration.
+            return
+    registered = {name for name in tools if name.startswith("agent_")}
+    if registered != set(MCP_TOOL_POLICIES):
+        missing = sorted(registered - set(MCP_TOOL_POLICIES))
+        stale = sorted(set(MCP_TOOL_POLICIES) - registered)
+        raise RuntimeError(f"MCP tool policies mismatch; missing={missing}, stale={stale}")
+    invalid = [
+        name
+        for name, policy in MCP_TOOL_POLICIES.items()
+        if policy.mutation and (not policy.identity_keys or not policy.follow_up)
+    ]
+    if invalid:
+        raise RuntimeError(f"Mutation tool policies require identity and follow-up: {invalid}")
+    for name, policy in MCP_TOOL_POLICIES.items():
+        if policy.detail_param is None:
+            continue
+        if not _tool_detail_param_is_boolean(tools[name], policy.detail_param):
+            raise RuntimeError(f"MCP detail policy invalid: {name}.{policy.detail_param}")
+
+
+def _tool_detail_param_is_boolean(tool: Any, parameter: str) -> bool:
+    schema = getattr(tool, "parameters", None)
+    if not isinstance(schema, dict):
+        schema = getattr(tool, "inputSchema", getattr(tool, "input_schema", None))
+    if isinstance(schema, dict):
+        property_schema = schema.get("properties", {}).get(parameter)
+        return isinstance(property_schema, dict) and property_schema.get("type") == "boolean"
+
+    function = getattr(tool, "fn", tool)
+    try:
+        annotation = get_type_hints(function).get(parameter)
+    except (NameError, TypeError):
+        parameter_spec = inspect.signature(function).parameters.get(parameter)
+        annotation = parameter_spec.annotation if parameter_spec else inspect.Parameter.empty
+    return annotation in (bool, StrictBool)
 
 
 def _infer_route_from_slot_name(slot_name: str) -> str:

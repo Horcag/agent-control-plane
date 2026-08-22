@@ -572,9 +572,11 @@ class WatchEventsSnapshotNudgeTest(unittest.TestCase):
             return_value=control,
         ):
             server = build_server()
-        return asyncio.run(
+        result = asyncio.run(
             server._tool_manager.call_tool("agent_watch_events", {"job_ids": ["job-1"]})
         )
+        assert result.structuredContent is not None
+        return result.structuredContent
 
     def test_unfinished_pass_says_nothing_will_notify_you(self) -> None:
         result = self._call(

@@ -98,13 +98,12 @@ print(full_smoke.get("codex_model_catalog", {}).get("status"))
 ### MCP context protocol
 
 Call the exact ACP tool needed; do not enumerate generic tool registries. Scope every
-call by route, job, or plan and extract only the needed `structuredContent` fields.
-Use compact smoke first. Durable-result, log-tail, summary, review-inbox, and checkpoint
-MCP tools return UTF-8-safe byte-bounded previews by default (at most 16 KiB of content
-and at most 64 KiB of logical JSON). Round-trip `next_offset` or `next_cursor` to continue;
-request `full=True` only for deliberate legacy access to the unbounded payload. The CLI
-keeps its existing full-output behavior. Reuse returned cursors so plan and watch calls
-return deltas rather than unchanged snapshots.
+call by route, job, or plan and extract only needed `structuredContent` fields: it is
+authoritative, while `content` is only a short summary. MCP responses default to at most
+48 KiB structured content and less than 64 KiB on the wire; oversized fields are guarded
+with identity, counts, and a follow-up. Request `full=True` only where that tool explicitly
+declares it. Round-trip `next_offset` or `next_cursor` to continue; the CLI keeps its full
+output behavior. Reuse returned cursors so plan and watch calls return deltas.
 
 ```python
 snapshot = await session.call_tool("agent_plan_snapshot", {"plan_id": "release"})
