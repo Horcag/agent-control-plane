@@ -46,6 +46,11 @@ _CONFIG_LOCK_RETRY_SEC = 0.02
 
 _MAX_LONG_POLL_SEC = 300.0
 _MIN_POLL_INTERVAL_SEC = 0.5
+_MCP_INSTRUCTIONS = (
+    "Scope calls by route, job, or plan; read only needed structuredContent fields. "
+    "Reuse plan/watch cursors for deltas, never replay unchanged snapshots or logs. "
+    "Use compact smoke by default; request full diagnostics, results, or logs only explicitly."
+)
 
 
 def _normalize_poll_params(
@@ -259,7 +264,7 @@ def build_server(
         mcp_kwargs["port"] = port
     if stateless_http:
         mcp_kwargs["stateless_http"] = True
-    mcp = fast_mcp("agent-control-plane", **mcp_kwargs)
+    mcp = fast_mcp("agent-control-plane", instructions=_MCP_INSTRUCTIONS, **mcp_kwargs)
     register = _offloaded(mcp)
 
     @register
@@ -442,15 +447,7 @@ def build_server(
         cursor: dict[str, Any] | None = None,
         stale_after_sec: float = DEFAULT_STALE_AFTER_SEC,
     ) -> dict[str, Any]:
-        """Return one non-blocking pass of watch events for many jobs, a plan, or a task glob.
-
-        This is the MCP equivalent of `agent-control watch --events`. It never long-polls,
-        so it follows jobs that outlive a single tool call: pass the returned `cursor` back
-        on the next call to receive only what changed since. Stop when `done` is true.
-        `pending` lists every job that is not settled yet with its last status, so a status
-        that will never go terminal on its own is visible instead of silently waited on.
-        Never retype the terminal status list - `terminal_statuses` is in every response.
-        """
+        """Return non-blocking event deltas; reuse its cursor and stop when done."""
         if not (job_ids or plan_id or task_glob):
             return {
                 "ok": False,
@@ -596,11 +593,7 @@ def build_server(
         expected_result_status: str | None = None,
         controller_gate_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Edit a never-claimed (pending/ready, attempt_no 0) plan task's fields in place.
-
-        Only fields explicitly passed here are changed; omit a field to leave it as-is.
-        Refused once the task has a job, a dispatch token, or a prior attempt.
-        """
+        """Edit specified fields of an unclaimed plan task; refused after its first attempt."""
         overrides: dict[str, Any] = {}
         if title is not None:
             overrides["title"] = title
@@ -763,16 +756,7 @@ def build_server(
         expected_result_status: str | None = None,
         controller_gate_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Explicitly make a failed task eligible for a new dispatch attempt.
-
-        `allow_awaiting_review` is an explicit opt-in to retry a task that is still
-        `awaiting_review` (its pending handoff is rejected first) so accidental
-        double-runs of a task the root has not decided on stay impossible by default.
-
-        The execution overrides (route through controller_gate_mode) apply only to the
-        new attempt being created; only fields explicitly passed here are changed, and
-        the durable record of the attempt that already ran is untouched.
-        """
+        """Explicitly retry one task with optional new-attempt execution overrides."""
         overrides = _plan_execution_field_overrides(
             route=route,
             slot=slot,

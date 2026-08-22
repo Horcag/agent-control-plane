@@ -114,6 +114,25 @@ of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
 
 ### MCP coordinators: watch parity and its limits
 
+Use exact ACP tool names rather than broad tool discovery. Scope a call to its route, job,
+or plan, consume only needed `structuredContent` fields, and keep the returned cursor for
+the next plan/watch call. Start with compact `agent_smoke`; request `full=True`, a complete
+result, or an inbox payload only for a specific review need. Do not re-request unchanged
+status/snapshot data or print whole tool responses.
+
+```text
+agent_plan_snapshot(plan_id="release") -> { cursor, ready_next, running, ... }
+agent_plan_dispatch(plan_id="release", max_jobs=1) -> { dispatched, ... }
+agent_plan_watch(plan_id="release", since=<cursor>) -> { cursor, changes, ... }
+agent_summary_job(job_id="job-123", lines=20) -> compact review signal
+agent_result_job(job_id="job-123") -> only after that signal requires the full result
+```
+
+Keep expensive command output in the run artifact or worker log; report the exit code and
+a short tail/count. Run independent checks separately (or with fail-fast semantics), so a
+later success cannot hide an earlier failure. Use one combined `pytest -k 'api or cli'`
+expression, not repeated `-k` flags, and use `TMPDIR=/tmp` when WSL capture paths drift.
+
 The CLI `watch --events` *streams*: a shell process holds a connection open and prints
 lines as they arrive. MCP has no equivalent streaming transport, so that exact shape
 cannot be mirrored. What MCP does have is `agent_watch_events`, the same event vocabulary

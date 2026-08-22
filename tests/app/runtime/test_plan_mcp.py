@@ -20,8 +20,9 @@ from agent_control_plane.entities.slot import SlotStore
 
 
 class _FakeFastMCP:
-    def __init__(self, _name: str) -> None:
+    def __init__(self, _name: str, **kwargs: object) -> None:
         self.tools: dict[str, object] = {}
+        self.instructions = kwargs.get("instructions")
 
     def tool(self):
         def register(function):
@@ -272,6 +273,27 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
         "agent_plan_list",
         "agent_retention_gc",
     }.issubset(server.tools)
+
+
+def test_mcp_instructions_bound_context_and_keep_tool_docs_compact(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=object(),
+    ):
+        server = build_server()
+
+    assert isinstance(server.instructions, str)
+    assert len(server.instructions) <= 512
+    assert all(term in server.instructions.lower() for term in ("route", "cursor", "compact"))
+    assert all(len(function.__doc__ or "") <= 240 for function in server.tools.values())
 
 
 def test_mcp_model_catalog_refreshes_after_config_change(monkeypatch, tmp_path: Path) -> None:
@@ -666,7 +688,12 @@ def test_main_transport_and_host_port_parsing(monkeypatch) -> None:
         return_value=Mock(),
     ):
         mcp_server.main([])
-        fake_fastmcp.assert_called_with("agent-control-plane", host="127.0.0.1", port=8766)
+        fake_fastmcp.assert_called_with(
+            "agent-control-plane",
+            instructions=mcp_server._MCP_INSTRUCTIONS,
+            host="127.0.0.1",
+            port=8766,
+        )
         server_instance.run.assert_called_with(transport="stdio")
 
         fake_fastmcp.reset_mock()
@@ -674,7 +701,11 @@ def test_main_transport_and_host_port_parsing(monkeypatch) -> None:
 
         mcp_server.main(["--transport", "streamable-http", "--host", "127.0.0.1", "--port", "8766"])
         fake_fastmcp.assert_called_with(
-            "agent-control-plane", host="127.0.0.1", port=8766, stateless_http=True
+            "agent-control-plane",
+            instructions=mcp_server._MCP_INSTRUCTIONS,
+            host="127.0.0.1",
+            port=8766,
+            stateless_http=True,
         )
         server_instance.run.assert_called_with(transport="streamable-http")
 
@@ -694,11 +725,17 @@ def test_build_server_without_host_port_preserves_defaults(monkeypatch) -> None:
         return_value=Mock(),
     ):
         build_server()
-        fake_fastmcp.assert_called_once_with("agent-control-plane")
+        fake_fastmcp.assert_called_once_with(
+            "agent-control-plane", instructions=mcp_server._MCP_INSTRUCTIONS
+        )
 
         fake_fastmcp.reset_mock()
         build_server(stateless_http=True)
-        fake_fastmcp.assert_called_once_with("agent-control-plane", stateless_http=True)
+        fake_fastmcp.assert_called_once_with(
+            "agent-control-plane",
+            instructions=mcp_server._MCP_INSTRUCTIONS,
+            stateless_http=True,
+        )
 
 
 def test_wait_budget_clamping_for_all_four_tools(monkeypatch) -> None:

@@ -95,6 +95,29 @@ full_smoke = full_result.structuredContent or {}
 print(full_smoke.get("codex_model_catalog", {}).get("status"))
 ```
 
+### MCP context protocol
+
+Call the exact ACP tool needed; do not enumerate generic tool registries. Scope every
+call by route, job, or plan and extract only the needed `structuredContent` fields.
+Use compact smoke first and request `full=True`, a result, or logs only for an explicit
+review question. Reuse returned cursors so plan and watch calls return deltas rather
+than unchanged snapshots.
+
+```python
+snapshot = await session.call_tool("agent_plan_snapshot", {"plan_id": "release"})
+plan = snapshot.structuredContent or {}
+await session.call_tool("agent_plan_dispatch", {"plan_id": "release", "max_jobs": 1})
+next_plan = await session.call_tool(
+    "agent_plan_watch", {"plan_id": "release", "since": plan["cursor"]}
+)
+```
+
+For root review, read a bounded job summary first, then request one result or inbox item
+only when its compact status identifies it. Keep heavy command output in the run artifact
+or worker log; report its exit code and a short tail/count. Run independent checks
+separately (or fail fast), use one combined `pytest -k 'a or b'` expression, and set
+`TMPDIR=/tmp` when WSL capture paths are unreliable.
+
 
 ## Five-minute offline demo
 
