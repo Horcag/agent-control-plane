@@ -79,6 +79,22 @@ To manage and wire the MCP server across client sessions and repositories:
 
 When running HTTP transport, host binding defaults to loopback `127.0.0.1`. Server-side long-polling wait budgets (`agent_watch_job`, `agent_plan_watch`, `agent_plan_run_until_review`, `agent_start_job` with `wait=True`) are capped at a ceiling of 300s (`timeout_clamped_to: 300.0`).
 
+`agent_smoke` returns compact diagnostics by default. Scope it to one configured route when
+only that route and its slots matter; request `full=True` only for legacy, expanded
+diagnostics such as model inventory, native quality gate definitions, raw slot porcelain,
+and slot preparation commands. For example, an MCP client can extract only the fields it
+needs from `structuredContent`:
+
+```python
+result = await session.call_tool("agent_smoke", {"route": "app"})
+smoke = result.structuredContent or {}
+print(smoke.get("status"), smoke.get("failures"), smoke.get("slot_summary"))
+
+full_result = await session.call_tool("agent_smoke", {"route": "app", "full": True})
+full_smoke = full_result.structuredContent or {}
+print(full_smoke.get("codex_model_catalog", {}).get("status"))
+```
+
 
 ## Five-minute offline demo
 

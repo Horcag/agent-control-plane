@@ -138,6 +138,32 @@ def _configured_routing_policies(config: ControlConfig) -> tuple[RoutingPolicy, 
 
 
 _ROUTING_HISTORY_LIMIT = 200
+_COMPACT_SMOKE_ROUTE_LIMIT = 8
+_COMPACT_SMOKE_SLOT_LIMIT = 32
+_COMPACT_SMOKE_FIELDS = (
+    "status",
+    "failures",
+    "model_control_scope",
+    "config",
+    "database",
+    "runs_root",
+    "agy_on_path",
+    "codex_on_path",
+    "claude_on_path",
+    "default_backend",
+    "agy_model",
+    "codex_model",
+    "codex_reasoning_effort",
+    "claude_model",
+    "claude_reasoning_effort",
+    "codex_quality_tier",
+    "workspace_access",
+    "native_quality_policy",
+    "terminal_slot_policy",
+    "runs_layout",
+    "slot_root",
+    "worktree_base",
+)
 COORDINATOR_SCOPE = (
     "ACP controls delegated worker profiles only; the parent/coordinating Codex thread is "
     "external and cannot be selected, downgraded, or escalated by ACP."
@@ -324,13 +350,20 @@ class AgentControlPlane:
         )
         return payload
 
-    def smoke(self) -> dict[str, Any]:
+    def smoke(
+        self,
+        *,
+        route: str | None = None,
+        full: bool = True,
+    ) -> dict[str, Any]:
+        if route is not None and route not in self.config.routes:
+            raise PolicyError(f"Unknown route: {route}")
         self.store.initialize()
         self.plan_store.initialize()
         self.review_inbox.initialize()
         catalog_diagnostics = self._catalog_diagnostics()
         smoke_diagnostics = self._smoke_routing_diagnostics(catalog_diagnostics)
-        return {
+        payload = {
             "status": "failed" if smoke_diagnostics["failures"] else "passed",
             "failures": smoke_diagnostics["failures"],
             "model_control_scope": COORDINATOR_SCOPE,
@@ -462,6 +495,98 @@ class AgentControlPlane:
                 for command in self.config.slot_prepare
             ],
         }
+
+        scoped_payload = self._route_scoped_smoke_payload(payload, route=route)
+        if full:
+            return scoped_payload
+        return self._compact_smoke_payload(scoped_payload, route=route)
+
+    @staticmethod
+    def _route_scoped_smoke_payload(
+        payload: dict[str, Any],
+        *,
+        route: str | None,
+    ) -> dict[str, Any]:
+        if route is None:
+            return payload
+        return {
+            **payload,
+            "routes": {route: payload["routes"][route]},
+            "slots": {
+                name: slot for name, slot in payload["slots"].items() if slot["route"] == route
+            },
+        }
+
+    @staticmethod
+    def _compact_smoke_payload(
+        payload: dict[str, Any],
+        *,
+        route: str | None,
+    ) -> dict[str, Any]:
+        route_items = sorted(payload["routes"].items())
+        slot_items = sorted(payload["slots"].items())
+        returned_routes = route_items[:_COMPACT_SMOKE_ROUTE_LIMIT]
+        returned_route_names = {name for name, _details in returned_routes}
+        returned_slots = [
+            (name, details)
+            for name, details in slot_items
+            if details["route"] in returned_route_names
+        ][:_COMPACT_SMOKE_SLOT_LIMIT]
+        model_catalog = payload["codex_model_catalog"]
+
+        compact = {key: payload[key] for key in _COMPACT_SMOKE_FIELDS}
+        compact.update(
+            {
+                "route": route,
+                "claude_model_catalog": payload["claude_model_catalog"],
+                "codex_model_catalog": {
+                    "status": model_catalog["status"],
+                    "profile_resolution_errors": model_catalog["profile_resolution_errors"],
+                },
+                "routes": {
+                    name: {
+                        key: details[key]
+                        for key in (
+                            "path",
+                            "exists",
+                            "required_branch",
+                            "backend",
+                            "workspace_access",
+                            "native_quality_policy",
+                        )
+                    }
+                    for name, details in returned_routes
+                },
+                "route_summary": {
+                    "total": len(route_items),
+                    "returned": len(returned_routes),
+                    "truncated": len(returned_routes) < len(route_items),
+                },
+                "slots": {
+                    name: {
+                        "name": details["name"],
+                        "route": details["route"],
+                        "path": details["path"],
+                        "status": details["status"],
+                        "scope": details["scope"],
+                        "configured": details["configured"],
+                        "exists": details["exists"],
+                        "is_git_workspace": details["is_git_workspace"],
+                        "branch": details["branch"],
+                        "is_dirty": bool(details["dirty"]),
+                        "active_job_id": details["active_job_id"],
+                        "problem_count": len(details["problems"]),
+                    }
+                    for name, details in returned_slots
+                },
+                "slot_summary": {
+                    "total": len(slot_items),
+                    "returned": len(returned_slots),
+                    "truncated": len(returned_slots) < len(slot_items),
+                },
+            }
+        )
+        return compact
 
     def _catalog_diagnostics(self) -> dict[str, dict[str, Any]]:
         profiles: dict[str, list[dict[str, Any]]] = {}

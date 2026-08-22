@@ -57,6 +57,24 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
                 with anyio.fail_after(5):
                     await session.initialize()
                 smoke = await _call_tool(session, "agent_smoke", {}, timings)
+                route_smoke = await _call_tool(
+                    session,
+                    "agent_smoke",
+                    {"route": "acp"},
+                    timings,
+                )
+                full_smoke = await _call_tool(
+                    session,
+                    "agent_smoke",
+                    {"full": True},
+                    timings,
+                )
+                unknown_route = await _call_tool(
+                    session,
+                    "agent_smoke",
+                    {"route": "missing"},
+                    timings,
+                )
                 unscoped = await session.call_tool("agent_slots_list", {})
                 assert unscoped.isError is True
                 await _call_tool(session, "agent_slots_list", {"route": "acp"}, timings)
@@ -81,6 +99,9 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
                 results.update(
                     {
                         "smoke": smoke,
+                        "route_smoke": route_smoke,
+                        "full_smoke": full_smoke,
+                        "unknown_route": unknown_route,
                         "slots": reloaded_slots,
                         "reloaded_smoke": reloaded_smoke,
                     }
@@ -113,7 +134,16 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
         "balanced",
         "deep",
     }
-    assert results["smoke"]["codex_quality_profiles"] == {}
+    assert "models" not in results["smoke"]["codex_model_catalog"]
+    assert "codex_quality_profiles" not in results["smoke"]
+    assert "slot_prepare" not in results["smoke"]
+    assert set(results["route_smoke"]["routes"]) == {"acp"}
+    assert all(slot["route"] == "acp" for slot in results["route_smoke"]["slots"].values())
+    assert results["full_smoke"]["codex_model_catalog"]["status"] == "missing"
+    assert "models" in results["full_smoke"]["codex_model_catalog"]
+    assert results["full_smoke"]["codex_quality_profiles"] == {}
+    assert "slot_prepare" in results["full_smoke"]
+    assert results["unknown_route"] == {"ok": False, "error": "Unknown route: missing"}
     assert "status" in results["smoke"]
     assert "failures" in results["smoke"]
     assert "model_control_scope" in results["smoke"]

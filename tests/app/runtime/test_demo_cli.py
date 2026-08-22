@@ -156,3 +156,5 @@ def test_smoke_cli_preserves_structured_payload_and_exit_status(tmp_path: Path, 
         assert failed_payload["failures"][0]["code"] == "smoke_failure"
         assert main(["smoke", "--config", str(tmp_path / "config.toml")]) == 0
         assert json.loads(capsys.readouterr().out)["status"] == "passed"
+    assert control.smoke.call_count == 2
+    control.smoke.assert_called_with()

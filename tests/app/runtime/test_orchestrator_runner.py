@@ -34,6 +34,7 @@ from agent_control_plane.features.agent_runner import (
 )
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
+from agent_control_plane.features.slot_lifecycle import SlotStatus
 from agent_control_plane.shared.config import (
     CodexAdaptiveRoutingConfig,
     CodexModelCatalogConfig,
@@ -46,6 +47,7 @@ from agent_control_plane.shared.config import (
     NativeQualityGateConfig,
     RouteConfig,
     SlotConfig,
+    SlotPrepareCommand,
 )
 
 
@@ -197,6 +199,152 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertNotIn(
                 "all_policy_initial_profiles_premium", {item["code"] for item in smoke["failures"]}
             )
+
+    def test_smoke_compact_projection_is_bounded_and_omits_noisy_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            noisy_command = "command-argument-" + ("x" * 40_000)
+            routes = MappingProxyType(
+                {
+                    f"route-{index:02}": replace(
+                        base.routes["main"],
+                        name=f"route-{index:02}",
+                        native_quality_gates=(
+                            NativeQualityGateConfig(
+                                name="noisy-gate",
+                                command=("python", noisy_command),
+                            ),
+                        ),
+                    )
+                    for index in range(20)
+                }
+            )
+            config = replace(
+                base,
+                routes=routes,
+                slot_prepare=(
+                    SlotPrepareCommand(
+                        name="noisy-prepare",
+                        working_dir=Path("."),
+                        marker=None,
+                        command=("python", noisy_command),
+                        timeout_sec=10,
+                        routes=(),
+                    ),
+                ),
+            )
+            control = AgentControlPlane(config)
+            noisy_dirty = " M " + ("dirty-path-" * 4_000)
+            noisy_problem = "problem-" + ("detail-" * 4_000)
+            slots = [
+                SlotStatus(
+                    name=f"slot-{index:03}",
+                    route=f"route-{index % 20:02}",
+                    path=root / "slots" / f"slot-{index:03}",
+                    status="available",
+                    scope="dynamic",
+                    configured=False,
+                    exists=True,
+                    is_git_workspace=True,
+                    branch="main",
+                    dirty=noisy_dirty,
+                    active_job_id=None,
+                    use_count=0,
+                    last_used_at=None,
+                    note=noisy_problem,
+                    problems=(noisy_problem,),
+                )
+                for index in range(80)
+            ]
+            noisy_models = {"models": [{"blob": "model-" + ("y" * 40_000)}]}
+
+            with (
+                patch.object(control.slots, "list_slots", return_value=slots),
+                patch.object(
+                    control.model_catalog,
+                    "inspection_payload",
+                    return_value=noisy_models,
+                ),
+            ):
+                full = control.smoke()
+                compact = control.smoke(full=False)
+
+            serialized = json.dumps(compact, sort_keys=True)
+            self.assertLess(len(serialized.encode("utf-8")), 16_384)
+            self.assertEqual(
+                compact["route_summary"], {"total": 20, "returned": 8, "truncated": True}
+            )
+            self.assertEqual(
+                compact["slot_summary"], {"total": 80, "returned": 32, "truncated": True}
+            )
+            self.assertTrue(
+                all(slot["route"] in compact["routes"] for slot in compact["slots"].values())
+            )
+            self.assertNotIn("codex_quality_profiles", compact)
+            self.assertNotIn("models", compact["codex_model_catalog"])
+            self.assertNotIn("native_quality_gates", next(iter(compact["routes"].values())))
+            self.assertNotIn("slot_prepare", compact)
+            self.assertNotIn(noisy_dirty, serialized)
+            self.assertNotIn(noisy_problem, serialized)
+            self.assertNotIn(noisy_command, serialized)
+            self.assertEqual(len(full["routes"]), 20)
+            self.assertEqual(len(full["slots"]), 80)
+            self.assertEqual(full["codex_model_catalog"]["models"], noisy_models["models"])
+            self.assertEqual(full["slots"]["slot-000"]["dirty"], noisy_dirty)
+            self.assertEqual(full["slot_prepare"][0]["command"][1], noisy_command)
+
+    def test_smoke_route_scope_excludes_other_routes_and_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            main_workspace = _git_repo(root / "main", "main")
+            other_workspace = _git_repo(root / "other", "other")
+            base = _config(root, main_workspace)
+            routes = MappingProxyType(
+                {
+                    "main": base.routes["main"],
+                    "other": replace(
+                        base.routes["main"],
+                        name="other",
+                        path=other_workspace,
+                        required_branch="other",
+                        worktree_base=other_workspace,
+                    ),
+                }
+            )
+            control = AgentControlPlane(replace(base, routes=routes))
+            slots = [
+                SlotStatus(
+                    name=f"{route}-1",
+                    route=route,
+                    path=root / "slots" / f"{route}-1",
+                    status="available",
+                    scope="dynamic",
+                    configured=False,
+                    exists=True,
+                    is_git_workspace=True,
+                    branch=route,
+                    dirty="",
+                    active_job_id=None,
+                    use_count=0,
+                    last_used_at=None,
+                    note=None,
+                    problems=(),
+                )
+                for route in ("main", "other")
+            ]
+
+            with patch.object(control.slots, "list_slots", return_value=slots):
+                compact = control.smoke(route="main", full=False)
+                full = control.smoke(route="main")
+
+            self.assertEqual(set(compact["routes"]), {"main"})
+            self.assertEqual(set(compact["slots"]), {"main-1"})
+            self.assertEqual(set(full["routes"]), {"main"})
+            self.assertEqual(set(full["slots"]), {"main-1"})
+            with self.assertRaisesRegex(PolicyError, "Unknown route: missing"):
+                control.smoke(route="missing", full=False)
 
     def test_model_routing_explain_states_coordinator_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

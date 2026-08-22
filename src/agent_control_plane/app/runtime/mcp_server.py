@@ -87,9 +87,14 @@ class ConfigFreshControl:
         self._lock = RLock()
         self._attach_configured_slots_sync_guard(self._control, self._loaded_fingerprint)
 
-    def smoke(self) -> dict[str, Any]:
+    def smoke(
+        self,
+        *,
+        route: str | None = None,
+        full: bool = False,
+    ) -> dict[str, Any]:
         control = self._fresh_control()
-        payload = control.smoke()
+        payload = control.smoke(route=route, full=full)
         current_fingerprint = _config_fingerprint(self._config_path)
         payload.update(
             {
@@ -258,9 +263,12 @@ def build_server(
     register = _offloaded(mcp)
 
     @register
-    def agent_smoke() -> dict[str, Any]:
-        """Check configuration, database initialization, route paths, and agy availability."""
-        return control.smoke()
+    def agent_smoke(route: str | None = None, full: bool = False) -> dict[str, Any]:
+        """Return compact smoke diagnostics, optionally scoped to one route or fully expanded."""
+        try:
+            return control.smoke(route=route, full=full)
+        except (PolicyError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_model_catalog() -> dict[str, Any]:

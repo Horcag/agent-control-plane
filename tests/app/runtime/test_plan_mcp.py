@@ -334,6 +334,36 @@ def test_mcp_model_routing_explain_delegates_and_returns_clean_errors(monkeypatc
     control.model_routing_explain.assert_called_with("adaptive", "missing")
 
 
+def test_mcp_smoke_defaults_to_compact_and_forwards_typed_scope(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.smoke.return_value = {"status": "passed", "routes": {"main": {}}}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        assert server.tools["agent_smoke"]() == control.smoke.return_value
+        control.smoke.assert_called_once_with(route=None, full=False)
+
+        server.tools["agent_smoke"]("main", True)
+        control.smoke.assert_called_with(route="main", full=True)
+
+        control.smoke.side_effect = PolicyError("Unknown route: missing")
+        assert server.tools["agent_smoke"]("missing", False) == {
+            "ok": False,
+            "error": "Unknown route: missing",
+        }
+
+
 def test_mcp_plan_retry_task_forwards_execution_overrides_to_control(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")
