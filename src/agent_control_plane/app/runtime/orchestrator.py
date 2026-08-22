@@ -14,7 +14,7 @@ from typing import Any
 from agent_control_plane.app.runtime.finalization_service import FinalizationService
 from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
 from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
-from agent_control_plane.app.runtime.mcp_payload_windows import (
+from agent_control_plane.app.runtime.mcp_byte_windows import (
     DEFAULT_PREVIEW_BYTES,
     file_preview,
     missing_file_preview,

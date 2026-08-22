@@ -5,12 +5,12 @@ from collections.abc import Mapping, Sequence
 from itertools import islice
 from typing import Any
 
-from agent_control_plane.app.runtime.mcp_payload_windows import (
+from agent_control_plane.app.runtime.mcp_byte_windows import (
     DEFAULT_PREVIEW_BYTES,
     MAX_RESPONSE_BYTES,
-    _utf8_prefix,
     serialized_bytes,
     text_preview,
+    utf8_prefix,
 )
 
 _MAX_CHECK_SUMMARIES = 32
@@ -248,19 +248,19 @@ def _sequence_length(value: Any) -> int:
 
 def _compact_scalar(value: Any, *, limit: int = 512) -> Any:
     if isinstance(value, str):
-        return _utf8_prefix(value, limit)
+        return utf8_prefix(value, limit)
     if value is None or isinstance(value, bool | int | float):
         return value
-    return _utf8_prefix(str(value), limit)
+    return utf8_prefix(str(value), limit)
 
 
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, str):
-        return _utf8_prefix(value, 256)
+        return utf8_prefix(value, 256)
     if value is None or isinstance(value, bool | int | float):
         return value
     if depth >= 3:
-        return _utf8_prefix(str(value), 256)
+        return utf8_prefix(str(value), 256)
     if isinstance(value, Mapping):
         items = list(islice(value.items(), _MAX_CHECK_SUMMARIES + 1))
         compact = {
@@ -272,7 +272,7 @@ def _bounded_value(value: Any, *, depth: int = 0) -> Any:
         return compact
     if isinstance(value, Sequence):
         return [_bounded_value(item, depth=depth + 1) for item in value[:_MAX_CHECK_SUMMARIES]]
-    return _utf8_prefix(str(value), 256)
+    return utf8_prefix(str(value), 256)
 
 
 def _optional_string(value: Any) -> str | None:

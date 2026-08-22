@@ -136,6 +136,14 @@ def serialized_bytes(payload: Any) -> int:
     return len(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
 
 
+def validate_compact_window(offset: int, limit: int) -> tuple[int, int]:
+    return _validate_offset(offset, 0), _validate_limit(limit)
+
+
+def utf8_prefix(value: str, limit: int) -> str:
+    return _utf8_prefix(value, limit)
+
+
 def _validate_limit(limit: int) -> int:
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("limit must be an integer")

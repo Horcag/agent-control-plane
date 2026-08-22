@@ -5,8 +5,8 @@ import json
 
 import pytest
 
-from agent_control_plane.app.runtime import mcp_payload_windows
-from agent_control_plane.app.runtime.mcp_payload_windows import (
+from agent_control_plane.app.runtime import mcp_byte_windows
+from agent_control_plane.app.runtime.mcp_byte_windows import (
     MAX_PREVIEW_BYTES,
     file_preview,
     missing_file_preview,
@@ -104,7 +104,7 @@ def test_tail_preview_bounds_a_multi_megabyte_single_line(tmp_path, monkeypatch)
     path = tmp_path / "attempt.log"
     path.write_text("x" * (2 * 1024 * 1024), encoding="utf-8")
     monkeypatch.setattr(
-        mcp_payload_windows,
+        mcp_byte_windows,
         "_sha256_file",
         lambda _path: pytest.fail("tail preview must not hash the full file"),
     )

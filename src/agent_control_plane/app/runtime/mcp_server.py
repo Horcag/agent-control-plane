@@ -14,7 +14,10 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from agent_control_plane.app.runtime.mcp_payload_windows import DEFAULT_PREVIEW_BYTES
+from agent_control_plane.app.runtime.mcp_byte_windows import (
+    DEFAULT_PREVIEW_BYTES,
+    validate_compact_window,
+)
 from agent_control_plane.app.runtime.mcp_payloads import compact_checkpoint, compact_review_item
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
@@ -521,6 +524,7 @@ def build_server(
         if full:
             return control.summary_job(job_id, lines)
         try:
+            validate_compact_window(cursor if cursor is not None else 0, limit)
             return control.mcp_summary_job(job_id, lines, cursor=cursor, limit=limit)
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -871,6 +875,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Return one compact durable handoff; full=True preserves the legacy payload."""
         try:
+            if not full:
+                validate_compact_window(offset, limit)
             item = control.get_review_inbox_item(item_id)
             return {
                 "ok": True,
@@ -889,6 +895,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Resolve an item and return a compact projection unless full=True."""
         try:
+            if not full:
+                validate_compact_window(offset, limit)
             item = control.resolve_review_inbox_item(item_id, decision)
             return {
                 "ok": True,
@@ -906,6 +914,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Re-run gates and return a compact projection unless full=True."""
         try:
+            if not full:
+                validate_compact_window(offset, limit)
             item = control.requalify_review_inbox_item(item_id)
             return {
                 "ok": True,
@@ -974,6 +984,7 @@ def build_server(
         if full:
             return control.tail_job(job_id, lines)
         try:
+            validate_compact_window(cursor if cursor is not None else 0, limit)
             return control.mcp_tail_job(job_id, lines, cursor=cursor, limit=limit)
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -989,6 +1000,7 @@ def build_server(
         if full:
             return control.result_job(job_id)
         try:
+            validate_compact_window(offset, limit)
             return control.mcp_result_job(job_id, offset=offset, limit=limit)
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -1178,6 +1190,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Checkpoint a slot and return compact metadata unless full=True."""
         try:
+            if not full:
+                validate_compact_window(offset, limit)
             payload = control.checkpoint_slot(name, job_id=job_id)
             return {
                 "ok": True,
