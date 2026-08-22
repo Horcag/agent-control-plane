@@ -882,7 +882,7 @@ def build_server(
                 "ok": True,
                 "item": item if full else compact_review_item(item, offset=offset, limit=limit),
             }
-        except KeyError as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -902,7 +902,7 @@ def build_server(
                 "ok": True,
                 "item": item if full else compact_review_item(item, offset=offset, limit=limit),
             }
-        except (KeyError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -921,7 +921,7 @@ def build_server(
                 "ok": True,
                 "item": item if full else compact_review_item(item, offset=offset, limit=limit),
             }
-        except (KeyError, ValueError, RuntimeError) as exc:
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -1197,7 +1197,7 @@ def build_server(
                 "ok": True,
                 **(payload if full else compact_checkpoint(payload, offset=offset, limit=limit)),
             }
-        except (KeyError, PolicyError, SlotError) as exc:
+        except (KeyError, PolicyError, SlotError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register

@@ -137,7 +137,12 @@ def serialized_bytes(payload: Any) -> int:
 
 
 def validate_compact_window(offset: int, limit: int) -> tuple[int, int]:
-    return _validate_offset(offset, 0), _validate_limit(limit)
+    """Validate compact-window arguments without applying an EOF clamp."""
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise TypeError("offset must be an integer")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+    return offset, _validate_limit(limit)
 
 
 def utf8_prefix(value: str, limit: int) -> str:

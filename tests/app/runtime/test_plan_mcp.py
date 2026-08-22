@@ -605,6 +605,53 @@ def test_mcp_review_inbox_requalify_delegates_and_returns_clean_errors(monkeypat
     control.requalify_review_inbox_item.assert_called_with("agent_job:job-1")
 
 
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("agent_review_inbox_get", ("agent_job:job-1",)),
+        ("agent_review_inbox_resolve", ("agent_job:job-1", "accepted")),
+        ("agent_review_inbox_requalify", ("agent_job:job-1",)),
+        ("agent_slots_checkpoint", ("acp-1", "job-1")),
+    ],
+)
+@pytest.mark.parametrize("parameter", ["offset", "limit"])
+def test_mcp_compact_mutations_reject_invalid_window_before_controller_call(
+    monkeypatch, tool, args, parameter
+) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        kwargs = {parameter: True if parameter == "offset" else 3}
+        response = server.tools[tool](*args, **kwargs)
+
+    expected_error = (
+        "offset must be an integer"
+        if parameter == "offset"
+        else "limit must be between 4 and 16384 bytes"
+    )
+    assert response == {"ok": False, "error": expected_error}
+    assert not any(
+        getattr(control, name).called
+        for name in (
+            "get_review_inbox_item",
+            "resolve_review_inbox_item",
+            "requalify_review_inbox_item",
+            "checkpoint_slot",
+        )
+    )
+
+
 def test_mcp_reconcile_requires_explicit_verified_runner_termination(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")
