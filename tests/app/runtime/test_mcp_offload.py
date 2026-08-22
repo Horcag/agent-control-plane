@@ -108,3 +108,20 @@ async def test_concurrency_is_restored() -> None:
         elapsed = time.monotonic() - start
 
         assert elapsed < n_calls * sleep_duration * 0.6
+
+
+@pytest.mark.anyio
+async def test_real_fastmcp_rejects_boolean_page_control_before_controller_call() -> None:
+    control = Mock()
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        server = build_server()
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        response = await session.call_tool(
+            "agent_plan_snapshot", {"plan_id": "plan-1", "event_limit": True}
+        )
+
+    assert response.isError is True
+    control.plan_snapshot.assert_not_called()

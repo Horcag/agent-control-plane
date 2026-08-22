@@ -398,49 +398,88 @@ class ReviewInboxStore:
         parent_thread_id: str | None = None,
         limit: int = 50,
     ) -> list[ReviewInboxItem]:
+        rows, _ = self.list_items_page(
+            review_status=review_status,
+            parent_thread_id=parent_thread_id,
+            limit=limit,
+            offset=0,
+        )
+        return rows
+
+    def list_items_page(
+        self,
+        *,
+        review_status: str | None = "pending",
+        parent_thread_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[ReviewInboxItem], int]:
         if review_status is not None and review_status not in REVIEW_STATUSES:
             expected = ", ".join(sorted(REVIEW_STATUSES))
             raise ValueError(f"review_status must be one of {expected}, or None")
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         self.initialize()
         with self._connect() as db:
             if review_status is None and parent_thread_id is None:
                 rows = db.execute(
                     """
                     select * from review_inbox_items
-                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ?
+                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ? offset ?
                     """,
-                    (limit,),
+                    (limit, offset),
                 ).fetchall()
+                total_count = int(
+                    db.execute("select count(*) from review_inbox_items").fetchone()[0]
+                )
             elif review_status is None:
                 rows = db.execute(
                     """
                     select * from review_inbox_items
                     where parent_thread_id = ?
-                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ?
+                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ? offset ?
                     """,
-                    (parent_thread_id, limit),
+                    (parent_thread_id, limit, offset),
                 ).fetchall()
+                total_count = int(
+                    db.execute(
+                        "select count(*) from review_inbox_items where parent_thread_id = ?",
+                        (parent_thread_id,),
+                    ).fetchone()[0]
+                )
             elif parent_thread_id is None:
                 rows = db.execute(
                     """
                     select * from review_inbox_items
                     where review_status = ?
-                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ?
+                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ? offset ?
                     """,
-                    (review_status, limit),
+                    (review_status, limit, offset),
                 ).fetchall()
+                total_count = int(
+                    db.execute(
+                        "select count(*) from review_inbox_items where review_status = ?",
+                        (review_status,),
+                    ).fetchone()[0]
+                )
             else:
                 rows = db.execute(
                     """
                     select * from review_inbox_items
                     where review_status = ? and parent_thread_id = ?
-                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ?
+                    order by coalesce(source_completed_at, updated_at) desc, item_id limit ? offset ?
                     """,
-                    (review_status, parent_thread_id, limit),
+                    (review_status, parent_thread_id, limit, offset),
                 ).fetchall()
-        return [_item_from_row(row) for row in rows]
+                total_count = int(
+                    db.execute(
+                        "select count(*) from review_inbox_items where review_status = ? and parent_thread_id = ?",
+                        (review_status, parent_thread_id),
+                    ).fetchone()[0]
+                )
+        return [_item_from_row(row) for row in rows], total_count
 
     def resolve(self, item_id: str, decision: str) -> ReviewInboxItem:
         self.initialize()

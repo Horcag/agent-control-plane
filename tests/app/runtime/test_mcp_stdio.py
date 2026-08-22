@@ -127,7 +127,7 @@ def test_real_stdio_server_reloads_changed_slot_config_without_stale_sqlite_writ
     )
     assert results["reloaded_smoke"]["config_reloaded"] is True
     assert results["reloaded_smoke"]["reload_required"] is False
-    assert results["slots"]["result"][0]["path"] == str(new_slot.resolve())
+    assert results["slots"]["result"]["items"][0]["path"] == str(new_slot.resolve())
     assert results["smoke"]["codex_model_catalog"]["status"] == "missing"
     assert set(results["smoke"]["codex_model_catalog"]["profile_resolution_errors"]) == {
         "mechanical",

@@ -946,6 +946,17 @@ class AgentControlPlane:
     ) -> list[dict[str, Any]]:
         return self.plan_service.list_plans(limit, include_archived=include_archived)
 
+    def list_plans_page(
+        self,
+        limit: int,
+        *,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        return self.plan_service.list_plans_page(
+            limit, offset=offset, include_archived=include_archived
+        )
+
     def start_job(self, options: StartOptions) -> JobRecord:
         try:
             return JobLauncher(
@@ -1264,6 +1275,7 @@ class AgentControlPlane:
         task_id_glob: str | None = None,
         cursor: Mapping[str, Any] | None = None,
         stale_after_sec: float = DEFAULT_STALE_AFTER_SEC,
+        max_selected_jobs: int | None = None,
     ) -> dict[str, Any]:
         """Take one non-blocking pass over a watch selection and report what changed.
 
@@ -1290,6 +1302,7 @@ class AgentControlPlane:
                 task_id_glob=task_id_glob,
             ),
             stale_after_sec=stale_after_sec,
+            max_selected_jobs=max_selected_jobs,
         )
         stream.load_cursor(cursor)
         events = [asdict(event) for event in stream.tick()]
@@ -1523,6 +1536,31 @@ class AgentControlPlane:
                 limit=limit,
             )
         ]
+
+    def list_review_inbox_page(
+        self,
+        *,
+        review_status: str | None = "pending",
+        parent_thread_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+        sync_subagents: bool = False,
+        since_hours: float | None = 72.0,
+        max_files: int = 100,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if sync_subagents:
+            self.sync_subagent_results(
+                since_hours=since_hours,
+                max_files=max_files,
+                parent_thread_id=parent_thread_id,
+            )
+        items, total_count = self.review_inbox.list_items_page(
+            review_status=review_status,
+            parent_thread_id=parent_thread_id,
+            limit=limit,
+            offset=offset,
+        )
+        return [_compact_review_item(item, excerpt_limit=600) for item in items], total_count
 
     def get_review_inbox_item(self, item_id: str) -> dict[str, Any]:
         return self.review_inbox.get(item_id).as_dict()

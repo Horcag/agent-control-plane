@@ -1292,8 +1292,20 @@ class PlanStore:
         *,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
+        rows, _ = self.list_plans_page(limit, offset=0, include_archived=include_archived)
+        return rows
+
+    def list_plans_page(
+        self,
+        limit: int,
+        *,
+        offset: int = 0,
+        include_archived: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
         if limit <= 0:
             raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         self.initialize()
         with self._connect() as db:
             db.execute("begin immediate")
@@ -1303,22 +1315,28 @@ class PlanStore:
                     """
                     select plan_id from plans
                     where ? or archived_at is null
-                    order by updated_at desc limit ?
+                    order by updated_at desc limit ? offset ?
                     """,
-                    (int(include_archived), limit),
+                    (int(include_archived), limit, offset),
                 ).fetchall()
             ]
             for plan_id in plan_ids:
                 self._sync_plan(db, plan_id)
+            total_count = int(
+                db.execute(
+                    "select count(*) from plans where ? or archived_at is null",
+                    (int(include_archived),),
+                ).fetchone()[0]
+            )
             rows = db.execute(
                 """
                 select p.*, count(t.task_id) as task_count,
                        sum(case when t.state = 'completed' then 1 else 0 end) as completed_count
                 from plans p left join plan_tasks t on t.plan_id = p.plan_id
                 where ? or p.archived_at is null
-                group by p.plan_id order by p.updated_at desc limit ?
+                group by p.plan_id order by p.updated_at desc limit ? offset ?
                 """,
-                (int(include_archived), limit),
+                (int(include_archived), limit, offset),
             ).fetchall()
         return [
             {
@@ -1326,13 +1344,15 @@ class PlanStore:
                 "title": row["title"],
                 "status": _listed_plan_status(row),
                 "progress": f"{int(row['completed_count'] or 0)}/{int(row['task_count'])}",
+                "task_count": int(row["task_count"]),
+                "completed_count": int(row["completed_count"] or 0),
                 "updated_at": row["updated_at"],
                 "cancel_requested_at": row["cancel_requested_at"],
                 "cancelled_at": row["cancelled_at"],
                 "archived_at": row["archived_at"],
             }
             for row in rows
-        ]
+        ], total_count
 
     def _record_decision(
         self,

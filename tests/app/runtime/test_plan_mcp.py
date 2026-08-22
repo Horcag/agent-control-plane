@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from agent_control_plane.app.runtime import mcp_server
+from agent_control_plane.app.runtime.mcp_byte_windows import serialized_bytes
 from agent_control_plane.app.runtime.mcp_server import (
     ConfigFreshControl,
     ConfigFreshnessError,
@@ -328,9 +329,9 @@ def test_mcp_model_catalog_refreshes_after_config_change(monkeypatch, tmp_path: 
         side_effect=[initial, refreshed],
     ) as from_config_path:
         server = build_server(str(config_path))
-        assert server.tools["agent_model_catalog"]() == {"version": "old"}
+        assert server.tools["agent_model_catalog"]()["version"] == "old"
         config_path.write_text("version = 'new'\n", encoding="utf-8")
-        assert server.tools["agent_model_catalog"]() == {"version": "new"}
+        assert server.tools["agent_model_catalog"]()["version"] == "new"
 
     assert from_config_path.call_count == 2
     initial.model_catalog_inspection.assert_called_once_with()
@@ -1113,3 +1114,285 @@ def test_low_poll_interval_raised_when_timeout_positive(monkeypatch) -> None:
 
     assert control.watch_job.call_args.kwargs["timeout_sec"] == 10.0
     assert control.watch_job.call_args.kwargs["poll_interval_sec"] == 0.5
+
+
+def test_mcp_collection_pages_delegate_owner_offsets_and_keep_truthful_cursors(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    page = [{"plan_id": f"plan-{index}"} for index in range(40, 60)]
+    control.list_plans_page.return_value = (page, 75)
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        response = server.tools["agent_plan_list"](offset=40, limit=20)
+
+    assert response == {
+        "items": page,
+        "offset": 40,
+        "limit": 20,
+        "total_count": 75,
+        "returned": 20,
+        "truncated": True,
+        "next_cursor": 60,
+    }
+    control.list_plans_page.assert_called_once_with(20, offset=40, include_archived=False)
+
+
+def test_mcp_review_inbox_default_is_valid_and_pages_at_controller_boundary(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.list_review_inbox_page.return_value = ([{"item_id": "item-1"}], 1)
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        response = server.tools["agent_review_inbox_list"]()
+
+    assert response["ok"] is True
+    assert response["items"] == [{"item_id": "item-1"}]
+    assert response["total_count"] == 1
+    assert response["next_cursor"] is None
+    assert control.list_review_inbox_page.call_args.kwargs["max_files"] == 100
+
+
+@pytest.mark.parametrize("offset, limit", [(True, 20), (0, True), (-1, 20), (0, 101)])
+def test_mcp_collection_controls_fail_before_controller_call(monkeypatch, offset, limit) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        response = server.tools["agent_plan_list"](offset=offset, limit=limit)
+
+    assert response["ok"] is False
+    control.list_plans_page.assert_not_called()
+
+
+def test_mcp_collection_wrappers_bound_hostile_unicode_payloads(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    hostile = "😀" * 10_000
+    control = Mock()
+    control.model_catalog_inspection.return_value = {
+        "models": [
+            {"model": f"model-{index}", "rate_card_source": hostile} for index in range(10_000)
+        ]
+    }
+    control.analytics.return_value = {
+        "attempts": [
+            {"job_id": f"job-{index}", "tool_counts": {hostile: index}} for index in range(10_000)
+        ]
+    }
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        catalog = server.tools["agent_model_catalog"]()
+        analytics = server.tools["agent_analytics"](limit=100)
+
+    assert catalog["total_count"] == 10_000
+    assert len(catalog["items"]) == 20
+    assert serialized_bytes(catalog) < 64 * 1024
+    assert analytics["sample_count"] == 100
+    assert analytics["sample_truncated"] is True
+    assert serialized_bytes(analytics) < 64 * 1024
+
+
+def test_mcp_plan_and_review_list_wrappers_bound_exact_hostile_twenty_row_probes(
+    monkeypatch,
+) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    hostile = "😀" * 100_000
+    control = Mock()
+    control.list_plans_page.return_value = (
+        [
+            {
+                "plan_id": f"plan-{index}",
+                "title": hostile,
+                "status": "running",
+                "progress": "1/2",
+                "task_count": 2,
+                "completed_count": 1,
+                "updated_at": "2026-08-22T00:00:00Z",
+            }
+            for index in range(20)
+        ],
+        25,
+    )
+    control.list_review_inbox_page.return_value = (
+        [
+            {
+                "item_id": f"item-{index}",
+                "source_kind": "agent_job",
+                "source_id": f"job-{index}",
+                "review_status": "pending",
+                "task_id": f"task-{index}",
+                "route": "acp",
+                "slot_name": "acp-1",
+                "checkpoint_sha": "a" * 40,
+                "result_excerpt": hostile,
+                "result_text": hostile,
+                "verification_bundle": {"commands": [hostile], "metadata": {"x": hostile}},
+                "metadata": {"x": hostile},
+            }
+            for index in range(20)
+        ],
+        25,
+    )
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        plans = server.tools["agent_plan_list"]()
+        inbox = server.tools["agent_review_inbox_list"]()
+
+    assert serialized_bytes(plans) < 64 * 1024
+    assert plans["total_count"] == 25
+    assert plans["returned"] == 20
+    assert plans["truncated"] is True
+    assert plans["next_cursor"] == 20
+    assert plans["items"][0]["title"] != hostile
+    assert serialized_bytes(inbox) < 64 * 1024
+    assert inbox["total_count"] == 25
+    assert inbox["returned"] == 20
+    assert inbox["truncated"] is True
+    assert inbox["next_cursor"] == 20
+    assert inbox["items"][0]["result_excerpt"] != hostile
+    assert inbox["items"][0]["result_excerpt_sha256"]
+    assert "result_text" not in inbox["items"][0]
+    assert "verification_bundle" not in inbox["items"][0]
+    assert "metadata" not in inbox["items"][0]
+
+
+def test_mcp_plan_snapshot_preserves_event_and_review_decision_fields(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.plan_snapshot.return_value = {
+        "changes": [{"event": "review_requested", "cursor": 4, "task_id": "task-1"}],
+        "awaiting_review": [
+            {
+                "task_id": "task-1",
+                "review_status": "pending",
+                "accepted_sha": "a" * 40,
+                "dispatch_error": "x" * 2_000,
+                "result_path": "/result.md",
+                "needs_strategy_revision": True,
+                "retry_fingerprint": "fingerprint",
+                "depends_on": ["task-0"],
+                "route": "acp",
+                "backend": "codex",
+                "result_summary": "summary" * 1_000,
+                "execution": {
+                    "route": "acp",
+                    "slot": "acp-1",
+                    "backend": "codex",
+                    "workspace_access": "native",
+                    "read_only": False,
+                    "codex_model": "gpt-5.6-sol",
+                    "codex_reasoning_effort": "high",
+                    "expected_result_status": "completed",
+                    "controller_gate_mode": "full",
+                    "effective_scope_sha256": "b" * 64,
+                    "codex_tool_call_budget": 160,
+                    "retry_override_reason": "retry reason",
+                    "brief_sha256": "c" * 64,
+                    "brief_chars": 123,
+                    "brief": "must not leak",
+                    "effective_scope": ["src/private.py"],
+                },
+            }
+        ],
+    }
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        response = build_server().tools["agent_plan_snapshot"]("plan-1")
+
+    assert response["changes"][0]["event"] == "review_requested"
+    task = response["awaiting_review"][0]
+    assert task["review_status"] == "pending"
+    assert task["accepted_sha"] == "a" * 40
+    assert task["needs_strategy_revision"] is True
+    assert task["depends_on"] == ["task-0"]
+    assert task["result_summary"] != "summary" * 1_000
+    assert task["execution"]["route"] == "acp"
+    assert task["execution"]["brief_chars"] == 123
+    assert "brief" not in task["execution"]
+    assert "effective_scope" not in task["execution"]
+
+
+def test_mcp_slots_compact_huge_dirty_payload_and_analytics_defaults_to_twenty(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    dirty = "😀" * 100_000
+    control = Mock()
+    control.list_slots.return_value = [{"name": "acp-1", "route": "acp", "dirty": dirty}]
+    control.analytics.return_value = {"attempts": [{"job_id": str(index)} for index in range(100)]}
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        server = build_server()
+        slots = server.tools["agent_slots_list"](route="acp")
+        analytics = server.tools["agent_analytics"]()
+
+    assert serialized_bytes(slots) < 64 * 1024
+    assert slots["items"][0]["dirty_total_bytes"] == len(dirty.encode("utf-8"))
+    assert len(slots["items"][0]["dirty_sha256"]) == 64
+    assert analytics["sample_count"] == 20
+    assert analytics["sample_truncated"] is True
+    assert serialized_bytes(analytics) < 64 * 1024
+    assert control.analytics.call_args.kwargs["limit"] == 20

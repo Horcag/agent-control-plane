@@ -63,6 +63,10 @@ class EmptySelectionError(ValueError):
     """Raised when a watch selection matches no jobs."""
 
 
+class WatchSelectionTooLargeError(ValueError):
+    """Raised when a stateless watch cannot preserve every selected job in its cursor."""
+
+
 def _default_clock() -> datetime:
     return datetime.fromisoformat(utc_now())
 
@@ -138,6 +142,7 @@ class WatchEventStream:
         read_retries: int = DEFAULT_READ_RETRIES,
         read_retry_backoff_sec: float = DEFAULT_READ_RETRY_BACKOFF_SEC,
         error_surface_threshold: int = DEFAULT_ERROR_SURFACE_THRESHOLD,
+        max_selected_jobs: int | None = None,
         clock: Callable[[], datetime] = _default_clock,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -147,17 +152,21 @@ class WatchEventStream:
             raise ValueError("read_retries must be at least 1")
         if error_surface_threshold < 1:
             raise ValueError("error_surface_threshold must be at least 1")
+        if max_selected_jobs is not None and max_selected_jobs < 1:
+            raise ValueError("max_selected_jobs must be positive")
         self._store = store
         self._selection = selection
         self._stale_after_sec = stale_after_sec
         self._read_retries = read_retries
         self._read_retry_backoff_sec = read_retry_backoff_sec
         self._error_surface_threshold = error_surface_threshold
+        self._max_selected_jobs = max_selected_jobs
         self._clock = clock
         self._sleep = sleep
         self._selection_failures = 0
         self._store.initialize()
         job_ids = self._resolve_selection()
+        self._require_bounded_selection(job_ids)
         if not job_ids:
             raise EmptySelectionError(
                 "Watch selection matched no jobs: "
@@ -228,6 +237,7 @@ class WatchEventStream:
         events: list[WatchEvent] = []
         try:
             discovered = self._resolve_selection_with_retry()
+            self._require_bounded_selection(discovered)
             self._selection_failures = 0
         except sqlite3.Error as exc:
             self._selection_failures += 1
@@ -239,6 +249,13 @@ class WatchEventStream:
         for job_id, state in list(self._states.items()):
             events.extend(self._tick_job(job_id, state))
         return events
+
+    def _require_bounded_selection(self, job_ids: frozenset[str]) -> None:
+        if self._max_selected_jobs is not None and len(job_ids) > self._max_selected_jobs:
+            raise WatchSelectionTooLargeError(
+                f"Watch selection has {len(job_ids)} jobs, exceeding the safe limit "
+                f"of {self._max_selected_jobs}; narrow job_ids, plan_id, or task_glob"
+            )
 
     def run(
         self,

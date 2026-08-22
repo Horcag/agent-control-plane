@@ -14,9 +14,27 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from pydantic import StrictInt
+
 from agent_control_plane.app.runtime.mcp_byte_windows import (
     DEFAULT_PREVIEW_BYTES,
     validate_compact_window,
+)
+from agent_control_plane.app.runtime.mcp_collection_rows import (
+    compact_plan_list_page,
+    compact_review_list_page,
+)
+from agent_control_plane.app.runtime.mcp_collections import (
+    DEFAULT_COLLECTION_LIMIT,
+    MAX_ANALYTICS_SAMPLES,
+    MAX_COLLECTION_LIMIT,
+    compact_analytics,
+    compact_model_catalog,
+    compact_plan_snapshot,
+    compact_slots_page,
+    validate_optional_cursor,
+    validate_page,
+    validate_positive_limit,
 )
 from agent_control_plane.app.runtime.mcp_payloads import compact_checkpoint, compact_review_item
 from agent_control_plane.app.runtime.orchestrator import (
@@ -277,20 +295,28 @@ def build_server(
         """Return compact smoke diagnostics, optionally scoped to one route or fully expanded."""
         try:
             return control.smoke(route=route, full=full)
-        except (PolicyError, ValueError) as exc:
+        except (PolicyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_model_catalog() -> dict[str, Any]:
-        """Return bounded Codex model catalog metadata without cache instruction blobs."""
-        return control.model_catalog_inspection()
+    def agent_model_catalog(
+        offset: StrictInt = 0,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+    ) -> dict[str, Any]:
+        """Return a bounded truthful page of Codex model catalog metadata."""
+        try:
+            offset, limit = validate_page(offset, limit)
+            payload = control.model_catalog_inspection()
+            return compact_model_catalog(payload, offset=offset, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_model_routing_explain(policy: str, route: str) -> dict[str, Any]:
         """Explain bounded adaptive routing evidence for one named policy and route."""
         try:
             return control.model_routing_explain(policy, route)
-        except (PolicyError, ValueError) as exc:
+        except (PolicyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -458,6 +484,14 @@ def build_server(
                 "ok": False,
                 "error": "agent_watch_events requires job_ids, plan_id, or task_glob",
             }
+        if job_ids is not None and len(job_ids) > MAX_COLLECTION_LIMIT:
+            return {
+                "ok": False,
+                "error": (
+                    f"watch selection exceeds {MAX_COLLECTION_LIMIT} explicit jobs; "
+                    "narrow job_ids before watching"
+                ),
+            }
         try:
             payload = control.watch_events(
                 job_ids=job_ids,
@@ -465,6 +499,7 @@ def build_server(
                 task_id_glob=task_glob,
                 cursor=cursor,
                 stale_after_sec=stale_after_sec,
+                max_selected_jobs=MAX_COLLECTION_LIMIT,
             )
         except EmptySelectionError as exc:
             return {"ok": False, "error": str(exc), "done": False}
@@ -531,7 +566,7 @@ def build_server(
 
     @register
     def agent_analytics(
-        limit: int = 100,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
         model: str | None = None,
         reasoning_effort: str | None = None,
         backend: str | None = None,
@@ -542,13 +577,20 @@ def build_server(
         backend filters to a single backend (e.g. "codex" or "claude") so
         analytics from mixed fleets can be inspected separately.
         """
-        return control.analytics(
-            limit=limit,
-            model=model,
-            reasoning_effort=reasoning_effort,
-            backend=backend,
-            valid_only=valid_only,
-        )
+        try:
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_ANALYTICS_SAMPLES
+            )
+            payload = control.analytics(
+                limit=effective_limit,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                backend=backend,
+                valid_only=valid_only,
+            )
+            return compact_analytics(payload, sample_limit=effective_limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_plan_create(
@@ -651,45 +693,55 @@ def build_server(
     @register
     def agent_plan_snapshot(
         plan_id: str,
-        since: int | None = None,
-        event_limit: int = 100,
-        item_limit: int = 20,
+        since: StrictInt | None = None,
+        event_limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        item_limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
     ) -> dict[str, Any]:
         """Return compact plan state; pass cursor as since to receive only new events."""
         try:
-            return control.plan_snapshot(
+            _, event_limit = validate_page(0, event_limit)
+            _, item_limit = validate_page(0, item_limit)
+            since = validate_optional_cursor(since, name="since")
+            payload = control.plan_snapshot(
                 plan_id,
                 since=since,
                 event_limit=event_limit,
                 item_limit=item_limit,
             )
-        except (KeyError, ValueError) as exc:
+            return compact_plan_snapshot(payload, event_limit=event_limit, item_limit=item_limit)
+        except (KeyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
     def agent_plan_watch(
         plan_id: str,
-        since: int,
+        since: StrictInt,
         poll_interval_sec: float = 5.0,
         timeout_sec: float = 25.0,
-        event_limit: int = 100,
-        item_limit: int = 20,
+        event_limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        item_limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
     ) -> dict[str, Any]:
         """Long-poll until the plan cursor advances, without returning worker logs."""
         eff_timeout, eff_poll, clamped = _normalize_poll_params(timeout_sec, poll_interval_sec)
         try:
+            _, event_limit = validate_page(0, event_limit)
+            _, item_limit = validate_page(0, item_limit)
+            validated_since = validate_optional_cursor(since, name="since")
+            if validated_since is None:
+                raise TypeError("since must be an integer")
             result = control.watch_plan(
                 plan_id,
-                since=since,
+                since=validated_since,
                 poll_interval_sec=eff_poll,
                 timeout_sec=eff_timeout,
                 event_limit=event_limit,
                 item_limit=item_limit,
             )
+            result = compact_plan_snapshot(result, event_limit=event_limit, item_limit=item_limit)
             if clamped and isinstance(result, dict):
                 result["timeout_clamped_to"] = _MAX_LONG_POLL_SEC
             return result
-        except (KeyError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -819,11 +871,24 @@ def build_server(
 
     @register
     def agent_plan_list(
-        limit: int = 20,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
         include_archived: bool = False,
-    ) -> list[dict[str, Any]]:
-        """List recent durable plans with compact progress counts."""
-        return control.list_plans(limit, include_archived=include_archived)
+        offset: StrictInt = 0,
+        full: bool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """List a truthful durable-plan page; full=True preserves the legacy list output."""
+        try:
+            offset, limit = validate_page(offset, limit)
+            if full:
+                return control.list_plans(limit, include_archived=include_archived)
+            items, total_count = control.list_plans_page(
+                limit, offset=offset, include_archived=include_archived
+            )
+            return compact_plan_list_page(
+                items, offset=offset, limit=limit, total_count=total_count
+            )
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_retention_gc(
@@ -844,26 +909,46 @@ def build_server(
     @register
     def agent_review_inbox_list(
         review_status: str | None = "pending",
-        limit: int = 50,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
         sync_subagents: bool = False,
         since_hours: float = 72.0,
-        max_files: int = 500,
+        max_files: StrictInt = MAX_COLLECTION_LIMIT,
         parent_thread_id: str | None = None,
+        offset: StrictInt = 0,
+        full: bool = False,
     ) -> dict[str, Any]:
-        """List durable handoffs; optionally import completed Codex subagents first."""
+        """List truthful durable-handoff pages; full=True preserves the legacy items wrapper."""
         try:
-            return {
-                "ok": True,
-                "items": control.list_review_inbox(
+            offset, limit = validate_page(offset, limit)
+            max_files = validate_positive_limit(
+                max_files, name="max_files", maximum=MAX_COLLECTION_LIMIT
+            )
+            if full:
+                items = control.list_review_inbox(
                     review_status=review_status,
                     parent_thread_id=parent_thread_id,
                     limit=limit,
                     sync_subagents=sync_subagents,
                     since_hours=since_hours,
                     max_files=max_files,
+                )
+                return {"ok": True, "items": items}
+            items, total_count = control.list_review_inbox_page(
+                review_status=review_status,
+                parent_thread_id=parent_thread_id,
+                limit=limit,
+                offset=offset,
+                sync_subagents=sync_subagents,
+                since_hours=since_hours,
+                max_files=max_files,
+            )
+            return {
+                "ok": True,
+                **compact_review_list_page(
+                    items, offset=offset, limit=limit, total_count=total_count
                 ),
             }
-        except (PolicyError, ValueError) as exc:
+        except (PolicyError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -1039,14 +1124,24 @@ def build_server(
         all_routes: bool = False,
         include_deleted: bool = False,
         include_stale: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Return explicitly scoped slot inventory; stale rows require an audit flag."""
-        return control.list_slots(
-            route=route,
-            all_routes=all_routes,
-            include_deleted=include_deleted,
-            include_stale=include_stale,
-        )
+        offset: StrictInt = 0,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        full: bool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Return a truthful route-scoped slot page; full=True preserves legacy list output."""
+        try:
+            offset, limit = validate_page(offset, limit)
+            slots = control.list_slots(
+                route=route,
+                all_routes=all_routes,
+                include_deleted=include_deleted,
+                include_stale=include_stale,
+            )
+            if full:
+                return slots
+            return compact_slots_page(slots, offset=offset, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_slots_create(

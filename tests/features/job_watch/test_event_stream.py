@@ -22,6 +22,7 @@ from agent_control_plane.features.job_watch import (
     WatchEvent,
     WatchEventStream,
     WatchSelection,
+    WatchSelectionTooLargeError,
     is_on_contract,
     watch_command_for,
 )
@@ -98,6 +99,18 @@ def test_empty_selection_raises(tmp_path: Path) -> None:
 
     with pytest.raises(EmptySelectionError):
         _stream(store, WatchSelection(task_id_glob="no-such-task-*"))
+
+
+def test_selection_larger_than_cursor_contract_fails_before_any_job_read(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.initialize()
+
+    with pytest.raises(WatchSelectionTooLargeError, match="narrow job_ids"):
+        _stream(
+            store,
+            WatchSelection(job_ids=frozenset(f"job-{index}" for index in range(101))),
+            max_selected_jobs=100,
+        )
 
 
 def test_explicit_nonexistent_job_id_fails_fast_on_tick(tmp_path: Path) -> None:

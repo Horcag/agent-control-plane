@@ -326,6 +326,13 @@ class PlanService:
     ) -> list[dict[str, Any]]:
         return self._plan_store.list_plans(limit, include_archived=include_archived)
 
+    def list_plans_page(
+        self, limit: int, *, offset: int = 0, include_archived: bool = False
+    ) -> tuple[list[dict[str, Any]], int]:
+        return self._plan_store.list_plans_page(
+            limit, offset=offset, include_archived=include_archived
+        )
+
     def reconcile_jobs(self, job_id: str | None = None) -> dict[str, Any]:
         return self._reconcile_jobs(job_id)
 
