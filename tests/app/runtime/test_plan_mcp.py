@@ -11,6 +11,12 @@ import pytest
 
 from agent_control_plane.app.runtime import mcp_server
 from agent_control_plane.app.runtime.mcp_byte_windows import serialized_bytes
+from agent_control_plane.app.runtime.mcp_mutation_payloads import (
+    bootstrap_payload,
+    reconcile_payload,
+    retention_payload,
+    slots_sync_payload,
+)
 from agent_control_plane.app.runtime.mcp_server import (
     ConfigFreshControl,
     ConfigFreshnessError,
@@ -675,11 +681,241 @@ def test_mcp_reconcile_requires_explicit_verified_runner_termination(monkeypatch
         terminate_verified_runners=True,
     )
 
-    assert response == {"terminated_orphan_runners": ["job-1"]}
+    assert response == {
+        "ok": True,
+        "counts": {"terminated_orphan_runners": 1},
+        "terminated_orphan_runners": ["job-1"],
+    }
     control.reconcile_jobs.assert_called_once_with(
         "job-1",
         terminate_verified_runners=True,
+        limit=20,
     )
+
+
+@pytest.mark.parametrize(
+    ("tool", "kwargs", "controller_method"),
+    [
+        ("agent_reconcile", {"limit": True}, "reconcile_jobs"),
+        ("agent_reconcile", {"terminate_verified_runners": 1}, "reconcile_jobs"),
+        ("agent_archive_jobs", {"apply": 1}, "archive_jobs"),
+        ("agent_retention_gc", {"cursor": 1}, "collect_garbage"),
+        ("agent_slots_sync", {"route": "acp", "all_routes": 1}, "sync_slots"),
+        ("agent_slots_cleanup", {"max_per_route": True, "route": "acp"}, "cleanup_slots"),
+        ("agent_slots_bootstrap", {"name": "acp-1", "create": 1}, "bootstrap_slot"),
+        (
+            "agent_slots_ensure_root_module",
+            {"remove_slot_modules": 1},
+            "ensure_slot_root_ide_module",
+        ),
+    ],
+)
+def test_mcp_mutation_controls_fail_before_controller_call(
+    monkeypatch, tool, kwargs, controller_method
+) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+    control = Mock()
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        response = server.tools[tool](**kwargs)
+
+    assert response["ok"] is False
+    getattr(control, controller_method).assert_not_called()
+
+
+def test_mcp_mutations_bound_work_before_controller_and_never_return_a_cursor(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+    control = Mock()
+    control.archive_jobs.return_value = [{"job_id": "job-1", "action": "archived"}]
+    control.reconcile_jobs.return_value = {"reconciled_orphaned_jobs": ["job-1"]}
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+        archived = server.tools["agent_archive_jobs"](apply=True, limit=3)
+        reconciled = server.tools["agent_reconcile"](limit=3)
+
+    assert archived["affected"] == [{"job_id": "job-1", "action": "archived"}]
+    assert "next_cursor" not in archived
+    assert "next_cursor" not in reconciled
+    control.archive_jobs.assert_called_once_with(older_than_days=14, limit=3, apply=True)
+    control.reconcile_jobs.assert_called_once_with(None, terminate_verified_runners=False, limit=3)
+
+
+def test_mcp_mutation_payloads_keep_required_diagnostics_under_64_kib() -> None:
+    hostile = "\U0001f9ea" * 20_000
+    reconcile = reconcile_payload({"errors": [hostile], "live_jobs": ["job-1"]})
+    retention = retention_payload(
+        {
+            "apply": True,
+            "cutoff": hostile,
+            "limit_per_category": 20,
+            "limit_total": True,
+            "counts": {"plans": 1},
+            "applied": {"plans": 1},
+            "candidates": {"plans": [{"plan_id": hostile}], "checkpoint_refs": []},
+            "blocked_checkpoint_refs": [
+                {"checkpoint_ref": "refs/agent-control-plane/jobs/one", "reason": hostile}
+            ],
+        }
+    )
+    bootstrap = bootstrap_payload(
+        _real_bootstrap_payload(hostile),
+        subject="bootstrap",
+    )
+    root_module = bootstrap_payload(_real_root_module_payload(hostile), subject="root module")
+    for payload in (reconcile, retention, bootstrap, root_module):
+        assert serialized_bytes(payload) < 64 * 1024
+    assert reconcile["counts"]["errors"] == 1
+    assert retention["applied"]["plans"] == 1
+    assert retention["blocked_checkpoint_refs"][0]["checkpoint_ref"].startswith("refs/")
+    assert bootstrap["bootstrap"]["config"]["config_path"]
+    assert bootstrap["bootstrap"]["slot"]["path"] == "/slots/acp-1"
+    assert bootstrap["bootstrap"]["ide"]["root_module"]["module_file"] == "/idea/root.iml"
+    assert bootstrap["bootstrap"]["config"]["source_roots"].get("truncated") is True
+    assert bootstrap["bootstrap"]["ide"]["dedicated_slot_modules"].get("total_count") == 21
+    assert bootstrap["bootstrap"]["ide"]["dedicated_slot_modules"].get("returned") == len(
+        bootstrap["bootstrap"]["ide"]["dedicated_slot_modules"]["items"]
+    )
+    assert bootstrap["bootstrap"]["ide"]["dedicated_slot_modules"].get("truncated") is True
+    assert root_module["module"]["root_module"]["status"] == "ready"
+    assert root_module["module"]["duplicate_inspection"]["profile_file"] == "/idea/profile.xml"
+    assert root_module["module"]["vcs_mappings"]["items"][0]["vcs_xml"] == "/idea/vcs.xml"
+    assert root_module["module"]["removed_slot_modules"]["items"][0]["error"] == "still-loaded"
+    assert hostile not in repr((bootstrap, root_module))
+
+
+def test_registered_slot_mutation_wrappers_project_real_payload_shapes(monkeypatch) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+    hostile = "\U0001f9ea" * 20_000
+    control = Mock()
+    control.bootstrap_slot.return_value = _real_bootstrap_payload(hostile)["bootstrap"]
+    control.ensure_slot_root_ide_module.return_value = _real_root_module_payload(hostile)["module"]
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        server = build_server()
+        bootstrap = server.tools["agent_slots_bootstrap"]("acp-1")
+        root_module = server.tools["agent_slots_ensure_root_module"]()
+
+    for payload in (bootstrap, root_module):
+        assert serialized_bytes(payload) < 64 * 1024
+        assert hostile not in repr(payload)
+    assert bootstrap["bootstrap"]["config"]["status"] == "created"
+    assert bootstrap["bootstrap"]["slot"]["dirty"].startswith("dirty")
+    assert root_module["module"]["dedicated_slot_modules"]["total_count"] == 21
+    assert root_module["module"]["removed_slot_modules"]["truncated"] is True
+
+
+def _real_bootstrap_payload(hostile: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "bootstrap": {
+            "config": {
+                "config_path": "/config/workspaces.toml",
+                "changed": True,
+                "created": True,
+                "status": "created",
+                "message": hostile,
+                "errors": [hostile] * 21,
+                "route": "acp",
+                "slot": "acp-1",
+                "route_added": True,
+                "slot_added": True,
+                "repo_path": "/repo",
+                "slot_path": "/slots/acp-1",
+                "source_roots": [f"/repo/src/{hostile}/{index}" for index in range(21)],
+            },
+            "slot": {
+                "name": "acp-1",
+                "path": "/slots/acp-1",
+                "status": "ready",
+                "dirty": f"dirty {hostile}",
+                "problems": [hostile] * 21,
+            },
+            "ide": _real_root_module_payload(hostile)["module"],
+        },
+    }
+
+
+def _real_root_module_payload(hostile: str) -> dict[str, object]:
+    modules = [
+        {
+            "module_name": f"module-{index}-{hostile}",
+            "module_file": f"/idea/{index}.iml",
+            "sdk_name": "Python 3.12",
+            "status": "ready",
+            "error": "",
+        }
+        for index in range(21)
+    ]
+    return {
+        "ok": True,
+        "module": {
+            "root_module": {
+                "module_name": f"root-{hostile}",
+                "module_file": "/idea/root.iml",
+                "status": "ready",
+                "problems": [hostile] * 21,
+            },
+            "vcs_mappings": {
+                "vcs_xml": "/idea/vcs.xml",
+                "status": "ready",
+                "mapped_directories": [f"/slots/{hostile}/{index}" for index in range(21)],
+            },
+            "duplicate_inspection": {
+                "profile_file": "/idea/profile.xml",
+                "status": "ready",
+                "error": "",
+            },
+            "dedicated_slot_modules": modules,
+            "removed_slot_modules": [{**item, "error": "still-loaded"} for item in modules],
+            "errors": [hostile] * 21,
+            "problems": [hostile] * 21,
+        },
+    }
+
+
+def test_slots_sync_payload_reports_exact_and_truncated_counts_truthfully() -> None:
+    rows = [
+        {"name": f"acp-{index}", "route": "acp", "path": f"/slots/{index}"} for index in range(20)
+    ]
+    exact = slots_sync_payload(rows, route="acp", all_routes=False, limit=20)
+    more = slots_sync_payload(
+        [*rows, {"name": "other-1", "route": "other"}],
+        route=None,
+        all_routes=True,
+        limit=20,
+    )
+
+    assert (exact["total_count"], exact["returned"], exact["truncated"]) == (20, 20, False)
+    assert (more["total_count"], more["returned"], more["truncated"]) == (21, 20, True)
+    assert more["all_routes"] is True
 
 
 def test_mcp_start_plumbs_workspace_access(monkeypatch) -> None:

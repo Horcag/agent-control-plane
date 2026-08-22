@@ -711,6 +711,7 @@ class AgentControlPlane:
         job_id: str | None = None,
         *,
         terminate_verified_runners: bool = False,
+        limit: int | None = None,
     ) -> dict[str, Any]:
         reconciler = JobReconciler(
             store=self.store,
@@ -724,6 +725,7 @@ class AgentControlPlane:
         return reconciler.reconcile(
             job_id,
             terminate_verified_runners=terminate_verified_runners,
+            limit=limit,
         )
 
     def create_plan(
@@ -1496,6 +1498,7 @@ class AgentControlPlane:
         older_than_days: int = 30,
         limit: int = 500,
         apply: bool = False,
+        limit_total: bool = False,
     ) -> dict[str, Any]:
         return RetentionService(
             self.config.database_path,
@@ -1507,10 +1510,19 @@ class AgentControlPlane:
             older_than_days=older_than_days,
             limit=limit,
             apply=apply,
+            limit_total=limit_total,
         )
 
-    def sync_slots(self) -> list[dict[str, Any]]:
-        return [status.as_dict() for status in self.slots.sync_configured_slots()]
+    def sync_slots(
+        self,
+        *,
+        route: str | None = None,
+        all_routes: bool = True,
+    ) -> list[dict[str, Any]]:
+        return [
+            status.as_dict()
+            for status in self.slots.sync_configured_slots(route=route, all_routes=all_routes)
+        ]
 
     def list_review_inbox(
         self,
@@ -1814,6 +1826,7 @@ class AgentControlPlane:
         self,
         *,
         max_per_route: int,
+        limit: int | None = None,
         apply: bool = False,
         force: bool = False,
         route: str | None = None,
@@ -1823,6 +1836,7 @@ class AgentControlPlane:
             decision.as_dict()
             for decision in self.slots.cleanup(
                 max_per_route=max_per_route,
+                limit=limit,
                 apply=apply,
                 force=force,
                 route=route,

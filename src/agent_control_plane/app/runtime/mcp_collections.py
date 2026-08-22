@@ -9,6 +9,7 @@ from agent_control_plane.app.runtime.mcp_collection_rows import compact_executio
 
 MAX_COLLECTION_LIMIT = 100
 DEFAULT_COLLECTION_LIMIT = 20
+MAX_MUTATION_LIMIT = 20
 MAX_ANALYTICS_SAMPLES = 100
 MAX_MCP_BYTES = 64 * 1024
 
@@ -27,6 +28,20 @@ def validate_positive_limit(value: int, *, name: str, maximum: int) -> int:
         raise TypeError(f"{name} must be an integer")
     if not 1 <= value <= maximum:
         raise ValueError(f"{name} must be between 1 and {maximum}")
+    return value
+
+
+def validate_mutation_cursor(value: int | None) -> None:
+    """Mutations are single-pass operations and cannot safely resume a page."""
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise TypeError("cursor must be an integer")
+    if value not in (None, 0):
+        raise ValueError("cursor must be absent or zero for a mutation")
+
+
+def validate_strict_bool(value: bool, *, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a boolean")
     return value
 
 

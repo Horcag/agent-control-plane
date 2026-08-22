@@ -14,7 +14,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from pydantic import StrictInt
+from pydantic import StrictBool, StrictInt
 
 from agent_control_plane.app.runtime.mcp_byte_windows import (
     DEFAULT_PREVIEW_BYTES,
@@ -28,13 +28,24 @@ from agent_control_plane.app.runtime.mcp_collections import (
     DEFAULT_COLLECTION_LIMIT,
     MAX_ANALYTICS_SAMPLES,
     MAX_COLLECTION_LIMIT,
+    MAX_MUTATION_LIMIT,
     compact_analytics,
     compact_model_catalog,
     compact_plan_snapshot,
     compact_slots_page,
+    validate_mutation_cursor,
     validate_optional_cursor,
     validate_page,
     validate_positive_limit,
+    validate_strict_bool,
+)
+from agent_control_plane.app.runtime.mcp_mutation_payloads import (
+    archive_payload,
+    bootstrap_payload,
+    reconcile_payload,
+    retention_payload,
+    slots_cleanup_payload,
+    slots_sync_payload,
 )
 from agent_control_plane.app.runtime.mcp_payloads import compact_checkpoint, compact_review_item
 from agent_control_plane.app.runtime.orchestrator import (
@@ -539,13 +550,27 @@ def build_server(
     @register
     def agent_reconcile(
         job_id: str | None = None,
-        terminate_verified_runners: bool = False,
+        terminate_verified_runners: StrictBool = False,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        cursor: StrictInt | None = None,
+        full: StrictBool = False,
     ) -> dict[str, Any]:
-        """Recover orphaned jobs and replay crash-safe terminal finalization."""
-        return control.reconcile_jobs(
-            job_id,
-            terminate_verified_runners=terminate_verified_runners,
-        )
+        """Recover a hard-bounded candidate set; this operation cannot be paginated."""
+        try:
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_MUTATION_LIMIT
+            )
+            validate_strict_bool(terminate_verified_runners, name="terminate_verified_runners")
+            validate_strict_bool(full, name="full")
+            validate_mutation_cursor(cursor)
+            payload = control.reconcile_jobs(
+                job_id,
+                terminate_verified_runners=terminate_verified_runners,
+                limit=effective_limit,
+            )
+            return payload if full else reconcile_payload(payload)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_summary_job(
@@ -892,18 +917,32 @@ def build_server(
 
     @register
     def agent_retention_gc(
-        older_than_days: int = 30,
-        limit: int = 500,
-        apply: bool = False,
+        older_than_days: StrictInt = 30,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        apply: StrictBool = False,
+        cursor: StrictInt | None = None,
+        full: StrictBool = False,
     ) -> dict[str, Any]:
         """Dry-run or prune only archived and reviewed state beyond retention."""
         try:
-            return control.collect_garbage(
-                older_than_days=older_than_days,
-                limit=limit,
-                apply=apply,
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_MUTATION_LIMIT
             )
-        except ValueError as exc:
+            validate_strict_bool(apply, name="apply")
+            validate_strict_bool(full, name="full")
+            if isinstance(older_than_days, bool) or not isinstance(older_than_days, int):
+                raise TypeError("older_than_days must be an integer")
+            if older_than_days < 0:
+                raise ValueError("older_than_days must be non-negative")
+            validate_mutation_cursor(cursor)
+            payload = control.collect_garbage(
+                older_than_days=older_than_days,
+                limit=effective_limit,
+                apply=apply,
+                limit_total=True,
+            )
+            return payload if full else retention_payload(payload)
+        except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -1102,21 +1141,63 @@ def build_server(
 
     @register
     def agent_archive_jobs(
-        older_than_days: int = 14,
-        limit: int = 50,
-        apply: bool = False,
-    ) -> list[dict[str, Any]]:
-        """List or archive terminal job run directories older than a threshold. Dry-run by default."""
-        return control.archive_jobs(
-            older_than_days=older_than_days,
-            limit=limit,
-            apply=apply,
-        )
+        older_than_days: StrictInt = 14,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        apply: StrictBool = False,
+        cursor: StrictInt | None = None,
+        full: StrictBool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Archive one hard-bounded selection; retrying a cursor never repeats work."""
+        try:
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_MUTATION_LIMIT
+            )
+            validate_strict_bool(apply, name="apply")
+            validate_strict_bool(full, name="full")
+            if isinstance(older_than_days, bool) or not isinstance(older_than_days, int):
+                raise TypeError("older_than_days must be an integer")
+            if older_than_days < 0:
+                raise ValueError("older_than_days must be non-negative")
+            validate_mutation_cursor(cursor)
+            rows = control.archive_jobs(
+                older_than_days=older_than_days,
+                limit=effective_limit,
+                apply=apply,
+            )
+            if full:
+                return rows
+            return archive_payload(rows, apply=apply, limit=effective_limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_slots_sync() -> list[dict[str, Any]]:
-        """Register configured slots in SQLite and return their current state."""
-        return control.sync_slots()
+    def agent_slots_sync(
+        route: str | None = None,
+        all_routes: StrictBool = False,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        cursor: StrictInt | None = None,
+        full: StrictBool = False,
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Synchronize an explicit route scope; this idempotent operation has no cursor."""
+        try:
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_MUTATION_LIMIT
+            )
+            validate_strict_bool(all_routes, name="all_routes")
+            validate_strict_bool(full, name="full")
+            validate_mutation_cursor(cursor)
+            if route is not None and all_routes:
+                raise ValueError("route and all_routes are mutually exclusive")
+            if route is None and not all_routes:
+                raise ValueError("route scope is required; pass route or all_routes")
+            rows = control.sync_slots(route=route, all_routes=all_routes)
+            if full:
+                return rows
+            return slots_sync_payload(
+                rows, route=route, all_routes=all_routes, limit=effective_limit
+            )
+        except (TypeError, ValueError, SlotError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_slots_list(
@@ -1173,13 +1254,18 @@ def build_server(
         slot_path: str | None = None,
         branch: str | None = None,
         start_point: str | None = None,
-        create: bool = True,
-        ensure_ide: bool = True,
-        remove_slot_modules: bool = True,
+        create: StrictBool = True,
+        ensure_ide: StrictBool = True,
+        remove_slot_modules: StrictBool = True,
+        full: StrictBool = False,
     ) -> dict[str, Any]:
         """Add missing route/slot config, create the slot, and update IDEA/VCS mappings."""
         try:
-            return {
+            validate_strict_bool(create, name="create")
+            validate_strict_bool(ensure_ide, name="ensure_ide")
+            validate_strict_bool(remove_slot_modules, name="remove_slot_modules")
+            validate_strict_bool(full, name="full")
+            payload = {
                 "ok": True,
                 "bootstrap": control.bootstrap_slot(
                     name,
@@ -1194,7 +1280,8 @@ def build_server(
                     remove_slot_modules=remove_slot_modules,
                 ),
             }
-        except (ConfigBootstrapError, SlotError) as exc:
+            return payload if full else bootstrap_payload(payload, subject="slot bootstrap")
+        except (ConfigBootstrapError, SlotError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -1230,17 +1317,21 @@ def build_server(
 
     @register
     def agent_slots_ensure_root_module(
-        remove_slot_modules: bool = False,
+        remove_slot_modules: StrictBool = False,
+        full: StrictBool = False,
     ) -> dict[str, Any]:
         """Ensure managed IDEA modules, SDK roots, and module-scoped duplicate analysis."""
         try:
-            return {
+            validate_strict_bool(remove_slot_modules, name="remove_slot_modules")
+            validate_strict_bool(full, name="full")
+            payload = {
                 "ok": True,
                 "module": control.ensure_slot_root_ide_module(
                     remove_slot_modules=remove_slot_modules,
                 ),
             }
-        except SlotError as exc:
+            return payload if full else bootstrap_payload(payload, subject="root module")
+        except (SlotError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
@@ -1297,26 +1388,49 @@ def build_server(
 
     @register
     def agent_slots_cleanup(
-        max_per_route: int,
-        apply: bool = False,
-        force: bool = False,
+        max_per_route: StrictInt,
+        apply: StrictBool = False,
+        force: StrictBool = False,
         route: str | None = None,
-        all_routes: bool = False,
+        all_routes: StrictBool = False,
+        limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
+        cursor: StrictInt | None = None,
+        full: StrictBool = False,
     ) -> dict[str, Any]:
         """List or apply least-recently-used slot cleanup above a per-route limit."""
         try:
-            return {
+            effective_limit = validate_positive_limit(
+                limit, name="limit", maximum=MAX_MUTATION_LIMIT
+            )
+            validate_strict_bool(apply, name="apply")
+            validate_strict_bool(force, name="force")
+            validate_strict_bool(all_routes, name="all_routes")
+            validate_strict_bool(full, name="full")
+            if isinstance(max_per_route, bool) or not isinstance(max_per_route, int):
+                raise TypeError("max_per_route must be an integer")
+            if max_per_route < 0:
+                raise ValueError("max_per_route must be non-negative")
+            validate_mutation_cursor(cursor)
+            decisions = control.cleanup_slots(
+                max_per_route=max_per_route,
+                limit=effective_limit,
+                apply=apply,
+                force=force,
+                route=route,
+                all_routes=all_routes,
+            )
+            payload = {
                 "ok": True,
                 "apply": apply,
-                "decisions": control.cleanup_slots(
-                    max_per_route=max_per_route,
-                    apply=apply,
-                    force=force,
-                    route=route,
-                    all_routes=all_routes,
-                ),
+                "limit": effective_limit,
+                "decisions": decisions,
             }
-        except SlotError as exc:
+            return (
+                payload
+                if full
+                else slots_cleanup_payload(decisions, apply=apply, limit=effective_limit)
+            )
+        except (SlotError, TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     return mcp

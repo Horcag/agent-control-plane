@@ -59,8 +59,11 @@ class JobReconciler:
         job_id: str | None = None,
         *,
         terminate_verified_runners: bool = False,
+        limit: int | None = None,
     ) -> dict[str, Any]:
-        jobs = self._candidates(job_id)
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be positive")
+        jobs = self._candidates(job_id, limit=limit)
         report: dict[str, list[str]] = {
             "reconciled_orphaned_jobs": [],
             "reconciled_terminal_jobs": [],
@@ -82,7 +85,7 @@ class JobReconciler:
                 report["errors"].append(f"{job.job_id}: {exc}")
         return report
 
-    def _candidates(self, job_id: str | None) -> list[JobRecord]:
+    def _candidates(self, job_id: str | None, *, limit: int | None) -> list[JobRecord]:
         if job_id is not None:
             return [self.store.get_job(job_id)]
         candidates = {job.job_id: job for job in self.store.reconciliation_candidates()}
@@ -93,7 +96,8 @@ class JobReconciler:
                 candidates[slot.active_job_id] = self.store.get_job(slot.active_job_id)
             except KeyError:
                 continue
-        return list(candidates.values())
+        jobs = list(candidates.values())
+        return jobs if limit is None else jobs[:limit]
 
     def _reconcile_job(
         self,

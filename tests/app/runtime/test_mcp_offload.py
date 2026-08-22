@@ -125,3 +125,18 @@ async def test_real_fastmcp_rejects_boolean_page_control_before_controller_call(
 
     assert response.isError is True
     control.plan_snapshot.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_real_fastmcp_rejects_strict_bool_before_reconcile_controller_call() -> None:
+    control = Mock()
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl", return_value=control
+    ):
+        server = build_server()
+
+    async with create_connected_server_and_client_session(server._mcp_server) as session:
+        response = await session.call_tool("agent_reconcile", {"terminate_verified_runners": 1})
+
+    assert response.isError is True
+    control.reconcile_jobs.assert_not_called()

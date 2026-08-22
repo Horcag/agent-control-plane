@@ -30,6 +30,7 @@ from agent_control_plane.features.agent_runner import (
 from agent_control_plane.features.agent_runner.lib.codex_process_monitor import (
     terminate_spawned_process,
 )
+from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunResult
 from agent_control_plane.features.result_handoff import (
     clean_checkpointed_workspace,
@@ -139,6 +140,32 @@ def test_reconcile_replays_crash_after_terminal_transition(tmp_path: Path) -> No
     assert second["reconciled_terminal_jobs"] == []
     assert second["errors"] == []
     assert repeated.checkpoint_sha == checkpoint_sha
+
+
+def test_reconciler_core_default_is_unbounded_but_explicit_limit_is_bounded() -> None:
+    reconciler = JobReconciler(
+        store=object(),
+        slot_store=object(),
+        is_terminal=lambda _job: False,
+        finalize=lambda _job_id, _allow: object(),
+        write_orphan_result=lambda _job, _message: None,
+        process_is_alive=lambda _pid: False,
+        terminate_verified_process=lambda _identity: object(),
+    )
+    candidates = [object() for _ in range(21)]
+    reconciler._candidates = (
+        lambda _job_id, *, limit: (  # type: ignore[method-assign]
+            candidates if limit is None else candidates[:limit]
+        )
+    )
+    seen: list[object] = []
+    reconciler._reconcile_job = lambda job, _report, **_kwargs: seen.append(job)  # type: ignore[method-assign]
+
+    reconciler.reconcile()
+    assert len(seen) == 21
+    seen.clear()
+    reconciler.reconcile(limit=20)
+    assert len(seen) == 20
 
 
 def test_reconcile_reuses_checkpoint_after_crash_before_slot_release(tmp_path: Path) -> None:

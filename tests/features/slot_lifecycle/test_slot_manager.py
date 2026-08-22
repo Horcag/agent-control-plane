@@ -8,7 +8,11 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 from agent_control_plane.entities.slot import SlotStore
-from agent_control_plane.features.slot_lifecycle.lib.slot_manager import SlotError, SlotManager
+from agent_control_plane.features.slot_lifecycle.lib.slot_manager import (
+    SlotError,
+    SlotManager,
+    SlotStatus,
+)
 from agent_control_plane.shared.config import (
     ControlConfig,
     ControlDefaults,
@@ -398,6 +402,21 @@ class SlotManagerTest(unittest.TestCase):
             self.assertEqual([decision.name for decision in decisions], ["acp-1"])
             self.assertEqual([call.args[0] for call in inspect_slot.call_args_list], ["acp-1"])
 
+    def test_cleanup_apply_fails_closed_when_full_preflight_exceeds_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manager = SlotManager(_config(root, root / "slots"), SlotStore(root / "jobs.sqlite3"))
+            statuses = [_cleanup_status(root, index) for index in range(21)]
+            with (
+                patch.object(manager, "list_slots", return_value=statuses),
+                patch.object(manager, "delete_slot") as delete_slot,
+            ):
+                with self.assertRaisesRegex(SlotError, "exceeds mutation limit"):
+                    manager.cleanup(max_per_route=0, limit=20, apply=True, route="main")
+                with self.assertRaisesRegex(SlotError, "exceeds mutation limit"):
+                    manager.cleanup(max_per_route=0, limit=20, apply=True, route="main")
+            delete_slot.assert_not_called()
+
 
 def _config(
     root: Path,
@@ -458,6 +477,26 @@ def _config(
         routes=MappingProxyType(routes),
         slots=MappingProxyType(slots or {}),
         slot_prepare=slot_prepare,
+    )
+
+
+def _cleanup_status(root: Path, index: int) -> SlotStatus:
+    return SlotStatus(
+        name=f"main-{index}",
+        route="main",
+        path=root / "slots" / f"main-{index}",
+        status="available",
+        scope="configured",
+        configured=True,
+        exists=True,
+        is_git_workspace=True,
+        branch="main",
+        dirty="",
+        active_job_id=None,
+        use_count=0,
+        last_used_at=None,
+        note=None,
+        problems=(),
     )
 
 

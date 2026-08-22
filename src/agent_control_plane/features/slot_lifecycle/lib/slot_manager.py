@@ -111,11 +111,22 @@ class SlotManager:
         """Set the MCP-owned freshness guard for configured-slot registration."""
         self._configured_slots_sync_guard = guard
 
-    def sync_configured_slots(self) -> list[SlotStatus]:
+    def sync_configured_slots(
+        self,
+        *,
+        route: str | None = None,
+        all_routes: bool = True,
+    ) -> list[SlotStatus]:
+        if route is not None and all_routes:
+            raise SlotError("route and all_routes are mutually exclusive")
+        if route is None and not all_routes:
+            raise SlotError("route scope is required; pass route or all_routes")
         with self._configured_slots_sync_guard():
             for slot in self._config.slots.values():
+                if route is not None and slot.route != route:
+                    continue
                 self._register_configured_slot(slot.name)
-        return self.list_slots()
+        return self.list_slots(route=route)
 
     def _register_configured_slot(self, name: str) -> SlotRecord:
         configured = self._config.slots.get(name)
@@ -520,6 +531,7 @@ class SlotManager:
         self,
         *,
         max_per_route: int,
+        limit: int | None = None,
         apply: bool = False,
         force: bool = False,
         route: str | None = None,
@@ -527,6 +539,8 @@ class SlotManager:
     ) -> list[CleanupDecision]:
         if max_per_route < 0:
             raise SlotError("max_per_route must be non-negative")
+        if limit is not None and limit <= 0:
+            raise SlotError("limit must be positive")
         if route is not None and all_routes:
             raise SlotError("route and all_routes are mutually exclusive")
         if route is None and not all_routes:
@@ -555,11 +569,28 @@ class SlotManager:
                 if not status.is_git_workspace:
                     decisions.append(_decision(status, "skip", "slot is not a git workspace"))
                     continue
-                if not apply:
-                    decisions.append(_decision(status, "would_delete", "exceeds route slot limit"))
+                decisions.append(_decision(status, "would_delete", "exceeds route slot limit"))
+        if apply and limit is not None and len(decisions) > limit:
+            raise SlotError(
+                "cleanup selection exceeds mutation limit; narrow route/max_per_route, use force, or CLI"
+            )
+        if apply:
+            applied: list[CleanupDecision] = []
+            for decision in decisions:
+                if decision.action != "would_delete":
+                    applied.append(decision)
                     continue
-                self.delete_slot(status.name, force=force)
-                decisions.append(_decision(status, "deleted", "exceeds route slot limit"))
+                self.delete_slot(decision.name, force=force)
+                applied.append(
+                    CleanupDecision(
+                        name=decision.name,
+                        route=decision.route,
+                        path=decision.path,
+                        action="deleted",
+                        reason=decision.reason,
+                    )
+                )
+            return applied
         return decisions
 
     def _ensure_slot_path_allowed(self, path: Path, *, route: str | None = None) -> None:

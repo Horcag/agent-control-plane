@@ -40,6 +40,7 @@ class RetentionService:
         older_than_days: int = 30,
         limit: int = 500,
         apply: bool = False,
+        limit_total: bool = False,
     ) -> dict[str, Any]:
         if older_than_days < 0:
             raise ValueError("older_than_days must be non-negative")
@@ -53,6 +54,8 @@ class RetentionService:
             UTC,
         ).isoformat(timespec="seconds")
         candidates = self._candidates(cutoff, limit)
+        if limit_total:
+            candidates = _limit_candidates(candidates, limit)
         checkpoint_results = [
             self._checkpoint_decision(candidate, apply=apply)
             for candidate in candidates["checkpoint_refs"]
@@ -73,6 +76,7 @@ class RetentionService:
             "apply": apply,
             "cutoff": cutoff,
             "limit_per_category": limit,
+            "limit_total": limit_total,
             "counts": counts,
             "applied": applied,
             "blocked_checkpoint_refs": blocked,
@@ -253,6 +257,19 @@ def _rows(
     parameters: Sequence[Any],
 ) -> list[dict[str, Any]]:
     return [dict(row) for row in db.execute(query, parameters).fetchall()]
+
+
+def _limit_candidates(
+    candidates: dict[str, list[dict[str, Any]]], limit: int
+) -> dict[str, list[dict[str, Any]]]:
+    """Select at most ``limit`` rows across retention categories for MCP apply calls."""
+    remaining = limit
+    bounded: dict[str, list[dict[str, Any]]] = {}
+    for name, rows in candidates.items():
+        selected = rows[:remaining]
+        bounded[name] = selected
+        remaining -= len(selected)
+    return bounded
 
 
 def _delete_in(
