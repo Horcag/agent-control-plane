@@ -14,14 +14,14 @@ from typing import Any
 from agent_control_plane.app.runtime.finalization_service import FinalizationService
 from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
 from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
-from agent_control_plane.app.runtime.mcp_payloads import (
+from agent_control_plane.app.runtime.mcp_payload_windows import (
     DEFAULT_PREVIEW_BYTES,
-    compact_summary,
     file_preview,
     missing_file_preview,
     tail_preview,
     text_preview,
 )
+from agent_control_plane.app.runtime.mcp_payloads import compact_summary
 from agent_control_plane.entities.job import (
     TERMINAL_STATUSES,
     JobRecord,

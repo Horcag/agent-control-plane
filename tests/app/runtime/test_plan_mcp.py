@@ -560,6 +560,12 @@ def test_mcp_durable_payload_tools_are_bounded_by_default_and_keep_full_compatib
     control.mcp_tail_job.assert_called_once_with("job-1", 80, cursor=None, limit=16_384)
     control.mcp_summary_job.assert_called_once_with("job-1", 20, cursor=None, limit=16_384)
 
+    control.mcp_result_job.side_effect = ValueError("limit must be between 4 and 16384 bytes")
+    assert server.tools["agent_result_job"]("job-1", limit=3) == {
+        "ok": False,
+        "error": "limit must be between 4 and 16384 bytes",
+    }
+
 
 def test_mcp_review_inbox_requalify_delegates_and_returns_clean_errors(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")

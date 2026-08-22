@@ -14,11 +14,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-from agent_control_plane.app.runtime.mcp_payloads import (
-    DEFAULT_PREVIEW_BYTES,
-    compact_checkpoint,
-    compact_review_item,
-)
+from agent_control_plane.app.runtime.mcp_payload_windows import DEFAULT_PREVIEW_BYTES
+from agent_control_plane.app.runtime.mcp_payloads import compact_checkpoint, compact_review_item
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
     PolicyError,
@@ -523,7 +520,10 @@ def build_server(
         """Return byte-bounded status by default; full=True preserves the legacy payload."""
         if full:
             return control.summary_job(job_id, lines)
-        return control.mcp_summary_job(job_id, lines, cursor=cursor, limit=limit)
+        try:
+            return control.mcp_summary_job(job_id, lines, cursor=cursor, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_analytics(
@@ -973,7 +973,10 @@ def build_server(
         """Return a byte-bounded log tail; full=True preserves the legacy string."""
         if full:
             return control.tail_job(job_id, lines)
-        return control.mcp_tail_job(job_id, lines, cursor=cursor, limit=limit)
+        try:
+            return control.mcp_tail_job(job_id, lines, cursor=cursor, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_result_job(
@@ -985,7 +988,10 @@ def build_server(
         """Return a byte-bounded result window; full=True preserves the legacy string."""
         if full:
             return control.result_job(job_id)
-        return control.mcp_result_job(job_id, offset=offset, limit=limit)
+        try:
+            return control.mcp_result_job(job_id, offset=offset, limit=limit)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     @register
     def agent_cancel_job(job_id: str) -> dict[str, Any]:

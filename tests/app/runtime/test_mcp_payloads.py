@@ -3,16 +3,21 @@ from __future__ import annotations
 import hashlib
 import json
 
-from agent_control_plane.app.runtime.mcp_payloads import (
+import pytest
+
+from agent_control_plane.app.runtime import mcp_payload_windows
+from agent_control_plane.app.runtime.mcp_payload_windows import (
     MAX_PREVIEW_BYTES,
-    MAX_RESPONSE_BYTES,
-    compact_checkpoint,
-    compact_review_item,
-    compact_summary,
     file_preview,
     missing_file_preview,
     serialized_bytes,
     tail_preview,
+)
+from agent_control_plane.app.runtime.mcp_payloads import (
+    MAX_RESPONSE_BYTES,
+    compact_checkpoint,
+    compact_review_item,
+    compact_summary,
 )
 
 
@@ -39,16 +44,44 @@ def test_file_preview_is_byte_bounded_hashed_and_unicode_safe(tmp_path) -> None:
     assert resumed["content"].startswith("😀")
 
 
-def test_file_preview_clamps_offset_and_limit_without_splitting_code_points(tmp_path) -> None:
+def test_file_preview_aligns_offset_without_splitting_code_points(tmp_path) -> None:
     path = tmp_path / "unicode.txt"
     path.write_text("😀tail", encoding="utf-8")
 
-    payload = file_preview(path, stable_id="unicode", offset=1, limit=1)
+    payload = file_preview(path, stable_id="unicode", offset=1, limit=4)
 
     assert payload["offset"] == 4
     assert payload["limit"] == 4
     assert payload["content"] == "tail"
     assert payload["truncated"] is False
+
+
+@pytest.mark.parametrize("offset", [True, "0", -1])
+def test_file_preview_rejects_invalid_offsets(tmp_path, offset) -> None:
+    path = tmp_path / "result.md"
+    path.write_text("result", encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match="offset"):
+        file_preview(path, stable_id="job", offset=offset)
+
+
+@pytest.mark.parametrize("limit", [True, "16", 3, MAX_PREVIEW_BYTES + 1])
+def test_file_preview_rejects_invalid_limits(tmp_path, limit) -> None:
+    path = tmp_path / "result.md"
+    path.write_text("result", encoding="utf-8")
+
+    with pytest.raises((TypeError, ValueError), match="limit"):
+        file_preview(path, stable_id="job", limit=limit)
+
+
+def test_file_preview_allows_offset_beyond_eof(tmp_path) -> None:
+    path = tmp_path / "result.md"
+    path.write_text("result", encoding="utf-8")
+
+    payload = file_preview(path, stable_id="job", offset=10_000)
+
+    assert payload["content"] == ""
+    assert payload["offset"] == payload["total_bytes"]
 
 
 def test_missing_file_preview_separates_diagnostic_from_durable_content(tmp_path) -> None:
@@ -67,15 +100,22 @@ def test_missing_file_preview_separates_diagnostic_from_durable_content(tmp_path
     assert str(path) in payload["message"]
 
 
-def test_tail_preview_bounds_a_multi_megabyte_single_line(tmp_path) -> None:
+def test_tail_preview_bounds_a_multi_megabyte_single_line(tmp_path, monkeypatch) -> None:
     path = tmp_path / "attempt.log"
     path.write_text("x" * (2 * 1024 * 1024), encoding="utf-8")
+    monkeypatch.setattr(
+        mcp_payload_windows,
+        "_sha256_file",
+        lambda _path: pytest.fail("tail preview must not hash the full file"),
+    )
 
     payload = tail_preview(path, stable_id="job-log", lines=80)
 
     assert payload["tail_start"] == 0
     assert payload["returned_bytes"] == MAX_PREVIEW_BYTES
     assert payload["next_cursor"] == MAX_PREVIEW_BYTES
+    assert payload["sha256"] is None
+    assert payload["window_sha256"] == hashlib.sha256(b"x" * MAX_PREVIEW_BYTES).hexdigest()
     assert payload["truncated"] is True
     assert serialized_bytes(payload) < MAX_RESPONSE_BYTES
 
