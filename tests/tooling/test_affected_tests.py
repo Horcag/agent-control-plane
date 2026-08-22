@@ -166,7 +166,9 @@ def test_full_suite_env_var_forces_full_suite_despite_empty_change_set(tmp_path:
     assert payload["full_suite"] is True
 
 
-def test_empty_change_set_without_full_suite_flag_skips_everything(tmp_path: Path) -> None:
+def test_empty_change_set_without_full_suite_flag_skips_everything(
+    tmp_path: Path, monkeypatch
+) -> None:
     _git(tmp_path, "init")
     _git(tmp_path, "config", "user.name", "ACP Test")
     _git(tmp_path, "config", "user.email", "acp-test@example.invalid")
@@ -174,11 +176,16 @@ def test_empty_change_set_without_full_suite_flag_skips_everything(tmp_path: Pat
     _git(tmp_path, "add", ".")
     _git(tmp_path, "commit", "-m", "base")
 
+    monkeypatch.setenv("ACP_QUALITY_FULL_SUITE", "1")
+    default_mode_env = os.environ.copy()
+    default_mode_env.pop("ACP_QUALITY_FULL_SUITE")
+
     result = subprocess.run(
         [sys.executable, str(_SCRIPT), "--repo", str(tmp_path), "--worktree", "--list"],
         capture_output=True,
         text=True,
         check=True,
+        env=default_mode_env,
     )
 
     payload = json.loads(result.stdout)

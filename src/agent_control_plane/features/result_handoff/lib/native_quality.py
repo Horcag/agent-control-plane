@@ -35,7 +35,8 @@ def _resolve_gate_executable(cwd: Path, command: tuple[str, ...]) -> tuple[str, 
     workspace-relative path (e.g. ``.venv/Scripts/python.exe``) need it
     resolved to an absolute path before ``subprocess.run``. Bare program
     names (no directory separator) and already-absolute paths are left
-    untouched so PATH lookup keeps working.
+    untouched so PATH lookup keeps working. Resolve only the executable's
+    parent so a POSIX virtualenv launcher keeps its final symlink identity.
     """
     if not command:
         return command
@@ -47,7 +48,8 @@ def _resolve_gate_executable(cwd: Path, command: tuple[str, ...]) -> tuple[str, 
     candidate = cwd / executable
     if not candidate.exists():
         return command
-    return (str(candidate.resolve(strict=False)), *command[1:])
+    resolved_parent = candidate.parent.resolve(strict=False)
+    return (str(resolved_parent / candidate.name), *command[1:])
 
 
 class _BinaryOutput(Protocol):

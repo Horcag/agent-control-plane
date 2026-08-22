@@ -6,6 +6,8 @@ import shutil
 import sys
 from pathlib import Path
 
+import pytest
+
 from agent_control_plane.features.result_handoff import (
     NativeQualityGateRunner,
     NativeQualityGateSlotBroker,
@@ -525,6 +527,22 @@ def test_resolve_gate_executable_absolutizes_relative_path_with_directory(
 
     assert resolved[0] == str(executable.resolve(strict=False))
     assert resolved[1:] == ("-c", "print('ok')")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX virtualenv launchers use symlinks")
+def test_resolve_gate_executable_preserves_final_venv_launcher_symlink(tmp_path: Path) -> None:
+    tool_dir = tmp_path / ".venv" / "bin"
+    tool_dir.mkdir(parents=True)
+    interpreter = tmp_path / "runtime" / "python3"
+    interpreter.parent.mkdir()
+    interpreter.write_text("", encoding="utf-8")
+    launcher = tool_dir / "python"
+    launcher.symlink_to(interpreter)
+
+    resolved = _resolve_gate_executable(tmp_path, (".venv/bin/python", "-V"))
+
+    assert resolved == (str(tool_dir.resolve() / "python"), "-V")
+    assert resolved[0] != str(launcher.resolve())
 
 
 def test_resolve_gate_executable_leaves_bare_names_and_absolute_paths_unchanged(
