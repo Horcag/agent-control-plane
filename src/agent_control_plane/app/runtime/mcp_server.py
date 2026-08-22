@@ -447,7 +447,7 @@ def build_server(
         cursor: dict[str, Any] | None = None,
         stale_after_sec: float = DEFAULT_STALE_AFTER_SEC,
     ) -> dict[str, Any]:
-        """Return non-blocking event deltas; reuse its cursor and stop when done."""
+        """Return non-blocking event deltas; round-trip cursor, stop when done, expose pending/non-settled jobs, and use response terminal_statuses rather than retyping them."""
         if not (job_ids or plan_id or task_glob):
             return {
                 "ok": False,
@@ -593,7 +593,7 @@ def build_server(
         expected_result_status: str | None = None,
         controller_gate_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Edit specified fields of an unclaimed plan task; refused after its first attempt."""
+        """Edit specified fields; omitted fields are unchanged, and edits are refused after claim or attempt."""
         overrides: dict[str, Any] = {}
         if title is not None:
             overrides["title"] = title
@@ -756,7 +756,7 @@ def build_server(
         expected_result_status: str | None = None,
         controller_gate_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Explicitly retry one task with optional new-attempt execution overrides."""
+        """Retry explicitly; allow_awaiting_review is opt-in, prior attempts stay durable, and overrides apply only to the new attempt."""
         overrides = _plan_execution_field_overrides(
             route=route,
             slot=slot,

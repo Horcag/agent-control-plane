@@ -275,7 +275,7 @@ def test_mcp_registers_compact_plan_supervisor_surface(monkeypatch) -> None:
     }.issubset(server.tools)
 
 
-def test_mcp_instructions_bound_context_and_keep_tool_docs_compact(monkeypatch) -> None:
+def test_mcp_instructions_and_tool_description_contracts(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")
     fastmcp_module = ModuleType("mcp.server.fastmcp")
@@ -293,7 +293,16 @@ def test_mcp_instructions_bound_context_and_keep_tool_docs_compact(monkeypatch) 
     assert isinstance(server.instructions, str)
     assert len(server.instructions) <= 512
     assert all(term in server.instructions.lower() for term in ("route", "cursor", "compact"))
-    assert all(len(function.__doc__ or "") <= 240 for function in server.tools.values())
+    assert sum(len(function.__doc__ or "") for function in server.tools.values()) <= 8 * 1024
+    assert "non-blocking" in server.tools["agent_watch_events"].__doc__
+    assert "cursor" in server.tools["agent_watch_events"].__doc__
+    assert "pending/non-settled" in server.tools["agent_watch_events"].__doc__
+    assert "terminal_statuses" in server.tools["agent_watch_events"].__doc__
+    assert "omitted fields are unchanged" in server.tools["agent_plan_edit_task"].__doc__
+    assert "refused after claim or attempt" in server.tools["agent_plan_edit_task"].__doc__
+    assert "allow_awaiting_review is opt-in" in server.tools["agent_plan_retry_task"].__doc__
+    assert "prior attempts stay durable" in server.tools["agent_plan_retry_task"].__doc__
+    assert "only to the new attempt" in server.tools["agent_plan_retry_task"].__doc__
 
 
 def test_mcp_model_catalog_refreshes_after_config_change(monkeypatch, tmp_path: Path) -> None:
