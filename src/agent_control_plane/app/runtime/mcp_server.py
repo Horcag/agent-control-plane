@@ -14,6 +14,11 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+from agent_control_plane.app.runtime.mcp_payloads import (
+    DEFAULT_PREVIEW_BYTES,
+    compact_checkpoint,
+    compact_review_item,
+)
 from agent_control_plane.app.runtime.orchestrator import (
     AgentControlPlane,
     PolicyError,
@@ -508,9 +513,17 @@ def build_server(
         )
 
     @register
-    def agent_summary_job(job_id: str, lines: int = 20) -> dict[str, Any]:
-        """Return compact status, guardrail state, dirty status, and a short log tail."""
-        return control.summary_job(job_id, lines)
+    def agent_summary_job(
+        job_id: str,
+        lines: int = 20,
+        cursor: int | None = None,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        """Return byte-bounded status by default; full=True preserves the legacy payload."""
+        if full:
+            return control.summary_job(job_id, lines)
+        return control.mcp_summary_job(job_id, lines, cursor=cursor, limit=limit)
 
     @register
     def agent_analytics(
@@ -850,31 +863,53 @@ def build_server(
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_review_inbox_get(item_id: str) -> dict[str, Any]:
-        """Return one durable job or Codex subagent handoff."""
+    def agent_review_inbox_get(
+        item_id: str,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        """Return one compact durable handoff; full=True preserves the legacy payload."""
         try:
-            return {"ok": True, "item": control.get_review_inbox_item(item_id)}
+            item = control.get_review_inbox_item(item_id)
+            return {
+                "ok": True,
+                "item": item if full else compact_review_item(item, offset=offset, limit=limit),
+            }
         except KeyError as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_review_inbox_resolve(item_id: str, decision: str) -> dict[str, Any]:
-        """Resolve an inbox item without implicitly accepting a plan task."""
+    def agent_review_inbox_resolve(
+        item_id: str,
+        decision: str,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        """Resolve an item and return a compact projection unless full=True."""
         try:
+            item = control.resolve_review_inbox_item(item_id, decision)
             return {
                 "ok": True,
-                "item": control.resolve_review_inbox_item(item_id, decision),
+                "item": item if full else compact_review_item(item, offset=offset, limit=limit),
             }
         except (KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_review_inbox_requalify(item_id: str) -> dict[str, Any]:
-        """Re-run controller gates against a pending item's checkpoint and rebuild its bundle."""
+    def agent_review_inbox_requalify(
+        item_id: str,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        """Re-run gates and return a compact projection unless full=True."""
         try:
+            item = control.requalify_review_inbox_item(item_id)
             return {
                 "ok": True,
-                "item": control.requalify_review_inbox_item(item_id),
+                "item": item if full else compact_review_item(item, offset=offset, limit=limit),
             }
         except (KeyError, ValueError, RuntimeError) as exc:
             return {"ok": False, "error": str(exc)}
@@ -928,14 +963,29 @@ def build_server(
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_tail_job(job_id: str, lines: int = 80) -> str:
-        """Return the end of the active attempt log."""
-        return control.tail_job(job_id, lines)
+    def agent_tail_job(
+        job_id: str,
+        lines: int = 80,
+        cursor: int | None = None,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> str | dict[str, Any]:
+        """Return a byte-bounded log tail; full=True preserves the legacy string."""
+        if full:
+            return control.tail_job(job_id, lines)
+        return control.mcp_tail_job(job_id, lines, cursor=cursor, limit=limit)
 
     @register
-    def agent_result_job(job_id: str) -> str:
-        """Return the task result file content, or a not-ready message."""
-        return control.result_job(job_id)
+    def agent_result_job(
+        job_id: str,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> str | dict[str, Any]:
+        """Return a byte-bounded result window; full=True preserves the legacy string."""
+        if full:
+            return control.result_job(job_id)
+        return control.mcp_result_job(job_id, offset=offset, limit=limit)
 
     @register
     def agent_cancel_job(job_id: str) -> dict[str, Any]:
@@ -1113,10 +1163,20 @@ def build_server(
             return {"ok": False, "error": str(exc)}
 
     @register
-    def agent_slots_checkpoint(name: str, job_id: str) -> dict[str, Any]:
-        """Checkpoint a terminal job's dirty slot, persist review metadata, and release it."""
+    def agent_slots_checkpoint(
+        name: str,
+        job_id: str,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+        full: bool = False,
+    ) -> dict[str, Any]:
+        """Checkpoint a slot and return compact metadata unless full=True."""
         try:
-            return {"ok": True, **control.checkpoint_slot(name, job_id=job_id)}
+            payload = control.checkpoint_slot(name, job_id=job_id)
+            return {
+                "ok": True,
+                **(payload if full else compact_checkpoint(payload, offset=offset, limit=limit)),
+            }
         except (KeyError, PolicyError, SlotError) as exc:
             return {"ok": False, "error": str(exc)}
 

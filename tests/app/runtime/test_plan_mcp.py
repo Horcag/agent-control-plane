@@ -490,6 +490,77 @@ def test_mcp_registers_durable_handoff_and_checkpoint_surface(monkeypatch) -> No
     }.issubset(server.tools)
 
 
+def test_mcp_durable_payload_tools_are_bounded_by_default_and_keep_full_compatibility(
+    monkeypatch,
+) -> None:
+    mcp_module = ModuleType("mcp")
+    server_module = ModuleType("mcp.server")
+    fastmcp_module = ModuleType("mcp.server.fastmcp")
+    fastmcp_module.FastMCP = _FakeFastMCP  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", server_module)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp_module)
+
+    control = Mock()
+    control.mcp_result_job.return_value = {"id": "job-1", "content": "bounded-result"}
+    control.result_job.return_value = "full-result"
+    control.mcp_tail_job.return_value = {"id": "job-1:log", "content": "bounded-log"}
+    control.tail_job.return_value = "full-log"
+    control.mcp_summary_job.return_value = {"job_id": "job-1", "log_tail": {}}
+    control.summary_job.return_value = {"job_id": "job-1", "log_tail": "full-log"}
+    item = {
+        "item_id": "agent_job:job-1",
+        "result_text": "Status: completed\n",
+        "verification_bundle": {"review_ready": True},
+    }
+    control.get_review_inbox_item.return_value = item
+    control.resolve_review_inbox_item.return_value = item
+    control.requalify_review_inbox_item.return_value = item
+    checkpoint = {"slot": {"name": "acp-1", "dirty": ""}, "inbox": item}
+    control.checkpoint_slot.return_value = checkpoint
+
+    with patch(
+        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+        return_value=control,
+    ):
+        server = build_server()
+
+    assert server.tools["agent_result_job"]("job-1") == {
+        "id": "job-1",
+        "content": "bounded-result",
+    }
+    assert server.tools["agent_result_job"]("job-1", full=True) == "full-result"
+    assert server.tools["agent_tail_job"]("job-1")["content"] == "bounded-log"
+    assert server.tools["agent_tail_job"]("job-1", full=True) == "full-log"
+    assert server.tools["agent_summary_job"]("job-1")["log_tail"] == {}
+    assert server.tools["agent_summary_job"]("job-1", full=True)["log_tail"] == "full-log"
+
+    assert (
+        "verification_bundle"
+        not in server.tools["agent_review_inbox_get"]("agent_job:job-1")["item"]
+    )
+    assert server.tools["agent_review_inbox_get"]("agent_job:job-1", full=True)["item"] is item
+    assert (
+        server.tools["agent_review_inbox_resolve"]("agent_job:job-1", "accepted")["item"]["id"]
+        == "agent_job:job-1"
+    )
+    assert (
+        server.tools["agent_review_inbox_requalify"]("agent_job:job-1")["item"]["id"]
+        == "agent_job:job-1"
+    )
+    assert server.tools["agent_slots_checkpoint"]("acp-1", "job-1")["inbox"]["id"] == (
+        "agent_job:job-1"
+    )
+    assert server.tools["agent_slots_checkpoint"]("acp-1", "job-1", full=True) == {
+        "ok": True,
+        **checkpoint,
+    }
+
+    control.mcp_result_job.assert_called_once_with("job-1", offset=0, limit=16_384)
+    control.mcp_tail_job.assert_called_once_with("job-1", 80, cursor=None, limit=16_384)
+    control.mcp_summary_job.assert_called_once_with("job-1", 20, cursor=None, limit=16_384)
+
+
 def test_mcp_review_inbox_requalify_delegates_and_returns_clean_errors(monkeypatch) -> None:
     mcp_module = ModuleType("mcp")
     server_module = ModuleType("mcp.server")
@@ -510,7 +581,7 @@ def test_mcp_review_inbox_requalify_delegates_and_returns_clean_errors(monkeypat
         return_value=control,
     ):
         server = build_server()
-        assert server.tools["agent_review_inbox_requalify"]("agent_job:job-1") == {
+        assert server.tools["agent_review_inbox_requalify"]("agent_job:job-1", full=True) == {
             "ok": True,
             "item": {
                 "item_id": "agent_job:job-1",

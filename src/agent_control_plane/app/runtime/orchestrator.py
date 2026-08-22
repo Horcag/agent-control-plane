@@ -14,6 +14,14 @@ from typing import Any
 from agent_control_plane.app.runtime.finalization_service import FinalizationService
 from agent_control_plane.app.runtime.job_execution_service import JobExecutionService
 from agent_control_plane.app.runtime.job_guardrails import JobGuardrails
+from agent_control_plane.app.runtime.mcp_payloads import (
+    DEFAULT_PREVIEW_BYTES,
+    compact_summary,
+    file_preview,
+    missing_file_preview,
+    tail_preview,
+    text_preview,
+)
 from agent_control_plane.entities.job import (
     TERMINAL_STATUSES,
     JobRecord,
@@ -1020,6 +1028,43 @@ class AgentControlPlane:
         }
 
     def summary_job(self, job_id: str, log_lines: int = 20) -> dict[str, Any]:
+        payload = self._summary_job_base(job_id)
+        job = self.store.get_job(job_id)
+        payload["log_tail"] = self.tail_job(job_id, log_lines) if job.log_path else ""
+        return payload
+
+    def mcp_summary_job(
+        self,
+        job_id: str,
+        log_lines: int = 20,
+        *,
+        cursor: int | None = None,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+    ) -> dict[str, Any]:
+        payload = self._summary_job_base(job_id)
+        dirty_status = str(payload["dirty_status"])
+        payload["dirty_status"] = text_preview(
+            dirty_status,
+            stable_id=f"{job_id}:dirty-status",
+            limit=limit,
+        )
+        job = self.store.get_job(job_id)
+        if job.log_path is None:
+            payload["log_tail"] = text_preview(
+                "",
+                stable_id=f"{job_id}:log",
+                limit=limit,
+            )
+        else:
+            payload["log_tail"] = self.mcp_tail_job(
+                job_id,
+                log_lines,
+                cursor=cursor,
+                limit=limit,
+            )
+        return compact_summary(payload)
+
+    def _summary_job_base(self, job_id: str) -> dict[str, Any]:
         job = self._refresh_stale_worker_if_needed(job_id)
         metrics = self.store.attempt_metrics(job_id, limit=1)
         status = ""
@@ -1078,7 +1123,6 @@ class AgentControlPlane:
             "result_status": result_state.status,
             "forbidden_changes": forbidden,
             "dirty_status": status,
-            "log_tail": self.tail_job(job_id, log_lines) if job.log_path else "",
             "result_path": str(job.result_path),
             "run_dir": str(job.run_dir),
             "latest_attempt_metrics": metrics[0] if metrics else None,
@@ -1119,11 +1163,64 @@ class AgentControlPlane:
             return f"Log file does not exist yet: {job.log_path}"
         return _tail(job.log_path, lines)
 
+    def mcp_tail_job(
+        self,
+        job_id: str,
+        lines: int = 80,
+        *,
+        cursor: int | None = None,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+    ) -> dict[str, Any]:
+        job = self.store.get_job(job_id)
+        if job.log_path is None:
+            return missing_file_preview(
+                job.run_dir / "attempt.log",
+                stable_id=f"{job_id}:log",
+                message="No log file has been assigned yet.",
+                limit=limit,
+            )
+        if not job.log_path.exists():
+            return missing_file_preview(
+                job.log_path,
+                stable_id=f"{job_id}:log",
+                message=f"Log file does not exist yet: {job.log_path}",
+                limit=limit,
+            )
+        return tail_preview(
+            job.log_path,
+            stable_id=f"{job_id}:log",
+            lines=lines,
+            cursor=cursor,
+            limit=limit,
+        )
+
     def result_job(self, job_id: str) -> str:
         job = self.store.get_job(job_id)
         if not job.result_path.exists():
             return f"Result file does not exist yet: {job.result_path}"
         return job.result_path.read_text(encoding="utf-8", errors="replace")
+
+    def mcp_result_job(
+        self,
+        job_id: str,
+        *,
+        offset: int = 0,
+        limit: int = DEFAULT_PREVIEW_BYTES,
+    ) -> dict[str, Any]:
+        job = self.store.get_job(job_id)
+        if not job.result_path.exists():
+            return missing_file_preview(
+                job.result_path,
+                stable_id=job_id,
+                message=f"Result file does not exist yet: {job.result_path}",
+                limit=limit,
+            )
+        return file_preview(
+            job.result_path,
+            stable_id=job_id,
+            offset=offset,
+            limit=limit,
+        )
 
     def supervision_for(self, job_ids: Sequence[str]) -> dict[str, Any]:
         """Tell a caller that just launched ``job_ids`` how to actually supervise them.

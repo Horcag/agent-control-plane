@@ -116,16 +116,20 @@ of `Monitor` to `claude_allowed_tools` in configuration, not a code change.
 
 Use exact ACP tool names rather than broad tool discovery. Scope a call to its route, job,
 or plan, consume only needed `structuredContent` fields, and keep the returned cursor for
-the next plan/watch call. Start with compact `agent_smoke`; request `full=True`, a complete
-result, or an inbox payload only for a specific review need. Do not re-request unchanged
-status/snapshot data or print whole tool responses.
+the next plan/watch call. Start with compact `agent_smoke`. Result, tail, summary, inbox,
+and checkpoint tools expose UTF-8-safe previews capped at 16 KiB of content by default;
+round-trip `next_offset` or `next_cursor` for another window. Request `full=True` only for
+deliberate legacy access to an unbounded payload. Do not re-request unchanged status or
+snapshot data, and do not print whole tool responses.
 
 ```text
 agent_plan_snapshot(plan_id="release") -> { cursor, ready_next, running, ... }
 agent_plan_dispatch(plan_id="release", max_jobs=1) -> { dispatched, ... }
 agent_plan_watch(plan_id="release", since=<cursor>) -> { cursor, changes, ... }
-agent_summary_job(job_id="job-123", lines=20) -> compact review signal
-agent_result_job(job_id="job-123") -> only after that signal requires the full result
+agent_summary_job(job_id="job-123", lines=20) -> compact review signal and bounded log tail
+agent_result_job(job_id="job-123") -> bounded result preview plus hash and next_offset
+agent_result_job(job_id="job-123", offset=<next_offset>) -> next bounded preview
+agent_result_job(job_id="job-123", full=True) -> explicit unbounded legacy result
 ```
 
 Keep expensive command output in the run artifact or worker log; report the exit code and
