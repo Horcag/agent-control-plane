@@ -278,6 +278,7 @@ def build_server(
         raise RuntimeError(
             'The MCP server dependency is missing. Install with: python -m pip install -e ".[mcp]"'
         ) from exc
+    _rebuild_fastmcp_settings(fast_mcp)
 
     def _offloaded(mcp: Any) -> Callable[[Callable[..., Any]], Callable[..., Awaitable[Any]]]:
         """Register a blocking sync tool so its body runs off the event loop."""
@@ -1446,6 +1447,21 @@ def build_server(
 
     _validate_tool_policies(mcp)
     return mcp
+
+
+def _rebuild_fastmcp_settings(fast_mcp: type[Any]) -> None:
+    """Resolve FastMCP's generic settings annotations before first instantiation.
+
+    MCP 1.x defines ``Settings`` after postponed annotations are enabled. Newer
+    pydantic-settings versions inspect those fields strictly and warn while the
+    generic lifespan annotation is still a forward reference. At this boundary
+    the FastMCP module is fully imported, so Pydantic can safely complete it.
+    """
+    module = importlib.import_module(fast_mcp.__module__)
+    settings = getattr(module, "Settings", None)
+    if settings is None or getattr(settings, "__pydantic_complete__", True):
+        return
+    settings.model_rebuild()
 
 
 def _validate_tool_policies(mcp: Any) -> None:

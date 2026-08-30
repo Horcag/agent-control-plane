@@ -4,6 +4,7 @@ import functools
 import inspect
 import json
 import time
+import warnings
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -14,6 +15,7 @@ try:
     from mcp.server.fastmcp import FastMCP
     from mcp.shared.memory import create_connected_server_and_client_session
     from mcp.types import CallToolResult, TextContent
+    from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning
 except ImportError:
     pytest.skip("mcp is required for MCP offload tests", allow_module_level=True)
 
@@ -27,10 +29,14 @@ from agent_control_plane.app.runtime.mcp_server import _validate_tool_policies, 
 
 
 def test_every_registered_tool_is_coroutine_function() -> None:
-    with patch(
-        "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
-        return_value=Mock(),
+    with (
+        patch(
+            "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
+            return_value=Mock(),
+        ),
+        warnings.catch_warnings(),
     ):
+        warnings.simplefilter("error", IncompleteFieldDefinitionWarning)
         server = build_server()
 
     tools = server._tool_manager.list_tools()
