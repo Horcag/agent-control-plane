@@ -205,6 +205,21 @@ def verify_slot_checkpoint(workspace_path: Path, checkpoint: SlotCheckpoint) -> 
     current_head = head_commit(workspace)
     if current_head != checkpoint.base_sha:
         raise SlotCheckpointError("Workspace HEAD changed after checkpoint")
+    verify_slot_checkpoint_ref(workspace, checkpoint)
+
+
+def verify_slot_checkpoint_ref(workspace_path: Path, checkpoint: SlotCheckpoint) -> None:
+    """Verify the durable checkpoint without constraining the reusable slot checkout.
+
+    Before cleanup, ``verify_slot_checkpoint`` also proves that the live workspace
+    is still based on the checkpoint's original HEAD. After cleanup and release,
+    the slot may legitimately be checked out to another branch while terminal
+    finalization is being replayed. At that point only the immutable ref, commit,
+    and tree belong to the old job.
+    """
+    workspace = workspace_path.resolve(strict=False)
+    if workspace != checkpoint.workspace_path.resolve(strict=False):
+        raise SlotCheckpointError("Checkpoint belongs to a different workspace")
     verified_sha = _git(workspace, "rev-parse", "--verify", checkpoint.ref_name)
     verified_tree = _git(workspace, "rev-parse", f"{verified_sha}^{{tree}}")
     if verified_sha != checkpoint.commit_sha or verified_tree != checkpoint.tree_sha:

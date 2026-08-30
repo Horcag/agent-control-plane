@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -52,6 +53,27 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_launcher_rejects_a_globally_disabled_backend_before_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "disabled-codex")
+
+            with (
+                patch.dict(os.environ, {"ACP_DISABLED_BACKENDS": "codex"}),
+                self.assertRaisesRegex(PolicyError, "globally disabled"),
+            ):
+                control.start_job(
+                    StartOptions(
+                        task_id="disabled-codex",
+                        route="main",
+                        backend=CODEX_BACKEND,
+                    )
+                )
+
+            self.assertEqual(control.store.list_jobs(), [])
+
     def test_launcher_persists_launch_provenance_and_rejects_invalid_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

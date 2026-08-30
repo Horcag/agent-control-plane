@@ -10,6 +10,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolate_globally_disabled_backends(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep backend-policy tests independent from the operator's machine guard."""
+    monkeypatch.delenv("ACP_DISABLED_BACKENDS", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def isolate_port_assignments_path(tmp_path: Path) -> Generator[Path, None, None]:
     assignments_path = tmp_path / "port-assignments.json"
     with patch(

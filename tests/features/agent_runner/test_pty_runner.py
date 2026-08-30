@@ -2,9 +2,71 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent_control_plane.features.agent_runner.lib import pty_runner
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
+
+
+class PtyBackendSelectionTest(unittest.TestCase):
+    """The PTY backend is chosen by platform, so both branches need covering.
+
+    pywinpty and ptyprocess each refuse to install on the other platform, so a
+    given CI runner can only ever exercise one branch for real. Both are driven
+    through a stubbed importlib instead.
+    """
+
+    def _load_with(self, os_name: str, modules: dict[str, object]) -> object:
+        def fake_import(name: str) -> object:
+            if name in modules:
+                return modules[name]
+            raise ImportError(f"No module named {name!r}")
+
+        with (
+            patch.object(pty_runner.os, "name", os_name),
+            patch.object(pty_runner.importlib, "import_module", side_effect=fake_import),
+        ):
+            return pty_runner._load_pty_process()
+
+    def test_windows_uses_pywinpty(self) -> None:
+        winpty = SimpleNamespace(PtyProcess="conpty-backend")
+
+        self.assertEqual(self._load_with("nt", {"winpty": winpty}), "conpty-backend")
+
+    def test_posix_uses_the_unicode_ptyprocess_class(self) -> None:
+        # PtyProcessUnicode, not PtyProcess: the reader thread and the trust-prompt
+        # matcher both operate on str, and the bytes class would feed them bytes.
+        ptyprocess = SimpleNamespace(
+            PtyProcessUnicode="posix-backend",
+            PtyProcess="bytes-backend",
+        )
+
+        self.assertEqual(self._load_with("posix", {"ptyprocess": ptyprocess}), "posix-backend")
+
+    def test_missing_backend_names_the_distribution_to_install(self) -> None:
+        for os_name, distribution in (("nt", "pywinpty"), ("posix", "ptyprocess")):
+            with self.subTest(os_name=os_name):
+                with self.assertRaises(ImportError) as caught:
+                    self._load_with(os_name, {})
+
+                self.assertIn(distribution, str(caught.exception))
+
+    def test_run_reports_a_missing_backend_as_blocked(self) -> None:
+        with patch.object(
+            pty_runner,
+            "_load_pty_process",
+            side_effect=ImportError("ptyprocess is not installed or cannot be imported: boom"),
+        ):
+            result = PtyAgyRunner().run(
+                _spec(prompt="task", yolo=False),
+                cancel_requested=lambda: False,
+                pid_observed=lambda _pid: None,
+            )
+
+        self.assertEqual(result.status, "blocked")
+        self.assertFalse(result.completed)
+        self.assertIn("ptyprocess", result.message)
 
 
 class PtyRunnerCommandTest(unittest.TestCase):

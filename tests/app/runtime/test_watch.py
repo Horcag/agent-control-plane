@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import Mock, patch
 
+from agent_control_plane.app.runtime.cli import _watch_job_live
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane, StartOptions
 from agent_control_plane.entities.job import TERMINAL_STATUSES
 from agent_control_plane.entities.plan import PlanTaskDefinition
@@ -29,6 +30,38 @@ from agent_control_plane.shared.config import (
 
 
 class WatchJobTest(unittest.TestCase):
+    def test_live_watch_waits_for_finalization_after_terminal_status(self) -> None:
+        control = Mock()
+        control.summary_job.side_effect = [
+            {
+                "status": "completed",
+                "terminal": True,
+                "settled": False,
+                "finalization_status": "pending",
+                "log_tail": "",
+            },
+            {
+                "status": "completed",
+                "terminal": True,
+                "settled": True,
+                "on_contract": True,
+                "finalization_status": "completed",
+                "log_tail": "",
+            },
+        ]
+
+        with patch("agent_control_plane.app.runtime.cli.time.sleep"):
+            summary = _watch_job_live(
+                control,
+                "job-finalizing",
+                poll_interval_sec=0.01,
+                timeout_sec=1,
+                log_lines=20,
+            )
+
+        self.assertTrue(summary["settled"])
+        self.assertEqual(control.summary_job.call_count, 2)
+
     def test_watch_plan_returns_only_new_job_state_delta(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -83,6 +116,27 @@ class WatchJobTest(unittest.TestCase):
             self.assertTrue(summary["terminal"])
             self.assertFalse(summary["timed_out"])
             self.assertEqual(summary["status"], "completed")
+
+    def test_watch_does_not_return_before_terminal_finalization_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = AgentControlPlane(_config(root))
+            job = _create_job(control, root, "job-finalizing")
+            control.store.mark_finished(job.job_id, "completed")
+
+            with patch.object(control, "reconcile_jobs", return_value={}):
+                summary = control.watch_job(
+                    job.job_id,
+                    poll_interval_sec=0,
+                    timeout_sec=0,
+                    include_details=True,
+                )
+
+            self.assertTrue(summary["terminal"])
+            self.assertFalse(summary["settled"])
+            self.assertIsNone(summary["on_contract"])
+            self.assertTrue(summary["timed_out"])
+            self.assertEqual(summary["finalization_status"], "pending")
 
     def test_watch_reports_no_verdict_for_unsettled_job(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

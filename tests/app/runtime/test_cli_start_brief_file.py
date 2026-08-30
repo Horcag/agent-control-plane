@@ -158,3 +158,80 @@ def test_cli_start_brief_file_conflict_blocks_launch_before_start_job(
     assert exit_code == 2
     mock_control.start_job.assert_not_called()
     assert conventional_path.read_text(encoding="utf-8") == "# Original\n"
+
+
+def test_cli_start_wait_returns_off_contract_exit_code_and_reports_supervision(
+    tmp_path: Path,
+) -> None:
+    mock_control = MagicMock()
+    job = MagicMock()
+    job.job_id = "job-blocked"
+    job.status = "queued"
+    job.alerts = None
+    mock_control.start_job.return_value = job
+    mock_control.watch_job.return_value = {
+        "status": "blocked",
+        "expected_result_status": "completed",
+        "finalization_status": "completed",
+        "settled": True,
+        "on_contract": False,
+        "timed_out": False,
+    }
+    mock_control.supervision_for.return_value = {
+        "supervised": False,
+        "watch_command": "agent-control watch --events job-blocked",
+    }
+
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=mock_control,
+    ):
+        exit_code = main(
+            [
+                "start",
+                "--task-id",
+                "task-blocked",
+                "--route",
+                "dev",
+                "--wait",
+                "--poll-interval-sec",
+                "0",
+                "--wait-timeout-sec",
+                "1",
+                "--config",
+                str(tmp_path / "workspaces.toml"),
+            ]
+        )
+
+    assert exit_code == 1
+    mock_control.watch_job.assert_called_once()
+
+
+def test_cli_reconcile_returns_nonzero_when_recovery_has_errors(tmp_path: Path) -> None:
+    mock_control = MagicMock()
+    mock_control.reconcile_jobs.return_value = {
+        "reconciled_orphaned_jobs": [],
+        "reconciled_terminal_jobs": [],
+        "live_jobs": [],
+        "live_runner_conflicts": [],
+        "runner_identity_conflicts": [],
+        "terminated_orphan_runners": [],
+        "worker_identity_conflicts": [],
+        "errors": ["job-1: checkpoint verification failed"],
+    }
+
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=mock_control,
+    ):
+        exit_code = main(
+            [
+                "reconcile",
+                "--job-id",
+                "job-1",
+                "--config",
+                str(tmp_path / "workspaces.toml"),
+            ]
+        )
+
+    assert exit_code == 1

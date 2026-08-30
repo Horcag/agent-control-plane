@@ -84,6 +84,8 @@ The exit code is the point: it tells a caller what happened without parsing outp
 
 This applies to the plain `watch <job-id>` form too (its single JSON payload is
 unchanged for existing callers, but its exit code is now meaningful in the same way).
+`start --wait` uses the same settled verdict and exit codes instead of returning success
+when the launched job is blocked or finalization is still pending.
 
 Run `agent-control statuses` (or `--json`) to print the full terminal-status vocabulary
 and which statuses are capable of being on-contract, instead of guessing at status
@@ -135,7 +137,10 @@ agent_result_job(job_id="job-123", full=True) -> explicit unbounded legacy resul
 Keep expensive command output in the run artifact or worker log; report the exit code and
 a short tail/count. Run independent checks separately (or with fail-fast semantics), so a
 later success cannot hide an earlier failure. Use one combined `pytest -k 'api or cli'`
-expression, not repeated `-k` flags, and use `TMPDIR=/tmp` when WSL capture paths drift.
+expression, not repeated `-k` flags. On WSL, fix the process environment once if
+`python -c "import tempfile; print(tempfile.gettempdir())"` resolves under `/mnt`: native
+Linux tools should receive `TMPDIR=/tmp` from the shell or Codex environment policy. Do
+not hide a broken cross-filesystem temp configuration by prefixing individual test commands.
 
 The CLI `watch --events` *streams*: a shell process holds a connection open and prints
 lines as they arrive. MCP has no equivalent streaming transport, so that exact shape
@@ -327,6 +332,10 @@ After coordinator loss, run ordinary reconciliation first:
 agent-control reconcile --config .\config\workspaces.toml
 agent-control reconcile --job-id <job-id> --terminate-verified-runners --config .\config\workspaces.toml
 ```
+
+`reconcile` exits `0` only when it reports no recovery errors or unresolved process
+identity conflicts; it exits `1` when any such blocker remains. Read the JSON report
+before retrying.
 
 The termination option is opt-in and acts only when durable PID, start identity, and
 executable still match. Missing identity, PID reuse, unsupported platform, or any

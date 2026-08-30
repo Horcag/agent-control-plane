@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import queue
 import re
 import threading
@@ -28,6 +29,53 @@ class PtyProcessLike(Protocol):
     def terminate(self, force: bool = False) -> None: ...
 
 
+class PtyProcessFactory(Protocol):
+    """The class object a PTY backend exposes, as opposed to one of its processes.
+
+    `spawn` is a classmethod on both backends, so what the loader returns is a
+    class rather than an instance, and `PtyProcessLike` -- which describes an
+    instance -- does not cover it.
+    """
+
+    def spawn(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None = ...,
+        dimensions: tuple[int, int] = ...,
+    ) -> PtyProcessLike: ...
+
+
+def _load_pty_process() -> PtyProcessFactory:
+    """Return the PTY backend for this platform.
+
+    agy is a TUI: it has to be driven through a terminal, not a pipe, so the
+    runner needs a real PTY on every platform it supports. Windows has one
+    implementation of that (ConPTY through pywinpty) and POSIX has another
+    (openpty through ptyprocess), and the two are separate packages -- neither
+    installs on the other platform, which is why the dependency is split by
+    marker in pyproject.
+
+    They agree closely enough to sit behind `PtyProcessLike`: both expose
+    `spawn(argv, cwd=..., dimensions=(rows, cols))`, a `read(size)` that hands
+    back text, `isalive()`, `terminate(force=...)`, `pid` and `exitstatus`. The
+    one thing to get right is text: ptyprocess splits bytes and str across two
+    classes, so this asks for `PtyProcessUnicode`, whose `read` returns str like
+    pywinpty\'s does. Reading at EOF raises on both, in backend-specific ways --
+    the reader thread already catches broadly for that reason.
+    """
+    if os.name == "nt":
+        module_name, attribute, distribution = "winpty", "PtyProcess", "pywinpty"
+    else:
+        module_name, attribute, distribution = "ptyprocess", "PtyProcessUnicode", "ptyprocess"
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ImportError(f"{distribution} is not installed or cannot be imported: {exc}") from exc
+    factory: PtyProcessFactory = getattr(module, attribute)
+    return factory
+
+
 AgyRunSpec = AgentRunSpec
 AgyRunResult = AgentRunResult
 
@@ -41,14 +89,14 @@ class PtyAgyRunner:
         pid_observed: Callable[[int | None], None],
     ) -> AgyRunResult:
         try:
-            pty_process = importlib.import_module("winpty").PtyProcess
+            pty_process = _load_pty_process()
         except ImportError as exc:
             return AgyRunResult(
                 status="blocked",
                 completed=False,
                 exit_code=None,
                 result_status=None,
-                message=f"pywinpty is not installed or cannot be imported: {exc}",
+                message=str(exc),
             )
 
         command = self._build_command(spec)

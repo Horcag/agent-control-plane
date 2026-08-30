@@ -1096,6 +1096,7 @@ class AgentControlPlane:
             status = f"<git status failed: {exc}>"
 
         result_state = inspect_result(job.result_path, _job_start_timestamp(job))
+        settled = is_settled(job)
         return {
             "job_id": job.job_id,
             "task_id": job.task_id,
@@ -1103,6 +1104,8 @@ class AgentControlPlane:
             "expected_result_status": job.expected_result_status,
             "controller_gate_mode": job.controller_gate_mode,
             "terminal": self._is_terminal(job),
+            "settled": settled,
+            "on_contract": is_on_contract(job) if settled else None,
             "last_error": job.last_error,
             "backend": job.backend,
             "agy_model": job.agy_model,
@@ -1356,7 +1359,7 @@ class AgentControlPlane:
                     log_byte_limit=log_byte_limit,
                 )
             )
-            if summary["terminal"]:
+            if summary["settled"]:
                 summary["timed_out"] = False
                 summary["watch_elapsed_sec"] = round(time.monotonic() - started, 3)
                 return summary

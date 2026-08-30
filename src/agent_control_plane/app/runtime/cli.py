@@ -147,13 +147,18 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(control.model_routing_explain(args.policy, args.route))
             return 0
         if args.command == "reconcile":
-            _print_json(
-                control.reconcile_jobs(
-                    args.job_id,
-                    terminate_verified_runners=args.terminate_verified_runners,
-                )
+            payload = control.reconcile_jobs(
+                args.job_id,
+                terminate_verified_runners=args.terminate_verified_runners,
             )
-            return 0
+            _print_json(payload)
+            unresolved = (
+                "errors",
+                "live_runner_conflicts",
+                "runner_identity_conflicts",
+                "worker_identity_conflicts",
+            )
+            return 1 if any(payload.get(key) for key in unresolved) else 0
         if args.command == "plan":
             _print_json(handle_plan_command(control, args))
             return 0
@@ -233,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
                 # stderr, so piping start's JSON stays clean while the operator still sees it.
                 print("not supervised - watch it with:", file=sys.stderr)
                 print(f"  {supervision['watch_command']}", file=sys.stderr)
+            if args.wait:
+                return _exit_code_for_watch_payload(payload["watch"])
             return 0
         if args.command == "run-job":
             job = control.run_job(args.job_id, args.worker_instance_id)
@@ -645,7 +652,7 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--wait",
         action="store_true",
-        help="Wait until the job reaches a terminal status before returning",
+        help="Wait until the job is terminal and finalization has settled before returning",
     )
     start.add_argument(
         "--wait-timeout-sec",
@@ -1272,7 +1279,7 @@ def _watch_job_live(
             print(new_log.rstrip(), file=sys.stderr, flush=True)
         last_log_tail = log_tail
 
-        if summary["terminal"]:
+        if summary["settled"]:
             summary["timed_out"] = False
             summary["watch_elapsed_sec"] = round(elapsed, 3)
             return summary
@@ -1299,6 +1306,8 @@ def _print_live_summary(summary: dict[str, Any], elapsed: float) -> None:
         f"elapsed={elapsed:.1f}s",
         f"status={summary.get('status')}",
         f"terminal={summary.get('terminal')}",
+        f"settled={summary.get('settled')}",
+        f"finalization={summary.get('finalization_status') or '-'}",
         f"backend={summary.get('backend') or '-'}",
         f"worker_pid={summary.get('worker_pid') or '-'}",
         f"runner_pid={summary.get('runner_pid') or '-'}",

@@ -217,6 +217,156 @@ def test_reconcile_reuses_checkpoint_after_crash_before_slot_release(tmp_path: P
     assert control.slots.inspect_slot("app-1").status == "available"
 
 
+def test_reconcile_after_checkpoint_release_does_not_reinspect_reused_slot(
+    tmp_path: Path,
+) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-release-completion-crash")
+    base_sha = run_git(slot, "rev-parse", "HEAD")
+    (slot / "worker.txt").write_text("durable checkpoint\n", encoding="utf-8")
+
+    with (
+        patch.object(
+            control.store,
+            "mark_finalization_completed",
+            side_effect=RuntimeError("crash after slot release"),
+        ),
+        pytest.raises(RuntimeError, match="crash after slot release"),
+    ):
+        control.finish_job(job.job_id, "completed")
+
+    released = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert released.slot_released is True
+    assert released.checkpoint_sha is not None
+    assert control.store.get_job(job.job_id).finalization_status == "pending"
+    assert control.slots.inspect_slot("app-1").status == "available"
+
+    run_git(slot, "checkout", "-b", "next-job-branch", released.checkpoint_sha)
+    reused_head = run_git(slot, "rev-parse", "HEAD")
+    assert reused_head != base_sha
+
+    report = AgentControlPlane(config).reconcile_jobs(job.job_id)
+    replayed = control.review_inbox.get(f"agent_job:{job.job_id}")
+
+    assert report["errors"] == []
+    assert report["reconciled_terminal_jobs"] == [job.job_id]
+    assert control.store.get_job(job.job_id).finalization_status == "completed"
+    assert replayed.delivery_status == "checkpointed"
+    assert replayed.checkpoint_sha == released.checkpoint_sha
+    assert replayed.slot_released is True
+    assert control.slots.inspect_slot("app-1").status == "available"
+    assert run_git(slot, "branch", "--show-current") == "next-job-branch"
+    assert run_git(slot, "rev-parse", "HEAD") == reused_head
+
+
+def test_released_checkpoint_damage_does_not_quarantine_reused_slot(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-released-checkpoint-damage")
+    base_sha = run_git(slot, "rev-parse", "HEAD")
+    (slot / "worker.txt").write_text("durable checkpoint\n", encoding="utf-8")
+
+    with (
+        patch.object(
+            control.store,
+            "mark_finalization_completed",
+            side_effect=RuntimeError("crash after slot release"),
+        ),
+        pytest.raises(RuntimeError, match="crash after slot release"),
+    ):
+        control.finish_job(job.job_id, "completed")
+
+    released = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert released.checkpoint_ref is not None
+    assert released.checkpoint_sha is not None
+    run_git(slot, "checkout", "-b", "next-job-branch", released.checkpoint_sha)
+    reused_head = run_git(slot, "rev-parse", "HEAD")
+    run_git(slot, "update-ref", released.checkpoint_ref, base_sha)
+
+    report = AgentControlPlane(config).reconcile_jobs(job.job_id)
+    failed = control.review_inbox.get(f"agent_job:{job.job_id}")
+
+    assert report["reconciled_terminal_jobs"] == []
+    assert report["errors"] == [
+        f"{job.job_id}: Checkpoint ref no longer matches the verified commit and tree"
+    ]
+    assert control.store.get_job(job.job_id).finalization_status == "failed"
+    assert failed.delivery_status == "checkpoint_failed"
+    assert failed.slot_released is True
+    assert control.slots.inspect_slot("app-1").status == "available"
+    assert run_git(slot, "branch", "--show-current") == "next-job-branch"
+    assert run_git(slot, "rev-parse", "HEAD") == reused_head
+
+
+def test_reconcile_recovers_legacy_checkpoint_failure_after_slot_reuse(tmp_path: Path) -> None:
+    route = _committed_repo(tmp_path / "route")
+    slot = _committed_repo(tmp_path / "slots" / "app-1")
+    config = _config(tmp_path, route, slot)
+    control = AgentControlPlane(config)
+    job = _active_slot_job(control, tmp_path, slot, "job-legacy-released-checkpoint")
+    (slot / "worker.txt").write_text("durable checkpoint\n", encoding="utf-8")
+
+    with (
+        patch.object(
+            control.store,
+            "mark_finalization_completed",
+            side_effect=RuntimeError("crash after slot release"),
+        ),
+        pytest.raises(RuntimeError, match="crash after slot release"),
+    ):
+        control.finish_job(job.job_id, "completed")
+
+    released = control.review_inbox.get(f"agent_job:{job.job_id}")
+    assert released.checkpoint_ref is not None
+    assert released.checkpoint_sha is not None
+    run_git(slot, "checkout", "-b", "next-job-branch", released.checkpoint_sha)
+    control.review_inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id=job.job_id,
+            source_status="completed",
+            source_completed_at=control.store.get_job(job.job_id).finished_at,
+            delivery_status="checkpoint_failed",
+            task_id=job.task_id,
+            route=job.route,
+            workspace_path=slot,
+            slot_name=job.slot_name,
+            result_path=job.result_path,
+            checkpoint_ref=released.checkpoint_ref,
+            checkpoint_sha=released.checkpoint_sha,
+            checkpoint_tree_sha=released.checkpoint_tree_sha,
+            base_sha=released.base_sha,
+            checkpoint_error="Workspace HEAD changed after checkpoint",
+            slot_released=False,
+        )
+    )
+    control.store.mark_finalization_failed(job.job_id, "Workspace HEAD changed after checkpoint")
+    control.slot_store.mark_status(
+        "app-1",
+        "checkpoint_failed",
+        note="legacy replay compared the released slot checkout to the old base",
+    )
+
+    report = AgentControlPlane(config).reconcile_jobs(job.job_id)
+    recovered = control.review_inbox.get(f"agent_job:{job.job_id}")
+
+    assert report["errors"] == []
+    assert report["reconciled_terminal_jobs"] == [job.job_id]
+    assert control.store.get_job(job.job_id).finalization_status == "completed"
+    assert recovered.delivery_status == "checkpointed"
+    assert recovered.checkpoint_sha == released.checkpoint_sha
+    assert recovered.slot_released is True
+    assert recovered.checkpoint_error is None
+    assert control.slots.inspect_slot("app-1").status == "available"
+    assert run_git(slot, "branch", "--show-current") == "next-job-branch"
+    assert run_git(slot, "rev-parse", "HEAD") == released.checkpoint_sha
+
+
 @pytest.mark.skipif(
     not supports_verified_process_termination(),
     reason="OS has no safe exact-process termination primitive",

@@ -32,6 +32,7 @@ from agent_control_plane.features.agent_runner.lib.runner import (
     SUPPORTED_BACKENDS,
     normalize_backend,
 )
+from agent_control_plane.shared.agent_backends import globally_disabled_backends
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.git_tools import GitError, head_commit
@@ -255,6 +256,11 @@ class JobLauncher:
             self.config.defaults.backend,
         )
         normalized_backend = normalize_backend(backend)
+        if normalized_backend in globally_disabled_backends():
+            raise JobLaunchError(
+                f"Backend {normalized_backend!r} is globally disabled by "
+                "ACP_DISABLED_BACKENDS; choose an enabled backend"
+            )
         # agy backend supports native workspace access mode
         if normalized_backend == CLAUDE_BACKEND and workspace_access != "native":
             # claude ide_mcp reaches the IDE the same way Codex does — through a per-route

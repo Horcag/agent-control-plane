@@ -11,6 +11,7 @@ from agent_control_plane.features.result_handoff.lib.slot_checkpoint import (
     clean_checkpointed_workspace,
     create_slot_checkpoint,
     verify_slot_checkpoint,
+    verify_slot_checkpoint_ref,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "create_slot_checkpoint",
     "scan_codex_subagent_completions",
     "verify_slot_checkpoint",
+    "verify_slot_checkpoint_ref",
 ]

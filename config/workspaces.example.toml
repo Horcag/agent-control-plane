@@ -1,4 +1,6 @@
 # Copy this file to config/workspaces.toml and edit the paths for your machine.
+# To disable a worker backend across every ACP config, set the comma-separated
+# process environment variable ACP_DISABLED_BACKENDS (for example: "claude").
 # All relative paths are resolved from the repository root, not from this file.
 # Keep slots and generated worktrees next to this repository, not inside it.
 

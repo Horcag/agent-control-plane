@@ -31,6 +31,7 @@ from agent_control_plane.features.result_handoff import (
     parse_result_report,
     verify_clean_workspace_tree,
     verify_slot_checkpoint,
+    verify_slot_checkpoint_ref,
 )
 from agent_control_plane.features.slot_lifecycle import SlotManager
 from agent_control_plane.shared.config import ControlConfig
@@ -339,9 +340,14 @@ class FinalizationService:
     ) -> ReviewInboxItem | None:
         if job.slot_name is None:
             raise ValueError(f"Job {job.job_id} has no slot to finalize")
+        if not force_checkpoint:
+            released_item = self._released_job_review(job)
+            if released_item is not None:
+                return self._replay_released_handoff(job, released_item)
         slot = self.slot_store.require_slot(job.slot_name)
         if slot.path.resolve(strict=False) != job.workspace_path.resolve(strict=False):
             raise ValueError(f"Slot {job.slot_name} path changed before finalization: {slot.path}")
+        workspace_may_be_reused = allow_inactive and slot.active_job_id is None
         self.slot_store.claim_for_finalization(job.slot_name, job.job_id)
         try:
             state = workspace_state(job.workspace_path)
@@ -377,6 +383,7 @@ class FinalizationService:
                 job_status,
                 existing_checkpoint,
                 allow_inactive=allow_inactive,
+                workspace_may_be_reused=workspace_may_be_reused,
             )
         if state.dirty and should_checkpoint:
             return self._checkpoint_and_release_slot(
@@ -415,6 +422,58 @@ class FinalizationService:
             )
         return item
 
+    def _released_job_review(self, job: JobRecord) -> ReviewInboxItem | None:
+        try:
+            item = self.review_inbox.get(f"agent_job:{job.job_id}")
+        except KeyError:
+            return None
+        return item if item.slot_released else None
+
+    def _replay_released_handoff(
+        self,
+        job: JobRecord,
+        item: ReviewInboxItem,
+    ) -> ReviewInboxItem:
+        checkpoint_fields = (
+            item.checkpoint_ref,
+            item.checkpoint_sha,
+            item.checkpoint_tree_sha,
+            item.base_sha,
+        )
+        if not any(checkpoint_fields):
+            return item
+        if not all(checkpoint_fields):
+            raise SlotCheckpointError(
+                f"Released checkpoint metadata is incomplete for job {job.job_id}"
+            )
+        checkpoint = SlotCheckpoint(
+            job_id=job.job_id,
+            task_id=job.task_id,
+            terminal_status=job.status,
+            workspace_path=job.workspace_path.resolve(strict=False),
+            ref_name=str(item.checkpoint_ref),
+            commit_sha=str(item.checkpoint_sha),
+            tree_sha=str(item.checkpoint_tree_sha),
+            base_sha=str(item.base_sha),
+        )
+        try:
+            verify_slot_checkpoint_ref(job.workspace_path, checkpoint)
+        except (GitError, OSError, SlotCheckpointError) as exc:
+            failed_item = self._upsert_job_review(
+                job,
+                delivery_status="checkpoint_failed",
+                checkpoint=checkpoint,
+                checkpoint_error=str(exc),
+                slot_released=True,
+            )
+            self.store.add_event(
+                job.job_id,
+                "error",
+                f"Released terminal checkpoint failed verification: {exc}",
+            )
+            return failed_item
+        return item
+
     def _existing_job_checkpoint(self, job: JobRecord) -> SlotCheckpoint | None:
         try:
             item = self.review_inbox.get(f"agent_job:{job.job_id}")
@@ -447,11 +506,15 @@ class FinalizationService:
         checkpoint: SlotCheckpoint,
         *,
         allow_inactive: bool,
+        workspace_may_be_reused: bool,
     ) -> ReviewInboxItem:
         delivery_status = "checkpointed" if job_status == "completed" else "salvage_checkpointed"
         existing_item = self.review_inbox.get(f"agent_job:{job.job_id}")
         try:
-            verify_slot_checkpoint(job.workspace_path, checkpoint)
+            if workspace_may_be_reused:
+                verify_slot_checkpoint_ref(job.workspace_path, checkpoint)
+            else:
+                verify_slot_checkpoint(job.workspace_path, checkpoint)
             if workspace_state(job.workspace_path).dirty:
                 raise SlotCheckpointError(
                     "Workspace changed while the existing checkpoint was being verified"

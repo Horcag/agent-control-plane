@@ -19,7 +19,10 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
+  # The agy PTY runner needs a real terminal on both platforms, and the two
+  # implementations ship as different packages; neither installs on the other.
   "pywinpty>=2.0; platform_system == 'Windows'",
+  "ptyprocess>=0.7; platform_system != 'Windows'",
 ]
 
 [project.optional-dependencies]

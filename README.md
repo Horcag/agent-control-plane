@@ -118,7 +118,8 @@ For root review, read a bounded job summary first, then request one result or in
 only when its compact status identifies it. Keep heavy command output in the run artifact
 or worker log; report its exit code and a short tail/count. Run independent checks
 separately (or fail fast), use one combined `pytest -k 'a or b'` expression, and set
-`TMPDIR=/tmp` when WSL capture paths are unreliable.
+the WSL/Codex environment policy to `TMPDIR=/tmp` once when Python otherwise selects a
+temporary directory under `/mnt`. Do not prefix individual test commands as a workaround.
 
 
 ## Five-minute offline demo
