@@ -575,12 +575,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Terminate only runner PIDs whose durable process identity still matches",
     )
 
-    start = subparsers.add_parser("start", parents=[common], help="Start a background agent job")
+    start = subparsers.add_parser(
+        "start",
+        parents=[common],
+        help=(
+            "Start a background agent job; choose --codex-quality-tier semantically for "
+            "automatic routing"
+        ),
+    )
     start.add_argument("--task-id", required=True)
     start.add_argument("--route", required=True)
     start.add_argument("--backend", choices=SUPPORTED_BACKENDS)
     start.add_argument("--agy-model", help="Antigravity model to use when --backend=agy")
-    start.add_argument("--codex-model", help="Model to use when --backend=codex")
+    start.add_argument(
+        "--codex-model",
+        help="Fixed Codex model; without effort uses the configured default and disables policy routing",
+    )
     start.add_argument("--codex-premium-override-reason")
     start.add_argument(
         "--expected-result-status",
@@ -593,8 +603,9 @@ def _build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--codex-reasoning-effort",
         help=(
-            "Codex reasoning effort to use when --backend=codex; known catalog models "
-            "must use an effort declared by the current cache"
+            "Fixed Codex reasoning effort; requires --codex-model. A model without effort "
+            "uses the configured default and disables policy adaptation; known models must "
+            "use an effort declared by the current cache"
         ),
     )
     start.add_argument("--claude-model", help="Model to use when --backend=claude")
@@ -607,7 +618,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument(
         "--codex-quality-tier",
-        help="Configured Codex routing policy name (compatibility option name)",
+        help="Semantic Codex routing policy; leave raw model/effort unset for adaptation",
     )
     start.add_argument(
         "--codex-tool-call-budget",

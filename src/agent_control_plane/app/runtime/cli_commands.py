@@ -49,16 +49,23 @@ def add_plan_parser(
     plan_add.add_argument("--backend", choices=SUPPORTED_BACKENDS)
     plan_add.add_argument("--workspace-access", choices=("ide_mcp", "native"))
     plan_add.add_argument("--read-only", action="store_true")
-    plan_add.add_argument("--codex-quality-tier")
+    plan_add.add_argument(
+        "--codex-quality-tier",
+        help="Semantic Codex routing policy; leave raw model/effort unset for adaptation",
+    )
     plan_add.add_argument("--expected-result-status", choices=("partial", "completed", "blocked"))
     plan_add.add_argument("--controller-gate-mode", choices=("focused", "full", "none"))
     plan_add.add_argument("--codex-premium-override-reason")
-    plan_add.add_argument("--codex-model", help="Model to use when --backend=codex")
+    plan_add.add_argument(
+        "--codex-model",
+        help="Fixed Codex model; without effort uses the configured default and disables policy routing",
+    )
     plan_add.add_argument(
         "--codex-reasoning-effort",
         help=(
-            "Codex reasoning effort to use when --backend=codex; known catalog models "
-            "must use an effort declared by the current cache"
+            "Fixed Codex reasoning effort; requires --codex-model. A model without effort "
+            "uses the configured default and disables policy adaptation; known models must "
+            "use an effort declared by the current cache"
         ),
     )
     plan_add.add_argument("--claude-model", help="Model to use when --backend=claude")
@@ -85,16 +92,23 @@ def add_plan_parser(
     plan_edit.add_argument("--backend", choices=SUPPORTED_BACKENDS)
     plan_edit.add_argument("--workspace-access", choices=("ide_mcp", "native"))
     plan_edit.add_argument("--read-only", dest="read_only", action="store_true", default=None)
-    plan_edit.add_argument("--codex-quality-tier")
+    plan_edit.add_argument(
+        "--codex-quality-tier",
+        help="Semantic Codex routing policy; leave raw model/effort unset for adaptation",
+    )
     plan_edit.add_argument("--expected-result-status", choices=("partial", "completed", "blocked"))
     plan_edit.add_argument("--controller-gate-mode", choices=("focused", "full", "none"))
     plan_edit.add_argument("--codex-premium-override-reason")
-    plan_edit.add_argument("--codex-model", help="Model to use when --backend=codex")
+    plan_edit.add_argument(
+        "--codex-model",
+        help="Fixed Codex model; without effort uses the configured default and disables policy routing",
+    )
     plan_edit.add_argument(
         "--codex-reasoning-effort",
         help=(
-            "Codex reasoning effort to use when --backend=codex; known catalog models "
-            "must use an effort declared by the current cache"
+            "Fixed Codex reasoning effort; requires --codex-model. A model without effort "
+            "uses the configured default and disables policy adaptation; known models must "
+            "use an effort declared by the current cache"
         ),
     )
     plan_edit.add_argument("--claude-model", help="Model to use when --backend=claude")

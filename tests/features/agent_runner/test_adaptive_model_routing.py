@@ -21,7 +21,11 @@ from agent_control_plane.features.agent_runner.lib.model_catalog import (
 )
 
 
-def _catalog(*models: str, unpriced: tuple[str, ...] = ()) -> ModelCatalog:
+def _catalog(
+    *models: str,
+    unpriced: tuple[str, ...] = (),
+    api_input_rates: dict[str, float] | None = None,
+) -> ModelCatalog:
     with tempfile.TemporaryDirectory() as temp:
         cache_path = Path(temp) / "models_cache.json"
         cache_path.write_text(
@@ -44,12 +48,20 @@ def _catalog(*models: str, unpriced: tuple[str, ...] = ()) -> ModelCatalog:
                 credit_rate=(
                     None
                     if model in unpriced
-                    else CatalogRate(input=1.0, cached_input=0.1, output=2.0)
+                    else CatalogRate(
+                        input=(api_input_rates or {}).get(model, 1.0),
+                        cached_input=0.1,
+                        output=2.0,
+                    )
                 ),
                 api_usd_rate=(
                     None
                     if model in unpriced
-                    else CatalogRate(input=1.0, cached_input=0.1, output=2.0)
+                    else CatalogRate(
+                        input=(api_input_rates or {}).get(model, 1.0),
+                        cached_input=0.1,
+                        output=2.0,
+                    )
                 ),
                 rate_card_version=(None if model in unpriced else "test-rate-card"),
                 rate_card_source=(None if model in unpriced else "test"),
@@ -149,6 +161,77 @@ def _adaptive_routing(
 
 
 class AdaptiveModelRoutingTest(unittest.TestCase):
+    def test_cost_is_primary_after_quality_floor(self) -> None:
+        routing = ModelRoutingPolicy(
+            catalog=_catalog(
+                "reliable-model",
+                "economical-model",
+                api_input_rates={"reliable-model": 2.0, "economical-model": 1.0},
+            ),
+            policies=(
+                RoutingPolicy(
+                    name="code-change",
+                    task_class="implementation",
+                    tool_call_budget=90,
+                    candidates=(
+                        ModelProfile("reliable-model", "medium"),
+                        ModelProfile("economical-model", "medium"),
+                    ),
+                    adaptive=AdaptiveRoutingSettings(
+                        minimum_samples_per_candidate=3,
+                        history_window=20,
+                        quality_floor=0.65,
+                        prior_quality=0.75,
+                        prior_weight=2.0,
+                    ),
+                ),
+            ),
+        )
+        version = routing.catalog.version
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(
+                *(_history("reliable-model", catalog_version=version) for _ in range(3)),
+                _history("economical-model", catalog_version=version),
+                _history("economical-model", catalog_version=version),
+                _history("economical-model", catalog_version=version),
+                _history("economical-model", catalog_version=version, result_status="partial"),
+            ),
+        )
+
+        self.assertEqual(decision.ladder[0], ModelProfile("economical-model", "medium"))
+        scores = {score.model: score for score in decision.candidate_scores}
+        self.assertTrue(scores["economical-model"].eligible)
+        self.assertLess(
+            scores["economical-model"].quality_score or 0.0,
+            scores["reliable-model"].quality_score or 0.0,
+        )
+        self.assertLess(
+            scores["economical-model"].expected_api_usd or 0.0,
+            scores["reliable-model"].expected_api_usd or 0.0,
+        )
+
+    def test_duration_breaks_equal_cost_ties_before_quality(self) -> None:
+        routing = _adaptive_routing()
+        version = routing.catalog.version
+        decision = routing.decision_for_policy(
+            "code-change",
+            route="main",
+            history=(
+                *(
+                    _history("reliable-model", catalog_version=version, duration_sec=30.0)
+                    for _ in range(2)
+                ),
+                *(
+                    _history("economical-model", catalog_version=version, duration_sec=10.0)
+                    for _ in range(2)
+                ),
+            ),
+        )
+
+        self.assertEqual(decision.ladder[0], ModelProfile("economical-model", "medium"))
+
     def test_history_parser_requires_exact_true_and_finite_nonnegative_metrics(self) -> None:
         invalid_rows: tuple[tuple[str, dict[str, object] | None], ...] = (
             ("missing metrics_valid", None),

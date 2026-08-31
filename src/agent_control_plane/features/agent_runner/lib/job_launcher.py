@@ -287,36 +287,39 @@ class JobLauncher:
             if normalized_backend == AGY_BACKEND
             else None
         )
-        explicit_codex_profile = any(
-            value is not None
-            for value in (
-                options.codex_model,
-                options.codex_reasoning_effort,
-                route_config.codex_model,
-                route_config.codex_reasoning_effort,
-            )
+        explicit_codex_model = options.codex_model or route_config.codex_model
+        explicit_codex_effort = (
+            options.codex_reasoning_effort or route_config.codex_reasoning_effort
         )
-        if explicit_codex_profile and options.codex_quality_tier is not None:
-            raise JobLaunchError(
-                "Callers must choose either automatic policy routing or one fixed explicit profile; "
-                "codex_quality_tier cannot be combined with codex_model or codex_reasoning_effort"
+        explicit_codex_profile = False
+        if normalized_backend == CODEX_BACKEND:
+            if explicit_codex_effort is not None and explicit_codex_model is None:
+                raise JobLaunchError(
+                    "codex_reasoning_effort requires an explicit codex_model; choose a named "
+                    "codex_quality_tier for automatic policy routing"
+                )
+            explicit_codex_profile = (
+                explicit_codex_model is not None or explicit_codex_effort is not None
             )
-        if (
-            options.codex_premium_override_reason is not None
-            and normalized_backend == CODEX_BACKEND
-            and not explicit_codex_profile
-        ):
-            raise JobLaunchError(
-                "codex_premium_override_reason requires an explicit Codex model profile"
-            )
-        if (
-            explicit_codex_profile
-            and options.codex_premium_override_reason is not None
-            and not override_reason
-        ):
-            raise JobLaunchError(
-                "Explicit premium Codex launches require a nonblank codex_premium_override_reason"
-            )
+            if explicit_codex_profile and options.codex_quality_tier is not None:
+                raise JobLaunchError(
+                    "Callers must choose either automatic policy routing or one fixed explicit "
+                    "profile; codex_quality_tier cannot be combined with codex_model or "
+                    "codex_reasoning_effort"
+                )
+            if options.codex_premium_override_reason is not None and not explicit_codex_profile:
+                raise JobLaunchError(
+                    "codex_premium_override_reason requires an explicit Codex model profile"
+                )
+            if (
+                explicit_codex_profile
+                and options.codex_premium_override_reason is not None
+                and not override_reason
+            ):
+                raise JobLaunchError(
+                    "Explicit premium Codex launches require a nonblank "
+                    "codex_premium_override_reason"
+                )
         codex_quality_tier: str | None = None
         codex_policy_name: str | None = None
         routing_decision: RoutingDecision | None = None
@@ -343,11 +346,11 @@ class JobLauncher:
                 codex_reasoning_effort = initial_profile.reasoning_effort
             else:
                 codex_model = _option(
-                    options.codex_model or route_config.codex_model,
+                    explicit_codex_model,
                     self.config.defaults.codex_model,
                 )
                 codex_reasoning_effort = _option(
-                    options.codex_reasoning_effort or route_config.codex_reasoning_effort,
+                    explicit_codex_effort,
                     self.config.defaults.codex_reasoning_effort,
                 )
                 try:

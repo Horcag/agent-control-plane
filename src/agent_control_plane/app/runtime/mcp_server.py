@@ -85,7 +85,9 @@ _MIN_POLL_INTERVAL_SEC = 0.5
 _MCP_INSTRUCTIONS = (
     "Scope calls by route, job, or plan; read only needed structuredContent fields. "
     "Reuse plan/watch cursors for deltas, never replay unchanged snapshots or logs. "
-    "Use compact smoke by default; request full diagnostics, results, or logs only explicitly."
+    "Use compact smoke by default. For Codex, choose codex_quality_tier semantically and "
+    "leave raw fields unset for automatic routing; codex_model alone uses the configured "
+    "default effort and disables adaptation, while effort without model is rejected."
 )
 
 
@@ -376,7 +378,12 @@ def build_server(
         expected_result_status: str = "completed",
         controller_gate_mode: str = "full",
     ) -> dict[str, Any]:
-        """Start an agent job and optionally wait briefly for a terminal result."""
+        """Start an agent job and optionally wait briefly for a terminal result.
+
+        For normal Codex routing, set codex_quality_tier semantically and leave raw fields
+        unset. An explicit model alone uses the configured default effort and disables
+        policy adaptation; an effort requires an explicit model.
+        """
         normalized_backend = normalize_backend(backend) if backend is not None else None
         if normalized_backend is not None and normalized_backend not in SUPPORTED_BACKENDS:
             allowed = ", ".join(SUPPORTED_BACKENDS)

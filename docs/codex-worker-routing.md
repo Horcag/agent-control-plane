@@ -4,6 +4,15 @@ ACP controls delegated worker profiles only; the parent/coordinating Codex threa
 external and cannot be selected, downgraded, or escalated by ACP. Routing diagnostics
 must not claim knowledge of the actual parent model.
 
+Coordinators should choose `codex_quality_tier` from the task's semantic class, risk, and
+verifiability, and leave `codex_model` and `codex_reasoning_effort` unset for normal
+automatic routing. Supplying an explicit `codex_model` selects a fixed profile and uses
+the configured default effort when no effort is supplied; this disables policy adaptation
+and escalation. A reasoning effort without its explicit model is rejected rather than
+resolving the catalog's `default` model. The named policy/task
+class is the semantic coordinator contract; candidate allowlists and evidence guardrails
+are operator policy.
+
 ## Model catalog
 
 ACP does not embed a current model list, family rule, capacity weight, or token price in
@@ -232,6 +241,12 @@ Adaptive routing is fail-closed for each named policy:
 - Unknown price remains `null`. With `allow_missing_price = false`, a candidate with
   missing price is ineligible; only a policy that explicitly allows missing price may
   use it.
+
+After all quality, review, sampling, price, and catalog constraints are satisfied, ACP
+selects the eligible candidate with the lowest known expected API-equivalent cost, then
+the lowest expected duration. Quality score is a later tie-breaker, followed by the
+configured candidate order. This keeps quality as a hard eligibility constraint while
+optimizing cost and time-to-verified-result among candidates that clear it.
 
 Compare identical tasks on clean slots at the same commit. Keep the prompt, timeout,
 tools, acceptance criteria, and target files fixed. Evaluate:

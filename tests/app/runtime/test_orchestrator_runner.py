@@ -796,6 +796,45 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             self.assertIsNone(job.codex_quality_tier)
             self.assertIsNone(control.store.routing_decision(job.job_id))
 
+    def test_codex_effort_without_model_is_rejected_before_job_creation(self) -> None:
+        for route_effort in (False, True):
+            with self.subTest(route_effort=route_effort), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                workspace = _git_repo(root / "repo", "main")
+                config = _config(root, workspace)
+                if route_effort:
+                    config = replace(
+                        config,
+                        routes=MappingProxyType(
+                            {
+                                "main": replace(
+                                    config.routes["main"],
+                                    codex_model=None,
+                                    codex_reasoning_effort="high",
+                                )
+                            }
+                        ),
+                    )
+                control = AgentControlPlane(config)
+                task_id = "route-effort-only" if route_effort else "effort-only"
+                _brief(control.config.coordination_root, task_id)
+
+                with (
+                    patch.object(control, "_launch_worker", return_value=123) as launch,
+                    self.assertRaisesRegex(PolicyError, "requires an explicit codex_model"),
+                ):
+                    control.start_job(
+                        StartOptions(
+                            task_id=task_id,
+                            route="main",
+                            backend=CODEX_BACKEND,
+                            codex_reasoning_effort=None if route_effort else "high",
+                        )
+                    )
+
+                launch.assert_not_called()
+                self.assertEqual(control.store.list_jobs(), [])
+
     def test_controller_native_quality_requires_checkpointed_slot_and_persists_contract(
         self,
     ) -> None:
@@ -989,6 +1028,34 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
                 )
 
             self.assertEqual(job.agy_model, "Gemini 3.5 Flash (High)")
+            self.assertIsNone(job.codex_model)
+            self.assertIsNone(job.codex_reasoning_effort)
+
+    def test_agy_ignores_codex_effort_only_route_field(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            base = _config(root, workspace)
+            config = replace(
+                base,
+                routes=MappingProxyType(
+                    {"main": replace(base.routes["main"], codex_reasoning_effort="high")}
+                ),
+            )
+            control = AgentControlPlane(config)
+            _brief(control.config.coordination_root, "task-agy-effort-only")
+
+            with patch.object(control, "_launch_worker", return_value=123) as launch:
+                job = control.start_job(
+                    StartOptions(
+                        task_id="task-agy-effort-only",
+                        route="main",
+                        backend=AGY_BACKEND,
+                    )
+                )
+
+            launch.assert_called_once()
+            self.assertEqual(job.backend, AGY_BACKEND)
             self.assertIsNone(job.codex_model)
             self.assertIsNone(job.codex_reasoning_effort)
 

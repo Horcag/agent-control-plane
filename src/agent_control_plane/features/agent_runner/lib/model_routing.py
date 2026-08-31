@@ -401,7 +401,6 @@ class ModelRoutingPolicy:
         best = min(
             eligible,
             key=lambda score: (
-                -(score.quality_score or 0.0),
                 score.expected_api_usd is None,
                 score.expected_api_usd if score.expected_api_usd is not None else float("inf"),
                 score.expected_duration_sec is None,
@@ -410,6 +409,7 @@ class ModelRoutingPolicy:
                     if score.expected_duration_sec is not None
                     else float("inf")
                 ),
+                -(score.quality_score or 0.0),
                 score.configured_index,
             ),
         )
