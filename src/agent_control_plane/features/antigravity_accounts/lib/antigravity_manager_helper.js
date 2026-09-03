@@ -34,7 +34,7 @@ async function readInput() {
 }
 
 function writeJson(value) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  fs.writeFileSync(1, `${JSON.stringify(value)}\n`);
 }
 
 function fail(error) {
@@ -166,7 +166,7 @@ function loadKeyring(managerInstallRoot) {
 }
 
 function formatAgyCredential(token) {
-  const expiry = new Date(Number(token.expiry_timestamp) * 1000)
+  const expiry = new Date((Number(token.expiry_timestamp) > 10000000000 ? Number(token.expiry_timestamp) : Number(token.expiry_timestamp) * 1000))
     .toISOString()
     .replace(/\.(\d{3})Z$/, ".$1000Z");
   return JSON.stringify({
@@ -215,6 +215,31 @@ async function handleWriteAgyToken(input) {
   };
 }
 
+function inspectCliAccounts(input) {
+  const key = decryptMasterKey(input.managerUserData);
+  return { ok: true, accounts: input.accounts.map((row) => {
+    const token = JSON.parse(decryptPayload(key, row.token_json));
+    const quota = row.quota_json ? JSON.parse(decryptPayload(key, row.quota_json)) : {};
+    const models = {};
+    for (const [id, model] of Object.entries(quota.models || {})) {
+      models[id] = { percentage: model.percentage, resetTime: model.resetTime };
+    }
+    return { id: row.id, email: row.email, status: row.status, models,
+      forbidden: Boolean(quota.is_forbidden || quota.isForbidden),
+      fingerprint: crypto.createHash("sha256").update(token.refresh_token || "").digest("hex") };
+  }) };
+}
+
+function prepareCliToken(input) {
+  const key = decryptMasterKey(input.managerUserData);
+  const token = JSON.parse(decryptPayload(key, input.account.token_json));
+  if (!token.access_token || !token.refresh_token || !Number.isFinite(Number(token.expiry_timestamp))) {
+    throw new Error("Invalid CLI token fields");
+  }
+  // AGY owns OAuth refresh using its registered client. Do not change Manager's tokens or IDE.
+  return { ok: true, credential: formatAgyCredential(token) };
+}
+
 app.setName("Antigravity Manager");
 if (process.platform === "win32") {
   app.setAppUserModelId("com.draculabo.antigravity-manager");
@@ -225,6 +250,12 @@ readInput()
     const input = JSON.parse(raw);
     app.setPath("userData", input.managerUserData);
     return app.whenReady().then(async () => {
+      if (input.action === "inspect-cli-accounts" || input.action === "prepare-cli-token") {
+        const output = input.action === "inspect-cli-accounts" ? inspectCliAccounts(input) : prepareCliToken(input);
+        writeJson(output);
+        app.quit();
+        return;
+      }
       if (input.action !== "write-agy-token") {
         throw new Error(`Unsupported helper action: ${input.action}`);
       }

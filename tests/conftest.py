@@ -65,3 +65,9 @@ def cleanup_test_subprocesses() -> Generator[None, None, None]:
                             proc.wait(timeout=1)
                         except Exception:  # noqa: BLE001
                             pass
+
+
+@pytest.fixture(autouse=True)
+def isolate_manager_cli_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests and their subprocesses must never rotate the operator's real CLI account."""
+    monkeypatch.setenv("AGENT_CONTROL_PLANE_MANAGER_CLI_CONFIG", str(tmp_path / "manager-cli.json"))

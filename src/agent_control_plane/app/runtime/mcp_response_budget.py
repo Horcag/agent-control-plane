@@ -37,6 +37,10 @@ def _p(
 
 # Exhaustive registration validation keeps new MCP surfaces from bypassing this contract.
 MCP_TOOL_POLICIES: dict[str, ToolPolicy] = {
+    "agent_agy_accounts": _p("global", default="page", identity_keys=("current_account_id",)),
+    "agent_agy_switch": _p(
+        "global", True, identity_keys=("account_id", "verified"), follow_up="agent_agy_accounts"
+    ),
     "agent_smoke": _p("route", default="preview", detail_param="full", follow_up="agent_smoke"),
     "agent_model_catalog": _p("global", default="page", identity_keys=("model",)),
     "agent_model_routing_explain": _p(

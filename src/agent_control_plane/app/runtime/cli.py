@@ -449,7 +449,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         if args.command == "manager":
             if args.manager_command == "accounts":
-                _print_json(control.manager_accounts())
+                _print_json(control.manager_accounts(model=args.model))
                 return 0
             if args.manager_command == "switch-agy":
                 _print_json(
@@ -457,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
                         account_id=args.account_id,
                         email=args.email,
                         strategy=args.strategy,
+                        model=args.model,
                         dry_run=not args.apply,
                     )
                 )
@@ -1029,16 +1030,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Inspect and switch Antigravity Manager accounts for agy",
     )
     manager_subparsers = manager.add_subparsers(dest="manager_command", required=True)
-    manager_subparsers.add_parser(
+    manager_accounts = manager_subparsers.add_parser(
         "accounts",
         parents=[common],
         help="List Antigravity Manager cloud accounts and active targets",
     )
+    manager_accounts.add_argument("--model", help="Show cached quota for one AGY model")
     switch_agy = manager_subparsers.add_parser(
         "switch-agy",
         parents=[common],
         help="Switch the Antigravity CLI credential target through Manager account storage",
     )
+    switch_agy.add_argument("--model", help="Select CLI account by quota for this exact model")
     switch_agy.add_argument("--account-id")
     switch_agy.add_argument("--email")
     switch_agy.add_argument(

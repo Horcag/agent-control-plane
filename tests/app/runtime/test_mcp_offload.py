@@ -47,14 +47,14 @@ def test_every_registered_tool_is_coroutine_function() -> None:
         )
 
 
-def test_policy_matrix_has_fifty_valid_detail_parameters() -> None:
+def test_policy_matrix_has_valid_detail_parameters() -> None:
     with patch(
         "agent_control_plane.app.runtime.mcp_server.ConfigFreshControl",
         return_value=Mock(),
     ):
         server = build_server()
 
-    assert len(MCP_TOOL_POLICIES) == 50
+    assert len(MCP_TOOL_POLICIES) == 52
     _validate_tool_policies(server)
 
 

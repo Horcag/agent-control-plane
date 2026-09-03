@@ -6,7 +6,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -45,6 +45,9 @@ from agent_control_plane.features.antigravity_accounts import (
     AntigravityManagerError,
     is_agy_quota_failure,
 )
+from agent_control_plane.features.antigravity_accounts.lib.manager_cli import (
+    configured_cli_switcher,
+)
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.git_tools import compact_status_preview
@@ -82,6 +85,8 @@ class ExecutionState:
     resume_thread_id: str | None = None
     last_result_message: str = "Agent did not run"
     quota_recovery_used: bool = False
+    agy_account_id: str | None = None
+    agy_failed_accounts: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -446,6 +451,18 @@ class JobExecutionService:
         log_path = job.run_dir / f"attempt-{attempt_no:03d}.log"
         self._begin_attempt(job, attempt_no, log_path, profile)
         guard = AttemptGuard(self, job, state)
+        if job.backend == AGY_BACKEND:
+            state.agy_account_id = None
+            try:
+                switcher = configured_cli_switcher()
+                if switcher is not None and switcher.auto_switch:
+                    state.agy_account_id = switcher.prepare_attempt(
+                        job.agy_model or self.config.defaults.agy_model
+                    )
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                self.store.add_event(
+                    job.job_id, "warning", f"Optional AGY CLI account inspection unavailable: {exc}"
+                )
         result = state.runner.run(
             self._agent_run_spec(job, state, profile, log_path),
             cancel_requested=guard.should_stop,
@@ -823,9 +840,13 @@ class JobExecutionService:
                 outcome.log_path,
                 diagnostic,
                 already_used=state.quota_recovery_used,
+                failed_account_id=state.agy_account_id,
+                failed_accounts=state.agy_failed_accounts,
             )
         if recovery is not None:
             state.quota_recovery_used = True
+            self._resume_from_metrics(state, outcome.result)
+            state.attempt_prompt += "\nContinue from existing progress after quota recovery; do not repeat completed actions."
             state.max_attempts += 1
             state.last_result_message = recovery
             self.store.add_event(job.job_id, "warning", recovery)
@@ -910,8 +931,18 @@ class JobExecutionService:
         diagnostic_message: str,
         *,
         already_used: bool,
+        failed_account_id: str | None = None,
+        failed_accounts: set[str] | None = None,
     ) -> str | None:
-        if already_used or not self.config.defaults.auto_switch_agy_on_quota:
+        try:
+            switcher = configured_cli_switcher()
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            self.store.add_event(
+                job.job_id, "error", f"AGY CLI recovery configuration unavailable: {exc}"
+            )
+            return None
+        cli_enabled = switcher is not None and switcher.auto_switch
+        if not cli_enabled and (already_used or not self.config.defaults.auto_switch_agy_on_quota):
             return None
         try:
             log_text = log_path.read_text(encoding="utf-8", errors="replace")
@@ -919,6 +950,25 @@ class JobExecutionService:
             log_text = ""
         if not is_agy_quota_failure(f"{diagnostic_message}\n{log_text}"):
             return None
+        if cli_enabled:
+            if not failed_account_id or switcher is None:
+                self.store.add_event(
+                    job.job_id, "error", "AGY quota recovery needs a verified CLI account identity"
+                )
+                return None
+            tried = failed_accounts if failed_accounts is not None else set()
+            tried.add(failed_account_id)
+            try:
+                switched = switcher.switch(
+                    model=job.agy_model or self.config.defaults.agy_model,
+                    dry_run=False,
+                    failed_account_id=failed_account_id,
+                    excluded=tried,
+                )
+            except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+                self.store.add_event(job.job_id, "error", f"AGY CLI quota recovery failed: {exc}")
+                return None
+            return f"AGY CLI account verified: {switched['account_id']}; continuing the same model"
         try:
             result = AntigravityManagerAdapter(
                 electron_command=self.config.defaults.auto_switch_agy_electron_command,

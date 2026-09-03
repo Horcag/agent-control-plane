@@ -356,3 +356,80 @@ do not delete or replace the database.
 
 Safety baseline: refuse dirty task workspaces, keep target repositories independent of
 ACP, preserve `.git` in native workspace-write, and inspect status/diff before review.
+
+### Optional CLI-only Antigravity Manager switching (Windows and WSL)
+
+The legacy `manager switch-agy` adapter writes the Windows credential store. For
+current AGY CLI file authentication, opt into the CLI-only adapter with a local
+`~/.config/agent-control-plane/manager-cli.json`, or point
+`AGENT_CONTROL_PLANE_MANAGER_CLI_CONFIG` at another absolute config path:
+
+```json
+{
+  "database_path": "/mnt/c/Users/USER/.antigravity-agent/cloud_accounts.db",
+  "manager_user_data": "/mnt/c/Users/USER/AppData/Roaming/Antigravity Manager",
+  "electron_command": ["/absolute/path/to/installed/electron.exe"],
+  "helper_windows": true,
+  "token_paths": [
+    "/home/USER/.gemini/antigravity-cli/antigravity-oauth-token",
+    "/mnt/c/Users/USER/.gemini/antigravity-cli/antigravity-oauth-token"
+  ],
+  "auto_switch_on_quota": true
+}
+```
+
+Use native absolute Windows paths when the controller runs on Windows; UNC WSL
+paths may also be explicit targets. `helper_windows` translates WSL paths for a
+Windows Electron helper. The helper must run under the Windows user who owns the
+Manager encryption key. No dependency is downloaded or installed by this adapter.
+All target parents must already exist. No target repository configuration changes
+are required, and absence of this local file preserves the existing behavior.
+
+Disable Manager's **Auto-Switch** before applying CLI switches. The adapter refuses
+application while it is enabled: Manager has no independent CLI-sync off switch
+and would otherwise race the ACP writer. Manager can remain open for account and
+quota inspection. A manual Manager switch is still an external writer; inspect
+CLI identity again before continuing. Keep Manager's quota cache refreshed.
+
+```sh
+agent-control manager accounts --model gemini-3.8-flash-high
+agent-control manager switch-agy --model gemini-3.8-flash-high
+agent-control manager switch-agy --model gemini-3.8-flash-high --apply
+```
+
+The first switch command is a preview. Use `--account-id` for an explicit account.
+MCP exposes `agent_agy_accounts(model)` and `agent_agy_switch(model, account_id,
+apply=false)`. Both expose sanitized metadata only. CLI identity comes from the
+actual token files, not the Manager active-target setting. The adapter never
+writes IDE keyrings, Manager's active account, or generic Gemini CLI caches.
+
+Selection uses the exact requested model's cached percentage and account status;
+unknown quota is not zero or available. Cache freshness is explicitly unknown.
+A stored zero whose reported reset has passed permits one bounded provider probe;
+it is not presented as a refreshed positive quota. A rejected probe enters cooldown.
+Quota failures are recorded in a shared, model-specific cooldown file until
+the reported reset (or five minutes when absent). Concurrent ACP recovery can
+reuse a peer's verified switch. Each job excludes accounts it already exhausted.
+The selected account is remembered locally and restored before each new ACP attempt,
+including when an older CLI process has rewritten its previous token during OAuth
+refresh. Recovery preserves the model and existing progress; it does not accept results
+or replay completed jobs. Jobs already running at installation retain their old
+controller code; newly launched jobs load the integration.
+
+The CLI credential format and atomic-file approach follow Antigravity Manager;
+expiry timestamps in seconds and milliseconds are supported. AGY itself renews
+expired access tokens using the saved refresh token. New credentials take effect
+in new AGY processes; this does not promise hot account changes in an existing
+CLI process. Writes use private temporary files, replacement, and read-back on
+all configured targets. Multiple filesystems cannot form one atomic transaction:
+a failed second write rolls back earlier writes when they still contain this
+operation's bytes, otherwise the operation reports uncertainty without claiming
+success. Never blindly replay a switch with uncertain completion.
+
+ACP writers coordinate using atomic creation of a shared `acp-cli-switch.lock`
+directory next to the Manager database. SQLite locks are not used for this purpose:
+a live Windows/WSL test showed they do not safely coordinate this filesystem boundary.
+The selected-account and cooldown metadata use atomic JSON replacement. A crashed
+writer can leave a lock directory: acquisition times out with an explicit error.
+Inspect its `owner.json` and verify that its owner has exited before removing it;
+there is no time-based stale-lock takeover.

@@ -73,6 +73,9 @@ from agent_control_plane.features.agent_runner import (
     terminate_verified_process,
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
+from agent_control_plane.features.antigravity_accounts.lib.manager_cli import (
+    configured_cli_switcher,
+)
 from agent_control_plane.features.job_watch import (
     DEFAULT_STALE_AFTER_SEC,
     FINALIZATION_SLACK_SEC,
@@ -1691,7 +1694,9 @@ class AgentControlPlane:
             return scope.removeprefix("route:"), None
         return scope, None
 
-    def manager_accounts(self) -> dict[str, Any]:
+    def manager_accounts(self, model: str | None = None) -> dict[str, Any]:
+        if switcher := configured_cli_switcher():
+            return switcher.snapshot(model)
         return (
             AntigravityManagerAdapter(
                 electron_command=self.config.defaults.auto_switch_agy_electron_command,
@@ -1707,7 +1712,23 @@ class AgentControlPlane:
         email: str | None = None,
         strategy: str | None = None,
         dry_run: bool = True,
+        model: str | None = None,
     ) -> dict[str, Any]:
+        if switcher := configured_cli_switcher():
+            if email:
+                if account_id:
+                    raise ValueError("Pass either account_id or email, not both")
+                rows = switcher.snapshot()["accounts"]
+                account_id = next(
+                    (a["id"] for a in rows if a["email"].lower() == email.lower()), None
+                )
+                if account_id is None:
+                    raise ValueError("Requested Manager CLI account email not found")
+            return switcher.switch(account_id=account_id, model=model, dry_run=dry_run)
+        if model:
+            raise ValueError(
+                "Configure the optional Manager CLI integration for model-aware switching"
+            )
         result = AntigravityManagerAdapter(
             electron_command=self.config.defaults.auto_switch_agy_electron_command,
         ).switch_agy(

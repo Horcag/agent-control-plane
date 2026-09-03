@@ -324,6 +324,24 @@ def build_server(
             return {"ok": False, "error": str(exc)}
 
     @register
+    def agent_agy_accounts(model: str) -> dict[str, Any]:
+        """Inspect CLI identity and cached per-account quota for the exact AGY model. No tokens."""
+        try:
+            return control.manager_accounts(model=model)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @register
+    def agent_agy_switch(
+        model: str, account_id: str | None = None, apply: StrictBool = False
+    ) -> dict[str, Any]:
+        """Preview or apply CLI-only switching; success requires configured file read-back."""
+        try:
+            return control.switch_agy_account(model=model, account_id=account_id, dry_run=not apply)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @register
     def agent_model_catalog(
         offset: StrictInt = 0,
         limit: StrictInt = DEFAULT_COLLECTION_LIMIT,
