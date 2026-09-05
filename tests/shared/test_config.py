@@ -4,6 +4,7 @@ import contextlib
 import inspect
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 import urllib.error
@@ -1703,6 +1704,108 @@ required_branch = "main"
 
 
 class ConfigDiscoveryTest(unittest.TestCase):
+    def test_resolve_config_for_linked_worktree_uses_main_checkout_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            main_checkout = root / "arina-openclaw"
+            main_checkout.mkdir()
+            try:
+                subprocess.run(["git", "init", "-b", "main"], cwd=main_checkout, check=True)
+                (main_checkout / "README.md").write_text("# test\n", encoding="utf-8")
+                subprocess.run(["git", "add", "README.md"], cwd=main_checkout, check=True)
+                subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "user.name=Test User",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-m",
+                        "initial",
+                    ],
+                    cwd=main_checkout,
+                    check=True,
+                )
+                linked_worktree = root / "codex-worktree"
+                subprocess.run(
+                    ["git", "worktree", "add", "--detach", str(linked_worktree)],
+                    cwd=main_checkout,
+                    check=True,
+                )
+            except FileNotFoundError as exc:
+                raise unittest.SkipTest("git is not installed") from exc
+
+            canonical = main_checkout / ".agent-work" / "workspaces.toml"
+            canonical.parent.mkdir()
+            canonical.write_text(
+                f'[control]{chr(10)}coordination_root="{canonical.parent.as_posix()}"{chr(10)}'
+                f'runs_root="runs"{chr(10)}database="db"{chr(10)}worktree_root="w"{chr(10)}'
+                f'worktree_base="b"{chr(10)}slot_root="s"{chr(10)}'
+                f'[routes.main]{chr(10)}path="{main_checkout.as_posix()}"{chr(10)}'
+                f'required_branch="main"{chr(10)}',
+                encoding="utf-8",
+            )
+
+            self.assertTrue((linked_worktree / ".git").is_file())
+            self.assertEqual(resolve_config_for(linked_worktree), canonical)
+
+    def test_resolve_config_for_prefers_canonical_git_root_config_over_registered_copy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            repo = root / "main-tiger"
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            canonical = repo / ".agent-work" / "workspaces.toml"
+            copied = repo / ".agent-work" / "scratch" / "arina-vue-quality" / "workspaces.toml"
+            for config_path in (canonical, copied):
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+                config_path.write_text(
+                    f'[control]{chr(10)}coordination_root="{config_path.parent.as_posix()}"{chr(10)}'
+                    f'runs_root="runs"{chr(10)}database="db"{chr(10)}worktree_root="w"{chr(10)}'
+                    f'worktree_base="b"{chr(10)}slot_root="s"{chr(10)}'
+                    f'[routes.main]{chr(10)}path="{repo.as_posix()}"{chr(10)}'
+                    f'required_branch="main"{chr(10)}',
+                    encoding="utf-8",
+                )
+
+            index_path = root / "known-configs.json"
+            index_path.write_text(json.dumps([str(copied)]), encoding="utf-8")
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=index_path,
+            ):
+                self.assertEqual(resolve_config_for(repo), canonical)
+
+    def test_resolve_config_for_keeps_route_fallback_when_git_root_has_no_canonical_config(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            worktree = root / "route-worktree"
+            worktree.mkdir()
+            (worktree / ".git").write_text("gitdir: ../main/.git/worktrees/route-worktree\n")
+            routed_config = root / "controller" / "workspaces.toml"
+            routed_config.parent.mkdir()
+            routed_config.write_text(
+                f'[control]{chr(10)}coordination_root="{(root / "controller" / ".agent-work").as_posix()}"{chr(10)}'
+                f'runs_root="runs"{chr(10)}database="db"{chr(10)}worktree_root="w"{chr(10)}'
+                f'worktree_base="b"{chr(10)}slot_root="s"{chr(10)}'
+                f'[routes.main]{chr(10)}path="{worktree.as_posix()}"{chr(10)}'
+                f'required_branch="main"{chr(10)}',
+                encoding="utf-8",
+            )
+
+            index_path = root / "known-configs.json"
+            index_path.write_text(json.dumps([str(routed_config)]), encoding="utf-8")
+            with patch(
+                "agent_control_plane.shared.config.known_configs_path",
+                return_value=index_path,
+            ):
+                self.assertEqual(resolve_config_for(worktree), routed_config)
+
     def test_resolve_config_for_nearest_upwards(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp).resolve()

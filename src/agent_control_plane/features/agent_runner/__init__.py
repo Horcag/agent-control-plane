@@ -13,6 +13,7 @@ from agent_control_plane.features.agent_runner.lib.job_launcher import (
     JobLauncher,
     JobLaunchError,
     JobLaunchOptions,
+    ensure_config_route_admitted,
 )
 from agent_control_plane.features.agent_runner.lib.job_reconciler import JobReconciler
 from agent_control_plane.features.agent_runner.lib.model_catalog import ModelCatalog
@@ -124,6 +125,7 @@ __all__ = [
     "claude_ladder_for_explicit_model",
     "codex_job_capacity_units",
     "codex_quota_domain",
+    "ensure_config_route_admitted",
     "inspect_result",
     "normalize_backend",
     "parse_escalation_classification",

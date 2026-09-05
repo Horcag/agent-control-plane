@@ -53,6 +53,84 @@ from agent_control_plane.shared.config import (
 
 
 class OrchestratorRunnerResultTest(unittest.TestCase):
+    def test_launcher_starts_when_config_has_no_retirement_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "current-config")
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(StartOptions(task_id="current-config", route="main"))
+
+            self.assertEqual(job.status, "queued")
+
+    def test_launcher_starts_unlisted_route_from_partial_retirement_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            _brief(control.config.coordination_root, "partial-config")
+            marker_path = Path(str(control.config.config_path) + ".retired.json")
+            marker_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "routes": {"natively": str((root / "natively.toml").resolve())},
+                        "allow_unlisted_routes": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(control, "_launch_worker", return_value=123):
+                job = control.start_job(StartOptions(task_id="partial-config", route="main"))
+
+            self.assertEqual(job.status, "queued")
+
+    def test_launcher_rejects_retired_config_before_reconciliation_or_job_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            replacement = (root / "new-control" / ".agent-work" / "workspaces.toml").resolve()
+            marker_path = Path(str(control.config.config_path) + ".retired.json")
+            marker_path.write_text(
+                json.dumps({"version": 1, "routes": {"main": str(replacement)}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(control, "reconcile_jobs") as reconcile,
+                patch.object(control.store, "create_job") as create_job,
+                self.assertRaisesRegex(PolicyError, f"retired.*{replacement}"),
+            ):
+                control.start_job(StartOptions(task_id="retired-config", route="main"))
+
+            reconcile.assert_not_called()
+            create_job.assert_not_called()
+
+    def test_launcher_fails_closed_for_malformed_retirement_marker_before_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = _git_repo(root / "repo", "main")
+            control = AgentControlPlane(_config(root, workspace))
+            marker_path = Path(str(control.config.config_path) + ".retired.json")
+            marker_path.write_text(
+                json.dumps({"version": 1, "routes": {"main": "relative/workspaces.toml"}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(control, "reconcile_jobs") as reconcile,
+                patch.object(control.store, "create_job") as create_job,
+                self.assertRaisesRegex(PolicyError, "retirement marker is invalid"),
+            ):
+                control.start_job(StartOptions(task_id="malformed-marker", route="main"))
+
+            reconcile.assert_not_called()
+            create_job.assert_not_called()
+
     def test_launcher_rejects_a_globally_disabled_backend_before_job_creation(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

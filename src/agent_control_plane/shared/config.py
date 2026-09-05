@@ -29,6 +29,7 @@ from agent_control_plane.shared.agent_backends import (
     SUPPORTED_BACKENDS,
     normalize_backend,
 )
+from agent_control_plane.shared.git_tools import GitError, run_git
 from agent_control_plane.shared.path_rules import glob_matches_whole_tree
 
 
@@ -438,6 +439,16 @@ def resolve_config_for(cwd: Path | str | None = None) -> Path:
     resolved_cwd = (Path(cwd) if cwd else Path.cwd()).expanduser().resolve(strict=False)
     norm_cwd_str = os.path.normcase(str(resolved_cwd))
     norm_cwd = Path(norm_cwd_str)
+
+    # A repository's root config is the canonical implicit choice. Registered copies can
+    # describe the same route but must not win merely because their paths sort first.
+    repo_root = find_enclosing_git_repo(resolved_cwd)
+    canonical_config = repo_root / ".agent-work" / "workspaces.toml"
+    if (repo_root / ".git").exists() and canonical_config.is_file():
+        return canonical_config
+    linked_worktree_config = _linked_worktree_canonical_config(repo_root)
+    if linked_worktree_config is not None:
+        return linked_worktree_config
 
     candidate_config_paths: list[Path] = []
 
@@ -886,6 +897,28 @@ def find_enclosing_git_repo(path: Path) -> Path:
             break
         curr = parent
     return resolved
+
+
+def _linked_worktree_canonical_config(worktree_root: Path) -> Path | None:
+    """Find the main checkout config only for a real linked Git worktree."""
+    if not (worktree_root / ".git").is_file():
+        return None
+    try:
+        git_dir = _git_path_from_worktree(worktree_root, "--git-dir")
+        common_git_dir = _git_path_from_worktree(worktree_root, "--git-common-dir")
+    except (GitError, OSError):
+        return None
+    if git_dir == common_git_dir or common_git_dir.name != ".git":
+        return None
+    candidate = common_git_dir.parent / ".agent-work" / "workspaces.toml"
+    return candidate if candidate.is_file() else None
+
+
+def _git_path_from_worktree(worktree_root: Path, argument: str) -> Path:
+    git_path = Path(run_git(worktree_root, "rev-parse", argument))
+    if not git_path.is_absolute():
+        git_path = worktree_root / git_path
+    return git_path.resolve(strict=False)
 
 
 def wire_mcp_servers(

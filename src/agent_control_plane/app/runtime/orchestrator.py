@@ -66,6 +66,7 @@ from agent_control_plane.features.agent_runner import (
     RoutingPolicy,
     build_claude_model_catalog,
     codex_quota_domain,
+    ensure_config_route_admitted,
     inspect_result,
     normalize_backend,
     parse_routing_history_records,
@@ -978,6 +979,12 @@ class AgentControlPlane:
                 run_dir_for_job=self._run_dir_for_job,
                 slot_error_type=SlotError,
             ).start(options)
+        except JobLaunchError as exc:
+            raise PolicyError(str(exc)) from exc
+
+    def ensure_route_admitted(self, route: str) -> None:
+        try:
+            ensure_config_route_admitted(self.config.config_path, route)
         except JobLaunchError as exc:
             raise PolicyError(str(exc)) from exc
 

@@ -150,6 +150,7 @@ class JobLauncher:
         self.slot_error_type = slot_error_type
 
     def start(self, options: JobLaunchOptions) -> JobRecord:
+        ensure_config_route_admitted(self.config.config_path, options.route)
         override_reason = (
             options.codex_premium_override_reason.strip()
             if options.codex_premium_override_reason is not None
@@ -707,6 +708,56 @@ T = TypeVar("T")
 
 def _option(value: T | None, default: T) -> T:
     return default if value is None else value
+
+
+def ensure_config_route_admitted(config_path: Path, route: str) -> None:
+    replacement_config = _retired_config_replacement(config_path, route)
+    if replacement_config is not None:
+        raise JobLaunchError(
+            f"Configuration {config_path} is retired for route "
+            f"{route!r}; start new jobs with {replacement_config}. "
+            "Existing jobs continue under their recorded configuration."
+        )
+
+
+def _retired_config_replacement(config_path: Path, route: str) -> Path | None:
+    """Return a replacement config for a retired route, or fail closed on bad metadata."""
+    marker_path = Path(str(config_path) + ".retired.json")
+    if not marker_path.exists():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise JobLaunchError(f"retirement marker is invalid: {marker_path}") from exc
+    if not isinstance(marker, dict) or type(marker.get("version")) is not int:
+        raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+    if marker["version"] != 1:
+        raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+    routes = marker.get("routes")
+    if not isinstance(routes, dict) or not routes:
+        raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+    if "allow_unlisted_routes" in marker and type(marker["allow_unlisted_routes"]) is not bool:
+        raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+
+    replacements: dict[str, Path] = {}
+    for retired_route, replacement in routes.items():
+        if not isinstance(retired_route, str) or not retired_route:
+            raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+        if not isinstance(replacement, str) or not replacement:
+            raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+        replacement_path = Path(replacement)
+        if not replacement_path.is_absolute():
+            raise JobLaunchError(f"retirement marker is invalid: {marker_path}")
+        replacements[retired_route] = replacement_path
+
+    if route in replacements:
+        return replacements[route]
+    if marker.get("allow_unlisted_routes") is True:
+        return None
+    raise JobLaunchError(
+        f"Configuration {config_path} is retired, but its retirement marker has no replacement "
+        f"for route {route!r}: {marker_path}"
+    )
 
 
 def _backend_option(*values: str | None) -> str:

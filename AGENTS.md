@@ -47,3 +47,11 @@
 - In `ide_mcp` mode, isolate simultaneously loaded checkouts that share Python/TypeScript namespaces: a route with `ide_sdk_name` gets one IDEA module per slot, using the exact installed SDK and no cross-slot module dependencies.
 - In `ide_mcp` mode, use `agentbridge-slots-root` only for routes without a dedicated SDK and without overlapping package namespaces. Configure duplicate analysis as `SAME_MODULE` so useful intra-slot findings remain enabled while branch-clone matches are excluded.
 - In safe native `workspace-write`, treat `.git` as protected: inspect status/diffs but leave commits to the root reviewer unless yolo was explicitly authorized.
+- New project planes belong in that repository's `.agent-work/workspaces.toml`, with
+  repository-local coordination, run, and database paths. Do not append unrelated projects
+  to a parent-directory plane or copy a different project's coordination root.
+- Resolve the repository-local config before creating tasks or slots. An explicit legacy
+  config is for its existing jobs and reviews only when its retirement marker disables starts.
+- During a plane migration, keep existing jobs, plans, review records, and occupied slots
+  in their original database. New planes use distinct slot paths; never duplicate a live
+  slot's ownership across databases. Preserve historical artifact references.

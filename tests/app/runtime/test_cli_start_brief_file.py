@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_control_plane.app.runtime.cli import _install_brief_file, main
+from agent_control_plane.app.runtime.orchestrator import PolicyError
 
 
 def test_install_brief_file_writes_to_the_conventional_path(tmp_path: Path) -> None:
@@ -158,6 +159,40 @@ def test_cli_start_brief_file_conflict_blocks_launch_before_start_job(
     assert exit_code == 2
     mock_control.start_job.assert_not_called()
     assert conventional_path.read_text(encoding="utf-8") == "# Original\n"
+
+
+def test_cli_retired_config_blocks_brief_installation_before_creating_task_directory(
+    tmp_path: Path,
+) -> None:
+    coordination_root = tmp_path / ".agent-work"
+    source = tmp_path / "source-brief.md"
+    source.write_text("# Brief\n", encoding="utf-8")
+    mock_control = MagicMock()
+    mock_control.config.coordination_root = coordination_root
+    mock_control.ensure_route_admitted.side_effect = PolicyError("configuration is retired")
+
+    with patch(
+        "agent_control_plane.app.runtime.cli.AgentControlPlane.from_config_path",
+        return_value=mock_control,
+    ):
+        exit_code = main(
+            [
+                "start",
+                "--task-id",
+                "task-1",
+                "--route",
+                "dev",
+                "--brief-file",
+                str(source),
+                "--config",
+                str(tmp_path / "workspaces.toml"),
+            ]
+        )
+
+    assert exit_code == 2
+    assert not (coordination_root / "tasks" / "task-1").exists()
+    mock_control.ensure_route_admitted.assert_called_once_with("dev")
+    mock_control.start_job.assert_not_called()
 
 
 def test_cli_start_wait_returns_off_contract_exit_code_and_reports_supervision(

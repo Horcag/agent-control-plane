@@ -19,6 +19,42 @@ configured IDE integration is required. `native` is Codex-only. Keep
 there is a reviewed reason to change them. Smoke initializes the ACP SQLite database
 and reports route, slot, runner, and archive configuration; it does not launch a job.
 
+### Repository-local planes
+
+For project work, keep the canonical config at `<repository>/.agent-work/workspaces.toml`.
+Give each project its own coordination directory, runs directory, and SQLite database.
+Shared account-quota accounting may remain global. Slot paths must be project-specific;
+they may live outside the repository when that is the project's chosen layout.
+
+Implicit discovery prefers the enclosing repository's canonical config over registered
+scratch copies. A linked Git worktree without its own config uses the main checkout's
+canonical config when available. Explicit `--config` remains available for historical jobs.
+Run one MCP server per config and update each project's client URL when changing planes.
+
+During migration, retain existing jobs, plans, reviews, and occupied slots in their original
+database. Provision distinct slots for the new plane rather than copying live slot ownership.
+Keep old artifact paths usable while historical records still reference them.
+
+### Retiring a shared configuration
+
+To redirect new jobs from a retired config while allowing jobs already recorded with it
+to finish, add `<workspaces.toml>.retired.json` beside the old config:
+
+```json
+{
+  "version": 1,
+  "routes": {
+    "arina": "/absolute/path/to/arina/.agent-work/workspaces.toml"
+  }
+}
+```
+
+By default the marker blocks every new start through that config. Each listed route
+reports its replacement config; an unlisted route is refused until it is mapped. A
+partially retired shared config may set `"allow_unlisted_routes": true`; then only the
+listed routes are blocked. Invalid marker data fails closed before ACP creates a job,
+acquires a slot, or starts a worker.
+
 ## Slots and single jobs
 
 ```powershell

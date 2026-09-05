@@ -172,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.command == "start":
+            control.ensure_route_admitted(args.route)
             if args.brief_file:
                 _install_brief_file(
                     coordination_root=control.config.coordination_root,
