@@ -213,7 +213,10 @@ class PtyAgyRunner:
 
     @staticmethod
     def _build_command(spec: AgyRunSpec) -> list[str]:
-        command = [spec.agy_command]
+        launch = spec.agy_launch
+        command = [launch.executable if launch is not None else spec.agy_command]
+        if launch is not None and launch.add_new_project:
+            command.append("--new-project")
         if spec.yolo:
             command.append("--dangerously-skip-permissions")
         if spec.agy_model:
@@ -223,7 +226,10 @@ class PtyAgyRunner:
 
     @staticmethod
     def _display_command(spec: AgyRunSpec) -> str:
-        command = [spec.agy_command]
+        launch = spec.agy_launch
+        command = [launch.executable if launch is not None else spec.agy_command]
+        if launch is not None and launch.add_new_project:
+            command.append("--new-project")
         if spec.yolo:
             command.append("--dangerously-skip-permissions")
         if spec.agy_model:

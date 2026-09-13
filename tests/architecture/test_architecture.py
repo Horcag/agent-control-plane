@@ -30,6 +30,8 @@ def test_project_architecture(monkeypatch) -> None:
 # lifecycle, root-review cost accounting) and a mechanical reverse mapping would just be
 # restating the CLI subcommand list.
 MCP_TOOL_TO_CLI_COMMAND_PATH = {
+    "agent_agy_accounts": ("manager", "accounts"),
+    "agent_agy_switch": ("manager", "switch-agy"),
     "agent_accept_handoff": ("accept-handoff",),
     "agent_analytics": ("analytics",),
     "agent_archive_jobs": ("archive",),

@@ -14,7 +14,15 @@ worktree_base = "../my-project"
 # Give every route that lives in a different repository its own [routes.<name>].slot_root
 # so unrelated projects never materialize slots inside another project's slot directory.
 slot_root = "../agent-control-plane-slots"
-agy_command = "agy"
+# Explicit command used by compatible unmanaged jobs. If omitted it portably defaults to "agy";
+# it remains authoritative and is not a claim that an adapter, account selection, or CONNECT occurred.
+agy_command = "~/.local/bin/agy"
+# Unmanaged is the backward-compatible default and preserves agy_command, including Windows.
+# Select managed only when the explicit adapter below is installed and intended for every AGY job.
+agy_launch_mode = "unmanaged"
+# Managed mode requires this absolute regular non-symlink adapter. It fails closed if missing,
+# non-executable, or a symlink; it never falls back to agy_command.
+# agy_proxy_launcher = "~/.local/libexec/antigravity-proxy/agy"
 codex_command = "codex"
 # Optional override for the Claude Code CLI executable. Defaults to "claude" on PATH.
 # claude_command = "claude"

@@ -23,7 +23,21 @@ from agent_control_plane.app.runtime.orchestrator import (
 from agent_control_plane.app.runtime.plan_cli import handle_plan_command
 from agent_control_plane.app.runtime.review_cli import add_review_parser, handle_review_command
 from agent_control_plane.entities.job import TERMINAL_STATUSES
-from agent_control_plane.features.agent_runner import SUPPORTED_BACKENDS
+from agent_control_plane.features.agent_runner import (
+    SUPPORTED_BACKENDS,
+    WRAPPER_RELATIVE_PATH,
+    AgyLauncherError,
+    build_agy_launch,
+    configure_managed_project,
+    generate_project_wrapper,
+    migrate_project_wrapper,
+    restore_managed_config,
+    rollback_project_wrapper,
+    validate_configured_project,
+    validate_migration_binding,
+    validate_migration_path,
+    validate_recovery_binding,
+)
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.job_watch import (
     DEFAULT_STALE_AFTER_SEC,
@@ -67,6 +81,16 @@ _WATCH_ERROR_MAX_LEN = 240
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    migration_project: Path | None = None
+    migration_config: Path | None = None
+    if args.command == "agy-wrapper":
+        try:
+            migration_project = validate_migration_path(Path(args.project), "project path")
+            if args.config:
+                migration_config = validate_migration_path(Path(args.config), "config path")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     if args.command == "statuses":
         _print_statuses(json_output=args.json)
         return 0
@@ -124,6 +148,36 @@ def main(argv: list[str] | None = None) -> int:
         if config_path.resolve(strict=False) != default_config_path().resolve(strict=False):
             print(f"Using discovered config {config_path} for {cwd}", file=sys.stderr)
 
+    if args.command == "agy-wrapper" and migration_config is None:
+        try:
+            migration_config = validate_migration_path(Path(config_path), "config path")
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
+    if args.command == "agy-wrapper" and args.agy_wrapper_command == "restore-config":
+        if migration_project is None or migration_config is None:
+            print("missing validated recovery paths", file=sys.stderr)
+            return 2
+        try:
+            project, recovery_config = validate_recovery_binding(
+                project_path=migration_project,
+                config_path=migration_config,
+                expected_current_sha256=args.expected_current_sha256,
+            )
+            _print_json(
+                restore_managed_config(
+                    config_path=recovery_config,
+                    project_path=project,
+                    backup_path=Path(args.backup),
+                    expected_current_sha256=args.expected_current_sha256,
+                ).as_dict()
+            )
+            return 0
+        except (AgyLauncherError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     try:
         control = AgentControlPlane.from_config_path(config_path)
     except (FileNotFoundError, ValueError) as exc:
@@ -131,6 +185,120 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
+        if args.command == "agy-wrapper":
+            if migration_project is None:
+                print("missing validated project path", file=sys.stderr)
+                return 2
+            project = migration_project
+            wrapper = project / WRAPPER_RELATIVE_PATH
+            configured_project_paths = tuple(
+                path
+                for route in control.config.routes.values()
+                for path in (route.path, route.worktree_base)
+            )
+            config_path = migration_config or control.config.config_path
+            if args.agy_wrapper_command == "configure":
+                project, config_path = validate_migration_binding(
+                    project_path=project,
+                    config_path=config_path,
+                    expected_config_sha256=args.expected_config_sha256,
+                    expected_agy_command=args.expected_agy_command,
+                    configured_project_paths=configured_project_paths,
+                    actual_agy_command=control.config.agy_command,
+                )
+                _print_json(
+                    configure_managed_project(
+                        config_path=config_path,
+                        project_path=project,
+                        expected_config_sha256=args.expected_config_sha256,
+                        adapter=validate_migration_path(Path(args.adapter), "adapter path"),
+                        apply=args.apply,
+                    ).as_dict()
+                )
+                return 0
+            if args.agy_wrapper_command == "migrate":
+                project, config_path = validate_migration_binding(
+                    project_path=project,
+                    config_path=config_path,
+                    expected_config_sha256=args.expected_config_sha256,
+                    expected_agy_command=args.expected_agy_command,
+                    configured_project_paths=configured_project_paths,
+                    actual_agy_command=control.config.agy_command,
+                )
+                if args.launch_mode != control.config.agy_launch_mode:
+                    raise ValueError("--launch-mode must match [control].agy_launch_mode")
+                configured_adapter = control.config.agy_proxy_launcher
+                if args.launch_mode == "managed":
+                    if args.adapter is None:
+                        raise ValueError("managed migration requires --adapter")
+                    if (
+                        configured_adapter is None
+                        or Path(args.adapter).expanduser() != configured_adapter
+                    ):
+                        raise ValueError("--adapter must match [control].agy_proxy_launcher")
+                elif args.adapter is not None:
+                    raise ValueError("--adapter is only valid with --launch-mode managed")
+                wrapper = project / WRAPPER_RELATIVE_PATH
+                launch = build_agy_launch(
+                    agy_command=control.config.agy_command,
+                    mode=control.config.agy_launch_mode,
+                    adapter=control.config.agy_proxy_launcher,
+                    job_id="agy-wrapper-migration",
+                    attempt_ref="manual",
+                )
+                _print_json(
+                    migrate_project_wrapper(
+                        wrapper=wrapper,
+                        project_path=project,
+                        config_path=config_path,
+                        expected_sha256=args.expected_sha256,
+                        expected_config_sha256=args.expected_config_sha256,
+                        launcher=Path(launch.executable),
+                        apply=args.apply,
+                    ).as_dict()
+                )
+                return 0
+            if args.agy_wrapper_command == "generate":
+                project, config_path = validate_migration_binding(
+                    project_path=project,
+                    config_path=config_path,
+                    expected_config_sha256=args.expected_config_sha256,
+                    expected_agy_command=args.expected_agy_command,
+                    configured_project_paths=configured_project_paths,
+                    actual_agy_command=control.config.agy_command,
+                )
+                if control.config.agy_launch_mode != "managed":
+                    raise ValueError(
+                        "wrapper generation requires [control].agy_launch_mode = managed"
+                    )
+                launch = build_agy_launch(
+                    agy_command=control.config.agy_command,
+                    mode=control.config.agy_launch_mode,
+                    adapter=control.config.agy_proxy_launcher,
+                    job_id="agy-wrapper-generation",
+                    attempt_ref="manual",
+                )
+                _print_json(
+                    generate_project_wrapper(
+                        wrapper=wrapper,
+                        project_path=project,
+                        config_path=config_path,
+                        expected_config_sha256=args.expected_config_sha256,
+                        launcher=Path(launch.executable),
+                        apply=args.apply,
+                    ).as_dict()
+                )
+                return 0
+            if args.agy_wrapper_command == "rollback":
+                validate_configured_project(project, configured_project_paths)
+                _print_json(
+                    rollback_project_wrapper(
+                        wrapper=wrapper,
+                        backup_path=Path(args.backup),
+                        expected_current_sha256=args.expected_current_sha256,
+                    ).as_dict()
+                )
+                return 0
         if args.command == "smoke":
             payload = control.smoke()
             _print_json(payload)
@@ -494,6 +662,92 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_demo_parser(subparsers)
+
+    agy_wrapper = subparsers.add_parser(
+        "agy-wrapper",
+        parents=[common],
+        help="Preview, migrate, or recover the ACP-owned per-project AGY wrapper",
+    )
+    agy_wrapper_subparsers = agy_wrapper.add_subparsers(dest="agy_wrapper_command", required=True)
+    agy_migrate = agy_wrapper_subparsers.add_parser(
+        "migrate",
+        parents=[common],
+        help="Preview or replace one exact legacy/owned project wrapper",
+    )
+    agy_migrate.add_argument("--project", required=True, help="Absolute project root")
+    agy_migrate.add_argument(
+        "--expected-sha256",
+        required=True,
+        help="Current wrapper SHA-256 from a prior inspection",
+    )
+    agy_migrate.add_argument(
+        "--expected-config-sha256",
+        required=True,
+        help="Current workspaces.toml SHA-256 from a prior inspection",
+    )
+    agy_migrate.add_argument(
+        "--expected-agy-command",
+        required=True,
+        help="Exact configured control.agy_command expected by this migration",
+    )
+    agy_migrate.add_argument(
+        "--launch-mode",
+        required=True,
+        choices=("managed", "unmanaged"),
+        help="Explicit launch mode; it must match [control].agy_launch_mode",
+    )
+    agy_migrate.add_argument(
+        "--adapter",
+        help="Explicit managed adapter path; it must match [control].agy_proxy_launcher",
+    )
+    agy_migrate.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the per-file atomic replacement; default prints a dry-run receipt",
+    )
+    agy_configure = agy_wrapper_subparsers.add_parser(
+        "configure",
+        parents=[common],
+        help="Preview or narrowly configure managed AGY launch in one workspace TOML",
+    )
+    agy_configure.add_argument("--project", required=True, help="Absolute configured project root")
+    agy_configure.add_argument("--expected-config-sha256", required=True)
+    agy_configure.add_argument("--expected-agy-command", required=True)
+    agy_configure.add_argument("--adapter", required=True, help="Absolute managed adapter path")
+    agy_configure.add_argument("--apply", action="store_true")
+    agy_generate = agy_wrapper_subparsers.add_parser(
+        "generate",
+        parents=[common],
+        help="Generate an ACP-owned wrapper only for an already managed configured project",
+    )
+    agy_generate.add_argument("--project", required=True, help="Absolute configured project root")
+    agy_generate.add_argument("--expected-config-sha256", required=True)
+    agy_generate.add_argument("--expected-agy-command", required=True)
+    agy_generate.add_argument("--apply", action="store_true")
+    agy_rollback = agy_wrapper_subparsers.add_parser(
+        "rollback",
+        parents=[common],
+        help="Restore one migration backup only if the wrapper has its expected current hash",
+    )
+    agy_rollback.add_argument("--project", required=True, help="Absolute project root")
+    agy_rollback.add_argument("--backup", required=True, help="Backup path printed by migrate")
+    agy_rollback.add_argument(
+        "--expected-current-sha256",
+        required=True,
+        help="Wrapper SHA-256 printed by migrate after replacement",
+    )
+    agy_restore_config = agy_wrapper_subparsers.add_parser(
+        "restore-config",
+        parents=[common],
+        help="Restore a guarded ACP config backup only when its current hash still matches",
+    )
+    agy_restore_config.add_argument(
+        "--project", required=True, help="Absolute configured project root"
+    )
+    agy_restore_config.add_argument(
+        "--backup", required=True, help="Backup path printed by configure"
+    )
+    agy_restore_config.add_argument("--expected-current-sha256", required=True)
 
     mcp_parser = subparsers.add_parser("mcp", help="Manage MCP server")
     mcp_subparsers = mcp_parser.add_subparsers(dest="mcp_command", required=True)

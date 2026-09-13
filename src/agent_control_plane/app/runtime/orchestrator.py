@@ -73,8 +73,8 @@ from agent_control_plane.features.agent_runner import (
     process_is_alive,
     terminate_verified_process,
 )
-from agent_control_plane.features.antigravity_accounts import AntigravityManagerAdapter
-from agent_control_plane.features.antigravity_accounts.lib.manager_cli import (
+from agent_control_plane.features.antigravity_accounts import (
+    AntigravityManagerAdapter,
     configured_cli_switcher,
 )
 from agent_control_plane.features.job_watch import (

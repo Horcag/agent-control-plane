@@ -240,7 +240,7 @@ def _write_tempfile(parent: Path, payload_bytes: bytes) -> Path:
     temp_path = Path(name)
     try:
         if os.name == "posix":
-            os.fchmod(fd, 0o600)
+            os.chmod(temp_path, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload_bytes)
             handle.flush()
@@ -296,4 +296,3 @@ def _fsync_directory(path: Path) -> None:
     finally:
         if fd is not None:
             os.close(fd)
-

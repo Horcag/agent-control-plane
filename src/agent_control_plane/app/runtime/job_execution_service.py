@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -32,6 +33,7 @@ from agent_control_plane.features.agent_runner import (
     WorkerLease,
     WorkerLeaseError,
     assess_result_contract,
+    build_agy_launch,
     capture_process_identity,
     claude_ladder_for_explicit_model,
     codex_job_capacity_units,
@@ -43,10 +45,8 @@ from agent_control_plane.features.agent_runner import (
 from agent_control_plane.features.antigravity_accounts import (
     AntigravityManagerAdapter,
     AntigravityManagerError,
-    is_agy_quota_failure,
-)
-from agent_control_plane.features.antigravity_accounts.lib.manager_cli import (
     configured_cli_switcher,
+    is_agy_quota_failure,
 )
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
@@ -463,8 +463,15 @@ class JobExecutionService:
                 self.store.add_event(
                     job.job_id, "warning", f"Optional AGY CLI account inspection unavailable: {exc}"
                 )
+        run_spec = self._agent_run_spec(job, state, profile, log_path)
+        if run_spec.agy_launch is not None:
+            self.store.add_event(
+                job.job_id,
+                "info",
+                "AGY launch receipt " + json.dumps(run_spec.agy_launch.receipt(), sort_keys=True),
+            )
         result = state.runner.run(
-            self._agent_run_spec(job, state, profile, log_path),
+            run_spec,
             cancel_requested=guard.should_stop,
             pid_observed=lambda pid: self._record_runner_pid(job, pid),
         )
@@ -552,9 +559,20 @@ class JobExecutionService:
         log_path: Path,
     ) -> AgentRunSpec:
         claude_mcp_config_path, claude_allowed_tools = self._claude_binding(job)
+        agy_launch = None
+        agy_command = self.config.agy_command
+        if job.backend == AGY_BACKEND:
+            agy_launch = build_agy_launch(
+                agy_command=self.config.agy_command,
+                mode=getattr(self.config, "agy_launch_mode", "unmanaged"),
+                adapter=getattr(self.config, "agy_proxy_launcher", None),
+                job_id=job.job_id,
+                attempt_ref=log_path.stem,
+            )
+            agy_command = agy_launch.executable
         return AgentRunSpec(
             backend=job.backend,
-            agy_command=self.config.agy_command,
+            agy_command=agy_command,
             agy_model=job.agy_model,
             codex_command=self.config.codex_command,
             codex_model=profile.model,
@@ -595,6 +613,7 @@ class JobExecutionService:
             claude_max_turns=self.config.defaults.claude_max_turns,
             claude_bare=self.config.defaults.claude_bare,
             claude_mcp_config_path=claude_mcp_config_path,
+            agy_launch=agy_launch,
         )
 
     def _claude_binding(self, job: JobRecord) -> tuple[Path | None, tuple[str, ...]]:

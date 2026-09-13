@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import socket
+import stat
 import subprocess  # nosec B404
 import sys
 import tempfile
@@ -318,6 +319,12 @@ class ControlConfig:
     claude_model_catalog: ClaudeModelCatalogConfig = field(default_factory=ClaudeModelCatalogConfig)
     claude_mcp_servers: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     claude_config_path: Path | None = None
+    # Optional managed proxy launcher. Its presence is intentional policy: an unusable path
+    # must block AGY launch rather than quietly selecting the real executable.
+    agy_proxy_launcher: Path | None = None
+    # Unmanaged is the compatible default: ACP executes the explicit agy_command as supplied.
+    # Managed requires an explicit adapter and is the only mode that claims adapter mediation.
+    agy_launch_mode: str = "unmanaged"
 
     def slot_root_for(self, route: str | None) -> Path:
         """Slot directory that owns this route's worktrees.
@@ -1385,6 +1392,13 @@ def load_config(
         raise ValueError("control.worktree_base could not be inferred")
     resolved_worktree_base = Path(worktree_base)
 
+    agy_launch_mode = _agy_launch_mode(control)
+    agy_proxy_launcher = _optional_unresolved_path(control, "agy_proxy_launcher", project_root)
+    if agy_launch_mode == "managed" and agy_proxy_launcher is None:
+        raise ValueError("[control].agy_launch_mode = managed requires agy_proxy_launcher")
+    if agy_launch_mode == "managed" and agy_proxy_launcher is not None:
+        _validate_managed_adapter_path(agy_proxy_launcher)
+
     return ControlConfig(
         config_path=config_path,
         project_root=project_root,
@@ -1394,11 +1408,13 @@ def load_config(
         worktree_root=global_worktree_root,
         worktree_base=resolved_worktree_base,
         slot_root=slot_root,
-        agy_command=str(control.get("agy_command", "agy")),
+        agy_command=_string_value(control.get("agy_command", "agy")),
         codex_command=str(control.get("codex_command", "codex")),
         claude_command=str(control.get("claude_command", "claude")),
         claude_mcp_servers=MappingProxyType(_claude_mcp_servers(control)),
         claude_config_path=_claude_config_path_value(control),
+        agy_proxy_launcher=agy_proxy_launcher,
+        agy_launch_mode=agy_launch_mode,
         defaults=defaults,
         model_catalog=model_catalog,
         routing_policies=routing_policies,
@@ -1407,6 +1423,13 @@ def load_config(
         slots=MappingProxyType(slots),
         slot_prepare=tuple(slot_prepare),
     )
+
+
+def _agy_launch_mode(control: Mapping[str, Any]) -> str:
+    value = _string_value(control.get("agy_launch_mode", "unmanaged"))
+    if value not in {"managed", "unmanaged"}:
+        raise ValueError("[control].agy_launch_mode must be managed or unmanaged")
+    return value
 
 
 def _claude_mcp_servers(control: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1884,6 +1907,35 @@ def _optional_path(raw: Mapping[str, Any], key: str, base: Path) -> Path | None:
     if key not in raw:
         return None
     return _coerce_path(raw[key], base)
+
+
+def _optional_unresolved_path(raw: Mapping[str, Any], key: str, base: Path) -> Path | None:
+    """Keep a configured managed-adapter spelling intact until symlink checks complete."""
+    if key not in raw:
+        return None
+    path = Path(os.path.expandvars(str(raw[key]))).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+def _validate_managed_adapter_path(path: Path) -> None:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(
+            "[control].agy_proxy_launcher must be an absolute path without parent traversal"
+        )
+    for candidate in reversed((path, *path.parents)):
+        try:
+            status = candidate.lstat()
+        except OSError as exc:
+            raise ValueError(
+                f"[control].agy_proxy_launcher parent is unavailable: {candidate}"
+            ) from exc
+        if stat.S_ISLNK(status.st_mode):
+            raise ValueError(
+                f"[control].agy_proxy_launcher must not traverse a symlink: {candidate}"
+            )
+    status = path.lstat()
+    if not stat.S_ISREG(status.st_mode) or not os.access(path, os.X_OK):
+        raise ValueError("[control].agy_proxy_launcher must be an executable regular file")
 
 
 def _coerce_path(value: Any, base: Path) -> Path:

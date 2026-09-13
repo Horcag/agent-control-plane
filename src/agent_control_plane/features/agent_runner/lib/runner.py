@@ -24,9 +24,41 @@ __all__ = [
     "AgentRunResult",
     "AgentRunSpec",
     "AgentRunner",
+    "AgyLaunchSpec",
     "BudgetLifecycleEvent",
     "normalize_backend",
 ]
+
+
+@dataclass(frozen=True)
+class AgyLaunchSpec:
+    """The non-secret, configured launch contract for one AGY attempt.
+
+    ``launch_id`` identifies this local launch attempt only.  It is deliberately
+    not a conversation/session identifier and must never be used as CONNECT
+    evidence.
+    """
+
+    executable: str
+    managed: bool
+    add_new_project: bool
+    adapter_path: Path | None
+    adapter_sha256: str | None
+    launch_id: str
+    job_id: str
+    attempt_ref: str
+
+    def receipt(self) -> dict[str, str | bool | None]:
+        return {
+            "version": "agy-launch-receipt-v1",
+            "managed": self.managed,
+            "executable": self.executable,
+            "adapter_path": str(self.adapter_path) if self.adapter_path else None,
+            "adapter_sha256": self.adapter_sha256,
+            "launch_id": self.launch_id,
+            "job_id": self.job_id,
+            "attempt_ref": self.attempt_ref,
+        }
 
 
 @dataclass(frozen=True)
@@ -67,6 +99,7 @@ class AgentRunSpec:
     claude_max_turns: int = 0
     claude_bare: bool = True
     claude_mcp_config_path: Path | None = None
+    agy_launch: AgyLaunchSpec | None = None
 
 
 @dataclass(frozen=True)

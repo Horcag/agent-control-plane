@@ -19,6 +19,88 @@ configured IDE integration is required. `native` is Codex-only. Keep
 there is a reviewed reason to change them. Smoke initializes the ACP SQLite database
 and reports route, slot, runner, and archive configuration; it does not launch a job.
 
+### AGY launcher and project-wrapper migration
+
+`[control].agy_launch_mode` has two explicit states. `unmanaged` is the compatible default:
+ACP preserves the operator's configured `agy_command` (including existing Windows/no-proxy
+installations) and makes no claim that an adapter mediated the launch. `managed` requires an
+explicit absolute, regular, non-symlink `[control].agy_proxy_launcher`; ACP validates it at
+launch and fails closed when it is missing or invalid. Managed mode never falls back to the
+real AGY command, and it adds `--new-project` once at the typed PTY launch boundary. The adapter
+path and digest, mode, job, and attempt reference are recorded in a versioned launch receipt;
+the receipt's local launch identifier is not a conversation identifier or CONNECT proof.
+
+`agy_command` remains authoritative for unmanaged mode. Do not use `PATH` order as an adapter
+selection policy. A managed configuration must name its adapter directly; a project wrapper is
+not authority for adapter selection. ACP currently does not negotiate proxy capabilities, enforce
+OS egress, prove CONNECT/account affinity, provide failover, or validate vendor updates. Those
+runtime guarantees require a separate ADR and implementation.
+
+For an existing unmanaged configuration, transition the config first. The default is a dry run;
+the command binds the configured route/project, exact config bytes, existing `agy_command`, and
+an absolute executable non-symlink adapter. It changes only `agy_launch_mode` and
+`agy_proxy_launcher`, preserves the rest of the TOML text, and prints old/new hashes plus a
+same-directory backup path. The config and each wrapper are deliberately separate single-file
+transactions: if the later wrapper step fails, ACP still selects the configured managed adapter
+for new launches and does not claim a cross-file rollback.
+
+```sh
+sha256sum /acp/.agent-work/workspaces.toml
+agent-control agy-wrapper configure --config /acp/.agent-work/workspaces.toml \
+  --project /project --expected-config-sha256 <unmanaged-config-sha256> \
+  --expected-agy-command 'agy' \
+  --adapter /home/nikit/.local/libexec/antigravity-proxy/agy
+agent-control agy-wrapper configure --config /acp/.agent-work/workspaces.toml \
+  --project /project --expected-config-sha256 <unmanaged-config-sha256> \
+  --expected-agy-command 'agy' --adapter /home/nikit/.local/libexec/antigravity-proxy/agy --apply
+```
+
+Use the `after_sha256` printed by `configure` for the subsequent wrapper dry run and apply. Only
+the exact historical wrapper or a complete versioned ACP wrapper is accepted; a launcher equal to
+the wrapper, symlink inputs, symlink parent traversal, stale bytes/modes, or config drift is
+rejected. The config binding is rechecked under the short-lived config-operation lock immediately
+before wrapper publication and idempotent success.
+
+```sh
+sha256sum /project/.agent-work/bin/agy-project
+agent-control agy-wrapper migrate --config /acp/.agent-work/workspaces.toml \
+  --project /project --expected-sha256 <legacy-wrapper-sha256> \
+  --expected-config-sha256 <config-sha256> \
+  --expected-agy-command 'agy' \
+  --launch-mode managed --adapter /home/nikit/.local/libexec/antigravity-proxy/agy
+agent-control agy-wrapper migrate --config /acp/.agent-work/workspaces.toml \
+  --project /project --expected-sha256 <legacy-wrapper-sha256> \
+  --expected-config-sha256 <config-sha256> --expected-agy-command 'agy' \
+  --launch-mode managed --adapter /home/nikit/.local/libexec/antigravity-proxy/agy --apply
+```
+
+For a fresh already configured project, use `generate` instead of a historical one-off script.
+It only accepts a missing wrapper or already exact ACP-owned content, and it creates the owned
+wrapper parent after the same config recheck:
+
+```sh
+agent-control agy-wrapper generate --config /acp/.agent-work/workspaces.toml \
+  --project /fresh-project --expected-config-sha256 <config-sha256> \
+  --expected-agy-command 'agy'
+agent-control agy-wrapper generate --config /acp/.agent-work/workspaces.toml \
+  --project /fresh-project --expected-config-sha256 <config-sha256> \
+  --expected-agy-command 'agy' --apply
+```
+
+Each receipt contains `before_sha256`, `after_sha256`, `backup_path`, target mode/adapter, and
+recovery text without printing config content. To recover, use the printed backup and post-write
+hash; rollback and config restore reject symlinks, changed files, and mismatched hashes rather
+than overwriting a late edit:
+
+```sh
+agent-control agy-wrapper rollback --config /acp/.agent-work/workspaces.toml \
+  --project /project --backup /project/.agent-work/bin/agy-project.acp-agy-v2-<hash>.bak \
+  --expected-current-sha256 <post-write-sha256>
+agent-control agy-wrapper restore-config --config /acp/.agent-work/workspaces.toml \
+  --project /project --backup /acp/.agent-work/workspaces.toml.acp-agy-v2-<hash>.bak \
+  --expected-current-sha256 <configured-config-sha256>
+```
+
 ### Repository-local planes
 
 For project work, keep the canonical config at `<repository>/.agent-work/workspaces.toml`.
