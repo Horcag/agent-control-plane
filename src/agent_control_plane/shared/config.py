@@ -185,6 +185,8 @@ class RouteConfig:
     monitor_route_root: bool = True
     route_root_ignore_globs: tuple[str, ...] = ()
     dirty_diff_max_changed_lines: int | None = None
+    canonical_remote: str | None = None
+    canonical_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1338,6 +1340,8 @@ def load_config(
                 value.get("dirty_diff_max_changed_lines"),
                 f"routes.{name}.dirty_diff_max_changed_lines",
             ),
+            canonical_remote=_optional_string_value(value.get("canonical_remote")),
+            canonical_branch=_optional_string_value(value.get("canonical_branch")),
         )
 
     if not routes:
@@ -1353,10 +1357,16 @@ def load_config(
         route = str(_required(value, "route"))
         if route not in routes:
             raise ValueError(f"[slots.{name}] references unknown route: {route}")
+        slot_path = _path(value, "path", project_root)
+        route_config = routes[route]
+        if slot_path.resolve(strict=False) == route_config.path.resolve(strict=False):
+            raise ValueError(
+                f"[slots.{name}] path cannot be the canonical checkout of route {route}"
+            )
         slots[name] = SlotConfig(
             name=name,
             route=route,
-            path=_path(value, "path", project_root),
+            path=slot_path,
         )
 
     slot_prepare_raw = raw.get("slot_prepare", {})

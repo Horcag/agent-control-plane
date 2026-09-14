@@ -527,6 +527,25 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+        if args.command == "lifecycle":
+            if args.lifecycle_command in {"audit", "status"}:
+                _print_json(control.lifecycle_audit(refresh=not args.no_refresh))
+                return 0
+            if args.lifecycle_command == "reconcile":
+                _print_json(control.lifecycle_reconcile(refresh=not args.no_refresh))
+                return 0
+            if args.lifecycle_command == "apply":
+                _print_json(control.lifecycle_apply(args.operation_id))
+                return 0
+            if args.lifecycle_command == "poll":
+                _print_json(
+                    control.lifecycle_poll(
+                        passes=args.passes,
+                        interval_sec=args.interval_sec,
+                        max_interval_sec=args.max_interval_sec,
+                    )
+                )
+                return 0
         if args.command == "slots":
             if args.slot_command == "sync":
                 _print_json(control.sync_slots())
@@ -1140,6 +1159,26 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply the reported cleanup; default is a dry-run",
     )
+
+    lifecycle = subparsers.add_parser(
+        "lifecycle",
+        help="Audit accepted branches, checkpoints, worktrees, and slot records",
+    )
+    lifecycle_subparsers = lifecycle.add_subparsers(dest="lifecycle_command", required=True)
+    lifecycle_audit = lifecycle_subparsers.add_parser("audit", parents=[common])
+    lifecycle_audit.add_argument("--no-refresh", action="store_true")
+    lifecycle_status = lifecycle_subparsers.add_parser(
+        "status", parents=[common], help="Alias for audit"
+    )
+    lifecycle_status.add_argument("--no-refresh", action="store_true")
+    lifecycle_reconcile = lifecycle_subparsers.add_parser("reconcile", parents=[common])
+    lifecycle_reconcile.add_argument("--no-refresh", action="store_true")
+    lifecycle_apply = lifecycle_subparsers.add_parser("apply", parents=[common])
+    lifecycle_apply.add_argument("operation_id")
+    lifecycle_poll = lifecycle_subparsers.add_parser("poll", parents=[common])
+    lifecycle_poll.add_argument("--passes", type=int, default=3)
+    lifecycle_poll.add_argument("--interval-sec", type=float, default=30.0)
+    lifecycle_poll.add_argument("--max-interval-sec", type=float, default=300.0)
 
     slots = subparsers.add_parser("slots", help="Manage reusable IDE-indexed worktree slots")
     slot_subparsers = slots.add_subparsers(dest="slot_command", required=True)

@@ -1,0 +1,1985 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Any
+
+from agent_control_plane.entities.job import JobStore
+from agent_control_plane.entities.review_inbox import ReviewInboxItem, ReviewInboxStore
+from agent_control_plane.entities.slot import SlotRecord, SlotStore, SlotStoreError
+from agent_control_plane.shared.clock import utc_now
+from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.git_tools import GitError, run_git, workspace_snapshot
+from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.process_liveness import (
+    process_is_alive as shared_process_is_alive,
+)
+from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
+
+
+class LifecycleClass(StrEnum):
+    ACTIVE = "active"
+    DIRTY = "dirty"
+    UNIQUE_UNPUSHED = "unique-unpushed"
+    ACCEPTED_INTEGRATED = "accepted-integrated"
+    SAFE_TO_DELETE = "safe-to-delete"
+    QUARANTINED = "quarantined"
+    STALE = "stale"
+    RETAINED_UNOWNED = "retained-unowned"
+
+
+@dataclass(frozen=True)
+class FrozenSlot:
+    name: str
+    route: str
+    path: Path
+    generation: int
+    device: int
+    inode: int
+    branch: str
+    head: str
+    canonical_ref: str
+    canonical_tip: str
+    canonical_url: str
+    common_git_dir: str
+    checkpoint_ref: str
+    checkpoint_sha: str
+    default_branch: str
+    default_ref: str
+    default_sha: str | None
+    job_id: str
+    base_sha: str | None = None
+
+    @property
+    def operation_id(self) -> str:
+        payload = json.dumps(
+            [
+                self.name,
+                self.route,
+                str(self.path),
+                self.generation,
+                self.head,
+                self.canonical_ref,
+                self.canonical_tip,
+                self.canonical_url,
+                self.common_git_dir,
+                self.checkpoint_ref,
+                self.default_branch,
+                self.default_ref,
+                self.default_sha,
+                self.job_id,
+                self.base_sha,
+            ],
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
+class SlotLifecycleService:
+    """Audit all ACP slots and execute only exact, revalidated cleanup intents."""
+
+    def __init__(
+        self,
+        config: ControlConfig,
+        *,
+        slots: SlotStore,
+        jobs: JobStore,
+        inbox: ReviewInboxStore,
+        live_cwds: Callable[[Path], list[int]] | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+        process_is_alive: Callable[[int | None], bool] | None = None,
+    ) -> None:
+        self.config = config
+        self.slots = slots
+        self.jobs = jobs
+        self.inbox = inbox
+        self.live_cwds = live_cwds or _live_process_cwds
+        self.clock = clock
+        self.sleep = sleep
+        self.process_is_alive = process_is_alive or shared_process_is_alive
+        self._initialize()
+
+    def audit(self, *, refresh: bool = True) -> dict[str, Any]:
+        self.slots.initialize()
+        self.jobs.initialize()
+        self.inbox.initialize()
+        registered = self.slots.list_slots()
+        route_cache = self._fetch_canonical_routes(refresh=refresh)
+        rows = [self._audit_slot(slot, route_cache=route_cache) for slot in registered]
+        rows.extend(self._unmanaged_resources(registered, route_cache=route_cache))
+        counts = {value.value: 0 for value in LifecycleClass}
+        for row in rows:
+            counts[row["classification"]] += 1
+        payload = {
+            "observed_at": utc_now(),
+            "refresh": refresh,
+            "counts": counts,
+            "resources": rows,
+        }
+        self._event("audit", None, payload)
+        return payload
+
+    def _fetch_canonical_routes(self, *, refresh: bool) -> dict[str, dict[str, Any]]:
+        route_cache: dict[str, dict[str, Any]] = {}
+        for route_name, route in self.config.routes.items():
+            remote = route.canonical_remote
+            branch = route.canonical_branch
+            if not remote or not branch:
+                route_cache[route_name] = {
+                    "error": "canonical_remote and canonical_branch are not explicitly configured"
+                }
+                continue
+            canonical_ref = f"refs/remotes/{remote}/{branch}"
+            try:
+                if refresh:
+                    run_git(
+                        route.path,
+                        "fetch",
+                        "--no-tags",
+                        remote,
+                        f"refs/heads/{branch}:{canonical_ref}",
+                    )
+                tip = run_git(route.path, "rev-parse", "--verify", canonical_ref)
+                url = run_git(route.path, "remote", "get-url", remote)
+                common_git_dir = str(
+                    (route.path / run_git(route.path, "rev-parse", "--git-common-dir")).resolve(
+                        strict=False
+                    )
+                )
+                try:
+                    wt_raw = run_git(route.path, "worktree", "list", "--porcelain")
+                    worktrees = {
+                        Path(line[9:].strip()).resolve(strict=False)
+                        for line in wt_raw.splitlines()
+                        if line.startswith("worktree ")
+                    }
+                except GitError:
+                    worktrees = set()
+                route_cache[route_name] = {
+                    "remote": remote,
+                    "branch": branch,
+                    "canonical_ref": canonical_ref,
+                    "canonical_tip": tip,
+                    "canonical_url": url,
+                    "common_git_dir": common_git_dir,
+                    "worktrees": worktrees,
+                    "error": None,
+                }
+            except GitError as exc:
+                route_cache[route_name] = {"error": f"canonical refresh failed: {exc}"}
+        return route_cache
+
+    def _unmanaged_resources(
+        self, registered: list[SlotRecord], route_cache: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        registered_paths = {slot.path.resolve(strict=False) for slot in registered}
+        registered_branches: set[tuple[str, str]] = set()
+        for slot in registered:
+            try:
+                branch = run_git(slot.path, "branch", "--show-current")
+            except GitError:
+                continue
+            if branch:
+                registered_branches.add((slot.route, branch))
+        for route_name, route in self.config.routes.items():
+            try:
+                worktrees = _parse_worktrees(run_git(route.path, "worktree", "list", "--porcelain"))
+                branches = run_git(
+                    route.path,
+                    "for-each-ref",
+                    "--format=%(refname:short)%00%(objectname)",
+                    "refs/heads",
+                ).splitlines()
+            except GitError as exc:
+                rows.append(
+                    {
+                        "kind": "repository",
+                        "route": route_name,
+                        "classification": LifecycleClass.QUARANTINED.value,
+                        "reasons": [f"inventory failed: {exc}"],
+                    }
+                )
+                continue
+            for worktree in worktrees:
+                path = Path(worktree["path"]).resolve(strict=False)
+                if path in registered_paths or path == route.path.resolve(strict=False):
+                    continue
+                dirty = "unknown"
+                with suppress(GitError):
+                    dirty = run_git(path, "status", "--porcelain=v1", "-uall")
+                rows.append(
+                    {
+                        "kind": "worktree",
+                        "route": route_name,
+                        "path": str(path),
+                        "branch": worktree.get("branch"),
+                        "classification": (
+                            LifecycleClass.DIRTY.value
+                            if dirty not in {"", "unknown"}
+                            else LifecycleClass.STALE.value
+                        ),
+                        "reasons": ["unregistered worktree; ownership is not proven"],
+                    }
+                )
+            r_info = route_cache.get(route_name, {})
+            canonical_ref = r_info.get("canonical_ref")
+            for raw in branches:
+                if "\0" not in raw:
+                    continue
+                branch, sha = raw.split("\0", 1)
+                if branch == route.required_branch or (route_name, branch) in registered_branches:
+                    continue
+                integrated = bool(canonical_ref and _is_ancestor(route.path, sha, canonical_ref))
+                has_receipt = self._has_acceptance_receipt(route_name, branch, sha)
+                if integrated and has_receipt:
+                    classification = LifecycleClass.ACCEPTED_INTEGRATED.value
+                    reasons = ["unowned branch with valid acceptance receipt; integrated"]
+                elif integrated:
+                    classification = LifecycleClass.RETAINED_UNOWNED.value
+                    reasons = ["unowned branch without acceptance receipt; retained"]
+                else:
+                    classification = LifecycleClass.UNIQUE_UNPUSHED.value
+                    reasons = ["unowned branch; audit never authorizes deletion"]
+                rows.append(
+                    {
+                        "kind": "branch",
+                        "route": route_name,
+                        "branch": branch,
+                        "sha": sha,
+                        "classification": classification,
+                        "reasons": reasons,
+                    }
+                )
+        return rows
+
+    def _has_acceptance_receipt(self, route_name: str, branch: str, sha: str) -> bool:
+        items = self.inbox.list_items(review_status="accepted", limit=500)
+        for item in items:
+            if item.route == route_name and (item.checkpoint_sha == sha or item.base_sha == sha):
+                return True
+        return False
+
+    def apply(
+        self,
+        operation_id: str,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+        pre_mutation_hook: Callable[[str], None] | None = None,
+        executor_id: str | None = None,
+        owner_pid: int | None = None,
+    ) -> dict[str, Any]:
+        intent = self._intent(operation_id)
+        if intent is None:
+            raise ValueError(f"Unknown lifecycle cleanup operation: {operation_id}")
+        if intent["state"] == "completed":
+            return {**intent, "action": "already_completed"}
+        if intent["state"] == "quarantined":
+            return {**intent, "action": "quarantined", "reason": intent.get("error")}
+
+        actual_owner_pid = owner_pid if owner_pid is not None else os.getpid()
+        actual_executor = (
+            executor_id
+            or f"{actual_owner_pid}_{self.clock()}_{hashlib.sha256(str(time.time_ns()).encode()).hexdigest()[:8]}"
+        )
+        if not self.acquire_executor_lease(
+            operation_id, actual_executor, owner_pid=actual_owner_pid
+        ):
+            raise RuntimeError(
+                f"Operation {operation_id} is currently locked by another active executor"
+            )
+        fence_token = self.get_fence_token(operation_id, actual_executor)
+        if fence_token is None:
+            raise RuntimeError(f"Failed to acquire fence token for executor {actual_executor}")
+
+        proof = intent["proof"]
+        frozen = FrozenSlot(**{**proof, "path": Path(proof["path"])})
+
+        try:
+            # 1. Atomically acquire exclusive cleanup claim or re-validate existing claim
+            slot = self.slots.require_slot(frozen.name)
+            release_step = self._get_step(operation_id, "release_slot")
+            if slot.status == "cleaning" and slot.active_job_id == operation_id:
+                # Resuming an in-flight operation from crash
+                if slot.generation != frozen.generation:
+                    return self._quarantine(
+                        operation_id,
+                        f"slot generation moved from {frozen.generation} to {slot.generation}",
+                        {"name": frozen.name, "generation": slot.generation},
+                        frozen=frozen,
+                    )
+            elif release_step is not None and (
+                slot.status in ("available", "deleted")
+                and slot.generation == frozen.generation + 1
+                and slot.active_job_id is None
+            ):
+                # Resuming after slot release mutation already occurred
+                pass
+            else:
+                if slot.generation != frozen.generation:
+                    return self._quarantine(
+                        operation_id,
+                        f"slot generation moved from {frozen.generation} to {slot.generation}",
+                        {"name": frozen.name, "generation": slot.generation},
+                        frozen=frozen,
+                    )
+                try:
+                    slot = self.slots.claim_for_cleanup(
+                        frozen.name,
+                        operation_id,
+                        frozen.generation,
+                        expected_route=frozen.route,
+                        expected_path=frozen.path,
+                    )
+                except SlotStoreError as exc:
+                    return self._quarantine(
+                        operation_id,
+                        f"exclusive cleanup claim failed: {exc}",
+                        {"name": frozen.name, "error": str(exc)},
+                        frozen=frozen,
+                    )
+
+            # 2. Revalidate all pre-conditions within the exclusive claim
+            # Global invariants must NEVER be bypassed on resume/recovery.
+            route = self.config.routes.get(frozen.route)
+            if route is None:
+                raise ValueError(f"route {frozen.route} missing from config")
+
+            if slot.route != frozen.route:
+                raise ValueError(
+                    f"slot registered route changed from {frozen.route} to {slot.route}"
+                )
+            if slot.path.resolve(strict=False) != frozen.path.resolve(strict=False):
+                raise ValueError("slot registered path changed")
+
+            if frozen.path.resolve(strict=False) == route.path.resolve(strict=False):
+                raise ValueError("slot path is the canonical checkout of route")
+            slot_root = self.config.slot_root_for(frozen.route)
+            if not is_same_or_child(frozen.path, slot_root) or frozen.path.resolve(
+                strict=False
+            ) == slot_root.resolve(strict=False):
+                raise ValueError("slot path is outside managed slot_root")
+
+            if frozen.name in self.config.slots:
+                configured = self.config.slots[frozen.name]
+                if configured.route != frozen.route or configured.path.resolve(
+                    strict=False
+                ) != frozen.path.resolve(strict=False):
+                    raise ValueError("configured slot route or path changed")
+
+            remove_step = self._get_step(operation_id, "remove_worktree")
+            worktree_removed = remove_step is not None and remove_step.get("status") == "completed"
+            if not worktree_removed and frozen.path.exists():
+                stat = frozen.path.stat()
+                if (stat.st_dev, stat.st_ino) != (frozen.device, frozen.inode):
+                    raise ValueError("slot filesystem identity changed")
+
+            # Check remote URL
+            current_remote_url = run_git(
+                route.path, "remote", "get-url", route.canonical_remote or ""
+            )
+            if current_remote_url != frozen.canonical_url:
+                raise ValueError("canonical remote identity changed")
+
+            # Check repository identity
+            current_common_git_dir = str(
+                (route.path / run_git(route.path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+            if current_common_git_dir != frozen.common_git_dir:
+                raise ValueError("repository identity changed")
+
+            if not worktree_removed and frozen.path.exists():
+                try:
+                    wt_raw = run_git(route.path, "worktree", "list", "--porcelain")
+                    current_worktrees = {
+                        Path(line[9:].strip()).resolve(strict=False)
+                        for line in wt_raw.splitlines()
+                        if line.startswith("worktree ")
+                    }
+                except GitError:
+                    current_worktrees = set()
+                if frozen.path.resolve(strict=False) not in current_worktrees:
+                    raise ValueError("slot path is not in route git worktree inventory")
+
+            # Refetch exact named canonical ref inside exclusive fence before destructive mutation
+            run_git(
+                route.path,
+                "fetch",
+                "--no-tags",
+                route.canonical_remote or "",
+                f"refs/heads/{route.canonical_branch}:{frozen.canonical_ref}",
+            )
+            fetched_tip = run_git(route.path, "rev-parse", "--verify", frozen.canonical_ref)
+            if fetched_tip != frozen.canonical_tip:
+                raise ValueError("canonical remote ref moved")
+
+            # Verify checkpoint sha is still canonical-reachable
+            if not _is_ancestor(route.path, frozen.checkpoint_sha, fetched_tip):
+                raise ValueError("checkpoint sha is no longer canonical-reachable")
+
+            # Verify default ref has not moved or diverged (for configured slots)
+            if frozen.name in self.config.slots:
+                co_step = self._get_step(operation_id, "checkout_default")
+                ff_step = self._get_step(operation_id, "fast_forward_default")
+                current_default_sha = _run_git_or_none(
+                    route.path, "rev-parse", "--verify", frozen.default_ref
+                )
+                expected_pre_default = (
+                    frozen.canonical_tip if frozen.default_sha is None else frozen.default_sha
+                )
+                if ff_step is not None and ff_step.get("status") == "completed":
+                    if current_default_sha != frozen.canonical_tip:
+                        raise ValueError(
+                            f"default branch ref {frozen.default_ref} moved after fast-forward"
+                        )
+                elif ff_step is not None and ff_step.get("status") == "started":
+                    # Fast-forward crashed before recording step completion.
+                    # Both the exact valid pre-state and exact valid post-state are recognized.
+                    if current_default_sha not in (expected_pre_default, frozen.canonical_tip):
+                        raise ValueError(
+                            f"default branch ref {frozen.default_ref} moved or diverged during fast-forward"
+                        )
+                elif co_step is not None and (
+                    co_step.get("status") == "completed"
+                    or (
+                        co_step.get("status") == "started"
+                        and _run_git_or_none(frozen.path, "branch", "--show-current")
+                        == frozen.default_branch
+                    )
+                ):
+                    if current_default_sha != expected_pre_default:
+                        raise ValueError(
+                            f"default branch ref {frozen.default_ref} moved or disappeared after checkout_default"
+                        )
+                else:
+                    if current_default_sha != frozen.default_sha:
+                        raise ValueError(
+                            f"default branch ref {frozen.default_ref} moved or disappeared"
+                        )
+                    if frozen.default_sha is not None and not _is_ancestor(
+                        route.path, frozen.default_sha, fetched_tip
+                    ):
+                        raise ValueError("default branch is divergent from canonical tip")
+                if current_default_sha is not None and not _is_ancestor(
+                    route.path, current_default_sha, fetched_tip
+                ):
+                    raise ValueError("default branch is divergent from canonical tip")
+            else:
+                def_step = self._get_step(operation_id, "delete_default_branch")
+                current_default_sha = _run_git_or_none(
+                    route.path, "rev-parse", "--verify", frozen.default_ref
+                )
+                if frozen.default_sha is None:
+                    if current_default_sha is not None:
+                        raise ValueError(
+                            f"default branch ref {frozen.default_ref} was absent at freeze time but was later created"
+                        )
+                else:
+                    if def_step is not None and def_step.get("status") == "completed":
+                        if current_default_sha is not None:
+                            raise ValueError(
+                                f"default branch ref {frozen.default_ref} reappeared after deletion"
+                            )
+                    elif (
+                        def_step is not None
+                        and def_step.get("status") == "started"
+                        and current_default_sha is None
+                    ):
+                        # delete_default_branch mutation executed before crash
+                        pass
+                    else:
+                        if current_default_sha != frozen.default_sha:
+                            raise ValueError(
+                                f"default branch ref {frozen.default_ref} moved or missing"
+                            )
+                        if not _is_ancestor(route.path, frozen.default_sha, fetched_tip):
+                            raise ValueError("default branch is divergent from canonical tip")
+                if current_default_sha is not None and not _is_ancestor(
+                    route.path, current_default_sha, fetched_tip
+                ):
+                    raise ValueError("default branch is divergent from canonical tip")
+
+            # Verify task branch ref if task branch is distinct and to be deleted
+            need_task_branch = bool(frozen.branch and frozen.branch != frozen.default_branch)
+            if need_task_branch:
+                task_step = self._get_step(operation_id, "delete_task_branch")
+                task_ref = f"refs/heads/{frozen.branch}"
+                current_task_sha = _run_git_or_none(route.path, "rev-parse", "--verify", task_ref)
+                if task_step is not None and task_step.get("status") == "completed":
+                    if current_task_sha is not None:
+                        raise ValueError(f"task branch ref {task_ref} reappeared after deletion")
+                elif (
+                    task_step is not None
+                    and task_step.get("status") == "started"
+                    and current_task_sha is None
+                ):
+                    # delete_task_branch mutation executed before crash
+                    pass
+                else:
+                    if current_task_sha != frozen.head:
+                        raise ValueError(f"task branch ref {task_ref} moved or missing")
+
+            # Verify checkpoint ref if not yet deleted
+            cp_step = self._get_step(operation_id, "delete_checkpoint")
+            current_cp = _run_git_or_none(
+                route.path, "rev-parse", "--verify", frozen.checkpoint_ref
+            )
+            if cp_step is not None and cp_step.get("status") == "completed":
+                if current_cp is not None:
+                    raise ValueError("checkpoint ref reappeared after deletion")
+            elif cp_step is not None and cp_step.get("status") == "started" and current_cp is None:
+                # delete_checkpoint mutation executed before crash
+                pass
+            else:
+                if current_cp != frozen.checkpoint_sha:
+                    raise ValueError("checkpoint ref moved or missing")
+
+            # Verify exact accepted item receipt for slot generation
+            accepted = self._accepted_item(slot, expected_generation=frozen.generation)
+            if (
+                accepted is None
+                or accepted.checkpoint_sha != frozen.checkpoint_sha
+                or accepted.source_id != frozen.job_id
+                or (frozen.base_sha is not None and accepted.base_sha != frozen.base_sha)
+                or (
+                    accepted.workspace_path is not None
+                    and accepted.workspace_path.resolve(strict=False)
+                    != frozen.path.resolve(strict=False)
+                )
+            ):
+                raise ValueError(
+                    "exact accepted checkpoint receipt no longer matches slot generation"
+                )
+
+            # Validate durable job record if present
+            try:
+                job = self.jobs.get_job(frozen.job_id)
+            except KeyError:
+                job = None
+            if job is not None and (
+                job.slot_name != frozen.name
+                or (job.slot_generation is not None and job.slot_generation != frozen.generation)
+                or job.route != frozen.route
+                or job.workspace_path.resolve(strict=False) != frozen.path.resolve(strict=False)
+            ):
+                raise ValueError("durable job identity mismatch with slot generation")
+
+            # Verify checkout base HEAD is canonical-reachable
+            if not _is_ancestor(route.path, frozen.head, fetched_tip):
+                raise ValueError("checkout base HEAD is not canonical-reachable")
+
+            # Recheck liveness and full clean+ignored state if worktree exists
+            if not worktree_removed and frozen.path.exists():
+                pids = self.live_cwds(frozen.path)
+                if any(pid < 0 for pid in pids) or pids:
+                    raise ValueError(f"live processes detected in slot worktree: {pids}")
+
+                snapshot = workspace_snapshot(frozen.path)
+                if not snapshot.stable:
+                    raise ValueError("workspace identity changed during verification")
+                if snapshot.porcelain:
+                    raise ValueError("tracked or untracked workspace changes present")
+
+                ignored_raw = run_git(
+                    frozen.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
+                )
+                if any(line.startswith("!! ") for line in ignored_raw.splitlines()):
+                    raise ValueError("workspace contains unexpected ignored files")
+
+                # Verify branch / HEAD matches current lifecycle step
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                curr_head = _run_git_or_none(frozen.path, "rev-parse", "HEAD")
+                if frozen.name in self.config.slots:
+                    co_step = self._get_step(operation_id, "checkout_default")
+                    expected_pre_head = (
+                        frozen.canonical_tip if frozen.default_sha is None else frozen.default_sha
+                    )
+                    if ff_step is not None and ff_step.get("status") == "completed":
+                        if (
+                            curr_branch != frozen.default_branch
+                            or curr_head != frozen.canonical_tip
+                        ):
+                            raise ValueError("slot HEAD/branch drifted after fast-forward")
+                    elif ff_step is not None and ff_step.get("status") == "started":
+                        if curr_branch != frozen.default_branch:
+                            raise ValueError("slot branch drifted during fast-forward")
+                        if curr_head not in (expected_pre_head, frozen.canonical_tip):
+                            raise ValueError("slot HEAD drifted during fast-forward")
+                    elif co_step is not None and (
+                        co_step.get("status") == "completed" or curr_branch == frozen.default_branch
+                    ):
+                        if curr_branch != frozen.default_branch:
+                            raise ValueError("slot branch drifted after default checkout")
+                    else:
+                        if curr_branch != frozen.branch or curr_head != frozen.head:
+                            raise ValueError("slot branch or HEAD drifted from audited snapshot")
+                else:
+                    if curr_branch != frozen.branch or curr_head != frozen.head:
+                        raise ValueError("slot branch or HEAD drifted from audited snapshot")
+
+            # 3. Execute external mutations through crash-recoverable step journal
+            self._apply_steps_journal(
+                frozen,
+                operation_id,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=actual_executor,
+                fence_token=fence_token,
+            )
+
+        except (GitError, OSError, ValueError, SlotStoreError) as exc:
+            with suppress(Exception):
+                self.slots.quarantine_cleanup(
+                    frozen.name,
+                    operation_id,
+                    frozen.generation,
+                    expected_route=frozen.route,
+                    expected_path=frozen.path,
+                    note=str(exc),
+                )
+            return self._quarantine(
+                operation_id, str(exc), {"name": frozen.name, "error": str(exc)}, frozen=frozen
+            )
+        finally:
+            with suppress(Exception):
+                self.release_executor_lease(operation_id, actual_executor, fence_token=fence_token)
+
+        self._set_intent_state(operation_id, "completed", None)
+        result = {"operation_id": operation_id, "action": "completed", "slot": frozen.name}
+        self._event("cleanup_completed", operation_id, result)
+        return result
+
+    def _apply_steps_journal(
+        self,
+        frozen: FrozenSlot,
+        operation_id: str,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+        pre_mutation_hook: Callable[[str], None] | None = None,
+        executor_id: str,
+        fence_token: int,
+    ) -> None:
+        route = self.config.routes[frozen.route]
+        step_order = 0
+        is_temporary = frozen.name not in self.config.slots
+
+        if is_temporary:
+            # Temporary dynamic worktree lifecycle:
+            # Step 1: delete_checkpoint
+            step_order += 1
+
+            def _pre_del_cp() -> bool:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                return curr == frozen.checkpoint_sha
+
+            def _post_del_cp() -> bool:
+                return (
+                    _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                    is None
+                )
+
+            def _mutate_del_cp() -> None:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                if curr is not None:
+                    run_git(
+                        route.path, "update-ref", "-d", frozen.checkpoint_ref, frozen.checkpoint_sha
+                    )
+
+            self._execute_journal_step(
+                operation_id,
+                "delete_checkpoint",
+                step_order,
+                is_pre_state=_pre_del_cp,
+                is_post_state=_post_del_cp,
+                mutation=_mutate_del_cp,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 2: remove_worktree
+            step_order += 1
+
+            def _pre_remove_wt() -> bool:
+                if not frozen.path.exists():
+                    return True
+                pids = self.live_cwds(frozen.path)
+                if any(pid < 0 for pid in pids) or pids:
+                    raise ValueError(f"live process CWDs detected before worktree removal: {pids}")
+                snapshot = workspace_snapshot(frozen.path)
+                if not snapshot.stable or snapshot.porcelain:
+                    raise ValueError("workspace dirty or unstable before worktree removal")
+                ignored_raw = run_git(
+                    frozen.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
+                )
+                if any(line.startswith("!! ") for line in ignored_raw.splitlines()):
+                    raise ValueError("unexpected ignored files present before worktree removal")
+                return True
+
+            def _post_remove_wt() -> bool:
+                return not frozen.path.exists()
+
+            def _mutate_remove_wt() -> None:
+                if frozen.path.exists():
+                    run_git(route.path, "worktree", "remove", str(frozen.path))
+
+            self._execute_journal_step(
+                operation_id,
+                "remove_worktree",
+                step_order,
+                is_pre_state=_pre_remove_wt,
+                is_post_state=_post_remove_wt,
+                mutation=_mutate_remove_wt,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 3: delete_task_branch
+            need_task_branch = bool(frozen.branch and frozen.branch != frozen.default_branch)
+            if need_task_branch:
+                step_order += 1
+                task_ref = f"refs/heads/{frozen.branch}"
+
+                def _pre_del_task_branch() -> bool:
+                    curr = _run_git_or_none(route.path, "rev-parse", "--verify", task_ref)
+                    return curr == frozen.head
+
+                def _post_del_task_branch() -> bool:
+                    return _run_git_or_none(route.path, "rev-parse", "--verify", task_ref) is None
+
+                def _mutate_del_task_branch() -> None:
+                    run_git(route.path, "update-ref", "-d", task_ref, frozen.head)
+
+                self._execute_journal_step(
+                    operation_id,
+                    "delete_task_branch",
+                    step_order,
+                    is_pre_state=_pre_del_task_branch,
+                    is_post_state=_post_del_task_branch,
+                    mutation=_mutate_del_task_branch,
+                    crash_hook=crash_hook,
+                    pre_mutation_hook=pre_mutation_hook,
+                    executor_id=executor_id,
+                    fence_token=fence_token,
+                )
+
+            # Step 4: delete_default_branch
+            step_order += 1
+            def_ref = f"refs/heads/{frozen.default_branch}"
+
+            def _pre_del_def_branch() -> bool:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", def_ref)
+                if frozen.default_sha is None:
+                    return curr is None
+                return curr == frozen.default_sha
+
+            def _post_del_def_branch() -> bool:
+                return _run_git_or_none(route.path, "rev-parse", "--verify", def_ref) is None
+
+            def _mutate_del_def_branch() -> None:
+                if frozen.default_sha is None:
+                    curr = _run_git_or_none(route.path, "rev-parse", "--verify", def_ref)
+                    if curr is not None:
+                        raise ValueError(
+                            f"default branch ref {def_ref} was absent at freeze time but was later created"
+                        )
+                    return
+                run_git(
+                    route.path,
+                    "update-ref",
+                    "-d",
+                    def_ref,
+                    frozen.default_sha,
+                )
+
+            self._execute_journal_step(
+                operation_id,
+                "delete_default_branch",
+                step_order,
+                is_pre_state=_pre_del_def_branch,
+                is_post_state=_post_del_def_branch,
+                mutation=_mutate_del_def_branch,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 5: release_slot
+            step_order += 1
+
+            def _pre_release_slot_temp() -> bool:
+                current = self.slots.get_slot(frozen.name)
+                return current is not None and (current.status in ("cleaning", "deleted"))
+
+            def _post_release_slot_temp() -> bool:
+                current = self.slots.get_slot(frozen.name)
+                return (
+                    current is not None
+                    and current.status == "deleted"
+                    and current.active_job_id is None
+                )
+
+            def _mutate_release_slot_temp() -> None:
+                current = self.slots.get_slot(frozen.name)
+                if current is not None and current.status == "cleaning":
+                    self.slots.release_cleanup(
+                        frozen.name,
+                        operation_id,
+                        frozen.generation,
+                        expected_route=frozen.route,
+                        expected_path=frozen.path,
+                        status="deleted",
+                        note="accepted temporary worktree removed",
+                    )
+
+            self._execute_journal_step(
+                operation_id,
+                "release_slot",
+                step_order,
+                is_pre_state=_pre_release_slot_temp,
+                is_post_state=_post_release_slot_temp,
+                mutation=_mutate_release_slot_temp,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 6: prune
+            step_order += 1
+
+            def _pre_prune_temp() -> bool:
+                return True
+
+            def _post_prune_temp() -> bool:
+                return True
+
+            def _mutate_prune_temp() -> None:
+                run_git(route.path, "worktree", "prune")
+
+            self._execute_journal_step(
+                operation_id,
+                "prune",
+                step_order,
+                is_pre_state=_pre_prune_temp,
+                is_post_state=_post_prune_temp,
+                mutation=_mutate_prune_temp,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+        else:
+            # Configured slot lifecycle:
+            need_switch = bool(frozen.branch and frozen.branch != frozen.default_branch)
+
+            # Step 1: checkout_default
+            step_order += 1
+
+            def _pre_checkout() -> bool:
+                if not frozen.path.exists():
+                    raise ValueError("slot path missing before checkout")
+                pids = self.live_cwds(frozen.path)
+                if any(pid < 0 for pid in pids) or pids:
+                    raise ValueError(f"live process CWDs detected before checkout: {pids}")
+                snapshot = workspace_snapshot(frozen.path)
+                if not snapshot.stable or snapshot.porcelain:
+                    raise ValueError("workspace dirty or unstable before checkout")
+                ignored_raw = run_git(
+                    frozen.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
+                )
+                if any(line.startswith("!! ") for line in ignored_raw.splitlines()):
+                    raise ValueError("unexpected ignored files present before checkout")
+                if not need_switch:
+                    return True
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                curr_head = _run_git_or_none(frozen.path, "rev-parse", "HEAD")
+                return (curr_branch == frozen.branch and curr_head == frozen.head) or (
+                    curr_branch == frozen.default_branch
+                )
+
+            def _post_checkout() -> bool:
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                return curr_branch == frozen.default_branch
+
+            def _mutate_checkout() -> None:
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                if curr_branch == frozen.default_branch:
+                    return
+                exists = (
+                    _run_git_or_none(route.path, "rev-parse", "--verify", frozen.default_ref)
+                    is not None
+                )
+                if not exists:
+                    run_git(
+                        frozen.path, "checkout", "-b", frozen.default_branch, frozen.canonical_tip
+                    )
+                else:
+                    run_git(frozen.path, "checkout", frozen.default_branch)
+
+            self._execute_journal_step(
+                operation_id,
+                "checkout_default",
+                step_order,
+                is_pre_state=_pre_checkout,
+                is_post_state=_post_checkout,
+                mutation=_mutate_checkout,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 2: fast_forward_default
+            step_order += 1
+            expected_pre_head = (
+                frozen.canonical_tip if frozen.default_sha is None else frozen.default_sha
+            )
+
+            def _pre_ff() -> bool:
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                curr_head = _run_git_or_none(frozen.path, "rev-parse", "HEAD")
+                return curr_branch == frozen.default_branch and curr_head in (
+                    expected_pre_head,
+                    frozen.canonical_tip,
+                )
+
+            def _post_ff() -> bool:
+                curr_branch = _run_git_or_none(frozen.path, "branch", "--show-current")
+                curr_head = _run_git_or_none(frozen.path, "rev-parse", "HEAD")
+                return curr_branch == frozen.default_branch and curr_head == frozen.canonical_tip
+
+            def _mutate_ff() -> None:
+                curr_head = _run_git_or_none(frozen.path, "rev-parse", "HEAD")
+                if curr_head != frozen.canonical_tip:
+                    run_git(frozen.path, "merge", "--ff-only", frozen.canonical_tip)
+
+            self._execute_journal_step(
+                operation_id,
+                "fast_forward_default",
+                step_order,
+                is_pre_state=_pre_ff,
+                is_post_state=_post_ff,
+                mutation=_mutate_ff,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 3: delete_task_branch (if task branch was distinct from default branch)
+            if need_switch:
+                step_order += 1
+                task_ref = f"refs/heads/{frozen.branch}"
+
+                def _pre_del_branch() -> bool:
+                    curr = _run_git_or_none(route.path, "rev-parse", "--verify", task_ref)
+                    return curr == frozen.head
+
+                def _post_del_branch() -> bool:
+                    return _run_git_or_none(route.path, "rev-parse", "--verify", task_ref) is None
+
+                def _mutate_del_branch() -> None:
+                    run_git(route.path, "update-ref", "-d", task_ref, frozen.head)
+
+                self._execute_journal_step(
+                    operation_id,
+                    "delete_task_branch",
+                    step_order,
+                    is_pre_state=_pre_del_branch,
+                    is_post_state=_post_del_branch,
+                    mutation=_mutate_del_branch,
+                    crash_hook=crash_hook,
+                    pre_mutation_hook=pre_mutation_hook,
+                    executor_id=executor_id,
+                    fence_token=fence_token,
+                )
+
+            # Step 4: delete_checkpoint
+            step_order += 1
+
+            def _pre_del_checkpoint() -> bool:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                return curr == frozen.checkpoint_sha
+
+            def _post_del_checkpoint() -> bool:
+                return (
+                    _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                    is None
+                )
+
+            def _mutate_del_checkpoint() -> None:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", frozen.checkpoint_ref)
+                if curr is not None:
+                    run_git(
+                        route.path, "update-ref", "-d", frozen.checkpoint_ref, frozen.checkpoint_sha
+                    )
+
+            self._execute_journal_step(
+                operation_id,
+                "delete_checkpoint",
+                step_order,
+                is_pre_state=_pre_del_checkpoint,
+                is_post_state=_post_del_checkpoint,
+                mutation=_mutate_del_checkpoint,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 5: release_slot
+            step_order += 1
+
+            def _pre_release_slot() -> bool:
+                if frozen.path.exists():
+                    pids = self.live_cwds(frozen.path)
+                    if any(pid < 0 for pid in pids) or pids:
+                        raise ValueError(f"live process CWDs detected before slot release: {pids}")
+                    snapshot = workspace_snapshot(frozen.path)
+                    if not snapshot.stable or snapshot.porcelain:
+                        raise ValueError("workspace dirty or unstable before slot release")
+                    ignored_raw = run_git(
+                        frozen.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
+                    )
+                    if any(line.startswith("!! ") for line in ignored_raw.splitlines()):
+                        raise ValueError("unexpected ignored files present before slot release")
+                current = self.slots.get_slot(frozen.name)
+                return current is not None and (current.status in ("cleaning", "available"))
+
+            def _post_release_slot() -> bool:
+                current = self.slots.get_slot(frozen.name)
+                return (
+                    current is not None
+                    and current.status == "available"
+                    and current.active_job_id is None
+                )
+
+            def _mutate_release_slot() -> None:
+                current = self.slots.get_slot(frozen.name)
+                if current is not None and current.status == "cleaning":
+                    self.slots.release_cleanup(
+                        frozen.name,
+                        operation_id,
+                        frozen.generation,
+                        expected_route=frozen.route,
+                        expected_path=frozen.path,
+                        status="available",
+                        note="accepted lifecycle cleanup completed",
+                    )
+
+            self._execute_journal_step(
+                operation_id,
+                "release_slot",
+                step_order,
+                is_pre_state=_pre_release_slot,
+                is_post_state=_post_release_slot,
+                mutation=_mutate_release_slot,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+            # Step 6: prune
+            step_order += 1
+
+            def _pre_prune() -> bool:
+                return True
+
+            def _post_prune() -> bool:
+                return True
+
+            def _mutate_prune() -> None:
+                run_git(route.path, "worktree", "prune")
+
+            self._execute_journal_step(
+                operation_id,
+                "prune",
+                step_order,
+                is_pre_state=_pre_prune,
+                is_post_state=_post_prune,
+                mutation=_mutate_prune,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+    def _execute_journal_step(
+        self,
+        operation_id: str,
+        step_name: str,
+        step_order: int,
+        *,
+        is_pre_state: Callable[[], bool],
+        is_post_state: Callable[[], bool],
+        mutation: Callable[[], None],
+        crash_hook: Callable[[str], None] | None = None,
+        pre_mutation_hook: Callable[[str], None] | None = None,
+        executor_id: str,
+        fence_token: int,
+    ) -> None:
+        step = self._get_step(operation_id, step_name)
+        if step and step["status"] == "completed":
+            return
+        if step and step["status"] == "started":
+            # Restart after crash
+            if is_post_state():
+                self._set_step_status(operation_id, step_name, "completed", None)
+                if crash_hook:
+                    crash_hook(step_name)
+                return
+            if is_pre_state():
+                self.verify_fence(operation_id, executor_id, fence_token)
+                self.heartbeat_executor_lease(operation_id, executor_id, fence_token)
+                if pre_mutation_hook:
+                    pre_mutation_hook(step_name)
+                mutation()
+                if not is_post_state():
+                    raise ValueError(f"step {step_name} post-state verification failed after retry")
+                if crash_hook:
+                    crash_hook(step_name)
+                self._set_step_status(operation_id, step_name, "completed", None)
+                return
+            raise ValueError(
+                f"step {step_name} crash recovery failed: neither expected pre-state nor post-state found"
+            )
+
+        # First attempt for this step
+        if not is_pre_state():
+            raise ValueError(f"step {step_name} pre-state verification failed")
+
+        self._record_step(operation_id, step_name, step_order, "started")
+        self.verify_fence(operation_id, executor_id, fence_token)
+        self.heartbeat_executor_lease(operation_id, executor_id, fence_token)
+        if pre_mutation_hook:
+            pre_mutation_hook(step_name)
+        mutation()
+        if not is_post_state():
+            raise ValueError(f"step {step_name} post-state verification failed after mutation")
+        if crash_hook:
+            crash_hook(step_name)
+        self._set_step_status(operation_id, step_name, "completed", None)
+
+    def reconcile(self, *, refresh: bool = True, enqueue: bool = True) -> dict[str, Any]:
+        pending_by_route: dict[str, list[int]] = {}
+        if refresh:
+            for req in self.pending_reconciliation_requests():
+                pending_by_route.setdefault(req["route"], []).append(req["id"])
+
+        audit = self.audit(refresh=refresh)
+        enqueued: list[str] = []
+        if enqueue:
+            for resource in audit["resources"]:
+                if resource["classification"] != "safe-to-delete":
+                    continue
+                operation_id = str(resource["operation_id"])
+                self._record_intent(operation_id, resource["proof"])
+                enqueued.append(operation_id)
+
+        acknowledged_requests: list[int] = []
+        if refresh:
+            for route_name, req_ids in pending_by_route.items():
+                route_failed = any(
+                    res.get("route") == route_name
+                    and res.get("reasons")
+                    and any(
+                        "canonical refresh failed" in r
+                        or "inventory failed" in r
+                        or "not explicitly configured" in r
+                        for r in res["reasons"]
+                    )
+                    for res in audit["resources"]
+                )
+                if not route_failed:
+                    self.acknowledge_reconciliation_requests(req_ids)
+                    acknowledged_requests.extend(req_ids)
+
+        return {**audit, "enqueued": enqueued, "acknowledged_requests": acknowledged_requests}
+
+    def poll(
+        self, *, passes: int, interval_sec: float, max_interval_sec: float
+    ) -> list[dict[str, Any]]:
+        if passes <= 0 or interval_sec <= 0 or max_interval_sec < interval_sec:
+            raise ValueError("poll bounds must be positive and max_interval_sec >= interval_sec")
+        results = []
+        delay = interval_sec
+        for index in range(passes):
+            results.append(self.reconcile(refresh=True, enqueue=True))
+            if index + 1 < passes:
+                self.sleep(delay)
+                delay = min(max_interval_sec, delay * 2)
+        return results
+
+    def _audit_slot(
+        self,
+        slot: SlotRecord,
+        *,
+        route_cache: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        route = self.config.routes.get(slot.route)
+        base = {
+            "kind": "slot",
+            "name": slot.name,
+            "route": slot.route,
+            "path": str(slot.path),
+            "generation": slot.generation,
+        }
+        if route is None or not slot.path.exists():
+            return {
+                **base,
+                "classification": LifecycleClass.STALE.value,
+                "reasons": ["unknown route" if route is None else "registered path missing"],
+            }
+        if slot.active_job_id is not None or slot.status in {"active", "finalizing", "cleaning"}:
+            return {
+                **base,
+                "classification": LifecycleClass.ACTIVE.value,
+                "reasons": [f"slot owned by {slot.active_job_id}"],
+            }
+        try:
+            snapshot = workspace_snapshot(slot.path)
+            stat = slot.path.stat()
+        except (GitError, OSError) as exc:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [str(exc)],
+            }
+        if not snapshot.stable:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["workspace identity changed during audit"],
+            }
+        if snapshot.porcelain:
+            return {
+                **base,
+                "classification": LifecycleClass.DIRTY.value,
+                "reasons": ["tracked or untracked workspace changes"],
+            }
+
+        # Check ignored files
+        try:
+            ignored_raw = run_git(
+                slot.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
+            )
+        except GitError as exc:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"failed to check ignored workspace files: {exc}"],
+            }
+        ignored_entries = [
+            line[3:].strip() for line in ignored_raw.splitlines() if line.startswith("!! ")
+        ]
+        if ignored_entries:
+            return {
+                **base,
+                "classification": LifecycleClass.DIRTY.value,
+                "reasons": [
+                    f"unexpected ignored files present; workspace cannot be proven clean: {ignored_entries[:3]}"
+                ],
+            }
+
+        # Process CWD check
+        try:
+            pids = self.live_cwds(slot.path)
+        except (PermissionError, OSError) as exc:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"process CWD inspection permission/namespace uncertainty: {exc}"],
+            }
+        if any(pid < 0 for pid in pids):
+            reason = (
+                "process CWD inspection is unavailable on this platform"
+                if -1 in pids
+                else "process CWD inspection permission or namespace uncertainty; cannot prove slot is inactive"
+            )
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [reason],
+            }
+        if pids:
+            return {
+                **base,
+                "classification": LifecycleClass.ACTIVE.value,
+                "reasons": [f"live process CWDs: {pids}"],
+            }
+
+        r_info = route_cache.get(slot.route, {})
+        if r_info.get("error"):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [r_info["error"]],
+            }
+        canonical_ref = r_info["canonical_ref"]
+        canonical_tip = r_info["canonical_tip"]
+        canonical_url = r_info["canonical_url"]
+        common_git_dir = r_info["common_git_dir"]
+
+        if slot.path.resolve(strict=False) == route.path.resolve(strict=False):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["slot path is canonical checkout of route"],
+            }
+        slot_root = self.config.slot_root_for(slot.route)
+        if not is_same_or_child(slot.path, slot_root) or slot.path.resolve(
+            strict=False
+        ) == slot_root.resolve(strict=False):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["slot path is outside managed slot_root"],
+            }
+        if slot.name in self.config.slots:
+            configured = self.config.slots[slot.name]
+            if configured.route != slot.route or configured.path.resolve(
+                strict=False
+            ) != slot.path.resolve(strict=False):
+                return {
+                    **base,
+                    "classification": LifecycleClass.QUARANTINED.value,
+                    "reasons": ["configured slot route or path mismatch"],
+                }
+
+        try:
+            slot_common = str(
+                (slot.path / run_git(slot.path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+        except GitError as exc:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"failed to resolve slot git-common-dir: {exc}"],
+            }
+        if slot_common != common_git_dir:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["slot git-common-dir differs from route common git dir"],
+            }
+        route_worktrees = r_info.get("worktrees")
+        if route_worktrees is not None and slot.path.resolve(strict=False) not in route_worktrees:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["slot path is not in route git worktree inventory"],
+            }
+
+        accepted = self._accepted_item(slot)
+        if accepted is None or accepted.checkpoint_sha is None or accepted.checkpoint_ref is None:
+            return {
+                **base,
+                "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
+                "reasons": ["no exact accepted checkpoint receipt for slot generation"],
+            }
+        if accepted.workspace_path is not None and accepted.workspace_path.resolve(
+            strict=False
+        ) != slot.path.resolve(strict=False):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["accepted receipt workspace_path mismatch"],
+            }
+        try:
+            job = self.jobs.get_job(accepted.source_id)
+        except KeyError:
+            job = None
+        if job is not None and (
+            job.slot_name != slot.name
+            or (job.slot_generation is not None and job.slot_generation != slot.generation)
+            or job.route != slot.route
+            or job.workspace_path.resolve(strict=False) != slot.path.resolve(strict=False)
+        ):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["durable job identity mismatch with slot generation"],
+            }
+
+        valid_heads = {accepted.checkpoint_sha}
+        if accepted.base_sha is not None:
+            valid_heads.add(accepted.base_sha)
+        if snapshot.head not in valid_heads:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["slot HEAD differs from accepted checkpoint and base"],
+            }
+        try:
+            checkpoint_sha = run_git(
+                slot.path, "show-ref", "--verify", "--hash", accepted.checkpoint_ref
+            )
+        except GitError as exc:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"checkpoint ref unavailable: {exc}"],
+            }
+        if checkpoint_sha != accepted.checkpoint_sha:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": ["checkpoint ref moved"],
+            }
+        if not _is_ancestor(slot.path, accepted.checkpoint_sha, canonical_tip):
+            return {
+                **base,
+                "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
+                "reasons": ["accepted checkpoint is not canonical-reachable"],
+            }
+        if not _is_ancestor(slot.path, snapshot.head, canonical_tip):
+            return {
+                **base,
+                "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
+                "reasons": ["checkout base HEAD is not canonical-reachable"],
+            }
+
+        # Validate default branch
+        default_branch = f"slot/{slot.name}"
+        default_ref = f"refs/heads/{default_branch}"
+        default_sha = _run_git_or_none(route.path, "rev-parse", "--verify", default_ref)
+        if default_sha is not None and not _is_ancestor(route.path, default_sha, canonical_tip):
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"default branch {default_branch} has divergent or unmerged commits"],
+            }
+
+        frozen = FrozenSlot(
+            name=slot.name,
+            route=slot.route,
+            path=slot.path,
+            generation=slot.generation,
+            device=stat.st_dev,
+            inode=stat.st_ino,
+            branch=snapshot.branch,
+            head=snapshot.head or "",
+            canonical_ref=canonical_ref,
+            canonical_tip=canonical_tip,
+            canonical_url=canonical_url,
+            common_git_dir=common_git_dir,
+            checkpoint_ref=accepted.checkpoint_ref,
+            checkpoint_sha=accepted.checkpoint_sha,
+            default_branch=default_branch,
+            default_ref=default_ref,
+            default_sha=default_sha,
+            job_id=accepted.source_id,
+            base_sha=accepted.base_sha,
+        )
+        proof = {**frozen.__dict__, "path": str(frozen.path)}
+        return {
+            **base,
+            "classification": LifecycleClass.SAFE_TO_DELETE.value,
+            "reasons": [],
+            "operation_id": frozen.operation_id,
+            "proof": proof,
+        }
+
+    def _accepted_item(
+        self, slot: SlotRecord, *, expected_generation: int | None = None
+    ) -> ReviewInboxItem | None:
+        target_gen = expected_generation if expected_generation is not None else slot.generation
+        items = self.inbox.list_items(review_status="accepted", limit=500)
+        matches = [
+            item
+            for item in items
+            if item.slot_name == slot.name
+            and item.route == slot.route
+            and item.slot_generation == target_gen
+        ]
+        return (
+            max(matches, key=lambda item: item.reviewed_at or item.updated_at) if matches else None
+        )
+
+    def enqueue_reconciliation_request(self, route: str, reason: str = "acceptance") -> int:
+        self._initialize()
+        now = utc_now()
+        with control_database(self.config.database_path) as db:
+            cursor = db.execute(
+                """
+                insert into lifecycle_reconciliation_requests (route, reason, requested_at, status)
+                values (?, ?, ?, 'pending')
+                """,
+                (route, reason, now),
+            )
+            request_id = cursor.lastrowid or 0
+        self._event(
+            "reconciliation_enqueued",
+            None,
+            {"route": route, "reason": reason, "request_id": request_id},
+        )
+        return request_id
+
+    def pending_reconciliation_requests(self, route: str | None = None) -> list[dict[str, Any]]:
+        self._initialize()
+        with control_database(self.config.database_path) as db:
+            if route:
+                rows = db.execute(
+                    "select * from lifecycle_reconciliation_requests where route = ? and status = 'pending' order by id",
+                    (route,),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "select * from lifecycle_reconciliation_requests where status = 'pending' order by id",
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_reconciliation_requests(self, request_ids: list[int]) -> int:
+        if not request_ids:
+            return 0
+        self._initialize()
+        now = utc_now()
+        with control_database(self.config.database_path) as db:
+            placeholders = ",".join("?" for _ in request_ids)
+            cursor = db.execute(
+                f"""
+                update lifecycle_reconciliation_requests
+                set status = 'processed', processed_at = ?
+                where id in ({placeholders}) and status = 'pending'
+                """,  # nosec B608
+                (now, *request_ids),
+            )
+            return cursor.rowcount
+
+    def mark_reconciliation_requests_processed(self, route: str) -> None:
+        self._initialize()
+        now = utc_now()
+        with control_database(self.config.database_path) as db:
+            db.execute(
+                "update lifecycle_reconciliation_requests set status = 'processed', processed_at = ? where route = ? and status = 'pending'",
+                (now, route),
+            )
+
+    def acquire_executor_lease(
+        self,
+        operation_id: str,
+        executor_id: str,
+        lease_duration_sec: float = 30.0,
+        *,
+        owner_pid: int | None = None,
+    ) -> bool:
+        self._initialize()
+        now_sec = self.clock()
+        expires_at = now_sec + lease_duration_sec
+        pid_to_record = owner_pid if owner_pid is not None else os.getpid()
+        with control_database(self.config.database_path) as db:
+            db.execute("begin immediate")
+            row = db.execute(
+                "select executor_id, owner_pid, lease_expires_at, fence_token from lifecycle_cleanup_leases where operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is not None:
+                curr_executor = row["executor_id"]
+                curr_pid = row["owner_pid"]
+                curr_expires = float(row["lease_expires_at"])
+                curr_fence = int(row["fence_token"]) if row["fence_token"] is not None else 1
+
+                if curr_executor == executor_id:
+                    db.execute(
+                        """
+                        update lifecycle_cleanup_leases
+                        set lease_expires_at = ?, heartbeat_at = ?, owner_pid = ?
+                        where operation_id = ?
+                        """,
+                        (expires_at, utc_now(), pid_to_record, operation_id),
+                    )
+                    return True
+
+                # Different executor attempting takeover:
+                # Recovery must require proven process death or expired renewable ownership, not age alone.
+                if curr_pid is not None:
+                    if self.process_is_alive(curr_pid):
+                        # Original executor process is still alive: reject takeover even if lease_expires_at <= now_sec
+                        return False
+                else:
+                    # No owner PID recorded: require lease expiry
+                    if curr_expires > now_sec:
+                        return False
+
+                # Proven process death or expired unowned lease: allow takeover with incremented monotonic fence token
+                new_fence = curr_fence + 1
+                db.execute(
+                    """
+                    update lifecycle_cleanup_leases
+                    set executor_id = ?, owner_pid = ?, lease_expires_at = ?, fence_token = ?, acquired_at = ?, heartbeat_at = ?
+                    where operation_id = ?
+                    """,
+                    (
+                        executor_id,
+                        pid_to_record,
+                        expires_at,
+                        new_fence,
+                        utc_now(),
+                        utc_now(),
+                        operation_id,
+                    ),
+                )
+                return True
+
+            # First acquisition
+            db.execute(
+                """
+                insert into lifecycle_cleanup_leases (operation_id, executor_id, owner_pid, fence_token, lease_expires_at, acquired_at, heartbeat_at)
+                values (?, ?, ?, 1, ?, ?, ?)
+                """,
+                (operation_id, executor_id, pid_to_record, expires_at, utc_now(), utc_now()),
+            )
+            return True
+
+    def get_fence_token(self, operation_id: str, executor_id: str) -> int | None:
+        self._initialize()
+        with control_database(self.config.database_path) as db:
+            row = db.execute(
+                "select fence_token from lifecycle_cleanup_leases where operation_id = ? and executor_id = ?",
+                (operation_id, executor_id),
+            ).fetchone()
+            if row is not None and row["fence_token"] is not None:
+                return int(row["fence_token"])
+            return None
+
+    def verify_fence(self, operation_id: str, executor_id: str, fence_token: int) -> None:
+        self._initialize()
+        with control_database(self.config.database_path) as db:
+            row = db.execute(
+                "select executor_id, fence_token from lifecycle_cleanup_leases where operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    f"Lease for operation {operation_id} no longer exists; executor {executor_id} is stale"
+                )
+            if row["executor_id"] != executor_id or int(row["fence_token"]) != fence_token:
+                raise RuntimeError(
+                    f"Fencing token mismatch for operation {operation_id}: current owner is {row['executor_id']} with fence {row['fence_token']}, but caller is {executor_id} with fence {fence_token}"
+                )
+
+    def heartbeat_executor_lease(
+        self,
+        operation_id: str,
+        executor_id: str,
+        fence_token: int,
+        lease_duration_sec: float = 30.0,
+    ) -> bool:
+        self._initialize()
+        now_sec = self.clock()
+        expires_at = now_sec + lease_duration_sec
+        with control_database(self.config.database_path) as db:
+            cursor = db.execute(
+                """
+                update lifecycle_cleanup_leases
+                set lease_expires_at = ?, heartbeat_at = ?
+                where operation_id = ? and executor_id = ? and fence_token = ?
+                """,
+                (expires_at, utc_now(), operation_id, executor_id, fence_token),
+            )
+            return cursor.rowcount > 0
+
+    def release_executor_lease(
+        self, operation_id: str, executor_id: str, fence_token: int | None = None
+    ) -> None:
+        self._initialize()
+        with control_database(self.config.database_path) as db:
+            if fence_token is not None:
+                db.execute(
+                    "delete from lifecycle_cleanup_leases where operation_id = ? and executor_id = ? and fence_token = ?",
+                    (operation_id, executor_id, fence_token),
+                )
+            else:
+                db.execute(
+                    "delete from lifecycle_cleanup_leases where operation_id = ? and executor_id = ?",
+                    (operation_id, executor_id),
+                )
+
+    def _initialize(self) -> None:
+        apply_schema_migration(
+            self.config.database_path,
+            component="slot_lifecycle",
+            version=3,
+            checksum="slot-lifecycle-v3-leases-20260914",
+            migrate=_migrate,
+        )
+        apply_schema_migration(
+            self.config.database_path,
+            component="slot_lifecycle",
+            version=4,
+            checksum="slot-lifecycle-v4-fencing-20260914",
+            migrate=_migrate_v4,
+        )
+
+    def _record_intent(self, operation_id: str, proof: dict[str, Any]) -> None:
+        with control_database(self.config.database_path) as db:
+            db.execute(
+                "insert or ignore into lifecycle_cleanup_intents values (?, 'planned', ?, ?, null)",
+                (operation_id, json.dumps(proof, sort_keys=True), utc_now()),
+            )
+        self._event("cleanup_enqueued", operation_id, proof)
+
+    def _intent(self, operation_id: str) -> dict[str, Any] | None:
+        with control_database(self.config.database_path) as db:
+            row = db.execute(
+                "select * from lifecycle_cleanup_intents where operation_id = ?", (operation_id,)
+            ).fetchone()
+        return (
+            None
+            if row is None
+            else {
+                "operation_id": row["operation_id"],
+                "state": row["state"],
+                "proof": json.loads(row["proof_json"]),
+                "error": row["error"],
+            }
+        )
+
+    def _set_intent_state(self, operation_id: str, state: str, error: str | None) -> None:
+        with control_database(self.config.database_path) as db:
+            db.execute(
+                "update lifecycle_cleanup_intents set state = ?, error = ? where operation_id = ?",
+                (state, error, operation_id),
+            )
+
+    def _record_step(self, operation_id: str, step_name: str, step_order: int, status: str) -> None:
+        with control_database(self.config.database_path) as db:
+            db.execute(
+                """
+                insert into lifecycle_cleanup_steps (operation_id, step_name, step_order, status, started_at, completed_at, error)
+                values (?, ?, ?, ?, ?, null, null)
+                on conflict(operation_id, step_name) do update set
+                    status = excluded.status,
+                    started_at = excluded.started_at
+                """,
+                (operation_id, step_name, step_order, status, utc_now()),
+            )
+
+    def _set_step_status(
+        self, operation_id: str, step_name: str, status: str, error: str | None
+    ) -> None:
+        with control_database(self.config.database_path) as db:
+            completed_at = utc_now() if status == "completed" else None
+            db.execute(
+                """
+                update lifecycle_cleanup_steps
+                set status = ?, completed_at = coalesce(?, completed_at), error = ?
+                where operation_id = ? and step_name = ?
+                """,
+                (status, completed_at, error, operation_id, step_name),
+            )
+
+    def _get_step(self, operation_id: str, step_name: str) -> dict[str, Any] | None:
+        with control_database(self.config.database_path) as db:
+            row = db.execute(
+                "select * from lifecycle_cleanup_steps where operation_id = ? and step_name = ?",
+                (operation_id, step_name),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def _is_step_completed(self, operation_id: str, step_name: str) -> bool:
+        step = self._get_step(operation_id, step_name)
+        return step is not None and step.get("status") == "completed"
+
+    def _has_any_steps_started(self, operation_id: str) -> bool:
+        with control_database(self.config.database_path) as db:
+            row = db.execute(
+                "select 1 from lifecycle_cleanup_steps where operation_id = ?", (operation_id,)
+            ).fetchone()
+        return row is not None
+
+    def _quarantine(
+        self,
+        operation_id: str,
+        reason: str,
+        evidence: dict[str, Any],
+        *,
+        frozen: FrozenSlot | None = None,
+    ) -> dict[str, Any]:
+        if frozen is not None:
+            with suppress(Exception):
+                self.slots.quarantine_cleanup(
+                    frozen.name,
+                    operation_id,
+                    frozen.generation,
+                    expected_route=frozen.route,
+                    expected_path=frozen.path,
+                    note=reason,
+                )
+        self._set_intent_state(operation_id, "quarantined", reason)
+        result = {
+            "operation_id": operation_id,
+            "action": "quarantined",
+            "reason": reason,
+            "evidence": evidence,
+        }
+        self._event("cleanup_quarantined", operation_id, result)
+        return result
+
+    def _event(self, kind: str, operation_id: str | None, payload: dict[str, Any]) -> None:
+        with control_database(self.config.database_path) as db:
+            db.execute(
+                "insert into lifecycle_audit_events(event_type, operation_id, payload_json, created_at) values (?, ?, ?, ?)",
+                (kind, operation_id, json.dumps(payload, sort_keys=True), utc_now()),
+            )
+
+
+def _migrate(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        create table if not exists lifecycle_cleanup_intents (
+            operation_id text primary key,
+            state text not null,
+            proof_json text not null,
+            created_at text not null,
+            error text
+        )
+        """
+    )
+    db.execute(
+        """
+        create table if not exists lifecycle_audit_events (
+            id integer primary key autoincrement,
+            event_type text not null,
+            operation_id text,
+            payload_json text not null,
+            created_at text not null
+        )
+        """
+    )
+    db.execute(
+        """
+        create table if not exists lifecycle_cleanup_steps (
+            operation_id text not null,
+            step_name text not null,
+            step_order integer not null,
+            status text not null,
+            started_at text,
+            completed_at text,
+            error text,
+            primary key (operation_id, step_name)
+        )
+        """
+    )
+    db.execute(
+        """
+        create table if not exists lifecycle_reconciliation_requests (
+            id integer primary key autoincrement,
+            route text not null,
+            reason text not null,
+            requested_at text not null,
+            status text not null,
+            processed_at text
+        )
+        """
+    )
+    db.execute(
+        """
+        create table if not exists lifecycle_cleanup_leases (
+            operation_id text primary key,
+            executor_id text not null,
+            owner_pid integer,
+            fence_token integer not null default 1,
+            lease_expires_at real not null,
+            acquired_at text not null,
+            heartbeat_at text
+        )
+        """
+    )
+    cols = {
+        row["name"]
+        for row in db.execute("pragma table_info(lifecycle_reconciliation_requests)").fetchall()
+    }
+    if "processed_at" not in cols:
+        db.execute("alter table lifecycle_reconciliation_requests add column processed_at text")
+
+
+def _migrate_v4(db: sqlite3.Connection) -> None:
+    cols = {
+        row["name"] for row in db.execute("pragma table_info(lifecycle_cleanup_leases)").fetchall()
+    }
+    if "owner_pid" not in cols:
+        db.execute("alter table lifecycle_cleanup_leases add column owner_pid integer")
+    if "fence_token" not in cols:
+        db.execute(
+            "alter table lifecycle_cleanup_leases add column fence_token integer not null default 1"
+        )
+    if "heartbeat_at" not in cols:
+        db.execute("alter table lifecycle_cleanup_leases add column heartbeat_at text")
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    try:
+        run_git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    except GitError:
+        return False
+    return True
+
+
+def _run_git_or_none(repo: Path, *args: str) -> str | None:
+    try:
+        return run_git(repo, *args)
+    except GitError:
+        return None
+
+
+def _live_process_cwds(root: Path) -> list[int]:
+    if os.name == "nt" or not Path("/proc").is_dir():
+        return [-1]
+    canonical = root.resolve(strict=False)
+    matches: list[int] = []
+    try:
+        entries = list(Path("/proc").iterdir())
+    except (PermissionError, OSError):
+        return [-2]
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            cwd = (entry / "cwd").resolve(strict=True)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (PermissionError, OSError):
+            return [-2]
+        if cwd == canonical or cwd.is_relative_to(canonical):
+            matches.append(int(entry.name))
+    return matches
+
+
+def _parse_worktrees(output: str) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in [*output.splitlines(), ""]:
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = value
+        elif key == "branch":
+            current["branch"] = value.removeprefix("refs/heads/")
+        elif key == "HEAD":
+            current["head"] = value
+    return records

@@ -43,6 +43,7 @@ JOB_COLUMNS = {
     "read_only",
     "cancel_requested",
     "slot_name",
+    "slot_generation",
     "archived_at",
     "worker_instance_id",
     "worker_heartbeat_at",
@@ -123,6 +124,7 @@ class JobRecord:
     last_error: str | None
     cancel_requested: bool
     slot_name: str | None
+    slot_generation: int | None
     worker_instance_id: str | None
     worker_heartbeat_at: str | None
     finalization_status: str
@@ -184,6 +186,13 @@ class JobStore:
             checksum="job-store-model-observations-v7-20260801",
             migrate=self._migrate_model_observations,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="job_store",
+            version=8,
+            checksum="job-store-slot-generation-v8-20260914",
+            migrate=self._migrate_slot_generation,
+        )
         # create_attempt_metrics_table is idempotent (CREATE TABLE IF NOT EXISTS +
         # pragma-guarded ALTERs), so calling it here unconditionally on every
         # initialize() is the only mechanism by which its guarded column adds
@@ -191,6 +200,12 @@ class JobStore:
         # migration above was already recorded and therefore never re-runs.
         with self._connect() as db:
             create_attempt_metrics_table(db)
+
+    @staticmethod
+    def _migrate_slot_generation(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(jobs)").fetchall()}
+        if "slot_generation" not in columns:
+            db.execute("alter table jobs add column slot_generation integer")
 
     @staticmethod
     def _migrate_model_observations(db: sqlite3.Connection) -> None:
@@ -296,6 +311,7 @@ class JobStore:
                     allow_dirty integer not null,
                     read_only integer not null default 0,
                     slot_name text,
+                    slot_generation integer,
                     last_error text,
                     cancel_requested integer not null default 0,
                     worker_instance_id text,
@@ -380,6 +396,7 @@ class JobStore:
         codex_tool_call_budget: int | None = None,
         workspace_access: str = "ide_mcp",
         slot_name: str | None = None,
+        slot_generation: int | None = None,
         expected_result_status: str = "completed",
         controller_gate_mode: str = "full",
         launch_base_sha: str | None = None,
@@ -411,10 +428,10 @@ class JobStore:
                     codex_tool_call_budget, workspace_access,
                     launch_base_sha, brief_sha256, effective_scope_json, retry_override_reason,
                     created_at, updated_at, timeout_sec, idle_timeout_sec,
-                    print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name,
+                    print_timeout, max_restarts, yolo, allow_dirty, read_only, slot_name, slot_generation,
                     finalization_status
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -451,6 +468,7 @@ class JobStore:
                     int(allow_dirty),
                     int(read_only),
                     slot_name,
+                    slot_generation,
                     "not_started",
                 ),
             )
@@ -959,6 +977,8 @@ class JobStore:
             db.execute("alter table jobs add column read_only integer not null default 0")
         if "slot_name" not in columns:
             db.execute("alter table jobs add column slot_name text")
+        if "slot_generation" not in columns:
+            db.execute("alter table jobs add column slot_generation integer")
         if "runner_pid" not in columns:
             db.execute("alter table jobs add column runner_pid integer")
         if "backend" not in columns:
@@ -1214,6 +1234,9 @@ def _job_from_row(row: sqlite3.Row) -> JobRecord:
         last_error=row["last_error"],
         cancel_requested=bool(row["cancel_requested"]),
         slot_name=row["slot_name"],
+        slot_generation=(
+            int(row["slot_generation"]) if row["slot_generation"] is not None else None
+        ),
         worker_instance_id=row["worker_instance_id"],
         worker_heartbeat_at=row["worker_heartbeat_at"],
         finalization_status=row["finalization_status"],

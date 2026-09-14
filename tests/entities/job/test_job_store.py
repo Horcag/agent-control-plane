@@ -460,6 +460,83 @@ class JobStoreTest(unittest.TestCase):
             restarted = JobStore(database).set_runner_failure(job.job_id, "tool_timeout")
             self.assertEqual(restarted.runner_failure, "tool_timeout")
 
+    def test_slot_generation_v8_migrates_populated_pre_change_database(self) -> None:
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            database = root / "jobs.sqlite3"
+            store = JobStore(database)
+            store.initialize()
+
+            # Create an existing job before migration v8 was introduced
+            _create_job(store, root, "job-pre-v8")
+            store.update_job("job-pre-v8", slot_name="slot-alpha")
+
+            # Simulate a database populated up to migration v7 without slot_generation column
+            db = sqlite3.connect(database)
+            try:
+                db.execute("alter table jobs drop column slot_generation")
+                db.execute(
+                    "delete from schema_migrations where component = 'job_store' and version = 8"
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            # Prove pre-migration v8 database is populated and migration ledger has 1..7 applied
+            db = sqlite3.connect(database)
+            try:
+                cols_pre = {row[1] for row in db.execute("pragma table_info(jobs)").fetchall()}
+                self.assertNotIn("slot_generation", cols_pre)
+                versions = {
+                    row[0]
+                    for row in db.execute(
+                        "select version from schema_migrations where component = 'job_store'"
+                    ).fetchall()
+                }
+                self.assertEqual(versions, {1, 2, 3, 4, 5, 6, 7})
+            finally:
+                db.close()
+
+            # Initialize: triggers v8 migration (v1 is skipped because version 1 is in ledger)
+            store.initialize()
+
+            # Prove migration v8 was recorded and column was added
+            db = sqlite3.connect(database)
+            try:
+                migration = db.execute(
+                    "select checksum from schema_migrations where component = 'job_store' and version = 8"
+                ).fetchone()
+                self.assertEqual(migration, ("job-store-slot-generation-v8-20260914",))
+                cols_post = {row[1] for row in db.execute("pragma table_info(jobs)").fetchall()}
+                self.assertIn("slot_generation", cols_post)
+            finally:
+                db.close()
+
+            # Prove READ still works for existing populated pre-change record
+            read_job = store.get_job("job-pre-v8")
+            self.assertEqual(read_job.job_id, "job-pre-v8")
+            self.assertEqual(read_job.slot_name, "slot-alpha")
+            self.assertIsNone(read_job.slot_generation)
+
+            # Prove UPDATE still works (including setting slot_generation)
+            updated_job = store.update_job("job-pre-v8", slot_generation=42)
+            self.assertEqual(updated_job.slot_generation, 42)
+            self.assertEqual(store.get_job("job-pre-v8").slot_generation, 42)
+
+            # Prove CREATE still works with new schema
+            kwargs = _job_kwargs(root, "job-post-v8")
+            kwargs["task_id"] = "task-2"
+            new_job = store.create_job(
+                **kwargs,
+                slot_name="slot-beta",
+                slot_generation=99,
+            )
+            self.assertEqual(new_job.job_id, "job-post-v8")
+            self.assertEqual(new_job.slot_generation, 99)
+            self.assertEqual(store.get_job("job-post-v8").slot_generation, 99)
+
     def test_old_jobs_table_migration(self) -> None:
         import sqlite3
 

@@ -868,6 +868,11 @@ class FinalizationService:
             controller_gate_mode=job.controller_gate_mode,
             salvage_gate_evidence=salvage_gate_evidence,
         )
+        slot_generation: int | None = job.slot_generation
+        if slot_generation is None and job.slot_name:
+            slot_rec = self.slot_store.get_slot(job.slot_name)
+            if slot_rec is not None and slot_rec.active_job_id == job.job_id:
+                slot_generation = slot_rec.generation
         return self.review_inbox.upsert(
             ReviewInboxDraft(
                 source_kind="agent_job",
@@ -879,6 +884,7 @@ class FinalizationService:
                 route=job.route,
                 workspace_path=job.workspace_path,
                 slot_name=job.slot_name,
+                slot_generation=slot_generation,
                 result_path=job.result_path,
                 checkpoint_ref=checkpoint.ref_name if checkpoint else None,
                 checkpoint_sha=checkpoint.commit_sha if checkpoint else None,

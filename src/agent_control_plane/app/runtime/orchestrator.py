@@ -86,7 +86,11 @@ from agent_control_plane.features.job_watch import (
     is_settled,
     watch_command_for,
 )
-from agent_control_plane.features.lifecycle_cleanup import ArchiveService, RetentionService
+from agent_control_plane.features.lifecycle_cleanup import (
+    ArchiveService,
+    RetentionService,
+    SlotLifecycleService,
+)
 from agent_control_plane.features.plan_supervision import PlanService
 from agent_control_plane.features.result_handoff import (
     HandoffAcceptanceService,
@@ -290,6 +294,12 @@ class AgentControlPlane:
             policy_error=PolicyError,
             checkout_slot=self.checkout_slot,
             config=self.config,
+        )
+        self.slot_lifecycle = SlotLifecycleService(
+            self.config,
+            slots=self.slot_store,
+            jobs=self.store,
+            inbox=self.review_inbox,
         )
 
     @property
@@ -771,7 +781,12 @@ class AgentControlPlane:
         *,
         accepted_sha: str | None = None,
     ) -> dict[str, Any]:
-        return self.plan_service.accept_plan_task(plan_id, task_id, accepted_sha=accepted_sha)
+        result = self.plan_service.accept_plan_task(plan_id, task_id, accepted_sha=accepted_sha)
+        task = self.plan_store.get_task(plan_id, task_id)
+        result["lifecycle_refresh"] = self._lifecycle_refresh_after_acceptance(
+            route=task.get("route")
+        )
+        return result
 
     def accept_handoff(
         self,
@@ -785,7 +800,7 @@ class AgentControlPlane:
         false_positives: int = 0,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        return self.plan_service.accept_handoff(
+        result = self.plan_service.accept_handoff(
             plan_id,
             task_id,
             review_span_id=review_span_id,
@@ -795,6 +810,50 @@ class AgentControlPlane:
             false_positives=false_positives,
             notes=notes,
         )
+        task = self.plan_store.get_task(plan_id, task_id)
+        result["lifecycle_refresh"] = self._lifecycle_refresh_after_acceptance(
+            route=task.get("route")
+        )
+        return result
+
+    def lifecycle_audit(self, *, refresh: bool = True) -> dict[str, Any]:
+        return self.slot_lifecycle.audit(refresh=refresh)
+
+    def lifecycle_reconcile(self, *, refresh: bool = True) -> dict[str, Any]:
+        return self.slot_lifecycle.reconcile(refresh=refresh, enqueue=True)
+
+    def lifecycle_apply(self, operation_id: str) -> dict[str, Any]:
+        return self.slot_lifecycle.apply(operation_id)
+
+    def lifecycle_poll(
+        self, *, passes: int, interval_sec: float, max_interval_sec: float
+    ) -> list[dict[str, Any]]:
+        return self.slot_lifecycle.poll(
+            passes=passes,
+            interval_sec=interval_sec,
+            max_interval_sec=max_interval_sec,
+        )
+
+    def _lifecycle_refresh_after_acceptance(self, route: str | None = None) -> dict[str, Any]:
+        if not any(
+            route_cfg.canonical_remote and route_cfg.canonical_branch
+            for route_cfg in self.config.routes.values()
+        ):
+            return {"status": "skipped", "reason": "canonical refs are not configured"}
+        try:
+            if route and route in self.config.routes:
+                req_id = self.slot_lifecycle.enqueue_reconciliation_request(
+                    route, reason="acceptance"
+                )
+                return {"status": "enqueued", "route": route, "request_id": req_id}
+            req_ids: dict[str, int] = {}
+            for r in self.config.routes:
+                req_ids[r] = self.slot_lifecycle.enqueue_reconciliation_request(
+                    r, reason="acceptance"
+                )
+            return {"status": "enqueued", "requests": req_ids}
+        except Exception as exc:  # noqa: BLE001 - acceptance must remain durable
+            return {"status": "failed", "reason": str(exc)}
 
     def verify_continuation_handoff(
         self,
@@ -1591,7 +1650,12 @@ class AgentControlPlane:
         return self.review_inbox.get(item_id).as_dict()
 
     def resolve_review_inbox_item(self, item_id: str, decision: str) -> dict[str, Any]:
-        return self.review_inbox.resolve(item_id, decision).as_dict()
+        result = self.review_inbox.resolve(item_id, decision).as_dict()
+        if decision == "accepted":
+            result["lifecycle_refresh"] = self._lifecycle_refresh_after_acceptance(
+                route=result.get("route")
+            )
+        return result
 
     def requalify_review_inbox_item(self, item_id: str) -> dict[str, Any]:
         return self.finalization.requalify(item_id).as_dict()
@@ -1627,6 +1691,11 @@ class AgentControlPlane:
             max_files=max_files,
         ):
             matched_route, matched_slot_name = self._route_and_slot_for_scope(completion.route)
+            matched_slot_gen: int | None = None
+            if matched_slot_name:
+                slot_rec = self.slot_store.get_slot(matched_slot_name)
+                if slot_rec is not None:
+                    matched_slot_gen = slot_rec.generation
             imported.append(
                 self.review_inbox.upsert(
                     ReviewInboxDraft(
@@ -1638,6 +1707,7 @@ class AgentControlPlane:
                         route=matched_route,
                         workspace_path=completion.cwd,
                         slot_name=matched_slot_name,
+                        slot_generation=matched_slot_gen,
                         parent_thread_id=completion.parent_thread_id,
                         agent_path=completion.agent_path,
                         rollout_path=completion.rollout_path,
@@ -1910,6 +1980,12 @@ class AgentControlPlane:
                 stdout=worker_log,
                 stderr=subprocess.STDOUT,
                 creationflags=creationflags,
+                # A plan-dispatch CLI is intentionally short lived.  On POSIX the
+                # worker must not remain in its caller's process session, otherwise
+                # terminal/session teardown can kill it before the first attempt is
+                # recorded.  Windows gets the equivalent process-group boundary via
+                # creationflags above.
+                start_new_session=os.name != "nt",
             )
         self.store.add_event(
             job_id,

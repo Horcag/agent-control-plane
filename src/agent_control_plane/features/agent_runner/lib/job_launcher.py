@@ -662,12 +662,13 @@ class JobLauncher:
         self.store.add_event(job.job_id, "info", "Job created")
         if options.slot:
             try:
-                self.slots.acquire_for_job(
+                slot_record = self.slots.acquire_for_job(
                     options.slot,
                     job_id=job.job_id,
                     route=options.route,
                     allow_dirty=allow_dirty,
                 )
+                self.store.update_job(job.job_id, slot_generation=slot_record.generation)
             except self.slot_error_type as exc:
                 self.store.add_event(job.job_id, "error", str(exc))
                 return self.finish_job(job.job_id, "blocked", str(exc))

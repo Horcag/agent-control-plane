@@ -466,6 +466,31 @@ agent-control archive --older-than-days 14 --limit 50 --config .\config\workspac
 agent-control archive --older-than-days 14 --limit 50 --apply --config .\config\workspaces.toml
 ```
 
+### Accepted slot lifecycle and audit
+
+Configure `canonical_remote` and `canonical_branch` on every route eligible for
+cleanup. Without both values ACP reports the route as quarantined. Audit refreshes
+only the named branch and never deletes anything:
+
+```bash
+agent-control lifecycle audit --config .agent-work/workspaces.toml
+agent-control lifecycle reconcile --config .agent-work/workspaces.toml
+agent-control lifecycle poll --passes 3 --interval-sec 30 --max-interval-sec 300 \
+  --config .agent-work/workspaces.toml
+```
+
+`reconcile` can enqueue an exact operation after acceptance and canonical
+reachability are proved; it cannot apply it. Apply one inspected operation with
+`agent-control lifecycle apply <operation-id>`. Apply revalidates generation,
+path device/inode, tracked and untracked cleanliness, live process CWDs,
+checkpoint ref/SHA, common Git directory, remote URL, and canonical tip. Any
+mismatch is quarantined. Successful cleanup uses compare-and-delete refs, returns
+a reusable slot to `slot/<name>` (or removes an owned temporary worktree), and
+runs `git worktree prune`. The journal makes retry idempotent.
+
+Acceptance triggers the same read-only refresh/enqueue pass. Bounded polling is
+an exponential-backoff safety net and never applies cleanup itself.
+
 Retention refuses checkpoint-ref deletion when the stored SHA differs. MCP exposes the
 same durable plan, handoff, checkpoint, and reconciliation boundaries; use the CLI when
 you need a copyable audit trail. SQLite runs in WAL mode with versioned migrations and

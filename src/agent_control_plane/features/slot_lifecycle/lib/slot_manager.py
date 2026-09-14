@@ -594,9 +594,17 @@ class SlotManager:
         return decisions
 
     def _ensure_slot_path_allowed(self, path: Path, *, route: str | None = None) -> None:
+        if route is not None and route in self._config.routes:
+            route_path = self._config.routes[route].path
+            if path.resolve(strict=False) == route_path.resolve(strict=False) or is_same_or_child(
+                route_path, path
+            ):
+                raise SlotError(f"Slot path cannot be the canonical checkout: {path}")
         slot_root = self._config.slot_root_for(route)
         if not is_same_or_child(path, slot_root):
             raise SlotError(f"Slot path is outside slot_root: {path}")
+        if path.resolve(strict=False) == slot_root.resolve(strict=False):
+            raise SlotError(f"Slot path cannot be the slot_root itself: {path}")
 
     def _route_worktree_base(self, route: str) -> Path:
         route_config = self._config.routes.get(route)

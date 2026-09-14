@@ -278,6 +278,9 @@ rate_card_source = "operator-supplied example rates; verify before use"
 [routes.app]
 path = "../my-project"
 required_branch = "main"
+# Lifecycle cleanup is disabled for a route until both values are explicit.
+canonical_remote = "origin"
+canonical_branch = "main"
 # Optional route override: "ide_mcp" or "native". A per-job override has priority.
 # Codex and Claude Code support both modes; agy is ide_mcp only.
 # workspace_access = "native"

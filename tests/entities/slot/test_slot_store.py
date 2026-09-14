@@ -103,6 +103,147 @@ class SlotStoreTest(unittest.TestCase):
 
             self.assertEqual(synced.note, "checkpoint ref abc")
 
+    def test_register_slot_refuses_remapping_active_or_cleaning_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", root / "slots" / "main-1")
+            store.acquire_slot("main-1", "job-1")
+
+            # Active slot cannot be remapped to different route or path
+            with self.assertRaises(SlotStoreError):
+                store.register_slot("main-1", "other", root / "slots" / "main-1")
+            with self.assertRaises(SlotStoreError):
+                store.register_slot("main-1", "main", root / "slots" / "other-1")
+
+            # Release slot to available
+            store.release_slot("main-1", "job-1")
+            # Claim for cleanup
+            store.claim_for_cleanup(
+                "main-1",
+                "op-1",
+                expected_generation=2,
+                expected_route="main",
+                expected_path=root / "slots" / "main-1",
+            )
+            # Cleaning slot cannot be remapped
+            with self.assertRaises(SlotStoreError):
+                store.register_slot("main-1", "other", root / "slots" / "main-1")
+            with self.assertRaises(SlotStoreError):
+                store.register_slot("main-1", "main", root / "slots" / "other-1")
+
+    def test_register_slot_increments_generation_on_inactive_metadata_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SlotStore(root / "jobs.sqlite3")
+            initial = store.register_slot("main-1", "main", root / "slots" / "main-1")
+            self.assertEqual(initial.generation, 1)
+
+            # Same metadata does not increment generation
+            same = store.register_slot("main-1", "main", root / "slots" / "main-1")
+            self.assertEqual(same.generation, 1)
+
+            # Inactive path change increments generation
+            updated = store.register_slot("main-1", "main", root / "slots" / "main-2")
+            self.assertEqual(updated.generation, 2)
+            self.assertEqual(updated.path, root / "slots" / "main-2")
+
+            # Inactive route change increments generation
+            updated2 = store.register_slot("main-1", "route2", root / "slots" / "main-2")
+            self.assertEqual(updated2.generation, 3)
+            self.assertEqual(updated2.route, "route2")
+
+    def test_cas_fencing_on_cleanup_transitions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", root / "slots" / "main-1")
+
+            # claim_for_cleanup CAS checks
+            with self.assertRaises(SlotStoreError):
+                store.claim_for_cleanup(
+                    "main-1", "op-1", expected_generation=99, expected_route="main"
+                )
+            with self.assertRaises(SlotStoreError):
+                store.claim_for_cleanup(
+                    "main-1", "op-1", expected_generation=1, expected_route="wrong"
+                )
+            with self.assertRaises(SlotStoreError):
+                store.claim_for_cleanup(
+                    "main-1",
+                    "op-1",
+                    expected_generation=1,
+                    expected_path=root / "slots" / "wrong",
+                )
+
+            # Successful claim
+            claimed = store.claim_for_cleanup(
+                "main-1",
+                "op-1",
+                expected_generation=1,
+                expected_route="main",
+                expected_path=root / "slots" / "main-1",
+            )
+            self.assertEqual(claimed.status, "cleaning")
+            self.assertEqual(claimed.generation, 1)
+
+            # release_cleanup CAS checks
+            with self.assertRaises(SlotStoreError):
+                store.release_cleanup("main-1", "op-wrong", 1)
+            with self.assertRaises(SlotStoreError):
+                store.release_cleanup("main-1", "op-1", 99)
+            with self.assertRaises(SlotStoreError):
+                store.release_cleanup("main-1", "op-1", 1, expected_route="wrong")
+            with self.assertRaises(SlotStoreError):
+                store.release_cleanup("main-1", "op-1", 1, expected_path=root / "slots" / "wrong")
+
+            # quarantine_cleanup CAS checks
+            with self.assertRaises(SlotStoreError):
+                store.quarantine_cleanup("main-1", "op-1", 99)
+            with self.assertRaises(SlotStoreError):
+                store.quarantine_cleanup("main-1", "op-1", 1, expected_route="wrong")
+
+            # Successful release
+            released = store.release_cleanup(
+                "main-1",
+                "op-1",
+                1,
+                expected_route="main",
+                expected_path=root / "slots" / "main-1",
+            )
+            self.assertEqual(released.status, "available")
+            self.assertEqual(released.generation, 2)
+
+    def test_mark_deleted_cas_and_refuses_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", root / "slots" / "main-1")
+            store.acquire_slot("main-1", "job-1")
+
+            # Active slot refuses mark_deleted without force
+            with self.assertRaises(SlotStoreError):
+                store.mark_deleted("main-1")
+
+            # CAS conditions on mark_deleted
+            store.release_slot("main-1", "job-1")
+            current = store.require_slot("main-1")
+
+            with self.assertRaises(SlotStoreError):
+                store.mark_deleted("main-1", expected_generation=99)
+            with self.assertRaises(SlotStoreError):
+                store.mark_deleted("main-1", expected_route="wrong")
+            with self.assertRaises(SlotStoreError):
+                store.mark_deleted("main-1", expected_path=root / "slots" / "wrong")
+
+            deleted = store.mark_deleted(
+                "main-1",
+                expected_generation=current.generation,
+                expected_route="main",
+                expected_path=root / "slots" / "main-1",
+            )
+            self.assertEqual(deleted.status, "deleted")
+
 
 if __name__ == "__main__":
     unittest.main()

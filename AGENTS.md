@@ -55,3 +55,9 @@
 - During a plane migration, keep existing jobs, plans, review records, and occupied slots
   in their original database. New planes use distinct slot paths; never duplicate a live
   slot's ownership across databases. Preserve historical artifact references.
+- Accepted-resource cleanup is a separate durable lifecycle. Configure an exact canonical
+  remote and branch per route; audit/reconcile may refresh and enqueue, but never delete.
+  Apply one frozen operation only after revalidating slot generation, registered path and
+  filesystem identity, full tracked/untracked cleanliness, live process CWDs, exact
+  checkpoint/acceptance identity, repository identity, remote URL, and canonical tip.
+  Unknown, dirty, active, divergent, local-only, reused, or moved resources are quarantined.

@@ -27,6 +27,7 @@ class ReviewInboxDraft:
     route: str | None = None
     workspace_path: Path | None = None
     slot_name: str | None = None
+    slot_generation: int | None = None
     parent_thread_id: str | None = None
     agent_path: str | None = None
     result_path: Path | None = None
@@ -55,6 +56,7 @@ class ReviewInboxItem:
     route: str | None
     workspace_path: Path | None
     slot_name: str | None
+    slot_generation: int | None
     parent_thread_id: str | None
     agent_path: str | None
     result_path: Path | None
@@ -93,6 +95,7 @@ class ReviewInboxItem:
             "route": self.route,
             "workspace_path": str(self.workspace_path) if self.workspace_path else None,
             "slot_name": self.slot_name,
+            "slot_generation": self.slot_generation,
             "parent_thread_id": self.parent_thread_id,
             "agent_path": self.agent_path,
             "result_path": str(self.result_path) if self.result_path else None,
@@ -149,6 +152,22 @@ class ReviewInboxStore:
             checksum="review-inbox-requalify-v3-20260722",
             migrate=self._migrate_requalify_schema,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="review_inbox_store",
+            version=4,
+            checksum="review-inbox-slot-generation-v4-20260914",
+            migrate=self._migrate_slot_generation,
+        )
+
+    @staticmethod
+    def _migrate_slot_generation(db: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in db.execute("pragma table_info(review_inbox_items)").fetchall()
+        }
+        if "slot_generation" not in columns:
+            db.execute("alter table review_inbox_items add column slot_generation integer")
 
     @staticmethod
     def _migrate_schema(db: sqlite3.Connection) -> None:
@@ -166,6 +185,7 @@ class ReviewInboxStore:
                     route text,
                     workspace_path text,
                     slot_name text,
+                    slot_generation integer,
                     parent_thread_id text,
                     agent_path text,
                     result_path text,
@@ -244,6 +264,8 @@ class ReviewInboxStore:
             db.execute("alter table review_inbox_items add column source_completed_at text")
         if "verification_bundle_json" not in columns:
             db.execute("alter table review_inbox_items add column verification_bundle_json text")
+        if "slot_generation" not in columns:
+            db.execute("alter table review_inbox_items add column slot_generation integer")
         db.execute(
             """
             create index if not exists review_inbox_pending_idx
@@ -283,13 +305,13 @@ class ReviewInboxStore:
                 insert into review_inbox_items (
                     item_id, source_kind, source_id, source_status, source_completed_at,
                     delivery_status,
-                    review_status, task_id, route, workspace_path, slot_name,
+                    review_status, task_id, route, workspace_path, slot_name, slot_generation,
                     parent_thread_id, agent_path, result_path, rollout_path,
                     checkpoint_ref, checkpoint_sha, checkpoint_tree_sha, base_sha,
                     result_excerpt, verification_bundle_json, checkpoint_error, slot_released,
                     created_at, updated_at, reviewed_at
                 )
-                values (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null)
+                values (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null)
                 on conflict(source_kind, source_id) do update set
                     source_status = excluded.source_status,
                     source_completed_at = excluded.source_completed_at,
@@ -298,6 +320,11 @@ class ReviewInboxStore:
                     route = excluded.route,
                     workspace_path = excluded.workspace_path,
                     slot_name = excluded.slot_name,
+                    slot_generation = case
+                        when review_inbox_items.review_status = 'accepted' and review_inbox_items.slot_generation is not null
+                        then review_inbox_items.slot_generation
+                        else coalesce(excluded.slot_generation, review_inbox_items.slot_generation)
+                    end,
                     parent_thread_id = excluded.parent_thread_id,
                     agent_path = excluded.agent_path,
                     result_path = excluded.result_path,
@@ -323,6 +350,7 @@ class ReviewInboxStore:
                     draft.route,
                     _path_text(draft.workspace_path),
                     draft.slot_name,
+                    draft.slot_generation,
                     draft.parent_thread_id,
                     draft.agent_path,
                     _path_text(draft.result_path),
@@ -617,6 +645,11 @@ def _item_from_row(row: sqlite3.Row) -> ReviewInboxItem:
         route=row["route"],
         workspace_path=_optional_path(row["workspace_path"]),
         slot_name=row["slot_name"],
+        slot_generation=(
+            int(row["slot_generation"])
+            if "slot_generation" in columns and row["slot_generation"] is not None
+            else None
+        ),
         parent_thread_id=row["parent_thread_id"],
         agent_path=row["agent_path"],
         result_path=_optional_path(row["result_path"]),

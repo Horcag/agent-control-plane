@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
@@ -22,6 +23,7 @@ class SlotRecord:
     last_used_at: str | None
     use_count: int
     note: str | None
+    generation: int
 
 
 class SlotStore:
@@ -36,6 +38,19 @@ class SlotStore:
             checksum="slot-store-v1-20260715",
             migrate=self._migrate_schema,
         )
+        apply_schema_migration(
+            self.database_path,
+            component="slot_store",
+            version=2,
+            checksum="slot-store-generation-v2-20260914",
+            migrate=self._migrate_generation,
+        )
+
+    @staticmethod
+    def _migrate_generation(db: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in db.execute("pragma table_info(slots)").fetchall()}
+        if "generation" not in columns:
+            db.execute("alter table slots add column generation integer not null default 1")
 
     @staticmethod
     def _migrate_schema(db: sqlite3.Connection) -> None:
@@ -80,14 +95,43 @@ class SlotStore:
                     (name, route, str(path), "available", now, now, note),
                 )
             else:
-                db.execute(
-                    """
-                    update slots
-                    set route = ?, path = ?, updated_at = ?
-                    where name = ?
-                    """,
-                    (route, str(path), now, name),
-                )
+                if existing.active_job_id is not None or existing.status in {
+                    "active",
+                    "finalizing",
+                    "cleaning",
+                }:
+                    raise SlotStoreError(
+                        f"Cannot remap owned or cleaning slot {name} (status={existing.status!r}, active_job_id={existing.active_job_id!r})"
+                    )
+                metadata_changed = existing.route != route or existing.path.resolve(
+                    strict=False
+                ) != path.resolve(strict=False)
+                if metadata_changed:
+                    cursor = db.execute(
+                        """
+                        update slots
+                        set route = ?, path = ?, updated_at = ?, generation = generation + 1
+                        where name = ?
+                          and active_job_id is null
+                          and status not in ('active', 'finalizing', 'cleaning')
+                        """,
+                        (route, str(path), now, name),
+                    )
+                    if cursor.rowcount != 1:
+                        raise SlotStoreError(
+                            f"Cannot remap slot {name}: slot became active or cleaning concurrently"
+                        )
+                else:
+                    db.execute(
+                        """
+                        update slots
+                        set updated_at = ?
+                        where name = ?
+                          and active_job_id is null
+                          and status not in ('active', 'finalizing', 'cleaning')
+                        """,
+                        (now, name),
+                    )
         return self.require_slot(name)
 
     def mark_available(self, name: str, *, note: str | None = None) -> SlotRecord:
@@ -97,7 +141,7 @@ class SlotStore:
         normalized = status.strip()
         if not normalized:
             raise ValueError("Slot status must not be empty")
-        if normalized in {"active", "finalizing"}:
+        if normalized in {"active", "finalizing", "cleaning"}:
             raise ValueError(f"Slot status {normalized!r} requires an explicit owner operation")
         return self._update_inactive_status(name, normalized, note)
 
@@ -107,20 +151,188 @@ class SlotStore:
         *,
         note: str | None = None,
         force: bool = False,
+        expected_generation: int | None = None,
+        expected_route: str | None = None,
+        expected_path: Path | str | None = None,
+        expected_operation_id: str | None = None,
     ) -> SlotRecord:
-        if not force:
-            return self._update_inactive_status(name, "deleted", note)
         self.initialize()
+        now = utc_now()
+        conditions = ["name = ?"]
+        params: list[Any] = [now, note]
+        if not force:
+            conditions.append("active_job_id is null")
+            conditions.append("status not in ('active', 'finalizing', 'cleaning')")
+        if expected_operation_id is not None:
+            conditions.append("active_job_id = ?")
+        if expected_generation is not None:
+            conditions.append("generation = ?")
+        if expected_route is not None:
+            conditions.append("route = ?")
+        if expected_path is not None:
+            conditions.append("path = ?")
+        params.append(name)
+        if expected_operation_id is not None:
+            params.append(expected_operation_id)
+        if expected_generation is not None:
+            params.append(expected_generation)
+        if expected_route is not None:
+            params.append(expected_route)
+        if expected_path is not None:
+            params.append(str(expected_path))
         with self._connect() as db:
             cursor = db.execute(
-                """
+                f"""
                 update slots set status = 'deleted', active_job_id = null,
-                    updated_at = ?, note = ? where name = ?
-                """,
-                (utc_now(), note, name),
+                    updated_at = ?, note = ?, generation = generation + 1
+                where {" and ".join(conditions)}
+                """,  # nosec B608
+                tuple(params),
             )
             if cursor.rowcount != 1:
-                raise SlotStoreError(f"Slot is missing: {name}")
+                raise SlotStoreError(f"Slot is missing or condition mismatch: {name}")
+        return self.require_slot(name)
+
+    def claim_for_cleanup(
+        self,
+        name: str,
+        operation_id: str,
+        expected_generation: int,
+        *,
+        expected_route: str | None = None,
+        expected_path: Path | str | None = None,
+    ) -> SlotRecord:
+        """Atomically claim an available slot for lifecycle cleanup, bound to operation ID and generation."""
+        self.initialize()
+        now = utc_now()
+        conditions = [
+            "name = ?",
+            "active_job_id is null",
+            "status = 'available'",
+            "generation = ?",
+        ]
+        params: list[Any] = [operation_id, now, name, expected_generation]
+        if expected_route is not None:
+            conditions.append("route = ?")
+            params.append(expected_route)
+        if expected_path is not None:
+            conditions.append("path = ?")
+            params.append(str(expected_path))
+        with self._connect() as db:
+            cursor = db.execute(
+                f"""
+                update slots
+                set status = 'cleaning',
+                    active_job_id = ?,
+                    updated_at = ?,
+                    note = 'lifecycle cleanup in progress'
+                where {" and ".join(conditions)}
+                """,  # nosec B608
+                tuple(params),
+            )
+            if cursor.rowcount != 1:
+                raise SlotStoreError(
+                    f"Slot {name} cannot be claimed for cleanup: active, wrong status, or generation mismatch"
+                )
+        return self.require_slot(name)
+
+    def release_cleanup(
+        self,
+        name: str,
+        operation_id: str,
+        expected_generation: int,
+        *,
+        expected_route: str | None = None,
+        expected_path: Path | str | None = None,
+        status: str = "available",
+        note: str | None = None,
+    ) -> SlotRecord:
+        self.initialize()
+        now = utc_now()
+        conditions = [
+            "name = ?",
+            "active_job_id = ?",
+            "status = 'cleaning'",
+            "generation = ?",
+        ]
+        params: list[Any] = [status, now, note, name, operation_id, expected_generation]
+        if expected_route is not None:
+            conditions.append("route = ?")
+            params.append(expected_route)
+        if expected_path is not None:
+            conditions.append("path = ?")
+            params.append(str(expected_path))
+        with self._connect() as db:
+            cursor = db.execute(
+                f"""
+                update slots
+                set status = ?,
+                    active_job_id = null,
+                    updated_at = ?,
+                    note = ?,
+                    generation = generation + 1
+                where {" and ".join(conditions)}
+                """,  # nosec B608
+                tuple(params),
+            )
+            if cursor.rowcount != 1:
+                detail = f"at generation {expected_generation}"
+                if expected_route is not None:
+                    detail += f", route {expected_route}"
+                if expected_path is not None:
+                    detail += f", path {expected_path}"
+                raise SlotStoreError(
+                    f"Slot {name} is not claimed for cleanup by operation {operation_id} {detail}"
+                )
+        return self.require_slot(name)
+
+    def quarantine_cleanup(
+        self,
+        name: str,
+        operation_id: str,
+        expected_generation: int,
+        *,
+        expected_route: str | None = None,
+        expected_path: Path | str | None = None,
+        note: str | None = None,
+    ) -> SlotRecord:
+        self.initialize()
+        now = utc_now()
+        conditions = [
+            "name = ?",
+            "active_job_id = ?",
+            "status = 'cleaning'",
+            "generation = ?",
+        ]
+        params: list[Any] = [now, note, name, operation_id, expected_generation]
+        if expected_route is not None:
+            conditions.append("route = ?")
+            params.append(expected_route)
+        if expected_path is not None:
+            conditions.append("path = ?")
+            params.append(str(expected_path))
+        with self._connect() as db:
+            cursor = db.execute(
+                f"""
+                update slots
+                set status = 'quarantined',
+                    active_job_id = null,
+                    updated_at = ?,
+                    note = ?,
+                    generation = generation + 1
+                where {" and ".join(conditions)}
+                """,  # nosec B608
+                tuple(params),
+            )
+            if cursor.rowcount != 1:
+                detail = f"at generation {expected_generation}"
+                if expected_route is not None:
+                    detail += f", route {expected_route}"
+                if expected_path is not None:
+                    detail += f", path {expected_path}"
+                raise SlotStoreError(
+                    f"Slot {name} is not claimed for cleanup by operation {operation_id} {detail}"
+                )
         return self.require_slot(name)
 
     def acquire_slot(self, name: str, job_id: str) -> SlotRecord:
@@ -136,6 +348,7 @@ class SlotStore:
                     last_used_at = ?,
                     use_count = use_count + 1,
                     note = null
+                    , generation = generation + 1
                 where name = ? and active_job_id is null and status = 'available'
                 """,
                 (job_id, now, now, name),
@@ -250,4 +463,5 @@ def _slot_from_row(row: sqlite3.Row) -> SlotRecord:
         last_used_at=row["last_used_at"],
         use_count=row["use_count"],
         note=row["note"],
+        generation=int(row["generation"]),
     )
