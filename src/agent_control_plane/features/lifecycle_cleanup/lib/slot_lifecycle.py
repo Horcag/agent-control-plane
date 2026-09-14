@@ -4,6 +4,7 @@ import hashlib
 import json
 import ntpath
 import os
+import posixpath
 import shutil
 import sqlite3
 import sys
@@ -3605,18 +3606,30 @@ def prep_symlink_targets_equal(
     and safe standard extended-prefix removal on Windows.
     Preserves exact POSIX behavior and rejects genuinely different targets.
     """
-    if actual == expected:
+    if platform == "win32":
+        if actual == expected:
+            return True
+        try:
+            if actual.exists() and expected.exists() and os.path.samefile(actual, expected):
+                return True
+        except OSError:
+            pass
+        return canonical_windows_path(actual) == canonical_windows_path(expected)
+
+    # For non-win32 semantics, compare path representations with POSIX
+    # case-sensitive identity and preserve real POSIX same-path behavior as needed.
+    posix_actual = posixpath.normpath(actual.as_posix())
+    posix_expected = posixpath.normpath(expected.as_posix())
+    if posix_actual == posix_expected:
         return True
 
-    # Prefer filesystem identity when both targets exist
     try:
         if actual.exists() and expected.exists() and os.path.samefile(actual, expected):
-            return True
+            if sys.platform != "win32":
+                return True
+            return posix_actual.casefold() != posix_expected.casefold()
     except OSError:
         pass
-
-    if platform == "win32":
-        return canonical_windows_path(actual) == canonical_windows_path(expected)
 
     return False
 

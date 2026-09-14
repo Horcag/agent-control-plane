@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -4807,6 +4808,31 @@ def test_prep_symlink_targets_equal_posix_preservation(tmp_path: Path) -> None:
     p1 = tmp_path / "nonexistent"
     p2 = tmp_path / "NONEXISTENT"
     assert not prep_symlink_targets_equal(p1, p2, platform="linux")
+
+
+def test_prep_symlink_targets_equal_windows_path_host_posix_semantics() -> None:
+    # Regression for TIG-461: on Windows runners, Path instances are WindowsPath host
+    # objects whose equality operator is case-insensitive (w1 == w2 is True).
+    # When requesting POSIX semantics (platform="linux"), case difference must remain unequal.
+    if sys.platform == "win32":
+        w1 = Path(r"C:\repo\nonexistent")
+        w2 = Path(r"C:\repo\NONEXISTENT")
+    else:
+        orig_new = pathlib.WindowsPath.__new__
+        try:
+            pathlib.WindowsPath.__new__ = (  # type: ignore[method-assign]
+                lambda cls, *args, **kwargs: pathlib.PureWindowsPath.__new__(cls, *args, **kwargs)
+            )
+            w1 = pathlib.WindowsPath(r"C:\repo\nonexistent")
+            w2 = pathlib.WindowsPath(r"C:\repo\NONEXISTENT")
+        finally:
+            pathlib.WindowsPath.__new__ = orig_new  # type: ignore[method-assign]
+
+    assert isinstance(w1, pathlib.WindowsPath)
+    assert isinstance(w2, pathlib.WindowsPath)
+    assert w1 == w2  # Host WindowsPath equality is case-insensitive
+    assert not prep_symlink_targets_equal(w1, w2, platform="linux")
+    assert prep_symlink_targets_equal(w1, w1, platform="linux")
 
 
 def test_is_symlink_or_junction_semantics(tmp_path: Path) -> None:
