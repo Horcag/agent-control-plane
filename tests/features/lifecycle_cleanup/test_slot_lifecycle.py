@@ -17,6 +17,11 @@ from agent_control_plane.entities.job import JobStore
 from agent_control_plane.entities.review_inbox import ReviewInboxDraft, ReviewInboxStore
 from agent_control_plane.entities.slot import SlotRecord, SlotStore, SlotStoreError
 from agent_control_plane.features.lifecycle_cleanup import SlotLifecycleService
+from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+    canonical_windows_path,
+    is_symlink_or_junction,
+    prep_symlink_targets_equal,
+)
 from agent_control_plane.features.slot_lifecycle.lib.slot_manager import SlotError
 from agent_control_plane.shared.config import (
     ControlConfig,
@@ -4661,3 +4666,161 @@ def test_auto_return_fails_closed_on_ignored_file_appearing_after_claim(tmp_path
 
     # Branch must NOT be mutated: slot remains on task/app-1
     assert run_git(slot, "branch", "--show-current") == "task/app-1"
+
+
+def test_canonical_windows_path_extended_and_ordinary_drive_paths() -> None:
+    # Equivalent extended (\\?\ and \??\) and ordinary paths
+    assert canonical_windows_path(r"\\?\C:\repo\canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"\??\C:\repo\canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path("//?/C:/repo/canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path("C:/repo/canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+
+
+def test_canonical_windows_path_extended_and_ordinary_unc_paths() -> None:
+    # Equivalent extended (\\?\UNC\ and \??\UNC\) and ordinary UNC paths
+    assert canonical_windows_path(r"\\?\UNC\server\share\venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+    assert canonical_windows_path(r"\\?\unc\server\share\venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+    assert canonical_windows_path(r"\\?\Unc\server\share\venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+    assert canonical_windows_path(r"\??\UNC\server\share\venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+    assert canonical_windows_path("//?/UNC/server/share/venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+
+
+def test_canonical_windows_path_case_normalization() -> None:
+    # Windows paths are case-insensitive
+    assert canonical_windows_path(r"C:\Repo\Canonical_Venv") == canonical_windows_path(
+        r"c:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"\\?\C:\REPO\CANONICAL_VENV") == canonical_windows_path(
+        r"c:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"\\?\UNC\SERVER\SHARE\venv") == canonical_windows_path(
+        r"\\server\share\venv"
+    )
+
+
+def test_canonical_windows_path_dot_segments_and_separators() -> None:
+    # Redundant separators and dot segments normalize cleanly
+    assert canonical_windows_path(r"C:\repo\sub\..\canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"\\?\C:\repo\sub\..\canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"C:\repo\.\canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+    assert canonical_windows_path("C:/repo//canonical_venv") == canonical_windows_path(
+        r"C:\repo\canonical_venv"
+    )
+
+
+def test_canonical_windows_path_rejects_genuinely_different_targets() -> None:
+    # Different directory targets must never match
+    assert canonical_windows_path(r"\\?\C:\repo\canonical_venv") != canonical_windows_path(
+        r"C:\repo\wrong_venv"
+    )
+    assert canonical_windows_path(r"C:\repo\canonical_venv") != canonical_windows_path(
+        r"C:\repo\canonical_venv_2"
+    )
+    assert canonical_windows_path(r"C:\repo\canonical_venv") != canonical_windows_path(
+        r"D:\repo\canonical_venv"
+    )
+    assert canonical_windows_path(r"\\server1\share\venv") != canonical_windows_path(
+        r"\\server2\share\venv"
+    )
+    # Target checks must NOT use basename, suffix, or lexical containment
+    assert canonical_windows_path(r"C:\repo\canonical_venv") != canonical_windows_path(
+        r"C:\other\canonical_venv"
+    )
+    assert canonical_windows_path(r"C:\prefix_canonical_venv") != canonical_windows_path(
+        r"C:\canonical_venv"
+    )
+    assert canonical_windows_path(r"C:\a\canonical_venv\b") != canonical_windows_path(
+        r"C:\canonical_venv"
+    )
+
+
+def test_prep_symlink_targets_equal_windows_platform() -> None:
+    # Windows platform semantics: extended path equivalence and case normalization
+    assert prep_symlink_targets_equal(
+        Path(r"\\?\C:\repo\canonical_venv"),
+        Path(r"C:\repo\canonical_venv"),
+        platform="win32",
+    )
+    assert prep_symlink_targets_equal(
+        Path(r"\??\C:\repo\canonical_venv"),
+        Path(r"C:\repo\canonical_venv"),
+        platform="win32",
+    )
+    assert prep_symlink_targets_equal(
+        Path(r"C:\Repo\Canonical_Venv"),
+        Path(r"c:\repo\canonical_venv"),
+        platform="win32",
+    )
+    # Reject genuinely different targets
+    assert not prep_symlink_targets_equal(
+        Path(r"\\?\C:\repo\wrong_venv"),
+        Path(r"C:\repo\canonical_venv"),
+        platform="win32",
+    )
+    assert not prep_symlink_targets_equal(
+        Path(r"C:\other\canonical_venv"),
+        Path(r"C:\repo\canonical_venv"),
+        platform="win32",
+    )
+    assert not prep_symlink_targets_equal(
+        Path(r"C:\repo\canonical_venv"),
+        Path(r"D:\repo\canonical_venv"),
+        platform="win32",
+    )
+
+
+def test_prep_symlink_targets_equal_posix_preservation(tmp_path: Path) -> None:
+    d1 = tmp_path / "venv1"
+    d1.mkdir()
+    d2 = tmp_path / "venv2"
+    d2.mkdir()
+
+    # Filesystem identity via os.path.samefile works on existing targets
+    assert prep_symlink_targets_equal(d1, d1, platform="linux")
+    assert not prep_symlink_targets_equal(d1, d2, platform="linux")
+
+    # Non-existing targets on POSIX reject non-identical raw paths
+    p1 = tmp_path / "nonexistent"
+    p2 = tmp_path / "NONEXISTENT"
+    assert not prep_symlink_targets_equal(p1, p2, platform="linux")
+
+
+def test_is_symlink_or_junction_semantics(tmp_path: Path) -> None:
+    target = tmp_path / "target_dir"
+    target.mkdir()
+    link = tmp_path / "symlink_dir"
+    os.symlink(target, link)
+
+    regular_dir = tmp_path / "reg_dir"
+    regular_dir.mkdir()
+    regular_file = tmp_path / "file.txt"
+    regular_file.write_text("content", encoding="utf-8")
+
+    assert is_symlink_or_junction(link)
+    assert not is_symlink_or_junction(regular_dir)
+    assert not is_symlink_or_junction(regular_file)
+    assert not is_symlink_or_junction(tmp_path / "nonexistent")

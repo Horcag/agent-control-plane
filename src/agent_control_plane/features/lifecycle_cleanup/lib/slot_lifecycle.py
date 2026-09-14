@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import sqlite3
+import sys
 import time
 from collections.abc import Callable, Sequence
 from contextlib import suppress
@@ -2452,7 +2454,7 @@ class SlotLifecycleService:
                     strict=False
                 ) == slot.path.resolve(strict=False):
                     raise ValueError(f"disposable cache path outside slot: {cache_path}")
-                if cache_path.is_symlink():
+                if is_symlink_or_junction(cache_path):
                     raise ValueError(f"refusing to remove symlink as cache: {cache_path}")
                 if cache_path.is_dir():
                     shutil.rmtree(cache_path)
@@ -3486,6 +3488,8 @@ def _get_allowed_prep_symlinks(
                     link_str = Path(target_str).name
                 else:
                     continue
+                if sys.platform == "win32" and target_str.startswith("\\??\\"):
+                    target_str = "\\\\?\\" + target_str[4:]
                 target_p = Path(target_str)
                 if target_p.is_absolute():
                     expected_target = target_p.resolve(strict=False)
@@ -3520,6 +3524,8 @@ def _get_allowed_prep_symlinks(
             non_flags = [p for p in mklink_args if not p.startswith("/")]
             if len(non_flags) >= 2:
                 link_str, target_str = non_flags[0], non_flags[1]
+                if sys.platform == "win32" and target_str.startswith("\\??\\"):
+                    target_str = "\\\\?\\" + target_str[4:]
                 target_p = Path(target_str)
                 if target_p.is_absolute():
                     expected_target = target_p.resolve(strict=False)
@@ -3546,6 +3552,75 @@ def _get_allowed_prep_symlinks(
     return allowed
 
 
+def is_symlink_or_junction(path: Path, *, platform: str = sys.platform) -> bool:
+    """Check if path is a symbolic link or Windows directory junction."""
+    if path.is_symlink():
+        return True
+    if platform == "win32":
+        is_junc = getattr(path, "is_junction", None)
+        if callable(is_junc):
+            try:
+                if is_junc():
+                    return True
+            except OSError:
+                pass
+        is_junc_os = getattr(os.path, "isjunction", None)
+        if callable(is_junc_os):
+            try:
+                if is_junc_os(path):
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def canonical_windows_path(path: str | os.PathLike[str]) -> str:
+    """Normalize a Windows path to a canonical representation for identity comparison.
+
+    Safely removes standard extended-length prefixes (\\\\?\\ and \\??\\) for both
+    drive-letter and UNC paths, resolving dot-segments and applying normpath and normcase.
+    Does not use basename, suffix, lexical containment, or case-sensitive raw strings.
+    """
+    s = os.fspath(path)
+    norm = ntpath.normpath(s)
+    # Check for extended UNC paths: \\?\UNC\server\share or \??\UNC\server\share
+    if norm[:8].upper() in ("\\\\?\\UNC\\", "\\??\\UNC\\"):
+        norm = "\\\\" + norm[8:]
+    elif norm.startswith(("\\\\?\\", "\\??\\")):
+        norm = norm[4:]
+    norm = ntpath.normpath(norm)
+    return ntpath.normcase(norm)
+
+
+def prep_symlink_targets_equal(
+    actual: Path,
+    expected: Path,
+    *,
+    platform: str = sys.platform,
+) -> bool:
+    """Compare prep symlink targets for identity equivalence.
+
+    Prefers filesystem identity (os.path.samefile) when both targets exist on disk.
+    Otherwise compares a canonical Windows representation using normcase/normpath
+    and safe standard extended-prefix removal on Windows.
+    Preserves exact POSIX behavior and rejects genuinely different targets.
+    """
+    if actual == expected:
+        return True
+
+    # Prefer filesystem identity when both targets exist
+    try:
+        if actual.exists() and expected.exists() and os.path.samefile(actual, expected):
+            return True
+    except OSError:
+        pass
+
+    if platform == "win32":
+        return canonical_windows_path(actual) == canonical_windows_path(expected)
+
+    return False
+
+
 def _verify_prep_symlink(
     slot_path: Path,
     prep: AllowedPrepSymlink,
@@ -3554,7 +3629,7 @@ def _verify_prep_symlink(
     if not os.path.lexists(full_path):
         return False, f"prep symlink does not exist: {prep.link_rel_path}"
 
-    if not full_path.is_symlink():
+    if not is_symlink_or_junction(full_path):
         return False, f"prep path {prep.link_rel_path} is not a symlink (expected symlink)"
 
     try:
@@ -3562,13 +3637,16 @@ def _verify_prep_symlink(
     except OSError as exc:
         return False, f"could not read symlink {prep.link_rel_path}: {exc}"
 
+    if sys.platform == "win32" and raw_target.startswith("\\??\\"):
+        raw_target = "\\\\?\\" + raw_target[4:]
+
     target_p = Path(raw_target)
     if target_p.is_absolute():
         actual_target = target_p.resolve(strict=False)
     else:
         actual_target = (full_path.parent / target_p).resolve(strict=False)
 
-    if actual_target != prep.expected_target:
+    if not prep_symlink_targets_equal(actual_target, prep.expected_target):
         return (
             False,
             f"prep symlink {prep.link_rel_path} target drift: {actual_target} != {prep.expected_target}",
@@ -3590,7 +3668,7 @@ def _is_known_disposable_cache(slot_path: Path, rel_str: str) -> tuple[bool, Pat
         return False, None
 
     # Never treat symlinks as disposable caches
-    if full_path.is_symlink():
+    if is_symlink_or_junction(full_path):
         return False, None
 
     # Fail closed: check that no parent component under slot_path is a symlink
@@ -3598,7 +3676,7 @@ def _is_known_disposable_cache(slot_path: Path, rel_str: str) -> tuple[bool, Pat
     try:
         slot_resolved = slot_path.resolve(strict=False)
         while curr.resolve(strict=False) != slot_resolved and is_same_or_child(curr, slot_path):
-            if curr.is_symlink():
+            if is_symlink_or_junction(curr):
                 return False, None
             if curr == curr.parent:
                 break
@@ -3616,7 +3694,7 @@ def _is_known_disposable_cache(slot_path: Path, rel_str: str) -> tuple[bool, Pat
     for parent in rel_path.parents:
         if parent.name in KNOWN_DISPOSABLE_CACHE_NAMES:
             parent_full = slot_path / parent
-            if parent_full.is_dir() and not parent_full.is_symlink():
+            if parent_full.is_dir() and not is_symlink_or_junction(parent_full):
                 if (
                     parent.name == "__pycache__"
                     and full_path.is_file()
