@@ -532,7 +532,21 @@ def main(argv: list[str] | None = None) -> int:
                 _print_json(control.lifecycle_audit(refresh=not args.no_refresh))
                 return 0
             if args.lifecycle_command == "reconcile":
-                _print_json(control.lifecycle_reconcile(refresh=not args.no_refresh))
+                _print_json(
+                    control.lifecycle_reconcile(
+                        refresh=not args.no_refresh,
+                        auto_return=getattr(args, "auto_return", False),
+                    )
+                )
+                return 0
+            if args.lifecycle_command == "auto-return":
+                _print_json(
+                    control.lifecycle_auto_return(
+                        route=args.route,
+                        slot_name=args.slot,
+                        refresh=not args.no_refresh,
+                    )
+                )
                 return 0
             if args.lifecycle_command == "apply":
                 _print_json(control.lifecycle_apply(args.operation_id))
@@ -1173,6 +1187,15 @@ def _build_parser() -> argparse.ArgumentParser:
     lifecycle_status.add_argument("--no-refresh", action="store_true")
     lifecycle_reconcile = lifecycle_subparsers.add_parser("reconcile", parents=[common])
     lifecycle_reconcile.add_argument("--no-refresh", action="store_true")
+    lifecycle_reconcile.add_argument(
+        "--auto-return",
+        action="store_true",
+        help="Auto-return clean accepted slots to default branch before audit",
+    )
+    lifecycle_autoreturn = lifecycle_subparsers.add_parser("auto-return", parents=[common])
+    lifecycle_autoreturn.add_argument("--route")
+    lifecycle_autoreturn.add_argument("--slot")
+    lifecycle_autoreturn.add_argument("--no-refresh", action="store_true")
     lifecycle_apply = lifecycle_subparsers.add_parser("apply", parents=[common])
     lifecycle_apply.add_argument("operation_id")
     lifecycle_poll = lifecycle_subparsers.add_parser("poll", parents=[common])

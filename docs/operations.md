@@ -475,9 +475,44 @@ only the named branch and never deletes anything:
 ```bash
 agent-control lifecycle audit --config .agent-work/workspaces.toml
 agent-control lifecycle reconcile --config .agent-work/workspaces.toml
+agent-control lifecycle reconcile --auto-return --config .agent-work/workspaces.toml
+agent-control lifecycle auto-return --config .agent-work/workspaces.toml
 agent-control lifecycle poll --passes 3 --interval-sec 30 --max-interval-sec 300 \
   --config .agent-work/workspaces.toml
 ```
+
+#### Reusable slot auto-return and default branch contract
+
+Configured reusable slots follow the canonical default branch contract `slot/<slot-name>`
+(for example, `slot/acp-local-1`). When a task finishes and its checkpoint handoff is
+root-accepted, the slot should return to its clean default branch at the freshly fetched
+canonical remote tip:
+
+- **Post-acceptance auto-return**: Acceptance triggers an auto-return pass. For each inactive
+  clean slot, ACP validates that the task's checkpoint is integrated into the canonical remote
+  tip. Integration is proven either via Git ancestor reachability or via **exact accepted-tree
+  equivalence** to a commit in canonical history (handling squash-merges, signed root commits,
+  or distinct root integration commits).
+- **Fail-closed guarantees**: Auto-return never mutates a slot before root acceptance and
+  canonical integration are verified. Any dirty working tree, untracked changes, unexpected
+  ignored files, active job or lease, live process CWD, generation drift, remote URL rewrite,
+  or branch movement causes auto-return to fail closed and preserve slot state untouched.
+  Allowed preparation symlinks configured for the route (e.g. `.venv`) remain intact; known
+  disposable controller-generated caches (`.pytest_cache`, `.ruff_cache`, `.mypy_cache`,
+  `__pycache__`) are safely pruned under the cleanup claim; any unknown ignored files,
+  target drift, or late writes fail closed.
+- **Generation finalization and audit**: Under an exclusive cleanup claim, the slot switches to
+  `slot/<slot-name>` at canonical tip, and its generation counter is atomically incremented
+  (`generation = generation + 1`) upon release. On subsequent audits, a configured slot on its
+  default branch at a canonical-reachable tip is classified as `available` (with zero blocker
+  reasons), rather than `unique-unpushed` or `quarantined`.
+- **Freed task branch lifecycle**: Auto-returning the slot frees the previous task branch from
+  the worktree. Freed task branches are audited by the unmanaged branch lifecycle:
+  - If the branch is canonically integrated and has a verified root acceptance receipt, it is
+    classified as `accepted-integrated`, enqueued for cleanup by `reconcile`, and deleted via
+    journaled `apply`.
+  - If the branch contains unique unintegrated commits or lacks an acceptance receipt, it is
+    classified as `unique-unpushed` or `retained-unowned` and safely retained without deletion.
 
 `reconcile` can enqueue an exact operation after acceptance and canonical
 reachability are proved; it cannot apply it. Apply one inspected operation with

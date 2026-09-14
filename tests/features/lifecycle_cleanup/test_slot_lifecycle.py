@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +23,7 @@ from agent_control_plane.shared.config import (
     ControlDefaults,
     RouteConfig,
     SlotConfig,
+    SlotPrepareCommand,
     load_config,
 )
 from agent_control_plane.shared.git_tools import GitError, run_git
@@ -1956,7 +1958,10 @@ def test_deferred_reconciliation_requests_failure_and_concurrent_enqueue(tmp_pat
     assert pending[0]["reason"] == "request-2"
 
 
-def _fixture(tmp_path: Path) -> tuple[ControlConfig, Path, Path]:
+def _fixture(
+    tmp_path: Path,
+    slot_prepare: tuple[SlotPrepareCommand, ...] = (),
+) -> tuple[ControlConfig, Path, Path]:
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
     subprocess.run(
@@ -2017,8 +2022,24 @@ def _fixture(tmp_path: Path) -> tuple[ControlConfig, Path, Path]:
         defaults=defaults,
         routes=MappingProxyType({"app": route_config}),
         slots=MappingProxyType({"app-1": SlotConfig(name="app-1", route="app", path=slot)}),
-        slot_prepare=(),
+        slot_prepare=slot_prepare,
     )
+    prep_toml = ""
+    if slot_prepare:
+        prep_lines = ["[slot_prepare]"]
+        for cmd in slot_prepare:
+            prep_lines.append(f"[slot_prepare.{cmd.name}]")
+            if cmd.routes:
+                routes_str = ", ".join(f'"{r}"' for r in cmd.routes)
+                prep_lines.append(f"routes = [{routes_str}]")
+            prep_lines.append(f'working_dir = "{cmd.working_dir.as_posix()}"')
+            if cmd.marker:
+                prep_lines.append(f'marker = "{cmd.marker.as_posix()}"')
+            cmd_str = ", ".join(f'"{c}"' for c in cmd.command)
+            prep_lines.append(f"command = [{cmd_str}]")
+            prep_lines.append(f"timeout_sec = {cmd.timeout_sec}")
+        prep_toml = "\n" + "\n".join(prep_lines) + "\n"
+
     toml_content = f"""
 [control]
 coordination_root = "{(tmp_path / ".agent-work").as_posix()}"
@@ -2026,7 +2047,7 @@ runs_root = "{(tmp_path / "runs").as_posix()}"
 database = "{(tmp_path / "runs/jobs.sqlite3").as_posix()}"
 worktree_root = "{(tmp_path / "worktrees").as_posix()}"
 slot_root = "{(tmp_path / "slots").as_posix()}"
-
+{prep_toml}
 [routes.app]
 path = "{route.as_posix()}"
 required_branch = "main"
@@ -3854,3 +3875,789 @@ def test_unowned_branch_legacy_db_removed_path_checkpoint_sha_mismatch_retained(
     # Mismatched SHA must fail verification and be retained without operation ID
     assert branch_rows[0]["classification"] == "retained-unowned"
     assert "operation_id" not in branch_rows[0]
+
+
+def test_auto_return_accepted_and_canonically_integrated(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-ret-1"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-ret-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-ret-1", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    canonical_tip = run_git(route, "rev-parse", "origin/main")
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "returned"
+    assert res["branch"] == "slot/app-1"
+    assert res["head"] == canonical_tip
+    assert res["generation"] == gen + 1
+
+    # Verified: slot is now on default branch and clean
+    assert run_git(slot, "branch", "--show-current") == "slot/app-1"
+    assert run_git(slot, "rev-parse", "HEAD") == canonical_tip
+    assert run_git(slot, "status", "--porcelain=v1", "-uall") == ""
+
+    # Verified: audit recognizes the slot as available
+    audit = service.audit()
+    slot_row = next(r for r in audit["resources"] if r.get("name") == "app-1")
+    assert slot_row["classification"] == "available"
+    assert slot_row["reasons"] == []
+
+
+def test_auto_return_exact_tree_equivalence_distinct_root_commit(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    # Slot creates a task commit on a new task branch
+    run_git(slot, "checkout", "-b", "task/tree-equiv-task")
+    (slot / "feature_tree.txt").write_text("tree equivalence content\n", encoding="utf-8")
+    run_git(slot, "add", "feature_tree.txt")
+    run_git(slot, "commit", "-m", "worker task commit with unique tree")
+    worker_sha = run_git(slot, "rev-parse", "HEAD")
+    worker_tree = run_git(slot, "rev-parse", "HEAD^{tree}")
+
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-tree-equiv"
+    run_git(route, "update-ref", checkpoint_ref, worker_sha)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-tree-equiv",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=worker_sha,
+            checkpoint_tree_sha=worker_tree,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-tree-equiv", "accepted")
+
+    # Root integrates the exact same tree into main via a DISTINCT commit
+    # (simulating signed root commit or squash where worker_sha is NOT an ancestor)
+    run_git(route, "fetch", "origin")
+    main_tip = run_git(route, "rev-parse", "origin/main")
+    root_commit = run_git(
+        route, "commit-tree", worker_tree, "-p", main_tip, "-m", "root distinct integration"
+    )
+    run_git(route, "update-ref", "refs/heads/main", root_commit)
+    run_git(route, "push", "origin", "main")
+
+    # Prove that worker_sha is NOT an ancestor of canonical tip
+    with pytest.raises(GitError):
+        run_git(route, "merge-base", "--is-ancestor", worker_sha, root_commit)
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    # Exact tree equivalence allows auto-return to succeed
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "returned"
+    assert res["branch"] == "slot/app-1"
+    assert res["head"] == root_commit
+
+    # Audit classifies slot as available
+    audit = service.audit()
+    slot_row = next(r for r in audit["resources"] if r.get("name") == "app-1")
+    assert slot_row["classification"] == "available"
+    assert slot_row["reasons"] == []
+
+
+def test_auto_return_refuses_when_accepted_not_integrated(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    run_git(slot, "checkout", "-b", "task/unintegrated-work")
+    (slot / "unpushed.txt").write_text("not pushed\n", encoding="utf-8")
+    run_git(slot, "add", "unpushed.txt")
+    run_git(slot, "commit", "-m", "unpushed commit")
+    unpushed_sha = run_git(slot, "rev-parse", "HEAD")
+
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-unpushed-1"
+    run_git(route, "update-ref", checkpoint_ref, unpushed_sha)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-unpushed-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=unpushed_sha,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-unpushed-1", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    # Must refuse auto-return because commit is not in canonical remote
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "skipped"
+    assert "not canonical-integrated" in res["reason"]
+
+    # Slot remains on its task branch untouched
+    assert run_git(slot, "branch", "--show-current") == "task/unintegrated-work"
+    assert run_git(slot, "rev-parse", "HEAD") == unpushed_sha
+    assert slots.require_slot("app-1").generation == gen
+
+
+def test_auto_return_fails_closed_on_dirty_active_cwd_drift(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-fail-closed"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-fail-closed",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-fail-closed", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    # 1. Dirty tracked file
+    (slot / "change.txt").write_text("dirty edits\n", encoding="utf-8")
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "dirty" in res["reason"]
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"
+    run_git(slot, "checkout", "--", "change.txt")
+
+    # 2. Unexpected ignored file
+    (slot / ".gitignore").write_text("*.tmp\n", encoding="utf-8")
+    (slot / "extra.tmp").write_text("ignored file\n", encoding="utf-8")
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "dirty" in res["reason"] or "ignored" in res["reason"]
+    (slot / "extra.tmp").unlink()
+    (slot / ".gitignore").unlink()
+
+    # 3. Live process CWD
+    service.live_cwds = lambda _p: [99999]
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "live process" in res["reason"]
+    service.live_cwds = lambda _p: []
+
+    # 4. Active slot
+    slots.acquire_slot("app-1", "job-other")
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "skipped"
+    assert "not available" in res["reason"]
+    slots.release_slot("app-1", "job-other")
+
+    # 5. Default branch divergence
+    run_git(route, "branch", "slot/app-1", "HEAD")
+    # Add unique commit to slot/app-1 that is not in canonical remote
+    run_git(route, "checkout", "slot/app-1")
+    (route / "divergent.txt").write_text("divergent\n", encoding="utf-8")
+    run_git(route, "add", "divergent.txt")
+    run_git(route, "commit", "-m", "divergent commit")
+    run_git(route, "checkout", "main")
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "divergent" in res["reason"] or "unmerged" in res["reason"]
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"
+
+
+def test_freed_integrated_task_branch_gets_exact_cleanup_intent(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-freed-1"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-freed-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-freed-1", "accepted")
+
+    jobs = JobStore(config.database_path)
+    jobs.create_job(
+        job_id="job-freed-1",
+        task_id="task-freed-1",
+        route="app",
+        workspace_path=slot,
+        expected_branch="task/app-1",
+        expected_result_status="completed",
+        controller_gate_mode="full",
+        config_path=config.config_path,
+        run_dir=config.runs_root / "job-freed-1",
+        prompt_path=config.runs_root / "job-freed-1/prompt.md",
+        result_path=config.runs_root / "job-freed-1/result.md",
+        timeout_sec=10,
+        idle_timeout_sec=10,
+        print_timeout="10s",
+        max_restarts=0,
+        yolo=False,
+        allow_dirty=False,
+        read_only=False,
+        backend="agy",
+        workspace_access="native",
+        slot_name="app-1",
+    )
+    jobs.update_job("job-freed-1", status="completed")
+    jobs.set_root_acceptance("job-freed-1", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=jobs,
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    # Reconcile with auto_return=True: auto-returns slot to slot/app-1, freeing task/app-1
+    reconcile_res = service.reconcile(auto_return=True, enqueue=True)
+    assert run_git(slot, "branch", "--show-current") == "slot/app-1"
+
+    # The freed task branch task/app-1 is audited as accepted-integrated and enqueued
+    branch_rows = [
+        r
+        for r in reconcile_res["resources"]
+        if r.get("branch") == "task/app-1" and r.get("kind") == "branch"
+    ]
+    assert len(branch_rows) == 1
+    assert branch_rows[0]["classification"] == "accepted-integrated"
+    op_id = branch_rows[0]["operation_id"]
+    assert op_id in reconcile_res["enqueued"]
+
+    # Applying the cleanup deletes the freed integrated task branch
+    apply_res = service.apply(op_id)
+    assert apply_res["action"] == "completed"
+    with pytest.raises(GitError):
+        run_git(route, "rev-parse", "--verify", "refs/heads/task/app-1")
+
+
+def test_freed_unique_task_branch_remains_retained(tmp_path: Path) -> None:
+    config, route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+
+    # Create a unique unowned branch on route with unique work
+    run_git(route, "branch", "task/unique-work-branch", "main")
+    run_git(route, "checkout", "task/unique-work-branch")
+    (route / "unique_keep.txt").write_text("must be kept\n", encoding="utf-8")
+    run_git(route, "add", "unique_keep.txt")
+    run_git(route, "commit", "-m", "unique unmerged work")
+    unique_sha = run_git(route, "rev-parse", "HEAD")
+    run_git(route, "checkout", "main")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    # Reconcile must retain the unique branch and NOT enqueue any cleanup intent
+    reconcile_res = service.reconcile(enqueue=True)
+    branch_rows = [
+        r for r in reconcile_res["resources"] if r.get("branch") == "task/unique-work-branch"
+    ]
+    assert len(branch_rows) == 1
+    assert branch_rows[0]["classification"] == "unique-unpushed"
+    assert "operation_id" not in branch_rows[0]
+    assert branch_rows[0]["sha"] == unique_sha
+
+    # Branch is preserved and not deleted
+    assert (
+        run_git(route, "rev-parse", "--verify", "refs/heads/task/unique-work-branch") == unique_sha
+    )
+
+
+def test_auto_return_normally_prepared_slot_with_real_venv_symlink_and_caches(
+    tmp_path: Path,
+) -> None:
+    venv_dir = tmp_path / "canonical_venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    prep_cmd = SlotPrepareCommand(
+        name="acp_venv",
+        working_dir=Path("."),
+        marker=Path(".venv/pyvenv.cfg"),
+        command=("ln", "-s", str(venv_dir), ".venv"),
+        timeout_sec=30,
+        routes=("app",),
+    )
+
+    config, route, slot = _fixture(tmp_path, slot_prepare=(prep_cmd,))
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    (slot / ".gitignore").write_text(
+        ".venv\n.pytest_cache/\n.ruff_cache/\n__pycache__/\n", encoding="utf-8"
+    )
+    run_git(slot, "add", ".gitignore")
+    run_git(slot, "commit", "-m", "add gitignore for venv and caches")
+    run_git(slot, "push", "origin", "HEAD:main")
+    run_git(route, "fetch", "origin", "main:refs/remotes/origin/main")
+
+    os.symlink(venv_dir, slot / ".venv")
+    assert (slot / ".venv").is_symlink()
+    assert (slot / ".venv" / "pyvenv.cfg").exists()
+
+    (slot / ".pytest_cache").mkdir()
+    (slot / ".pytest_cache" / "v").mkdir()
+    (slot / ".pytest_cache" / "v" / "cache").write_text("{}", encoding="utf-8")
+    (slot / ".ruff_cache").mkdir()
+    (slot / ".ruff_cache" / "content.txt").write_text("cached", encoding="utf-8")
+    (slot / "src").mkdir(exist_ok=True)
+    (slot / "src" / "__pycache__").mkdir(exist_ok=True)
+    (slot / "src" / "__pycache__" / "mod.cpython-312.pyc").write_bytes(b"\x00\x01\x02\x03")
+
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-prepared-1"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-prepared-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-prepared-1", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "returned"
+    canonical_tip = res["head"]
+    assert res["branch"] == "slot/app-1"
+    assert res["generation"] == gen + 1
+
+    assert run_git(slot, "branch", "--show-current") == "slot/app-1"
+    assert run_git(slot, "rev-parse", "HEAD") == canonical_tip
+
+    # Verified: prep symlink remains intact and points to canonical venv
+    assert (slot / ".venv").is_symlink()
+    assert (slot / ".venv").resolve() == venv_dir.resolve()
+    assert (slot / ".venv" / "pyvenv.cfg").exists()
+
+    # Verified: disposable caches were removed
+    assert not (slot / ".pytest_cache").exists()
+    assert not (slot / ".ruff_cache").exists()
+    assert not (slot / "src" / "__pycache__").exists()
+
+    # Verified: audit recognizes the slot as available with zero blocker reasons
+    audit = service.audit()
+    slot_row = next(r for r in audit["resources"] if r.get("name") == "app-1")
+    assert slot_row["classification"] == "available"
+    assert slot_row["reasons"] == []
+
+
+def test_auto_return_fails_closed_on_unknown_ignored_file(tmp_path: Path) -> None:
+    venv_dir = tmp_path / "canonical_venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    prep_cmd = SlotPrepareCommand(
+        name="acp_venv",
+        working_dir=Path("."),
+        marker=Path(".venv/pyvenv.cfg"),
+        command=("ln", "-s", str(venv_dir), ".venv"),
+        timeout_sec=30,
+        routes=("app",),
+    )
+
+    config, route, slot = _fixture(tmp_path, slot_prepare=(prep_cmd,))
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    (slot / ".gitignore").write_text(".venv\n*.tmp\n", encoding="utf-8")
+    run_git(slot, "add", ".gitignore")
+    run_git(slot, "commit", "-m", "add gitignore")
+    run_git(slot, "push", "origin", "HEAD:main")
+    run_git(route, "fetch", "origin", "main:refs/remotes/origin/main")
+
+    os.symlink(venv_dir, slot / ".venv")
+
+    # Add unknown ignored file
+    (slot / "rogue.tmp").write_text("unknown ignored\n", encoding="utf-8")
+
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-unknown-ignored"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-unknown-ignored",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-unknown-ignored", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "unexpected ignored" in res["reason"] or "ignored" in res["reason"]
+
+    # Must avoid branch mutation: slot remains on task/app-1
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"
+    assert slots.require_slot("app-1").generation == gen
+
+
+def test_auto_return_fails_closed_on_wrong_symlink_target_drift(tmp_path: Path) -> None:
+    venv_dir = tmp_path / "canonical_venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    wrong_venv = tmp_path / "wrong_venv"
+    wrong_venv.mkdir()
+    (wrong_venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    prep_cmd = SlotPrepareCommand(
+        name="acp_venv",
+        working_dir=Path("."),
+        marker=Path(".venv/pyvenv.cfg"),
+        command=("ln", "-s", str(venv_dir), ".venv"),
+        timeout_sec=30,
+        routes=("app",),
+    )
+
+    config, route, slot = _fixture(tmp_path, slot_prepare=(prep_cmd,))
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    (slot / ".gitignore").write_text(".venv\n", encoding="utf-8")
+    run_git(slot, "add", ".gitignore")
+    run_git(slot, "commit", "-m", "add gitignore")
+    run_git(slot, "push", "origin", "HEAD:main")
+    run_git(route, "fetch", "origin", "main:refs/remotes/origin/main")
+
+    # Symlink points to wrong target (drift)
+    os.symlink(wrong_venv, slot / ".venv")
+
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-target-drift"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-target-drift",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-target-drift", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "target drift" in res["reason"] or "symlink" in res["reason"]
+
+    # Must avoid branch mutation: slot remains on task/app-1
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"
+    assert slots.require_slot("app-1").generation == gen
+
+
+def test_auto_return_fails_closed_on_wrong_symlink_type(tmp_path: Path) -> None:
+    venv_dir = tmp_path / "canonical_venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    prep_cmd = SlotPrepareCommand(
+        name="acp_venv",
+        working_dir=Path("."),
+        marker=Path(".venv/pyvenv.cfg"),
+        command=("ln", "-s", str(venv_dir), ".venv"),
+        timeout_sec=30,
+        routes=("app",),
+    )
+
+    config, route, slot = _fixture(tmp_path, slot_prepare=(prep_cmd,))
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    (slot / ".gitignore").write_text(".venv\n", encoding="utf-8")
+    run_git(slot, "add", ".gitignore")
+    run_git(slot, "commit", "-m", "add gitignore")
+    run_git(slot, "push", "origin", "HEAD:main")
+    run_git(route, "fetch", "origin", "main:refs/remotes/origin/main")
+
+    # Regular directory instead of symlink
+    (slot / ".venv").mkdir()
+    (slot / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-wrong-type"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-wrong-type",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-wrong-type", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "not a symlink" in res["reason"] or "symlink" in res["reason"]
+
+    # Must avoid branch mutation: slot remains on task/app-1
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"
+    assert slots.require_slot("app-1").generation == gen
+
+
+def test_auto_return_fails_closed_on_ignored_file_appearing_after_claim(tmp_path: Path) -> None:
+    venv_dir = tmp_path / "canonical_venv"
+    venv_dir.mkdir()
+    (venv_dir / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+
+    prep_cmd = SlotPrepareCommand(
+        name="acp_venv",
+        working_dir=Path("."),
+        marker=Path(".venv/pyvenv.cfg"),
+        command=("ln", "-s", str(venv_dir), ".venv"),
+        timeout_sec=30,
+        routes=("app",),
+    )
+
+    config, route, slot = _fixture(tmp_path, slot_prepare=(prep_cmd,))
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    gen = slots.require_slot("app-1").generation
+
+    (slot / ".gitignore").write_text(".venv\n*.late\n", encoding="utf-8")
+    run_git(slot, "add", ".gitignore")
+    run_git(slot, "commit", "-m", "add gitignore")
+    run_git(slot, "push", "origin", "HEAD:main")
+    run_git(route, "fetch", "origin", "main:refs/remotes/origin/main")
+
+    os.symlink(venv_dir, slot / ".venv")
+
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/job-late-ignored"
+    run_git(route, "update-ref", checkpoint_ref, accepted)
+
+    inbox = ReviewInboxStore(config.database_path)
+    inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-late-ignored",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=gen,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    inbox.resolve("agent_job:job-late-ignored", "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    # Intercept claim_for_cleanup so a late ignored file is injected right after claim
+    real_claim = slots.claim_for_cleanup
+
+    def inject_late_ignored(*args: Any, **kwargs: Any) -> Any:
+        res = real_claim(*args, **kwargs)
+        (slot / "injected.late").write_text(
+            "late ignored file written concurrently\n", encoding="utf-8"
+        )
+        return res
+
+    slots.claim_for_cleanup = inject_late_ignored  # type: ignore[assignment]
+
+    res = service.auto_return_slot("app-1")
+    assert res["status"] == "failed"
+    assert "transition failed" in res["reason"]
+
+    # Slot must be quarantined because claim was acquired and invariant violated
+    assert slots.require_slot("app-1").status == "quarantined"
+
+    # Branch must NOT be mutated: slot remains on task/app-1
+    assert run_git(slot, "branch", "--show-current") == "task/app-1"

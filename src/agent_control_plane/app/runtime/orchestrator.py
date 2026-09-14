@@ -819,8 +819,21 @@ class AgentControlPlane:
     def lifecycle_audit(self, *, refresh: bool = True) -> dict[str, Any]:
         return self.slot_lifecycle.audit(refresh=refresh)
 
-    def lifecycle_reconcile(self, *, refresh: bool = True) -> dict[str, Any]:
-        return self.slot_lifecycle.reconcile(refresh=refresh, enqueue=True)
+    def lifecycle_reconcile(
+        self, *, refresh: bool = True, auto_return: bool = False
+    ) -> dict[str, Any]:
+        return self.slot_lifecycle.reconcile(refresh=refresh, enqueue=True, auto_return=auto_return)
+
+    def lifecycle_auto_return(
+        self,
+        *,
+        route: str | None = None,
+        slot_name: str | None = None,
+        refresh: bool = True,
+    ) -> list[dict[str, Any]]:
+        if slot_name is not None:
+            return [self.slot_lifecycle.auto_return_slot(slot_name, refresh=refresh)]
+        return self.slot_lifecycle.auto_return_slots(route=route, refresh=refresh)
 
     def lifecycle_apply(self, operation_id: str) -> dict[str, Any]:
         return self.slot_lifecycle.apply(operation_id)
@@ -841,17 +854,23 @@ class AgentControlPlane:
         ):
             return {"status": "skipped", "reason": "canonical refs are not configured"}
         try:
+            auto_returned = self.slot_lifecycle.auto_return_slots(route=route, refresh=True)
             if route and route in self.config.routes:
                 req_id = self.slot_lifecycle.enqueue_reconciliation_request(
                     route, reason="acceptance"
                 )
-                return {"status": "enqueued", "route": route, "request_id": req_id}
+                return {
+                    "status": "enqueued",
+                    "route": route,
+                    "request_id": req_id,
+                    "auto_returned": auto_returned,
+                }
             req_ids: dict[str, int] = {}
             for r in self.config.routes:
                 req_ids[r] = self.slot_lifecycle.enqueue_reconciliation_request(
                     r, reason="acceptance"
                 )
-            return {"status": "enqueued", "requests": req_ids}
+            return {"status": "enqueued", "requests": req_ids, "auto_returned": auto_returned}
         except Exception as exc:  # noqa: BLE001 - acceptance must remain durable
             return {"status": "failed", "reason": str(exc)}
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
@@ -34,6 +35,7 @@ class LifecycleClass(StrEnum):
     QUARANTINED = "quarantined"
     STALE = "stale"
     RETAINED_UNOWNED = "retained-unowned"
+    AVAILABLE = "available"
 
 
 @dataclass(frozen=True)
@@ -321,7 +323,14 @@ class SlotLifecycleService:
                     and not is_ancestor
                     and _is_patch_equivalent(route.path, sha, canonical_ref)
                 )
-                integrated = is_ancestor or is_patch
+                branch_tree = _commit_tree(route.path, sha)
+                is_tree = bool(
+                    canonical_ref
+                    and not (is_ancestor or is_patch)
+                    and branch_tree
+                    and _has_canonical_tree(route.path, branch_tree, canonical_ref)
+                )
+                integrated = is_ancestor or is_patch or is_tree
 
                 acc_entry = evidence["accepted_shas"].get(sha) or evidence["accepted_branches"].get(
                     branch
@@ -1254,8 +1263,31 @@ class SlotLifecycleService:
             ):
                 raise ValueError("durable job identity mismatch with slot generation")
 
-            # Verify checkout base HEAD is canonical-reachable
-            if not _is_ancestor(route.path, frozen.head, fetched_tip):
+            # Verify checkpoint and checkout base HEAD are canonical-reachable
+            cp_tree = (accepted.checkpoint_tree_sha if accepted else None) or _commit_tree(
+                route.path, frozen.checkpoint_sha
+            )
+            if not (
+                _is_ancestor(route.path, frozen.checkpoint_sha, fetched_tip)
+                or (
+                    cp_tree
+                    and _has_canonical_tree(
+                        route.path, cp_tree, fetched_tip, base_sha=frozen.base_sha
+                    )
+                )
+            ):
+                raise ValueError("accepted checkpoint is not canonical-reachable")
+
+            head_tree = _commit_tree(route.path, frozen.head)
+            if not (
+                _is_ancestor(route.path, frozen.head, fetched_tip)
+                or (
+                    head_tree
+                    and _has_canonical_tree(
+                        route.path, head_tree, fetched_tip, base_sha=frozen.base_sha
+                    )
+                )
+            ):
                 raise ValueError("checkout base HEAD is not canonical-reachable")
 
             # Recheck liveness and full clean+ignored state if worktree exists
@@ -2006,7 +2038,13 @@ class SlotLifecycleService:
 
             is_anc = _is_ancestor(route.path, current_sha, fetched_tip)
             is_pe = False if is_anc else _is_patch_equivalent(route.path, current_sha, fetched_tip)
-            if not (is_anc or is_pe):
+            branch_tree = _commit_tree(route.path, current_sha)
+            is_te = (
+                False
+                if (is_anc or is_pe or not branch_tree)
+                else _has_canonical_tree(route.path, branch_tree, fetched_tip)
+            )
+            if not (is_anc or is_pe or is_te):
                 return self._quarantine(
                     operation_id,
                     "branch is no longer integrated into canonical tip",
@@ -2047,7 +2085,18 @@ class SlotLifecycleService:
             "action": "completed",
         }
 
-    def reconcile(self, *, refresh: bool = True, enqueue: bool = True) -> dict[str, Any]:
+    def reconcile(
+        self,
+        *,
+        refresh: bool = True,
+        enqueue: bool = True,
+        auto_return: bool = False,
+    ) -> dict[str, Any]:
+        self._initialize()
+        auto_returned: list[dict[str, Any]] = []
+        if auto_return:
+            auto_returned = self.auto_return_slots(refresh=refresh)
+
         pending_by_route: dict[str, list[int]] = {}
         if refresh:
             for req in self.pending_reconciliation_requests():
@@ -2089,7 +2138,429 @@ class SlotLifecycleService:
                     self.acknowledge_reconciliation_requests(req_ids)
                     acknowledged_requests.extend(req_ids)
 
-        return {**audit, "enqueued": enqueued, "acknowledged_requests": acknowledged_requests}
+        result = {**audit, "enqueued": enqueued, "acknowledged_requests": acknowledged_requests}
+        if auto_return:
+            result["auto_returned"] = auto_returned
+        return result
+
+    def auto_return_slot(
+        self,
+        slot_name: str,
+        *,
+        refresh: bool = True,
+    ) -> dict[str, Any]:
+        self._initialize()
+        slot = self.slots.get_slot(slot_name)
+        if slot is None:
+            return {"slot": slot_name, "status": "failed", "reason": f"slot {slot_name} not found"}
+        if slot.name not in self.config.slots:
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": f"slot {slot_name} is not a configured reusable slot",
+            }
+        route = self.config.routes.get(slot.route)
+        if route is None:
+            return {"slot": slot_name, "status": "failed", "reason": f"unknown route {slot.route}"}
+        if not route.canonical_remote or not route.canonical_branch:
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": f"canonical remote/branch not configured for route {slot.route}",
+            }
+        if slot.active_job_id is not None or slot.status != "available":
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": f"slot {slot_name} is not available (status={slot.status}, active_job_id={slot.active_job_id})",
+            }
+        if not slot.path.exists():
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"slot path {slot.path} does not exist",
+            }
+
+        slot_root = self.config.slot_root_for(slot.route)
+        if not is_same_or_child(slot.path, slot_root) or slot.path.resolve(
+            strict=False
+        ) == slot_root.resolve(strict=False):
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "slot path is outside managed slot_root",
+            }
+
+        try:
+            slot_common = str(
+                (slot.path / run_git(slot.path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+            route_common = str(
+                (route.path / run_git(route.path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+        except GitError as exc:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"failed to resolve git-common-dir: {exc}",
+            }
+        if slot_common != route_common:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "slot git-common-dir differs from route common git dir",
+            }
+
+        try:
+            snapshot = workspace_snapshot(slot.path)
+        except (GitError, OSError) as exc:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"failed to snapshot workspace: {exc}",
+            }
+
+        if not snapshot.stable or snapshot.porcelain:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "workspace dirty or unstable; refusing to return slot",
+            }
+
+        # Check ignored files and preparation artifacts
+        ok_ignored, err_ignored, _ = _inspect_ignored_entries(slot.path, slot.route, self.config)
+        if not ok_ignored:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": err_ignored or "unexpected ignored files present",
+            }
+
+        # Check live process CWDs
+        try:
+            pids = self.live_cwds(slot.path)
+        except (PermissionError, OSError) as exc:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"process CWD inspection failed: {exc}",
+            }
+        if any(pid < 0 for pid in pids) or pids:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"live process CWDs detected: {pids}",
+            }
+
+        # Fetch canonical remote tip
+        canonical_ref = f"refs/remotes/{route.canonical_remote}/{route.canonical_branch}"
+        if refresh:
+            try:
+                run_git(
+                    route.path,
+                    "fetch",
+                    "--no-tags",
+                    route.canonical_remote,
+                    f"refs/heads/{route.canonical_branch}:{canonical_ref}",
+                )
+            except GitError as exc:
+                return {
+                    "slot": slot_name,
+                    "status": "failed",
+                    "reason": f"canonical fetch failed: {exc}",
+                }
+
+        try:
+            canonical_tip = run_git(route.path, "rev-parse", "--verify", canonical_ref)
+        except GitError as exc:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"canonical tip resolution failed: {exc}",
+            }
+
+        default_branch = f"slot/{slot.name}"
+        default_ref = f"refs/heads/{default_branch}"
+        default_sha = _run_git_or_none(route.path, "rev-parse", "--verify", default_ref)
+
+        if default_sha is not None:
+            def_tree = _commit_tree(route.path, default_sha)
+            if not (
+                _is_ancestor(route.path, default_sha, canonical_tip)
+                or (def_tree and _has_canonical_tree(route.path, def_tree, canonical_tip))
+            ):
+                return {
+                    "slot": slot_name,
+                    "status": "failed",
+                    "reason": f"default branch {default_branch} has divergent or unmerged commits",
+                }
+
+        # If already on default branch
+        if snapshot.branch == default_branch:
+            if snapshot.head == canonical_tip:
+                return {
+                    "slot": slot_name,
+                    "status": "unchanged",
+                    "branch": default_branch,
+                    "head": canonical_tip,
+                    "generation": slot.generation,
+                }
+            if not snapshot.head:
+                return {
+                    "slot": slot_name,
+                    "status": "failed",
+                    "reason": "slot has no HEAD commit",
+                }
+            head_tree = _commit_tree(slot.path, snapshot.head)
+            if not (
+                _is_ancestor(slot.path, snapshot.head, canonical_tip)
+                or (head_tree and _has_canonical_tree(slot.path, head_tree, canonical_tip))
+            ):
+                return {
+                    "slot": slot_name,
+                    "status": "failed",
+                    "reason": f"default branch head {snapshot.head} is not canonical-reachable",
+                }
+            try:
+                run_git(slot.path, "merge", "--ff-only", canonical_tip)
+            except GitError as exc:
+                return {
+                    "slot": slot_name,
+                    "status": "failed",
+                    "reason": f"fast-forward failed: {exc}",
+                }
+            return {
+                "slot": slot_name,
+                "status": "fast_forwarded",
+                "branch": default_branch,
+                "head": canonical_tip,
+                "generation": slot.generation,
+            }
+
+        # Slot is on a non-default branch.
+        accepted = self._accepted_item(slot)
+        if accepted is None or accepted.checkpoint_sha is None or accepted.checkpoint_ref is None:
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": "no exact accepted checkpoint receipt for slot generation",
+            }
+        if accepted.review_status != "accepted":
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": f"review status is {accepted.review_status}, not accepted",
+            }
+
+        current_cp_sha = _run_git_or_none(
+            slot.path, "show-ref", "--verify", "--hash", accepted.checkpoint_ref
+        )
+        if current_cp_sha != accepted.checkpoint_sha:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "checkpoint ref moved or missing",
+            }
+
+        checkpoint_tree = accepted.checkpoint_tree_sha or _commit_tree(
+            slot.path, accepted.checkpoint_sha
+        )
+        checkpoint_integrated = _is_ancestor(slot.path, accepted.checkpoint_sha, canonical_tip) or (
+            checkpoint_tree is not None
+            and _has_canonical_tree(
+                slot.path, checkpoint_tree, canonical_tip, base_sha=accepted.base_sha
+            )
+        )
+        if not checkpoint_integrated:
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": "accepted checkpoint is not canonical-integrated",
+            }
+
+        if not snapshot.head:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "slot has no HEAD commit",
+            }
+
+        head_tree = _commit_tree(slot.path, snapshot.head)
+        valid_heads = {accepted.checkpoint_sha}
+        if accepted.base_sha is not None:
+            valid_heads.add(accepted.base_sha)
+        if snapshot.head not in valid_heads and head_tree != checkpoint_tree:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": "slot HEAD differs from accepted checkpoint and base",
+            }
+
+        head_integrated = _is_ancestor(slot.path, snapshot.head, canonical_tip) or (
+            head_tree is not None
+            and _has_canonical_tree(slot.path, head_tree, canonical_tip, base_sha=accepted.base_sha)
+        )
+        if not head_integrated:
+            return {
+                "slot": slot_name,
+                "status": "skipped",
+                "reason": "slot HEAD is not canonical-integrated",
+            }
+
+        # Atomically claim slot for return
+        op_id = f"auto-return:{slot.name}:{slot.generation}:{int(self.clock())}"
+        try:
+            self.slots.claim_for_cleanup(
+                slot.name,
+                op_id,
+                expected_generation=slot.generation,
+                expected_route=slot.route,
+                expected_path=slot.path,
+            )
+        except SlotStoreError as exc:
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"failed to claim slot: {exc}",
+            }
+
+        try:
+            post_claim_snap = workspace_snapshot(slot.path)
+            if not post_claim_snap.stable or post_claim_snap.porcelain:
+                raise ValueError("workspace dirty or unstable after claim")
+
+            post_pids = self.live_cwds(slot.path)
+            if any(pid < 0 for pid in post_pids) or post_pids:
+                raise ValueError(f"live process CWDs detected after claim: {post_pids}")
+
+            # Re-snapshot ignored state immediately after acquiring the cleanup claim
+            ok_post, reason_post, caches_to_remove = _inspect_ignored_entries(
+                slot.path, slot.route, self.config
+            )
+            if not ok_post:
+                raise ValueError(f"ignored workspace state invalid after claim: {reason_post}")
+
+            # Remove known disposable controller-generated caches safely
+            for cache_path in sorted(caches_to_remove, key=lambda p: len(p.parts), reverse=True):
+                if not os.path.lexists(cache_path):
+                    continue
+                if not is_same_or_child(cache_path, slot.path) or cache_path.resolve(
+                    strict=False
+                ) == slot.path.resolve(strict=False):
+                    raise ValueError(f"disposable cache path outside slot: {cache_path}")
+                if cache_path.is_symlink():
+                    raise ValueError(f"refusing to remove symlink as cache: {cache_path}")
+                if cache_path.is_dir():
+                    shutil.rmtree(cache_path)
+                elif cache_path.is_file():
+                    cache_path.unlink()
+
+            # Re-verify ignored state after cache disposal
+            ok_after_clean, reason_after_clean, remaining_caches = _inspect_ignored_entries(
+                slot.path, slot.route, self.config
+            )
+            if not ok_after_clean:
+                raise ValueError(
+                    f"workspace contains invalid ignored entries after cache removal: {reason_after_clean}"
+                )
+            if remaining_caches:
+                raise ValueError(
+                    f"disposable caches remained after disposal: {[str(c) for c in remaining_caches]}"
+                )
+
+            default_exists = (
+                _run_git_or_none(route.path, "rev-parse", "--verify", default_ref) is not None
+            )
+            if not default_exists:
+                run_git(slot.path, "checkout", "-b", default_branch, canonical_tip)
+            else:
+                run_git(slot.path, "checkout", default_branch)
+                curr_head = _run_git_or_none(slot.path, "rev-parse", "HEAD")
+                if curr_head != canonical_tip:
+                    run_git(slot.path, "merge", "--ff-only", canonical_tip)
+
+            final_snap = workspace_snapshot(slot.path)
+            if not final_snap.stable or final_snap.porcelain:
+                raise ValueError("workspace dirty after checkout")
+
+            # Re-verify prep symlinks after checkout
+            allowed_links = _get_allowed_prep_symlinks(slot.path, slot.route, self.config)
+            for prep_link in allowed_links.values():
+                if os.path.lexists(slot.path / prep_link.link_rel_path):
+                    ok_sym, reason_sym = _verify_prep_symlink(slot.path, prep_link)
+                    if not ok_sym:
+                        raise ValueError(f"prep symlink broken after checkout: {reason_sym}")
+
+            self.slots.release_cleanup(
+                slot.name,
+                op_id,
+                expected_generation=slot.generation,
+                expected_route=slot.route,
+                expected_path=slot.path,
+                status="available",
+                note="auto-return to default branch completed",
+            )
+        except (GitError, OSError, ValueError, SlotStoreError) as exc:
+            with suppress(Exception):
+                self.slots.quarantine_cleanup(
+                    slot.name,
+                    op_id,
+                    slot.generation,
+                    expected_route=slot.route,
+                    expected_path=slot.path,
+                    note=f"auto-return failed: {exc}",
+                )
+            return {
+                "slot": slot_name,
+                "status": "failed",
+                "reason": f"auto-return transition failed: {exc}",
+            }
+
+        self._event(
+            "slot_auto_returned",
+            op_id,
+            {
+                "slot": slot.name,
+                "route": slot.route,
+                "previous_branch": snapshot.branch,
+                "default_branch": default_branch,
+                "head": canonical_tip,
+                "generation": slot.generation + 1,
+            },
+        )
+        return {
+            "slot": slot.name,
+            "status": "returned",
+            "previous_branch": snapshot.branch,
+            "branch": default_branch,
+            "head": canonical_tip,
+            "generation": slot.generation + 1,
+        }
+
+    def auto_return_slots(
+        self,
+        *,
+        route: str | None = None,
+        refresh: bool = True,
+    ) -> list[dict[str, Any]]:
+        self._initialize()
+        results: list[dict[str, Any]] = []
+        fetched_routes: set[str] = set()
+        for slot in self.slots.list_slots():
+            if slot.name not in self.config.slots:
+                continue
+            if route is not None and slot.route != route:
+                continue
+            should_refresh = refresh and (slot.route not in fetched_routes)
+            res = self.auto_return_slot(slot.name, refresh=should_refresh)
+            if should_refresh:
+                fetched_routes.add(slot.route)
+            results.append(res)
+        return results
 
     def poll(
         self, *, passes: int, interval_sec: float, max_interval_sec: float
@@ -2153,26 +2624,15 @@ class SlotLifecycleService:
                 "reasons": ["tracked or untracked workspace changes"],
             }
 
-        # Check ignored files
-        try:
-            ignored_raw = run_git(
-                slot.path, "status", "--porcelain=v1", "-uall", "--ignored=matching"
-            )
-        except GitError as exc:
-            return {
-                **base,
-                "classification": LifecycleClass.QUARANTINED.value,
-                "reasons": [f"failed to check ignored workspace files: {exc}"],
-            }
-        ignored_entries = [
-            line[3:].strip() for line in ignored_raw.splitlines() if line.startswith("!! ")
-        ]
-        if ignored_entries:
+        # Check ignored files and preparation artifacts
+        ok_ignored, err_ignored, _ = _inspect_ignored_entries(slot.path, slot.route, self.config)
+        if not ok_ignored:
             return {
                 **base,
                 "classification": LifecycleClass.DIRTY.value,
                 "reasons": [
-                    f"unexpected ignored files present; workspace cannot be proven clean: {ignored_entries[:3]}"
+                    err_ignored
+                    or "unexpected ignored files present; workspace cannot be proven clean"
                 ],
             }
 
@@ -2267,6 +2727,48 @@ class SlotLifecycleService:
                 "reasons": ["slot path is not in route git worktree inventory"],
             }
 
+        # Validate default branch
+        default_branch = f"slot/{slot.name}"
+        default_ref = f"refs/heads/{default_branch}"
+        default_sha = _run_git_or_none(route.path, "rev-parse", "--verify", default_ref)
+        if default_sha is not None:
+            def_tree = _commit_tree(route.path, default_sha)
+            if not (
+                _is_ancestor(route.path, default_sha, canonical_tip)
+                or (def_tree and _has_canonical_tree(route.path, def_tree, canonical_tip))
+            ):
+                return {
+                    **base,
+                    "classification": LifecycleClass.QUARANTINED.value,
+                    "reasons": [
+                        f"default branch {default_branch} has divergent or unmerged commits"
+                    ],
+                }
+
+        # Check if configured reusable slot is already returned to its default branch
+        if slot.name in self.config.slots and snapshot.branch == default_branch:
+            if not snapshot.head:
+                return {
+                    **base,
+                    "classification": LifecycleClass.QUARANTINED.value,
+                    "reasons": ["slot has no HEAD commit"],
+                }
+            head_tree = _commit_tree(slot.path, snapshot.head)
+            if not (
+                _is_ancestor(slot.path, snapshot.head, canonical_tip)
+                or (head_tree and _has_canonical_tree(slot.path, head_tree, canonical_tip))
+            ):
+                return {
+                    **base,
+                    "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
+                    "reasons": ["default branch HEAD is not canonical-reachable"],
+                }
+            return {
+                **base,
+                "classification": LifecycleClass.AVAILABLE.value,
+                "reasons": [],
+            }
+
         accepted = self._accepted_item(slot)
         if accepted is None or accepted.checkpoint_sha is None or accepted.checkpoint_ref is None:
             return {
@@ -2323,28 +2825,33 @@ class SlotLifecycleService:
                 "classification": LifecycleClass.QUARANTINED.value,
                 "reasons": ["checkpoint ref moved"],
             }
-        if not _is_ancestor(slot.path, accepted.checkpoint_sha, canonical_tip):
+
+        checkpoint_tree = accepted.checkpoint_tree_sha or _commit_tree(
+            slot.path, accepted.checkpoint_sha
+        )
+        checkpoint_integrated = _is_ancestor(slot.path, accepted.checkpoint_sha, canonical_tip) or (
+            checkpoint_tree is not None
+            and _has_canonical_tree(
+                slot.path, checkpoint_tree, canonical_tip, base_sha=accepted.base_sha
+            )
+        )
+        if not checkpoint_integrated:
             return {
                 **base,
                 "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
                 "reasons": ["accepted checkpoint is not canonical-reachable"],
             }
-        if not _is_ancestor(slot.path, snapshot.head, canonical_tip):
+
+        head_tree = _commit_tree(slot.path, snapshot.head)
+        head_integrated = _is_ancestor(slot.path, snapshot.head, canonical_tip) or (
+            head_tree is not None
+            and _has_canonical_tree(slot.path, head_tree, canonical_tip, base_sha=accepted.base_sha)
+        )
+        if not head_integrated:
             return {
                 **base,
                 "classification": LifecycleClass.UNIQUE_UNPUSHED.value,
                 "reasons": ["checkout base HEAD is not canonical-reachable"],
-            }
-
-        # Validate default branch
-        default_branch = f"slot/{slot.name}"
-        default_ref = f"refs/heads/{default_branch}"
-        default_sha = _run_git_or_none(route.path, "rev-parse", "--verify", default_ref)
-        if default_sha is not None and not _is_ancestor(route.path, default_sha, canonical_tip):
-            return {
-                **base,
-                "classification": LifecycleClass.QUARANTINED.value,
-                "reasons": [f"default branch {default_branch} has divergent or unmerged commits"],
             }
 
         frozen = FrozenSlot(
@@ -2387,7 +2894,10 @@ class SlotLifecycleService:
             for item in items
             if item.slot_name == slot.name
             and item.route == slot.route
-            and item.slot_generation == target_gen
+            and (
+                item.slot_generation == target_gen
+                or (item.slot_generation is None and target_gen == 1)
+            )
         ]
         return (
             max(matches, key=lambda item: item.reviewed_at or item.updated_at) if matches else None
@@ -2849,6 +3359,36 @@ def _is_patch_equivalent(repo: Path, commit_sha: str, upstream_ref: str) -> bool
     return candidate_non_merge_shas == cherry_shas
 
 
+def _commit_tree(repo: Path, commit_sha: str) -> str | None:
+    if not commit_sha:
+        return None
+    return _run_git_or_none(repo, "rev-parse", "--verify", f"{commit_sha}^{{tree}}")
+
+
+def _has_canonical_tree(
+    repo: Path,
+    tree_sha: str,
+    canonical_tip: str,
+    base_sha: str | None = None,
+    max_commits: int = 500,
+) -> bool:
+    if not tree_sha or not canonical_tip:
+        return False
+    tip_tree = _run_git_or_none(repo, "rev-parse", "--verify", f"{canonical_tip}^{{tree}}")
+    if tip_tree == tree_sha:
+        return True
+    try:
+        if base_sha and _is_ancestor(repo, base_sha, canonical_tip):
+            rev_spec = [f"-n{max_commits}", f"{base_sha}..{canonical_tip}"]
+        else:
+            rev_spec = [f"-n{max_commits}", canonical_tip]
+        output = run_git(repo, "log", "--format=%T", *rev_spec)
+        trees = {line.strip() for line in output.splitlines() if line.strip()}
+        return tree_sha in trees
+    except GitError:
+        return False
+
+
 def _run_git_or_none(repo: Path, *args: str) -> str | None:
     try:
         return run_git(repo, *args)
@@ -2896,3 +3436,242 @@ def _parse_worktrees(output: str) -> list[dict[str, str]]:
         elif key == "HEAD":
             current["head"] = value
     return records
+
+
+@dataclass(frozen=True)
+class AllowedPrepSymlink:
+    name: str
+    link_rel_path: str
+    expected_target: Path
+    marker: Path | None
+
+
+# Explicit exact list of known disposable controller-generated cache names
+KNOWN_DISPOSABLE_CACHE_NAMES: frozenset[str] = frozenset(
+    {
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        "__pycache__",
+    }
+)
+
+
+def _get_allowed_prep_symlinks(
+    slot_path: Path,
+    route_name: str,
+    config: ControlConfig,
+) -> dict[str, AllowedPrepSymlink]:
+    allowed: dict[str, AllowedPrepSymlink] = {}
+    for cmd in config.slot_prepare:
+        if cmd.routes and route_name not in cmd.routes:
+            continue
+        working_dir = (
+            (slot_path / cmd.working_dir).resolve(strict=False)
+            if not cmd.working_dir.is_absolute()
+            else cmd.working_dir.resolve(strict=False)
+        )
+        parts = list(cmd.command)
+        if not parts:
+            continue
+        # Support ln -s [options] <target> [link_name]
+        if parts[0] == "ln":
+            flags = [p for p in parts[1:] if p.startswith("-")]
+            if any("s" in f or f == "--symbolic" for f in flags):
+                pos_args = [p for p in parts[1:] if not p.startswith("-") and p != "--"]
+                if len(pos_args) == 2:
+                    target_str, link_str = pos_args[0], pos_args[1]
+                elif len(pos_args) == 1:
+                    target_str = pos_args[0]
+                    link_str = Path(target_str).name
+                else:
+                    continue
+                target_p = Path(target_str)
+                if target_p.is_absolute():
+                    expected_target = target_p.resolve(strict=False)
+                else:
+                    expected_target = (working_dir / target_p).resolve(strict=False)
+                link_full = working_dir / link_str
+                try:
+                    rel_p = Path(os.path.relpath(link_full, slot_path)).as_posix()
+                    if rel_p.startswith(".."):
+                        continue
+                except ValueError:
+                    continue
+                marker_full = (
+                    (slot_path / cmd.marker).resolve(strict=False)
+                    if cmd.marker is not None
+                    else None
+                )
+                allowed[rel_p] = AllowedPrepSymlink(
+                    name=cmd.name,
+                    link_rel_path=rel_p,
+                    expected_target=expected_target,
+                    marker=marker_full,
+                )
+        # Support mklink on Windows
+        elif parts[0].lower() == "mklink" or (
+            len(parts) >= 3
+            and parts[0].lower() == "cmd"
+            and parts[1].lower() == "/c"
+            and parts[2].lower() == "mklink"
+        ):
+            mklink_args = parts[1:] if parts[0].lower() == "mklink" else parts[3:]
+            non_flags = [p for p in mklink_args if not p.startswith("/")]
+            if len(non_flags) >= 2:
+                link_str, target_str = non_flags[0], non_flags[1]
+                target_p = Path(target_str)
+                if target_p.is_absolute():
+                    expected_target = target_p.resolve(strict=False)
+                else:
+                    expected_target = (working_dir / target_p).resolve(strict=False)
+                link_full = working_dir / link_str
+                try:
+                    rel_p = Path(os.path.relpath(link_full, slot_path)).as_posix()
+                    if rel_p.startswith(".."):
+                        continue
+                except ValueError:
+                    continue
+                marker_full = (
+                    (slot_path / cmd.marker).resolve(strict=False)
+                    if cmd.marker is not None
+                    else None
+                )
+                allowed[rel_p] = AllowedPrepSymlink(
+                    name=cmd.name,
+                    link_rel_path=rel_p,
+                    expected_target=expected_target,
+                    marker=marker_full,
+                )
+    return allowed
+
+
+def _verify_prep_symlink(
+    slot_path: Path,
+    prep: AllowedPrepSymlink,
+) -> tuple[bool, str | None]:
+    full_path = slot_path / prep.link_rel_path
+    if not os.path.lexists(full_path):
+        return False, f"prep symlink does not exist: {prep.link_rel_path}"
+
+    if not full_path.is_symlink():
+        return False, f"prep path {prep.link_rel_path} is not a symlink (expected symlink)"
+
+    try:
+        raw_target = os.readlink(full_path)
+    except OSError as exc:
+        return False, f"could not read symlink {prep.link_rel_path}: {exc}"
+
+    target_p = Path(raw_target)
+    if target_p.is_absolute():
+        actual_target = target_p.resolve(strict=False)
+    else:
+        actual_target = (full_path.parent / target_p).resolve(strict=False)
+
+    if actual_target != prep.expected_target:
+        return (
+            False,
+            f"prep symlink {prep.link_rel_path} target drift: {actual_target} != {prep.expected_target}",
+        )
+
+    if prep.marker is not None and not prep.marker.exists():
+        return False, f"prep marker does not exist: {prep.marker}"
+
+    return True, None
+
+
+def _is_known_disposable_cache(slot_path: Path, rel_str: str) -> tuple[bool, Path | None]:
+    rel_path = Path(rel_str.rstrip("/"))
+    if rel_path.is_absolute() or ".." in rel_path.parts:
+        return False, None
+
+    full_path = slot_path / rel_path
+    if not os.path.lexists(full_path):
+        return False, None
+
+    # Never treat symlinks as disposable caches
+    if full_path.is_symlink():
+        return False, None
+
+    # Fail closed: check that no parent component under slot_path is a symlink
+    curr = full_path.parent
+    try:
+        slot_resolved = slot_path.resolve(strict=False)
+        while curr.resolve(strict=False) != slot_resolved and is_same_or_child(curr, slot_path):
+            if curr.is_symlink():
+                return False, None
+            if curr == curr.parent:
+                break
+            curr = curr.parent
+    except OSError:
+        return False, None
+
+    # Check if this exact path is a known cache directory
+    if rel_path.name in KNOWN_DISPOSABLE_CACHE_NAMES:
+        if full_path.is_dir():
+            return True, full_path
+        return False, None
+
+    # Check if this path is inside a known cache directory
+    for parent in rel_path.parents:
+        if parent.name in KNOWN_DISPOSABLE_CACHE_NAMES:
+            parent_full = slot_path / parent
+            if parent_full.is_dir() and not parent_full.is_symlink():
+                if (
+                    parent.name == "__pycache__"
+                    and full_path.is_file()
+                    and not full_path.name.endswith((".pyc", ".pyo"))
+                ):
+                    return False, None
+                return True, parent_full
+
+    return False, None
+
+
+def _inspect_ignored_entries(
+    slot_path: Path,
+    route_name: str,
+    config: ControlConfig,
+) -> tuple[bool, str | None, set[Path]]:
+    try:
+        ignored_raw = run_git(slot_path, "status", "--porcelain=v1", "-uall", "--ignored=matching")
+    except GitError as exc:
+        return False, f"failed to check ignored workspace files: {exc}", set()
+
+    ignored_lines = [
+        line[3:].strip() for line in ignored_raw.splitlines() if line.startswith("!! ")
+    ]
+    if not ignored_lines:
+        return True, None, set()
+
+    allowed_symlinks = _get_allowed_prep_symlinks(slot_path, route_name, config)
+
+    # If any allowed prep symlink is present on disk, verify it!
+    for rel_p, prep_link in allowed_symlinks.items():
+        full_p = slot_path / rel_p
+        if os.path.lexists(full_p):
+            ok, reason = _verify_prep_symlink(slot_path, prep_link)
+            if not ok:
+                return False, f"invalid preparation symlink: {reason}", set()
+
+    caches_to_remove: set[Path] = set()
+    unknown_entries: list[str] = []
+
+    for raw_entry in ignored_lines:
+        rel_norm = raw_entry.rstrip("/")
+        if rel_norm in allowed_symlinks:
+            continue
+        is_cache, cache_root = _is_known_disposable_cache(slot_path, raw_entry)
+        if is_cache and cache_root is not None:
+            caches_to_remove.add(cache_root)
+        else:
+            unknown_entries.append(raw_entry)
+
+    if unknown_entries:
+        return (
+            False,
+            f"unexpected ignored files present; workspace cannot be proven clean: {unknown_entries[:3]}",
+            set(),
+        )
+
+    return True, None, caches_to_remove
