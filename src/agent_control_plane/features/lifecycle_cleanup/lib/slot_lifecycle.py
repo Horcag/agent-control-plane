@@ -5,7 +5,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -83,6 +83,39 @@ class FrozenSlot:
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
+@dataclass(frozen=True)
+class FrozenBranch:
+    route: str
+    branch: str
+    sha: str
+    canonical_ref: str
+    canonical_tip: str
+    canonical_url: str
+    common_git_dir: str
+    receipt_source: str
+    receipt_id: str
+    kind: str = "branch"
+
+    @property
+    def operation_id(self) -> str:
+        payload = json.dumps(
+            [
+                self.kind,
+                self.route,
+                self.branch,
+                self.sha,
+                self.canonical_ref,
+                self.canonical_tip,
+                self.canonical_url,
+                self.common_git_dir,
+                self.receipt_source,
+                self.receipt_id,
+            ],
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()
+
+
 class SlotLifecycleService:
     """Audit all ACP slots and execute only exact, revalidated cleanup intents."""
 
@@ -97,6 +130,8 @@ class SlotLifecycleService:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         process_is_alive: Callable[[int | None], bool] | None = None,
+        legacy_database: Path | Sequence[Path] | None = None,
+        legacy_databases: Sequence[Path] | None = None,
     ) -> None:
         self.config = config
         self.slots = slots
@@ -106,7 +141,41 @@ class SlotLifecycleService:
         self.clock = clock
         self.sleep = sleep
         self.process_is_alive = process_is_alive or shared_process_is_alive
+
+        self.legacy_databases: list[Path] = []
+        if legacy_databases is not None:
+            raw_dbs = list(legacy_databases)
+        elif legacy_database is not None:
+            if isinstance(legacy_database, (str, Path)):
+                raw_dbs = [Path(legacy_database)]
+            else:
+                raw_dbs = [Path(p) for p in legacy_database]
+        else:
+            raw_dbs = [
+                self.config.coordination_root / "legacy" / "control-plane" / "shared-jobs.sqlite3",
+                self.config.database_path.parent.parent
+                / "legacy"
+                / "control-plane"
+                / "shared-jobs.sqlite3",
+                self.config.worktree_base / "runs" / "jobs.sqlite3",
+                self.config.coordination_root / "runs" / "jobs.sqlite3",
+            ]
+
+        seen_dbs: set[Path] = set()
+        curr_db_resolved = self.config.database_path.resolve(strict=False)
+        for cand in raw_dbs:
+            p = Path(cand)
+            if p.exists():
+                res = p.resolve(strict=False)
+                if res != curr_db_resolved and res not in seen_dbs:
+                    seen_dbs.add(res)
+                    self.legacy_databases.append(res)
+        self.legacy_databases.sort(key=lambda p: str(p))
         self._initialize()
+
+    @property
+    def legacy_database(self) -> Path | None:
+        return self.legacy_databases[0] if self.legacy_databases else None
 
     def audit(self, *, refresh: bool = True) -> dict[str, Any]:
         self.slots.initialize()
@@ -233,41 +302,642 @@ class SlotLifecycleService:
                 )
             r_info = route_cache.get(route_name, {})
             canonical_ref = r_info.get("canonical_ref")
+            worktree_branches = {wt.get("branch") for wt in worktrees if wt.get("branch")}
+            evidence = self._load_route_evidence(route_name, route.path)
             for raw in branches:
                 if "\0" not in raw:
                     continue
                 branch, sha = raw.split("\0", 1)
                 if branch == route.required_branch or (route_name, branch) in registered_branches:
                     continue
-                integrated = bool(canonical_ref and _is_ancestor(route.path, sha, canonical_ref))
-                has_receipt = self._has_acceptance_receipt(route_name, branch, sha)
-                if integrated and has_receipt:
-                    classification = LifecycleClass.ACCEPTED_INTEGRATED.value
-                    reasons = ["unowned branch with valid acceptance receipt; integrated"]
-                elif integrated:
-                    classification = LifecycleClass.RETAINED_UNOWNED.value
-                    reasons = ["unowned branch without acceptance receipt; retained"]
-                else:
-                    classification = LifecycleClass.UNIQUE_UNPUSHED.value
-                    reasons = ["unowned branch; audit never authorizes deletion"]
-                rows.append(
-                    {
-                        "kind": "branch",
-                        "route": route_name,
-                        "branch": branch,
-                        "sha": sha,
-                        "classification": classification,
-                        "reasons": reasons,
-                    }
+                is_protected = (
+                    branch in ("main", "master", "dev", route.canonical_branch)
+                    or branch in worktree_branches
+                    or branch.startswith("slot/")
                 )
+                is_ancestor = bool(canonical_ref and _is_ancestor(route.path, sha, canonical_ref))
+                is_patch = bool(
+                    canonical_ref
+                    and not is_ancestor
+                    and _is_patch_equivalent(route.path, sha, canonical_ref)
+                )
+                integrated = is_ancestor or is_patch
+
+                acc_entry = evidence["accepted_shas"].get(sha) or evidence["accepted_branches"].get(
+                    branch
+                )
+                rej_entry = evidence["rejected_shas"].get(sha) or evidence["rejected_branches"].get(
+                    branch
+                )
+
+                row = self._classify_branch(
+                    route_name=route_name,
+                    branch=branch,
+                    sha=sha,
+                    canonical_ref=canonical_ref,
+                    r_info=r_info,
+                    is_protected=is_protected,
+                    integrated=integrated,
+                    acc_entry=acc_entry,
+                    rej_entry=rej_entry,
+                    schema_errors=evidence["schema_errors"],
+                )
+                rows.append(row)
         return rows
 
+    def _classify_branch(
+        self,
+        *,
+        route_name: str,
+        branch: str,
+        sha: str,
+        canonical_ref: str | None,
+        r_info: dict[str, Any],
+        is_protected: bool,
+        integrated: bool,
+        acc_entry: tuple[str, str, str] | None,
+        rej_entry: tuple[str, str, str] | None,
+        schema_errors: list[str] | None = None,
+    ) -> dict[str, Any]:
+        effective_review = "none"
+        if rej_entry and not acc_entry:
+            effective_review = "rejected"
+        elif rej_entry and acc_entry:
+            acc_ts = acc_entry[2] or ""
+            rej_ts = rej_entry[2] or ""
+            if acc_ts and rej_ts and acc_ts > rej_ts:
+                effective_review = "accepted"
+            else:
+                effective_review = "contradictory"
+        elif acc_entry:
+            effective_review = "accepted"
+
+        rej_label = f"{rej_entry[0]}:{rej_entry[1]}" if rej_entry else ""
+        acc_label = f"{acc_entry[0]}:{acc_entry[1]}" if acc_entry else ""
+
+        if schema_errors and effective_review == "accepted" and integrated and not is_protected:
+            classification = LifecycleClass.QUARANTINED.value
+            reasons = [
+                f"unsupported legacy schema or database error ({'; '.join(schema_errors)}); fail-closed"
+            ]
+        elif effective_review == "rejected":
+            if integrated:
+                classification = LifecycleClass.QUARANTINED.value
+                reasons = [f"unowned branch has rejected review record ({rej_label}); quarantined"]
+            else:
+                classification = LifecycleClass.UNIQUE_UNPUSHED.value
+                reasons = [
+                    "unowned branch with unmerged commits and rejected review record; audit never authorizes deletion"
+                ]
+        elif effective_review == "contradictory":
+            if integrated:
+                classification = LifecycleClass.QUARANTINED.value
+                reasons = [
+                    f"unowned branch has contradictory review records ({rej_label} vs {acc_label}); quarantined"
+                ]
+            else:
+                classification = LifecycleClass.UNIQUE_UNPUSHED.value
+                reasons = [
+                    "unowned branch with contradictory review records; audit never authorizes deletion"
+                ]
+        elif effective_review == "accepted":
+            if integrated and is_protected:
+                classification = LifecycleClass.RETAINED_UNOWNED.value
+                reasons = [
+                    f"unowned branch with acceptance receipt ({acc_label}) is protected or in worktree; retained"
+                ]
+            elif integrated:
+                classification = LifecycleClass.ACCEPTED_INTEGRATED.value
+                reasons = [
+                    f"unowned branch with valid acceptance receipt ({acc_label}); integrated"
+                ]
+            else:
+                classification = LifecycleClass.UNIQUE_UNPUSHED.value
+                reasons = [
+                    "unowned branch with acceptance receipt but unmerged commits; audit never authorizes deletion"
+                ]
+        elif integrated:
+            classification = LifecycleClass.RETAINED_UNOWNED.value
+            reasons = ["unowned branch without acceptance receipt; retained"]
+        else:
+            classification = LifecycleClass.UNIQUE_UNPUSHED.value
+            reasons = [
+                "unowned branch with unique unmerged commits; audit never authorizes deletion"
+            ]
+
+        row: dict[str, Any] = {
+            "kind": "branch",
+            "route": route_name,
+            "branch": branch,
+            "sha": sha,
+            "classification": classification,
+            "reasons": reasons,
+        }
+
+        if classification == LifecycleClass.ACCEPTED_INTEGRATED.value and acc_entry is not None:
+            frozen = FrozenBranch(
+                route=route_name,
+                branch=branch,
+                sha=sha,
+                canonical_ref=canonical_ref or "",
+                canonical_tip=r_info.get("canonical_tip", ""),
+                canonical_url=r_info.get("canonical_url", ""),
+                common_git_dir=r_info.get("common_git_dir", ""),
+                receipt_source=acc_entry[0],
+                receipt_id=acc_entry[1],
+            )
+            row["operation_id"] = frozen.operation_id
+            row["proof"] = {**frozen.__dict__}
+
+        return row
+
+    def _load_route_evidence(self, route_name: str, route_path: Path) -> dict[str, Any]:
+        route = self.config.routes.get(route_name)
+        target_route_path = route_path.resolve(strict=False)
+        try:
+            target_common_git_dir = str(
+                (route_path / run_git(route_path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+        except GitError:
+            target_common_git_dir = ""
+        target_coordination_root = self.config.coordination_root.resolve(strict=False)
+        target_slot_root = getattr(route, "slot_root", None) or getattr(
+            self.config, "slot_root", None
+        )
+        if target_slot_root:
+            target_slot_root = target_slot_root.resolve(strict=False)
+
+        target_ckpt_refs: dict[str, str] = {}
+        with suppress(GitError):
+            for line in run_git(
+                route_path,
+                "for-each-ref",
+                "--format=%(refname)%00%(objectname)",
+                "refs/agent-control-plane/jobs",
+            ).splitlines():
+                if "\0" in line:
+                    rname, rsha = line.split("\0", 1)
+                    target_ckpt_refs[rname] = rsha
+
+        def _is_workspace_verified(
+            wp_val: str | Path | None,
+            job_id: str | None = None,
+            ckpt_ref: str | None = None,
+            ckpt_sha: str | None = None,
+        ) -> bool:
+            wp_str = str(wp_val).strip() if wp_val is not None else ""
+            if wp_str:
+                wp = Path(wp_str).resolve(strict=False)
+                if wp.exists():
+                    if not target_common_git_dir:
+                        return False
+                    try:
+                        cg = str(
+                            (wp / run_git(wp, "rev-parse", "--git-common-dir")).resolve(
+                                strict=False
+                            )
+                        )
+                        if cg != target_common_git_dir:
+                            return False
+                        if job_id and ckpt_ref:
+                            j_hash = hashlib.sha256(
+                                job_id.encode("utf-8", errors="surrogatepass")
+                            ).hexdigest()
+                            valid_refs = {
+                                f"refs/agent-control-plane/jobs/{j_hash}",
+                                f"refs/agent-control-plane/jobs/{job_id}",
+                            }
+                            if ckpt_ref not in valid_refs:
+                                return False
+                        return not (
+                            ckpt_ref
+                            and ckpt_ref in target_ckpt_refs
+                            and ckpt_sha
+                            and target_ckpt_refs[ckpt_ref] != ckpt_sha
+                        )
+                    except (GitError, OSError):
+                        return False
+
+                # The workspace path is non-existent/removed.
+                # Lexical containment alone can NEVER prove repository identity.
+                is_lexical = (
+                    is_same_or_child(wp, target_route_path)
+                    or is_same_or_child(wp, target_coordination_root)
+                    or bool(target_slot_root and is_same_or_child(wp, target_slot_root))
+                )
+                if not is_lexical:
+                    return False
+
+            # For non-existent historical workspaces or unprovided workspace paths:
+            # An independently present exact checkpoint ref or hashed/exact job checkpoint ref
+            # in this repository is strictly required (and matching SHA where supplied).
+            candidate_refs: list[str] = []
+            if job_id:
+                j_hash = hashlib.sha256(job_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+                valid_job_refs = {
+                    f"refs/agent-control-plane/jobs/{j_hash}",
+                    f"refs/agent-control-plane/jobs/{job_id}",
+                }
+                if ckpt_ref:
+                    if ckpt_ref not in valid_job_refs:
+                        return False
+                    candidate_refs.append(ckpt_ref)
+                else:
+                    candidate_refs.extend(sorted(valid_job_refs))
+            elif ckpt_ref:
+                candidate_refs.append(ckpt_ref)
+
+            for ref in candidate_refs:
+                if ref in target_ckpt_refs:
+                    ref_sha = target_ckpt_refs[ref]
+                    if ckpt_sha:
+                        if ref_sha == ckpt_sha:
+                            return True
+                    else:
+                        return True
+
+            return False
+
+        accepted_shas: dict[str, tuple[str, str, str]] = {}
+        rejected_shas: dict[str, tuple[str, str, str]] = {}
+        accepted_branches: dict[str, tuple[str, str, str]] = {}
+        rejected_branches: dict[str, tuple[str, str, str]] = {}
+        accepted_job_ids: set[str] = set()
+        rejected_job_ids: set[str] = set()
+        schema_errors: list[str] = []
+
+        # Current review inbox items
+        for item in self.inbox.list_items(review_status=None, limit=5000):
+            if item.route != route_name:
+                continue
+            if not _is_workspace_verified(
+                item.workspace_path,
+                job_id=item.source_id,
+                ckpt_ref=item.checkpoint_ref,
+                ckpt_sha=item.checkpoint_sha,
+            ):
+                continue
+            ts = item.reviewed_at or item.created_at or ""
+            if item.review_status == "accepted":
+                if item.source_id:
+                    accepted_job_ids.add(item.source_id)
+                if item.checkpoint_sha:
+                    accepted_shas[item.checkpoint_sha] = ("inbox", item.item_id, ts)
+            elif item.review_status == "rejected":
+                if item.source_id:
+                    rejected_job_ids.add(item.source_id)
+                if item.checkpoint_sha:
+                    rejected_shas[item.checkpoint_sha] = ("inbox", item.item_id, ts)
+
+        # Current control database
+        verified_curr_jobs: dict[str, tuple[str | None, str | None, str]] = {}
+        with control_database(self.config.database_path) as db, suppress(sqlite3.Error):
+            for row in db.execute(
+                "select job_id, workspace_path, expected_branch, status, root_acceptance, updated_at from jobs where route = ?",
+                (route_name,),
+            ).fetchall():
+                jid = row["job_id"]
+                ws = row["workspace_path"]
+                exp = row["expected_branch"]
+                ra = row["root_acceptance"]
+                ts = row["updated_at"] or ""
+                if _is_workspace_verified(ws, job_id=jid):
+                    verified_curr_jobs[jid] = (exp, ra, ts)
+
+            for row in db.execute(
+                "select task_id, job_id, review_status, accepted_sha, updated_at from plan_tasks where accepted_sha is not null"
+            ).fetchall():
+                jid = row["job_id"]
+                asha = row["accepted_sha"]
+                if not (
+                    jid
+                    and (
+                        jid in verified_curr_jobs
+                        or _is_workspace_verified(None, job_id=jid, ckpt_sha=asha)
+                    )
+                ):
+                    continue
+                ts = row["updated_at"] or ""
+                if row["review_status"] == "accepted":
+                    accepted_shas[row["accepted_sha"]] = ("plan_task", row["task_id"], ts)
+                    accepted_job_ids.add(jid)
+                elif row["review_status"] == "rejected":
+                    rejected_shas[row["accepted_sha"]] = ("plan_task", row["task_id"], ts)
+                    rejected_job_ids.add(jid)
+
+            for row in db.execute(
+                "select job_id, outcome, checkpoint_sha, accepted_sha, recorded_at from review_job_outcomes"
+            ).fetchall():
+                jid = row["job_id"]
+                csha = row["checkpoint_sha"]
+                asha = row["accepted_sha"]
+                if not (
+                    jid
+                    and (
+                        jid in verified_curr_jobs
+                        or _is_workspace_verified(None, job_id=jid, ckpt_sha=csha or asha)
+                    )
+                ):
+                    continue
+                ts = row["recorded_at"] or ""
+                if row["outcome"] == "accepted":
+                    if row["accepted_sha"]:
+                        accepted_shas[row["accepted_sha"]] = ("outcome", jid, ts)
+                    if row["checkpoint_sha"]:
+                        accepted_shas[row["checkpoint_sha"]] = ("outcome", jid, ts)
+                    accepted_job_ids.add(jid)
+                elif row["outcome"] == "rejected":
+                    if row["checkpoint_sha"]:
+                        rejected_shas[row["checkpoint_sha"]] = ("outcome", jid, ts)
+                    rejected_job_ids.add(jid)
+
+            for jid, (exp, ra, ts) in verified_curr_jobs.items():
+                if not exp:
+                    continue
+                if ra == "accepted" or jid in accepted_job_ids:
+                    accepted_branches[exp] = ("job", jid, ts)
+                elif ra == "rejected" or jid in rejected_job_ids:
+                    rejected_branches[exp] = ("job", jid, ts)
+
+        # Legacy databases
+        for leg_db in self.legacy_databases:
+            if not leg_db.exists():
+                continue
+            try:
+                conn = sqlite3.connect(f"file:{leg_db}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+            except sqlite3.Error as exc:
+                schema_errors.append(f"failed to open legacy database {leg_db.name}: {exc}")
+                continue
+
+            try:
+                try:
+                    cur = conn.execute("PRAGMA quick_check")
+                    qc_row = cur.fetchone()
+                    if not qc_row or qc_row[0] != "ok":
+                        schema_errors.append(
+                            f"legacy database {leg_db.name} quick_check failed: {qc_row[0] if qc_row else 'empty'}"
+                        )
+                        continue
+                except sqlite3.Error as exc:
+                    schema_errors.append(f"legacy database {leg_db.name} quick_check error: {exc}")
+                    continue
+
+                tables = {
+                    r[0]
+                    for r in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+
+                leg_verified_jobs: dict[str, tuple[str | None, str | None, str]] = {}
+                if "jobs" in tables:
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+                    if not ("route" in cols and "job_id" in cols):
+                        schema_errors.append(
+                            f"legacy database {leg_db.name} has incomplete jobs table schema"
+                        )
+                    else:
+                        try:
+                            for row in conn.execute(
+                                "SELECT * FROM jobs WHERE route = ?",
+                                (route_name,),
+                            ).fetchall():
+                                col_names = set(row.keys())
+                                jid = row["job_id"]
+                                ws = (
+                                    row["workspace_path"] if "workspace_path" in col_names else None
+                                )
+                                exp = (
+                                    row["expected_branch"]
+                                    if "expected_branch" in col_names
+                                    else None
+                                )
+                                ra = (
+                                    row["root_acceptance"]
+                                    if "root_acceptance" in col_names
+                                    else None
+                                )
+                                ts = (
+                                    row["updated_at"]
+                                    if "updated_at" in col_names and row["updated_at"]
+                                    else ""
+                                )
+                                if _is_workspace_verified(ws, job_id=jid):
+                                    leg_verified_jobs[jid] = (exp, ra, ts)
+                        except sqlite3.Error as exc:
+                            schema_errors.append(f"querying jobs in {leg_db.name} failed: {exc}")
+
+                if "review_inbox_items" in tables:
+                    cols = {
+                        r[1]
+                        for r in conn.execute("PRAGMA table_info(review_inbox_items)").fetchall()
+                    }
+                    if not (
+                        "item_id" in cols
+                        and "source_id" in cols
+                        and "review_status" in cols
+                        and "route" in cols
+                    ):
+                        schema_errors.append(
+                            f"legacy database {leg_db.name} has incomplete review_inbox_items schema"
+                        )
+                    else:
+                        try:
+                            for row in conn.execute(
+                                "SELECT * FROM review_inbox_items WHERE route = ?",
+                                (route_name,),
+                            ).fetchall():
+                                col_names = set(row.keys())
+                                jid = row["source_id"]
+                                ws = (
+                                    row["workspace_path"] if "workspace_path" in col_names else None
+                                )
+                                cref = (
+                                    row["checkpoint_ref"] if "checkpoint_ref" in col_names else None
+                                )
+                                csha = (
+                                    row["checkpoint_sha"] if "checkpoint_sha" in col_names else None
+                                )
+                                rev = row["reviewed_at"] if "reviewed_at" in col_names else None
+                                cr = row["created_at"] if "created_at" in col_names else None
+                                ts = rev or cr or ""
+                                is_verified = False
+                                if jid and jid in leg_verified_jobs:
+                                    if (
+                                        cref
+                                        and cref in target_ckpt_refs
+                                        and csha
+                                        and target_ckpt_refs[cref] != csha
+                                    ):
+                                        is_verified = False
+                                    else:
+                                        is_verified = True
+                                if not is_verified and _is_workspace_verified(
+                                    ws, job_id=jid, ckpt_ref=cref, ckpt_sha=csha
+                                ):
+                                    is_verified = True
+                                if not is_verified:
+                                    continue
+                                st = row["review_status"]
+                                if st == "accepted":
+                                    if jid:
+                                        accepted_job_ids.add(jid)
+                                    if csha:
+                                        accepted_shas.setdefault(
+                                            csha, ("legacy_inbox", row["item_id"], ts)
+                                        )
+                                elif st == "rejected":
+                                    if jid:
+                                        rejected_job_ids.add(jid)
+                                    if csha:
+                                        rejected_shas.setdefault(
+                                            csha, ("legacy_inbox", row["item_id"], ts)
+                                        )
+                        except sqlite3.Error as exc:
+                            schema_errors.append(
+                                f"querying review_inbox_items in {leg_db.name} failed: {exc}"
+                            )
+
+                if "plan_tasks" in tables:
+                    cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_tasks)").fetchall()}
+                    if (
+                        "task_id" in cols
+                        and "job_id" in cols
+                        and "review_status" in cols
+                        and "accepted_sha" in cols
+                    ):
+                        try:
+                            for row in conn.execute(
+                                "SELECT * FROM plan_tasks WHERE accepted_sha IS NOT NULL"
+                            ).fetchall():
+                                col_names = set(row.keys())
+                                jid = row["job_id"]
+                                sha = row["accepted_sha"]
+                                is_verified = bool(
+                                    (jid and jid in leg_verified_jobs)
+                                    or _is_workspace_verified(None, job_id=jid, ckpt_sha=sha)
+                                )
+                                if not is_verified:
+                                    continue
+                                ts = (
+                                    row["updated_at"]
+                                    if "updated_at" in col_names and row["updated_at"]
+                                    else ""
+                                )
+                                st = row["review_status"]
+                                if st == "accepted":
+                                    accepted_shas.setdefault(
+                                        sha, ("legacy_plan_task", row["task_id"], ts)
+                                    )
+                                    accepted_job_ids.add(jid)
+                                elif st == "rejected":
+                                    rejected_shas.setdefault(
+                                        sha, ("legacy_plan_task", row["task_id"], ts)
+                                    )
+                                    rejected_job_ids.add(jid)
+                        except sqlite3.Error as exc:
+                            schema_errors.append(
+                                f"querying plan_tasks in {leg_db.name} failed: {exc}"
+                            )
+
+                if "review_job_outcomes" in tables:
+                    cols = {
+                        r[1]
+                        for r in conn.execute("PRAGMA table_info(review_job_outcomes)").fetchall()
+                    }
+                    if "job_id" in cols and "outcome" in cols:
+                        try:
+                            for row in conn.execute("SELECT * FROM review_job_outcomes").fetchall():
+                                col_names = set(row.keys())
+                                jid = row["job_id"]
+                                csha = (
+                                    row["checkpoint_sha"] if "checkpoint_sha" in col_names else None
+                                )
+                                asha = row["accepted_sha"] if "accepted_sha" in col_names else None
+                                is_verified = bool(
+                                    (jid and jid in leg_verified_jobs)
+                                    or _is_workspace_verified(
+                                        None, job_id=jid, ckpt_sha=csha or asha
+                                    )
+                                )
+                                if not is_verified:
+                                    continue
+                                ts = (
+                                    row["recorded_at"]
+                                    if "recorded_at" in col_names and row["recorded_at"]
+                                    else ""
+                                )
+                                csha = (
+                                    row["checkpoint_sha"] if "checkpoint_sha" in col_names else None
+                                )
+                                asha = row["accepted_sha"] if "accepted_sha" in col_names else None
+                                out = row["outcome"]
+                                if out == "accepted":
+                                    if asha:
+                                        accepted_shas.setdefault(asha, ("legacy_outcome", jid, ts))
+                                    if csha:
+                                        accepted_shas.setdefault(csha, ("legacy_outcome", jid, ts))
+                                    accepted_job_ids.add(jid)
+                                elif out == "rejected":
+                                    if csha:
+                                        rejected_shas.setdefault(csha, ("legacy_outcome", jid, ts))
+                                    rejected_job_ids.add(jid)
+                        except sqlite3.Error as exc:
+                            schema_errors.append(
+                                f"querying review_job_outcomes in {leg_db.name} failed: {exc}"
+                            )
+
+                for jid, (exp, ra, ts) in leg_verified_jobs.items():
+                    if not exp:
+                        continue
+                    if ra == "accepted" or jid in accepted_job_ids:
+                        accepted_branches.setdefault(exp, ("legacy_job", jid, ts))
+                    elif ra == "rejected" or jid in rejected_job_ids:
+                        rejected_branches.setdefault(exp, ("legacy_job", jid, ts))
+
+            finally:
+                conn.close()
+
+        # Checkpoint refs in git repo
+        with suppress(GitError):
+            for refname, sha in target_ckpt_refs.items():
+                suffix = refname.removeprefix("refs/agent-control-plane/jobs/")
+                for jid in accepted_job_ids:
+                    j_hash = hashlib.sha256(jid.encode("utf-8", errors="surrogatepass")).hexdigest()
+                    if suffix in (jid, j_hash):
+                        accepted_shas.setdefault(sha, ("checkpoint_ref", refname, ""))
+                for jid in rejected_job_ids:
+                    j_hash = hashlib.sha256(jid.encode("utf-8", errors="surrogatepass")).hexdigest()
+                    if suffix in (jid, j_hash):
+                        rejected_shas.setdefault(sha, ("checkpoint_ref", refname, ""))
+
+        return {
+            "accepted_shas": accepted_shas,
+            "rejected_shas": rejected_shas,
+            "accepted_branches": accepted_branches,
+            "rejected_branches": rejected_branches,
+            "schema_errors": schema_errors,
+        }
+
     def _has_acceptance_receipt(self, route_name: str, branch: str, sha: str) -> bool:
-        items = self.inbox.list_items(review_status="accepted", limit=500)
-        for item in items:
-            if item.route == route_name and (item.checkpoint_sha == sha or item.base_sha == sha):
-                return True
-        return False
+        route = self.config.routes.get(route_name)
+        route_path = route.path if route else Path.cwd()
+        evidence = self._load_route_evidence(route_name, route_path)
+        if evidence["schema_errors"]:
+            return False
+        acc_entry = evidence["accepted_shas"].get(sha) or evidence["accepted_branches"].get(branch)
+        rej_entry = evidence["rejected_shas"].get(sha) or evidence["rejected_branches"].get(branch)
+        if not acc_entry:
+            return False
+        if rej_entry:
+            acc_ts = acc_entry[2] or ""
+            rej_ts = rej_entry[2] or ""
+            if not (acc_ts and rej_ts and acc_ts > rej_ts):
+                return False
+        return True
 
     def apply(
         self,
@@ -302,6 +972,15 @@ class SlotLifecycleService:
             raise RuntimeError(f"Failed to acquire fence token for executor {actual_executor}")
 
         proof = intent["proof"]
+        if proof.get("kind") == "branch":
+            return self._apply_branch(
+                operation_id,
+                proof,
+                executor_id=actual_executor,
+                fence_token=fence_token,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+            )
         frozen = FrozenSlot(**{**proof, "path": Path(proof["path"])})
 
         try:
@@ -1178,6 +1857,196 @@ class SlotLifecycleService:
             crash_hook(step_name)
         self._set_step_status(operation_id, step_name, "completed", None)
 
+    def _apply_branch(
+        self,
+        operation_id: str,
+        proof: dict[str, Any],
+        *,
+        executor_id: str,
+        fence_token: int,
+        crash_hook: Callable[[str], None] | None = None,
+        pre_mutation_hook: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        frozen = FrozenBranch(**proof)
+        route = self.config.routes.get(frozen.route)
+        if route is None:
+            return self._quarantine(
+                operation_id,
+                f"route {frozen.route} missing from config",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+
+        # 1. Revalidate repository identity and remote URL
+        try:
+            current_remote_url = run_git(
+                route.path, "remote", "get-url", route.canonical_remote or ""
+            )
+            current_common_git_dir = str(
+                (route.path / run_git(route.path, "rev-parse", "--git-common-dir")).resolve(
+                    strict=False
+                )
+            )
+        except GitError as exc:
+            return self._quarantine(
+                operation_id,
+                f"git repository inspection failed: {exc}",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+
+        if current_remote_url != frozen.canonical_url:
+            return self._quarantine(
+                operation_id,
+                "canonical remote identity changed",
+                {"expected": frozen.canonical_url, "current": current_remote_url},
+                frozen=frozen,
+            )
+        if current_common_git_dir != frozen.common_git_dir:
+            return self._quarantine(
+                operation_id,
+                "repository identity changed",
+                {"expected": frozen.common_git_dir, "current": current_common_git_dir},
+                frozen=frozen,
+            )
+
+        # 2. Refetch exact canonical ref inside exclusive lease
+        try:
+            run_git(
+                route.path,
+                "fetch",
+                "--no-tags",
+                route.canonical_remote or "",
+                f"refs/heads/{route.canonical_branch}:{frozen.canonical_ref}",
+            )
+            fetched_tip = run_git(route.path, "rev-parse", "--verify", frozen.canonical_ref)
+        except GitError as exc:
+            return self._quarantine(
+                operation_id,
+                f"canonical refetch failed: {exc}",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+
+        if fetched_tip != frozen.canonical_tip:
+            return self._quarantine(
+                operation_id,
+                "canonical remote ref moved",
+                {"expected": frozen.canonical_tip, "current": fetched_tip},
+                frozen=frozen,
+            )
+
+        # 3. Verify branch is not protected
+        protected = {"main", "master", "dev", route.required_branch, route.canonical_branch}
+        if frozen.branch in protected:
+            return self._quarantine(
+                operation_id,
+                f"cannot delete protected branch {frozen.branch}",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+        if frozen.branch.startswith("slot/"):
+            return self._quarantine(
+                operation_id,
+                f"cannot delete slot default branch {frozen.branch}",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+
+        # 4. Check worktree checkout
+        try:
+            wt_raw = run_git(route.path, "worktree", "list", "--porcelain")
+            worktrees = _parse_worktrees(wt_raw)
+        except GitError as exc:
+            return self._quarantine(
+                operation_id,
+                f"failed to list worktrees: {exc}",
+                {"branch": frozen.branch},
+                frozen=frozen,
+            )
+        for wt in worktrees:
+            if wt.get("branch") == frozen.branch:
+                return self._quarantine(
+                    operation_id,
+                    f"branch {frozen.branch} is checked out in worktree {wt.get('path')}",
+                    {"worktree": wt.get("path")},
+                    frozen=frozen,
+                )
+
+        # 5. Check ref and compare-and-delete
+        branch_ref = f"refs/heads/{frozen.branch}"
+        del_step = self._get_step(operation_id, "delete_branch")
+        current_sha = _run_git_or_none(route.path, "rev-parse", "--verify", branch_ref)
+
+        if del_step is not None and del_step.get("status") == "completed":
+            if current_sha is not None:
+                return self._quarantine(
+                    operation_id,
+                    f"branch ref {branch_ref} reappeared after deletion",
+                    {"branch": frozen.branch, "sha": current_sha},
+                    frozen=frozen,
+                )
+        elif del_step is not None and del_step.get("status") == "started" and current_sha is None:
+            self._set_step_status(operation_id, "delete_branch", "completed", None)
+        else:
+            if current_sha is None:
+                return self._quarantine(
+                    operation_id,
+                    f"branch ref {branch_ref} missing",
+                    {"branch": frozen.branch},
+                    frozen=frozen,
+                )
+            if current_sha != frozen.sha:
+                return self._quarantine(
+                    operation_id,
+                    f"branch ref {branch_ref} moved from {frozen.sha} to {current_sha}",
+                    {"expected": frozen.sha, "current": current_sha},
+                    frozen=frozen,
+                )
+
+            is_anc = _is_ancestor(route.path, current_sha, fetched_tip)
+            is_pe = False if is_anc else _is_patch_equivalent(route.path, current_sha, fetched_tip)
+            if not (is_anc or is_pe):
+                return self._quarantine(
+                    operation_id,
+                    "branch is no longer integrated into canonical tip",
+                    {"branch": frozen.branch, "sha": current_sha},
+                    frozen=frozen,
+                )
+
+            def _pre_del_branch() -> bool:
+                curr = _run_git_or_none(route.path, "rev-parse", "--verify", branch_ref)
+                return curr == frozen.sha
+
+            def _post_del_branch() -> bool:
+                return _run_git_or_none(route.path, "rev-parse", "--verify", branch_ref) is None
+
+            def _mutate_del_branch() -> None:
+                run_git(route.path, "update-ref", "-d", branch_ref, frozen.sha)
+
+            self._execute_journal_step(
+                operation_id,
+                "delete_branch",
+                1,
+                is_pre_state=_pre_del_branch,
+                is_post_state=_post_del_branch,
+                mutation=_mutate_del_branch,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                fence_token=fence_token,
+            )
+
+        self._set_intent_state(operation_id, "completed", None)
+        self._event("cleanup_applied", operation_id, proof)
+        return {
+            "operation_id": operation_id,
+            "state": "completed",
+            "proof": proof,
+            "error": None,
+            "action": "completed",
+        }
+
     def reconcile(self, *, refresh: bool = True, enqueue: bool = True) -> dict[str, Any]:
         pending_by_route: dict[str, list[int]] = {}
         if refresh:
@@ -1188,7 +2057,15 @@ class SlotLifecycleService:
         enqueued: list[str] = []
         if enqueue:
             for resource in audit["resources"]:
-                if resource["classification"] != "safe-to-delete":
+                if (
+                    resource["classification"]
+                    not in (
+                        LifecycleClass.SAFE_TO_DELETE.value,
+                        LifecycleClass.ACCEPTED_INTEGRATED.value,
+                    )
+                    or not resource.get("operation_id")
+                    or not resource.get("proof")
+                ):
                     continue
                 operation_id = str(resource["operation_id"])
                 self._record_intent(operation_id, resource["proof"])
@@ -1814,9 +2691,9 @@ class SlotLifecycleService:
         reason: str,
         evidence: dict[str, Any],
         *,
-        frozen: FrozenSlot | None = None,
+        frozen: FrozenSlot | FrozenBranch | None = None,
     ) -> dict[str, Any]:
-        if frozen is not None:
+        if isinstance(frozen, FrozenSlot):
             with suppress(Exception):
                 self.slots.quarantine_cleanup(
                     frozen.name,
@@ -1936,6 +2813,42 @@ def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
     return True
 
 
+def _is_patch_equivalent(repo: Path, commit_sha: str, upstream_ref: str) -> bool:
+    try:
+        # If candidate-only range contains any merge commit, fail closed.
+        merges_raw = run_git(repo, "rev-list", "--merges", f"{upstream_ref}..{commit_sha}")
+        if merges_raw.strip():
+            return False
+
+        # Get all candidate-only non-merge commits.
+        cand_raw = run_git(repo, "rev-list", "--no-merges", f"{upstream_ref}..{commit_sha}")
+        candidate_non_merge_shas = {c.strip() for c in cand_raw.splitlines() if c.strip()}
+        if not candidate_non_merge_shas:
+            return False
+
+        raw = run_git(repo, "cherry", upstream_ref, commit_sha)
+    except GitError:
+        return False
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return False
+
+    cherry_shas: set[str] = set()
+    for line in lines:
+        if line.startswith("- "):
+            sha = line[2:].strip()
+            if sha:
+                cherry_shas.add(sha)
+        else:
+            return False
+
+    if not cherry_shas:
+        return False
+
+    return candidate_non_merge_shas == cherry_shas
+
+
 def _run_git_or_none(repo: Path, *args: str) -> str | None:
     try:
         return run_git(repo, *args)
@@ -1957,9 +2870,9 @@ def _live_process_cwds(root: Path) -> list[int]:
             continue
         try:
             cwd = (entry / "cwd").resolve(strict=True)
-        except (FileNotFoundError, ProcessLookupError):
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
             continue
-        except (PermissionError, OSError):
+        except OSError:
             return [-2]
         if cwd == canonical or cwd.is_relative_to(canonical):
             matches.append(int(entry.name))

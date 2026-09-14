@@ -2764,3 +2764,1093 @@ def test_crash_retry_task_branch_and_default_branch_exact_already_deleted(tmp_pa
     )
     res_temp = recovered_temp.apply(op_id_temp)
     assert res_temp["action"] == "completed"
+
+
+def test_unowned_branch_legacy_ownership_reconstruction(tmp_path: Path) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create an unowned legacy branch on route
+    run_git(route, "checkout", "-b", "codex/legacy-feature-1", "origin/main")
+    (route / "legacy.txt").write_text("legacy code\n", encoding="utf-8")
+    run_git(route, "add", "legacy.txt")
+    run_git(route, "commit", "-m", "legacy feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/legacy-feature-1")
+    # Merge to main and push so it is integrated into canonical branch
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/legacy-feature-1")
+    run_git(route, "push", "origin", "main")
+
+    # Setup legacy database with accepted review inbox item and job record
+    legacy_db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    legacy_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(legacy_db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                route TEXT,
+                workspace_path TEXT,
+                expected_branch TEXT,
+                root_acceptance TEXT,
+                updated_at TEXT
+            )
+        """)
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                review_status TEXT,
+                checkpoint_sha TEXT,
+                base_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-legacy-1",
+                "app",
+                str(route),
+                "codex/legacy-feature-1",
+                "accepted",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-legacy-1",
+                "job-legacy-1",
+                "accepted",
+                branch_sha,
+                "base-sha",
+                "app",
+                str(route),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    # Audit should reconstruct legacy ownership
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/legacy-feature-1"]
+    assert len(branch_rows) == 1
+    assert branch_rows[0]["classification"] == "accepted-integrated"
+    assert branch_rows[0]["operation_id"]
+    op_id = branch_rows[0]["operation_id"]
+
+    # Reconcile enqueues the operation
+    rec = service.reconcile()
+    assert op_id in rec["enqueued"]
+
+    # Apply deletes the branch ref using compare-and-delete
+    res = service.apply(op_id)
+    assert res["action"] == "completed"
+    with pytest.raises(GitError):
+        run_git(route, "show-ref", "--verify", "refs/heads/codex/legacy-feature-1")
+
+    # Second apply is idempotent
+    res2 = service.apply(op_id)
+    assert res2["action"] == "already_completed"
+
+
+def test_unowned_branch_foreign_legacy_db_same_route_different_workspace_retained(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create branch on route
+    run_git(route, "checkout", "-b", "codex/foreign-feature", "origin/main")
+    (route / "foreign.txt").write_text("feature content\n", encoding="utf-8")
+    run_git(route, "add", "foreign.txt")
+    run_git(route, "commit", "-m", "feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/foreign-feature")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/foreign-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Create foreign legacy DB with matching route, branch, and SHA, but foreign workspace
+    foreign_repo = tmp_path / "foreign_repo"
+    foreign_repo.mkdir()
+    foreign_db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    foreign_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(foreign_db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                route TEXT,
+                workspace_path TEXT,
+                expected_branch TEXT,
+                root_acceptance TEXT,
+                updated_at TEXT
+            )
+        """)
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                review_status TEXT,
+                checkpoint_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-foreign-1",
+                "app",
+                str(foreign_repo),
+                "codex/foreign-feature",
+                "accepted",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-foreign-1",
+                "job-foreign-1",
+                "accepted",
+                branch_sha,
+                "app",
+                str(foreign_repo),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/foreign-feature"]
+    assert len(branch_rows) == 1
+    # MUST NOT be accepted-integrated; foreign legacy DB cannot authorize deletion
+    assert branch_rows[0]["classification"] == "retained-unowned"
+    assert "operation_id" not in branch_rows[0]
+
+    # Reconcile must not enqueue any deletion for codex/foreign-feature
+    rec = service.reconcile()
+    assert not any("codex/foreign-feature" in str(op) for op in rec["enqueued"])
+    # The branch ref remains intact
+    assert run_git(route, "show-ref", "--verify", "refs/heads/codex/foreign-feature")
+
+
+def test_unowned_branch_multiple_legacy_databases_discovered_and_aggregated(tmp_path: Path) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Branch 1
+    run_git(route, "checkout", "-b", "codex/db1-feature", "origin/main")
+    (route / "db1.txt").write_text("db1\n", encoding="utf-8")
+    run_git(route, "add", "db1.txt")
+    run_git(route, "commit", "-m", "db1 commit")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/db1-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Branch 2
+    run_git(route, "checkout", "-b", "codex/db2-feature", "origin/main")
+    (route / "db2.txt").write_text("db2\n", encoding="utf-8")
+    run_git(route, "add", "db2.txt")
+    run_git(route, "commit", "-m", "db2 commit")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/db2-feature")
+    run_git(route, "push", "origin", "main")
+
+    db1_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    db1_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db1_path) as db1:
+        db1.execute(
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, route TEXT, workspace_path TEXT, expected_branch TEXT, root_acceptance TEXT, updated_at TEXT)"
+        )
+        db1.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            ("job-1", "app", str(route), "codex/db1-feature", "accepted", "2026-01-01T00:00:00Z"),
+        )
+
+    db2_path = config.worktree_base / "runs/jobs.sqlite3"
+    db2_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db2_path) as db2:
+        db2.execute(
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, route TEXT, workspace_path TEXT, expected_branch TEXT, root_acceptance TEXT, updated_at TEXT)"
+        )
+        db2.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            ("job-2", "app", str(route), "codex/db2-feature", "accepted", "2026-01-01T00:00:00Z"),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+    assert len(service.legacy_databases) >= 2
+
+    audit = service.audit()
+    b1_rows = [r for r in audit["resources"] if r.get("branch") == "codex/db1-feature"]
+    b2_rows = [r for r in audit["resources"] if r.get("branch") == "codex/db2-feature"]
+    assert len(b1_rows) == 1 and b1_rows[0]["classification"] == "accepted-integrated"
+    assert len(b2_rows) == 1 and b2_rows[0]["classification"] == "accepted-integrated"
+
+
+def test_unowned_branch_malformed_legacy_db_fails_closed(tmp_path: Path) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    run_git(route, "checkout", "-b", "codex/valid-feature", "origin/main")
+    (route / "valid.txt").write_text("valid\n", encoding="utf-8")
+    run_git(route, "add", "valid.txt")
+    run_git(route, "commit", "-m", "valid commit")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/valid-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Valid legacy DB
+    valid_db = tmp_path / "valid.sqlite3"
+    with sqlite3.connect(valid_db) as db:
+        db.execute(
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, route TEXT, workspace_path TEXT, expected_branch TEXT, root_acceptance TEXT, updated_at TEXT)"
+        )
+        db.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-val-1",
+                "app",
+                str(route),
+                "codex/valid-feature",
+                "accepted",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+
+    # Malformed legacy DB
+    malformed_db = tmp_path / "corrupt.sqlite3"
+    malformed_db.write_bytes(b"NOT A SQLITE FILE")
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+        legacy_databases=[valid_db, malformed_db],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/valid-feature"]
+    assert len(branch_rows) == 1
+    # Must fail closed to quarantined because of the malformed database
+    assert branch_rows[0]["classification"] == "quarantined"
+    assert "unsupported legacy schema or database error" in branch_rows[0]["reasons"][0]
+
+    rec = service.reconcile()
+    assert not any("codex/valid-feature" in str(op) for op in rec["enqueued"])
+
+
+def test_unowned_branch_task_id_not_used_as_branch_name(tmp_path: Path) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create branch codex/real-branch
+    run_git(route, "checkout", "-b", "codex/real-branch", "origin/main")
+    (route / "real.txt").write_text("real\n", encoding="utf-8")
+    run_git(route, "add", "real.txt")
+    run_git(route, "commit", "-m", "real commit")
+    sha = run_git(route, "rev-parse", "codex/real-branch")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/real-branch")
+    run_git(route, "push", "origin", "main")
+
+    # Legacy DB has task_id = 'task-xyz-999', expected_branch = 'codex/real-branch'
+    db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                route TEXT,
+                workspace_path TEXT,
+                expected_branch TEXT,
+                root_acceptance TEXT,
+                updated_at TEXT
+            )
+        """)
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                task_id TEXT,
+                review_status TEXT,
+                checkpoint_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-real-1",
+                "app",
+                str(route),
+                "codex/real-branch",
+                "accepted",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-real-1",
+                "job-real-1",
+                "dispatch-task-12345",
+                "accepted",
+                sha,
+                "app",
+                str(route),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/real-branch"]
+    assert len(branch_rows) == 1
+    assert branch_rows[0]["classification"] == "accepted-integrated"
+    assert branch_rows[0]["proof"]["branch"] == "codex/real-branch"
+
+
+def test_unowned_branch_patch_equivalent_cherry_classification(tmp_path: Path) -> None:
+    from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+        _is_ancestor,
+        _is_patch_equivalent,
+    )
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create a base commit on main
+    run_git(route, "checkout", "main")
+    (route / "base_cherry.txt").write_text("cherry base\n", encoding="utf-8")
+    run_git(route, "add", "base_cherry.txt")
+    run_git(route, "commit", "-m", "cherry base commit")
+    run_git(route, "push", "origin", "main")
+
+    # Create a branch with a patch
+    run_git(route, "checkout", "-b", "codex/cherry-patch", "origin/main")
+    (route / "cherry_feature.txt").write_text("cherry patch content\n", encoding="utf-8")
+    run_git(route, "add", "cherry_feature.txt")
+    run_git(route, "commit", "-m", "cherry feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/cherry-patch")
+
+    # Create an intervening commit on main before cherry-pick
+    run_git(route, "checkout", "main")
+    (route / "intervening.txt").write_text("intervening\n", encoding="utf-8")
+    run_git(route, "add", "intervening.txt")
+    run_git(route, "commit", "-m", "intervening commit")
+
+    # Cherry-pick onto main (creates distinct commit with identical diff)
+    run_git(route, "cherry-pick", branch_sha)
+    run_git(route, "push", "origin", "main")
+
+    # Verify is_ancestor is False but git cherry detects patch equivalence
+    assert not _is_ancestor(route, branch_sha, "origin/main")
+    assert _is_patch_equivalent(route, branch_sha, "origin/main")
+
+    # Add an acceptance receipt in review_inbox
+    inbox = ReviewInboxStore(config.database_path)
+    item = inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-cherry-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=route,
+            slot_name="none",
+            slot_generation=1,
+            checkpoint_ref="refs/agent-control-plane/jobs/job-cherry-1",
+            checkpoint_sha=branch_sha,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+        )
+    )
+    inbox.resolve(item.item_id, "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    cherry_rows = [r for r in audit["resources"] if r.get("branch") == "codex/cherry-patch"]
+    assert len(cherry_rows) == 1
+    assert cherry_rows[0]["classification"] == "accepted-integrated"
+    assert cherry_rows[0]["operation_id"]
+
+
+def test_is_patch_equivalent_empty_output_non_ancestor_fails_closed(tmp_path: Path) -> None:
+    from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+        _is_ancestor,
+        _is_patch_equivalent,
+    )
+
+    _config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Base commit on main
+    (route / "base_empty.txt").write_text("base\n", encoding="utf-8")
+    run_git(route, "add", "base_empty.txt")
+    run_git(route, "commit", "-m", "base commit")
+    run_git(route, "push", "origin", "main")
+
+    # Branch b1
+    run_git(route, "checkout", "-b", "b1", "main")
+    (route / "b1.txt").write_text("b1\n", encoding="utf-8")
+    run_git(route, "add", "b1.txt")
+    run_git(route, "commit", "-m", "b1 commit")
+
+    # Branch b2 from main
+    run_git(route, "checkout", "-b", "b2", "main")
+    (route / "b2.txt").write_text("b2\n", encoding="utf-8")
+    run_git(route, "add", "b2.txt")
+    run_git(route, "commit", "-m", "b2 commit")
+
+    # Merge b1 and b2 into main
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--no-ff", "b1", "-m", "merge b1")
+    run_git(route, "merge", "--no-ff", "b2", "-m", "merge b2")
+    run_git(route, "push", "origin", "main")
+
+    # Candidate merges b1 and b2 directly without main's merge commits
+    run_git(route, "checkout", "-b", "codex/candidate-merge-only", "b1")
+    run_git(route, "merge", "--no-ff", "b2", "-m", "merge b2 into candidate")
+    candidate_sha = run_git(route, "rev-parse", "codex/candidate-merge-only")
+
+    # Candidate is not an ancestor of main, git cherry output is empty
+    assert not _is_ancestor(route, candidate_sha, "origin/main")
+    # Must fail closed and return False
+    assert not _is_patch_equivalent(route, candidate_sha, "origin/main")
+
+
+def test_is_patch_equivalent_unique_merge_resolution_branch_fails_closed(tmp_path: Path) -> None:
+    from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+        _is_ancestor,
+        _is_patch_equivalent,
+    )
+
+    _config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Base commit on main
+    (route / "f.txt").write_text("base\n", encoding="utf-8")
+    run_git(route, "add", "f.txt")
+    run_git(route, "commit", "-m", "base commit")
+    run_git(route, "push", "origin", "main")
+
+    # Branch b1 modifies f.txt
+    run_git(route, "checkout", "-b", "b1", "main")
+    (route / "f.txt").write_text("b1\n", encoding="utf-8")
+    run_git(route, "commit", "-am", "b1 commit")
+
+    # Branch b2 modifies f.txt
+    run_git(route, "checkout", "-b", "b2", "main")
+    (route / "f.txt").write_text("b2\n", encoding="utf-8")
+    run_git(route, "commit", "-am", "b2 commit")
+
+    # Merge b1 into main
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--no-ff", "b1", "-m", "merge b1 into main")
+    run_git(route, "push", "origin", "main")
+
+    # Candidate merges b2 into b1 with conflict resolution containing unique work
+    run_git(route, "checkout", "-b", "codex/unique-merge-resolution", "b1")
+    with pytest.raises(GitError):
+        run_git(route, "merge", "b2")
+    (route / "f.txt").write_text("unique resolution in candidate\n", encoding="utf-8")
+    run_git(route, "add", "f.txt")
+    run_git(route, "commit", "-m", "unique merge resolution")
+    candidate_sha = run_git(route, "rev-parse", "codex/unique-merge-resolution")
+
+    assert not _is_ancestor(route, candidate_sha, "origin/main")
+    # Merge commit present in candidate-only range: must fail closed
+    assert not _is_patch_equivalent(route, candidate_sha, "origin/main")
+
+
+def test_is_patch_equivalent_all_non_merge_commits_patch_equivalent(tmp_path: Path) -> None:
+    from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+        _is_ancestor,
+        _is_patch_equivalent,
+    )
+
+    _config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Base commit on main
+    (route / "base_multi.txt").write_text("base\n", encoding="utf-8")
+    run_git(route, "add", "base_multi.txt")
+    run_git(route, "commit", "-m", "base")
+    run_git(route, "push", "origin", "main")
+
+    # Candidate branch with 2 commits
+    run_git(route, "checkout", "-b", "codex/multi-patch", "origin/main")
+    (route / "p1.txt").write_text("patch 1\n", encoding="utf-8")
+    run_git(route, "add", "p1.txt")
+    run_git(route, "commit", "-m", "patch 1")
+    c1 = run_git(route, "rev-parse", "HEAD")
+
+    (route / "p2.txt").write_text("patch 2\n", encoding="utf-8")
+    run_git(route, "add", "p2.txt")
+    run_git(route, "commit", "-m", "patch 2")
+    c2 = run_git(route, "rev-parse", "HEAD")
+
+    # Main gets an intervening commit, then cherry-picks both c1 and c2
+    run_git(route, "checkout", "main")
+    (route / "other.txt").write_text("other\n", encoding="utf-8")
+    run_git(route, "add", "other.txt")
+    run_git(route, "commit", "-m", "intervening")
+
+    run_git(route, "cherry-pick", c1)
+    run_git(route, "cherry-pick", c2)
+    run_git(route, "push", "origin", "main")
+
+    assert not _is_ancestor(route, c2, "origin/main")
+    # All non-merge commits cherry-picked, no merge commits
+    assert _is_patch_equivalent(route, c2, "origin/main")
+
+
+def test_is_patch_equivalent_one_unique_plus_commit_fails_closed(tmp_path: Path) -> None:
+    from agent_control_plane.features.lifecycle_cleanup.lib.slot_lifecycle import (
+        _is_ancestor,
+        _is_patch_equivalent,
+    )
+
+    _config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Base commit on main
+    (route / "base_one_unique.txt").write_text("base\n", encoding="utf-8")
+    run_git(route, "add", "base_one_unique.txt")
+    run_git(route, "commit", "-m", "base")
+    run_git(route, "push", "origin", "main")
+
+    # Candidate branch with 2 commits
+    run_git(route, "checkout", "-b", "codex/one-unique", "origin/main")
+    (route / "p1.txt").write_text("patch 1\n", encoding="utf-8")
+    run_git(route, "add", "p1.txt")
+    run_git(route, "commit", "-m", "patch 1")
+    c1 = run_git(route, "rev-parse", "HEAD")
+
+    (route / "p2_unique.txt").write_text("patch 2 unique\n", encoding="utf-8")
+    run_git(route, "add", "p2_unique.txt")
+    run_git(route, "commit", "-m", "patch 2 unique")
+    c2 = run_git(route, "rev-parse", "HEAD")
+
+    # Main cherry-picks c1, but NOT c2
+    run_git(route, "checkout", "main")
+    run_git(route, "cherry-pick", c1)
+    run_git(route, "push", "origin", "main")
+
+    assert not _is_ancestor(route, c2, "origin/main")
+    # Has one unique '+' commit (c2): must return False
+    assert not _is_patch_equivalent(route, c2, "origin/main")
+
+
+def test_unowned_branch_contradictory_rejection_quarantines(tmp_path: Path) -> None:
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    run_git(route, "checkout", "-b", "codex/conflict-branch", "origin/main")
+    (route / "conflict.txt").write_text("conflict\n", encoding="utf-8")
+    run_git(route, "add", "conflict.txt")
+    run_git(route, "commit", "-m", "conflict commit")
+    branch_sha = run_git(route, "rev-parse", "codex/conflict-branch")
+
+    # Merge to main
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/conflict-branch")
+    run_git(route, "push", "origin", "main")
+
+    inbox = ReviewInboxStore(config.database_path)
+    # Add acceptance
+    item1 = inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-conflict-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=route,
+            slot_name="none",
+            slot_generation=1,
+            checkpoint_ref="refs/agent-control-plane/jobs/job-conflict-1",
+            checkpoint_sha=branch_sha,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+        )
+    )
+    inbox.resolve(item1.item_id, "accepted")
+
+    # Add a later rejection for the same checkpoint sha
+    time.sleep(0.01)
+    item2 = inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-conflict-2",
+            source_status="failed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=route,
+            slot_name="none",
+            slot_generation=1,
+            checkpoint_ref="refs/agent-control-plane/jobs/job-conflict-2",
+            checkpoint_sha=branch_sha,
+            result_text="Status: blocked\n",
+            verification_bundle=_valid_bundle(),
+        )
+    )
+    inbox.resolve(item2.item_id, "rejected")
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    conflict_rows = [r for r in audit["resources"] if r.get("branch") == "codex/conflict-branch"]
+    assert len(conflict_rows) == 1
+    assert conflict_rows[0]["classification"] == "quarantined"
+    assert "contradictory" in conflict_rows[0]["reasons"][0]
+
+    rec = service.reconcile()
+    assert not any("codex/conflict-branch" in str(op) for op in rec["enqueued"])
+
+
+def test_unowned_branch_apply_drift_fails_closed(tmp_path: Path) -> None:
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    run_git(route, "checkout", "-b", "codex/drift-branch", "origin/main")
+    (route / "drift1.txt").write_text("drift1\n", encoding="utf-8")
+    run_git(route, "add", "drift1.txt")
+    run_git(route, "commit", "-m", "drift commit 1")
+    branch_sha = run_git(route, "rev-parse", "codex/drift-branch")
+
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/drift-branch")
+    run_git(route, "push", "origin", "main")
+
+    inbox = ReviewInboxStore(config.database_path)
+    item = inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="job-drift-1",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=route,
+            slot_name="none",
+            slot_generation=1,
+            checkpoint_ref="refs/agent-control-plane/jobs/job-drift-1",
+            checkpoint_sha=branch_sha,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+        )
+    )
+    inbox.resolve(item.item_id, "accepted")
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=inbox,
+        live_cwds=lambda _path: [],
+    )
+
+    rec = service.reconcile()
+    drift_op_id = next(
+        op
+        for op in rec["enqueued"]
+        if any(
+            r.get("branch") == "codex/drift-branch"
+            for r in rec["resources"]
+            if r.get("operation_id") == op
+        )
+    )
+
+    # Simulate branch drift: someone commits to codex/drift-branch before apply
+    run_git(route, "checkout", "codex/drift-branch")
+    (route / "drift2.txt").write_text("drift2\n", encoding="utf-8")
+    run_git(route, "add", "drift2.txt")
+    run_git(route, "commit", "-m", "drift commit 2")
+    run_git(route, "checkout", "main")
+
+    # Apply must fail closed and quarantine
+    res = service.apply(drift_op_id)
+    assert res["action"] == "quarantined"
+    assert "moved" in res["reason"]
+
+    # The branch ref MUST NOT be deleted
+    assert run_git(route, "rev-parse", "codex/drift-branch") != branch_sha
+
+
+def test_unowned_branch_legacy_db_fabricated_missing_path_no_checkpoint_retained(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create an unowned integrated branch on route
+    run_git(route, "checkout", "-b", "codex/fabricated-feature", "origin/main")
+    (route / "fab.txt").write_text("fabricated code\n", encoding="utf-8")
+    run_git(route, "add", "fab.txt")
+    run_git(route, "commit", "-m", "fabricated feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/fabricated-feature")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/fabricated-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Fabricate a missing/non-existent path under target coordination/slot root
+    slot_root = getattr(config, "slot_root", None) or (config.coordination_root / "slots")
+    fake_ws = slot_root / "fake-slot-fabricated"
+    assert not fake_ws.exists()
+
+    # Legacy database supplies this fabricated path under target slot root with no checkpoint ref
+    legacy_db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    legacy_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(legacy_db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                route TEXT,
+                workspace_path TEXT,
+                expected_branch TEXT,
+                root_acceptance TEXT,
+                updated_at TEXT
+            )
+        """)
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                review_status TEXT,
+                checkpoint_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "job-fake-1",
+                "app",
+                str(fake_ws),
+                "codex/fabricated-feature",
+                "accepted",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-fake-1",
+                "job-fake-1",
+                "accepted",
+                branch_sha,
+                "app",
+                str(fake_ws),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/fabricated-feature"]
+    assert len(branch_rows) == 1
+    # MUST NOT authorize accepted-integrated or an operation ID
+    assert branch_rows[0]["classification"] == "retained-unowned"
+    assert "operation_id" not in branch_rows[0]
+
+    rec = service.reconcile()
+    assert not any(
+        r.get("branch") == "codex/fabricated-feature" and "operation_id" in r
+        for r in rec["resources"]
+    )
+
+
+def test_unowned_branch_legacy_db_removed_historical_path_with_durable_checkpoint_accepted(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create an unowned integrated branch on route
+    run_git(route, "checkout", "-b", "codex/historical-feature", "origin/main")
+    (route / "hist.txt").write_text("historical code\n", encoding="utf-8")
+    run_git(route, "add", "hist.txt")
+    run_git(route, "commit", "-m", "historical feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/historical-feature")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/historical-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Historical slot path that was legitimately cleaned up / removed
+    slot_root = getattr(config, "slot_root", None) or (config.coordination_root / "slots")
+    historical_ws = slot_root / "historical-slot-99"
+    assert not historical_ws.exists()
+
+    # Exact durable checkpoint ref independently present in target repository
+    jid = "job-historical-1"
+    j_hash = hashlib.sha256(jid.encode("utf-8")).hexdigest()
+    ckpt_ref = f"refs/agent-control-plane/jobs/{j_hash}"
+    run_git(route, "update-ref", ckpt_ref, branch_sha)
+    assert run_git(route, "rev-parse", ckpt_ref) == branch_sha
+
+    # Legacy database references this removed historical path, job, and exact checkpoint ref
+    legacy_db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    legacy_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(legacy_db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE jobs (
+                job_id TEXT PRIMARY KEY,
+                route TEXT,
+                workspace_path TEXT,
+                expected_branch TEXT,
+                root_acceptance TEXT,
+                updated_at TEXT
+            )
+        """)
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                review_status TEXT,
+                checkpoint_ref TEXT,
+                checkpoint_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                jid,
+                "app",
+                str(historical_ws),
+                "codex/historical-feature",
+                "accepted",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-historical-1",
+                jid,
+                "accepted",
+                ckpt_ref,
+                branch_sha,
+                "app",
+                str(historical_ws),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/historical-feature"]
+    assert len(branch_rows) == 1
+    # Authorizes accepted-integrated and operation ID because of durable checkpoint ref
+    assert branch_rows[0]["classification"] == "accepted-integrated"
+    assert branch_rows[0]["operation_id"]
+    op_id = branch_rows[0]["operation_id"]
+
+    rec = service.reconcile()
+    assert op_id in rec["enqueued"]
+
+    res = service.apply(op_id)
+    assert res["action"] == "completed"
+    with pytest.raises(GitError):
+        run_git(route, "show-ref", "--verify", "refs/heads/codex/historical-feature")
+
+
+def test_unowned_branch_legacy_db_removed_path_checkpoint_sha_mismatch_retained(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import sqlite3
+
+    config, route, _slot = _fixture(tmp_path)
+    run_git(route, "fetch", "origin")
+    run_git(route, "checkout", "main")
+    run_git(route, "reset", "--hard", "origin/main")
+
+    # Create an unowned integrated branch on route
+    run_git(route, "checkout", "-b", "codex/sha-mismatch-feature", "origin/main")
+    (route / "mismatch.txt").write_text("mismatch code\n", encoding="utf-8")
+    run_git(route, "add", "mismatch.txt")
+    run_git(route, "commit", "-m", "mismatch feature commit")
+    branch_sha = run_git(route, "rev-parse", "codex/sha-mismatch-feature")
+    run_git(route, "checkout", "main")
+    run_git(route, "merge", "--ff-only", "codex/sha-mismatch-feature")
+    run_git(route, "push", "origin", "main")
+
+    # Historical slot path that does not exist
+    slot_root = getattr(config, "slot_root", None) or (config.coordination_root / "slots")
+    historical_ws = slot_root / "historical-slot-mismatch"
+    assert not historical_ws.exists()
+
+    # Create checkpoint ref in repo with branch_sha
+    jid = "job-mismatch-1"
+    j_hash = hashlib.sha256(jid.encode("utf-8")).hexdigest()
+    ckpt_ref = f"refs/agent-control-plane/jobs/{j_hash}"
+    run_git(route, "update-ref", ckpt_ref, branch_sha)
+
+    # Legacy DB specifies a contradictory/mismatched checkpoint SHA
+    bad_sha = "0" * 40
+    legacy_db_path = config.coordination_root / "legacy/control-plane/shared-jobs.sqlite3"
+    legacy_db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(legacy_db_path) as ldb:
+        ldb.execute("""
+            CREATE TABLE review_inbox_items (
+                item_id TEXT PRIMARY KEY,
+                source_id TEXT,
+                review_status TEXT,
+                checkpoint_ref TEXT,
+                checkpoint_sha TEXT,
+                route TEXT,
+                workspace_path TEXT,
+                created_at TEXT,
+                reviewed_at TEXT
+            )
+        """)
+        ldb.execute(
+            "INSERT INTO review_inbox_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "item-mismatch-1",
+                jid,
+                "accepted",
+                ckpt_ref,
+                bad_sha,
+                "app",
+                str(historical_ws),
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T01:00:00Z",
+            ),
+        )
+
+    service = SlotLifecycleService(
+        config,
+        slots=SlotStore(config.database_path),
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+
+    audit = service.audit()
+    branch_rows = [r for r in audit["resources"] if r.get("branch") == "codex/sha-mismatch-feature"]
+    assert len(branch_rows) == 1
+    # Mismatched SHA must fail verification and be retained without operation ID
+    assert branch_rows[0]["classification"] == "retained-unowned"
+    assert "operation_id" not in branch_rows[0]

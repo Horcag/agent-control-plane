@@ -500,6 +500,37 @@ do not delete or replace the database.
 Safety baseline: refuse dirty task workspaces, keep target repositories independent of
 ACP, preserve `.git` in native workspace-write, and inspect status/diff before review.
 
+#### Unowned branch audit and legacy lifecycle forensics
+
+During plane migrations or forensic cleanups, `agent-control lifecycle audit` also
+evaluates unowned local Git branches across configured routes:
+
+- **Multiple legacy database discovery**: ACP discovers and aggregates evidence across all
+  distinct discovered legacy coordination databases (such as historical migration databases
+  and coordination SQLite files). Discovered database paths are deduplicated and sorted
+  deterministically.
+- **Fail-closed schema safety**: Each candidate legacy database is inspected for schema
+  compatibility. Corrupted, unreadable, or malformed databases fail closed; ACP records a
+  blocker/quarantine rather than silently ignoring errors or authorizing deletion.
+- **Strict repository-identity binding**: Legacy acceptance evidence is strictly bound to
+  repository identity: an existing workspace must resolve to the exact target common Git
+  directory. Non-existent or removed historical workspaces cannot prove identity by lexical
+  containment alone; they strictly require an independently present exact or hashed job
+  checkpoint ref in the target repository (and matching SHA where the schema supplies it).
+  Route names, branch names, task IDs, and claimed paths alone are never trusted as proof
+  of repository identity. Foreign databases without verified repository ownership retain
+  branches as unowned and cannot authorize deletion.
+- **Branch ownership derivation**: Branch ownership is derived exclusively from verified job
+  records linking job identifiers to `jobs.expected_branch` and verified workspace paths.
+  Dispatch identifiers such as `review_inbox_items.task_id` are never used as Git branch names.
+- **Conservative classification**: Branches with unmerged work, foreign repository ownership,
+  or ambiguous/contradictory records remain `retained_unowned` or `quarantined_unowned`.
+  Only branches proven to be fully integrated into canonical tip or patch-equivalent with
+  verified durable root acceptance are proposed for deletion. Patch equivalence fails closed:
+  empty `git cherry` output for a non-ancestor candidate returns False; any merge commit
+  in the candidate-only range disqualifies patch equivalence; and every candidate-only non-merge
+  commit must affirmatively match a `- <sha>` line with zero `+` lines.
+
 ### Optional CLI-only Antigravity Manager switching (Windows and WSL)
 
 The legacy `manager switch-agy` adapter writes the Windows credential store. For
