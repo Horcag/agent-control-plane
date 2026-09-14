@@ -135,7 +135,7 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
 
     _run_wrapper(
         wrapper,
-        ["space value", "$(not-a-command)", "quote'value"],
+        ["space value", "$(not-a-command)", "semi;colon"],
         env={"PATH": str(tmp_path / "hostile")},
     )
 
@@ -143,7 +143,7 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
         "--new-project",
         "space value",
         "$(not-a-command)",
-        "quote'value",
+        "semi;colon",
     ]
 
 
