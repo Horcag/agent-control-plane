@@ -29,6 +29,7 @@ from agent_control_plane.shared.native_quality import (
     resolve_native_quality_contract,
     write_native_quality_contract,
 )
+from agent_control_plane.shared.process_liveness import process_is_alive
 
 
 def test_audit_and_apply_are_exact_idempotent_and_return_slot_to_default_branch(
@@ -904,7 +905,7 @@ def test_destructive_mutation_refetches_canonical_remote_tip(tmp_path: Path) -> 
     (cloned_other / "upstream_advance.txt").write_text("advance\n", encoding="utf-8")
     run_git(cloned_other, "add", "upstream_advance.txt")
     run_git(cloned_other, "commit", "-m", "advance upstream")
-    run_git(cloned_other, "push", "origin", "main")
+    run_git(cloned_other, "push", "origin", "HEAD:refs/heads/main")
 
     # When apply runs, it refetches inside the exclusive fence, discovers remote tip moved, and quarantines
     result = service.apply(op_id)
@@ -1070,10 +1071,7 @@ def test_real_detached_worker_survives_caller_exit(tmp_path: Path) -> None:
     config, _route, _slot = _fixture(tmp_path)
 
     caller_pid_file = tmp_path / "caller.pid"
-    fake_agy = tmp_path / "fake_agy"
-    fake_agy.write_text(
-        f"""#!{sys.executable}
-import json
+    script_body = f"""import json
 import os
 import re
 import sys
@@ -1123,12 +1121,11 @@ if verification_path is not None:
         "changed_files": [],
         "checks": [
             {{
-                "name": "fake_check",
                 "command": "true",
-                "status": "passed",
+                "cwd": ".",
+                "outcome": "passed",
                 "exit_code": 0,
-                "stdout": "",
-                "stderr": "",
+                "summary": "fake check passed",
             }}
         ],
         "unverified": [],
@@ -1136,15 +1133,23 @@ if verification_path is not None:
     verification_path.write_text(json.dumps(bundle), encoding="utf-8")
 
 sys.exit(0)
-""",
-        encoding="utf-8",
-    )
-    fake_agy.chmod(0o755)
+"""
+    if os.name == "nt":
+        fake_agy_py = tmp_path / "fake_agy_script.py"
+        fake_agy_py.write_text(script_body, encoding="utf-8")
+        fake_agy = tmp_path / "fake_agy.cmd"
+        fake_agy.write_text(
+            f'@echo off\r\n"{sys.executable}" "{fake_agy_py}" %*\r\n', encoding="utf-8"
+        )
+    else:
+        fake_agy = tmp_path / "fake_agy"
+        fake_agy.write_text(f"#!{sys.executable}\n" + script_body, encoding="utf-8")
+        fake_agy.chmod(0o755)
 
     toml_text = config.config_path.read_text(encoding="utf-8")
     toml_text = toml_text.replace(
         "[control]\n",
-        f'[control]\nagy_command = "{fake_agy}"\n',
+        f'[control]\nagy_command = "{fake_agy.as_posix()}"\n',
     )
     config.config_path.write_text(toml_text, encoding="utf-8")
 
@@ -1152,7 +1157,7 @@ sys.exit(0)
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "brief.md").write_text("# Brief\nDo something\n", encoding="utf-8")
 
-    src_dir = str(Path(__file__).resolve().parents[3] / "src")
+    src_dir = str((Path(__file__).resolve().parents[3] / "src").as_posix())
     caller_py = tmp_path / "caller.py"
     caller_py.write_text(
         f"""
@@ -1164,7 +1169,7 @@ os.environ["PYTHONPATH"] = r"{src_dir}" + os.pathsep + os.environ.get("PYTHONPAT
 from agent_control_plane.shared.config import load_config
 from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
 
-config = load_config(Path(r"{config.config_path}"))
+config = load_config(Path(r"{config.config_path.as_posix()}"))
 control = AgentControlPlane(config)
 job = control.store.create_job(
     job_id="job-real-detached",
@@ -1270,12 +1275,10 @@ sys.exit(0)
     child_deadline = time.monotonic() + 5.0
     child_alive = True
     while time.monotonic() < child_deadline:
-        try:
-            os.kill(child_pid, 0)
-            time.sleep(0.05)
-        except OSError:
+        if not process_is_alive(child_pid):
             child_alive = False
             break
+        time.sleep(0.05)
     assert not child_alive
 
     # Foreground completion parity assertion
@@ -1838,7 +1841,7 @@ def test_resume_invariant_preservation_detects_dirty_or_drift(tmp_path: Path) ->
     (cloned_b / "advance.txt").write_text("advance\n", encoding="utf-8")
     run_git(cloned_b, "add", "advance.txt")
     run_git(cloned_b, "commit", "-m", "advance")
-    run_git(cloned_b, "push", "origin", "main")
+    run_git(cloned_b, "push", "origin", "HEAD:refs/heads/main")
 
     recovered_b = SlotLifecycleService(
         config_b,
@@ -1965,6 +1968,11 @@ def test_deferred_reconciliation_requests_failure_and_concurrent_enqueue(tmp_pat
 def _fixture(tmp_path: Path) -> tuple[ControlConfig, Path, Path]:
     remote = tmp_path / "remote.git"
     subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(remote), "symbolic-ref", "HEAD", "refs/heads/main"],
+        check=True,
+        capture_output=True,
+    )
     route = tmp_path / "repo"
     subprocess.run(["git", "clone", str(remote), str(route)], check=True, capture_output=True)
     run_git(route, "config", "user.name", "Tests")
@@ -2022,21 +2030,21 @@ def _fixture(tmp_path: Path) -> tuple[ControlConfig, Path, Path]:
     )
     toml_content = f"""
 [control]
-coordination_root = "{tmp_path / ".agent-work"}"
-runs_root = "{tmp_path / "runs"}"
-database = "{tmp_path / "runs/jobs.sqlite3"}"
-worktree_root = "{tmp_path / "worktrees"}"
-slot_root = "{tmp_path / "slots"}"
+coordination_root = "{(tmp_path / ".agent-work").as_posix()}"
+runs_root = "{(tmp_path / "runs").as_posix()}"
+database = "{(tmp_path / "runs/jobs.sqlite3").as_posix()}"
+worktree_root = "{(tmp_path / "worktrees").as_posix()}"
+slot_root = "{(tmp_path / "slots").as_posix()}"
 
 [routes.app]
-path = "{route}"
+path = "{route.as_posix()}"
 required_branch = "main"
 canonical_remote = "origin"
 canonical_branch = "main"
 
 [slots.app-1]
 route = "app"
-path = "{slot}"
+path = "{slot.as_posix()}"
 """
     config.config_path.write_text(toml_content.strip() + "\n", encoding="utf-8")
     return config, route, slot
@@ -2208,21 +2216,21 @@ def test_remapping_configured_slot_to_canonical_checkout_reproduced_and_prevente
     # 1. Config validation prevents slot pointing to canonical checkout
     bad_toml = f"""
 [control]
-coordination_root = "{tmp_path / ".agent-work"}"
-runs_root = "{tmp_path / "runs"}"
-database = "{tmp_path / "runs/jobs.sqlite3"}"
-worktree_root = "{tmp_path / "worktrees"}"
-slot_root = "{tmp_path / "slots"}"
+coordination_root = "{(tmp_path / ".agent-work").as_posix()}"
+runs_root = "{(tmp_path / "runs").as_posix()}"
+database = "{(tmp_path / "runs/jobs.sqlite3").as_posix()}"
+worktree_root = "{(tmp_path / "worktrees").as_posix()}"
+slot_root = "{(tmp_path / "slots").as_posix()}"
 
 [routes.app]
-path = "{route}"
+path = "{route.as_posix()}"
 required_branch = "main"
 canonical_remote = "origin"
 canonical_branch = "main"
 
 [slots.canonical-attempt]
 route = "app"
-path = "{route}"
+path = "{route.as_posix()}"
 """
     bad_cfg_file = tmp_path / "bad_workspaces.toml"
     bad_cfg_file.write_text(bad_toml.strip() + "\n", encoding="utf-8")

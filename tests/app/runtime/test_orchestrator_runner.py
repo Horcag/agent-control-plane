@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -103,7 +104,7 @@ class OrchestratorRunnerResultTest(unittest.TestCase):
             with (
                 patch.object(control, "reconcile_jobs") as reconcile,
                 patch.object(control.store, "create_job") as create_job,
-                self.assertRaisesRegex(PolicyError, f"retired.*{replacement}"),
+                self.assertRaisesRegex(PolicyError, f"retired.*{re.escape(str(replacement))}"),
             ):
                 control.start_job(StartOptions(task_id="retired-config", route="main"))
 

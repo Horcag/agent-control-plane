@@ -883,6 +883,9 @@ class JobExecutionService:
             model = job.codex_model or self.config.defaults.claude_model
             effort = job.codex_reasoning_effort or self.config.defaults.claude_reasoning_effort
             return claude_ladder_for_explicit_model(self.claude_catalog, model, effort)
+        if normalize_backend(job.backend) == AGY_BACKEND:
+            model = job.agy_model or self.config.defaults.agy_model or "default"
+            return (ModelProfile(model=model, reasoning_effort="low"),)
         if normalize_backend(job.backend) != CODEX_BACKEND or job.codex_quality_tier is None:
             model = job.codex_model or self.config.defaults.codex_model
             effort = job.codex_reasoning_effort or self.config.defaults.codex_reasoning_effort

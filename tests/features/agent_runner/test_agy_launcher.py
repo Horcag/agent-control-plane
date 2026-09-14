@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -32,6 +34,21 @@ def _executable(path: Path, content: str = "#!/bin/sh\nexit 0\n") -> Path:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path
+
+
+def _run_wrapper(
+    wrapper: Path,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    if os.name == "nt":
+        sh = shutil.which("sh")
+        if not sh:
+            pytest.skip("sh is required to run POSIX wrapper on Windows")
+        full_env = {**os.environ, **env} if env is not None else None
+        return subprocess.run([sh, str(wrapper), *args], check=True, env=full_env)
+    return subprocess.run([str(wrapper), *args], check=True, env=env)
 
 
 def test_proxy_is_preferred_over_absolute_fallback_even_with_hostile_path(
@@ -110,15 +127,15 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
     captured = tmp_path / "captured.txt"
     launcher = _executable(
         tmp_path / "launcher",
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {captured}\n",
+        f'#!/bin/sh\nprintf \'%s\\n\' "$@" > "{captured.as_posix()}"\n',
     )
     wrapper = tmp_path / "agy-project"
     wrapper.write_bytes(render_project_wrapper(launcher))
     wrapper.chmod(0o755)
 
-    subprocess.run(
-        [str(wrapper), "space value", "$(not-a-command)", 'quote"value'],
-        check=True,
+    _run_wrapper(
+        wrapper,
+        ["space value", "$(not-a-command)", 'quote"value'],
         env={"PATH": str(tmp_path / "hostile")},
     )
 
@@ -132,15 +149,20 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
 
 def test_project_wrapper_safely_quotes_hostile_executable_path(tmp_path: Path) -> None:
     captured = tmp_path / "captured.txt"
+    launcher_name = (
+        "launcher $ ` ' quote space"
+        if os.name == "nt"
+        else "launcher $ ` back\\slash ' quote space"
+    )
     launcher = _executable(
-        tmp_path / "launcher $ ` back\\slash ' quote space",
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {captured}\n",
+        tmp_path / launcher_name,
+        f'#!/bin/sh\nprintf \'%s\\n\' "$@" > "{captured.as_posix()}"\n',
     )
     wrapper = tmp_path / "agy-project"
     wrapper.write_bytes(render_project_wrapper(launcher))
     wrapper.chmod(0o755)
 
-    subprocess.run([str(wrapper), "$(not-a-command)"], check=True)
+    _run_wrapper(wrapper, ["$(not-a-command)"])
 
     assert captured.read_text(encoding="utf-8").splitlines() == [
         "--new-project",
@@ -181,8 +203,9 @@ def test_migration_dry_run_apply_and_repeat_are_idempotent(tmp_path: Path) -> No
         and applied.backup_path.read_bytes() == LEGACY_PROJECT_WRAPPER
     )
     assert applied.backup_path is not None
-    assert stat.S_IMODE(applied.backup_path.stat().st_mode) == 0o751
-    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o751
+    if os.name != "nt":
+        assert stat.S_IMODE(applied.backup_path.stat().st_mode) == 0o751
+        assert stat.S_IMODE(wrapper.stat().st_mode) == 0o751
 
     repeated = migrate_project_wrapper(
         wrapper=wrapper,
@@ -219,7 +242,8 @@ def test_rollback_restores_the_legitimate_migration_backup(tmp_path: Path) -> No
 
     assert receipt.changed is True
     assert wrapper.read_bytes() == LEGACY_PROJECT_WRAPPER
-    assert stat.S_IMODE(wrapper.stat().st_mode) == 0o751
+    if os.name != "nt":
+        assert stat.S_IMODE(wrapper.stat().st_mode) == 0o751
 
 
 @pytest.mark.parametrize("tamper", ["rename", "recognized-bytes"])
@@ -408,7 +432,7 @@ def test_cli_migration_has_an_explicit_dry_run_and_apply_workflow(
                 'worktree_root = "worktrees"',
                 'worktree_base = "."',
                 'slot_root = "slots"',
-                f'agy_command = "{launcher}"',
+                f'agy_command = "{launcher.as_posix()}"',
                 "[routes.main]",
                 'path = "."',
                 'required_branch = "main"',
@@ -548,7 +572,7 @@ def test_public_config_service_and_pty_share_managed_launch_contract(tmp_path: P
                 'slot_root = "slots"',
                 'agy_command = "/must-not-be-selected/agy"',
                 'agy_launch_mode = "managed"',
-                f'agy_proxy_launcher = "{adapter}"',
+                f'agy_proxy_launcher = "{adapter.as_posix()}"',
                 "[routes.main]",
                 'path = "."',
                 'required_branch = "main"',
@@ -612,7 +636,7 @@ def test_managed_config_preserves_key_spelling_spacing_comments_and_crlf(tmp_pat
         == (
             '["control"]\r\n'
             '  "agy_launch_mode"  =  "managed"  # mode comment\r\n'
-            f'\tagy_proxy_launcher\t=\t"{adapter}"\t# adapter comment\r\n'
+            f"\tagy_proxy_launcher\t=\t{agy_launcher._toml_string(str(adapter))}\t# adapter comment\r\n"
         ).encode()
     )
 
@@ -631,7 +655,7 @@ def test_cli_configure_migrate_generate_and_restore_guarded_workflow(
     captured = tmp_path / "adapter-argv.txt"
     adapter = _executable(
         tmp_path / "adapter",
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {captured}\n",
+        f'#!/bin/sh\nprintf \'%s\\n\' "$@" > "{captured.as_posix()}"\n',
     )
     config = tmp_path / "config" / "workspaces.toml"
     config.parent.mkdir()
@@ -643,14 +667,14 @@ def test_cli_configure_migrate_generate_and_restore_guarded_workflow(
                 'runs_root = "runs"',
                 'database = "runs/jobs.sqlite3"',
                 'worktree_root = "worktrees"',
-                f'worktree_base = "{project}"',
+                f'worktree_base = "{project.as_posix()}"',
                 'slot_root = "slots"',
                 "# preserve this comment and quoted table spelling",
                 "[routes.main]",
-                f'path = "{project}"',
+                f'path = "{project.as_posix()}"',
                 'required_branch = "main"',
                 "[routes.fresh]",
-                f'path = "{fresh}"',
+                f'path = "{fresh.as_posix()}"',
                 'required_branch = "main"',
             ]
         ),
@@ -707,7 +731,7 @@ def test_cli_configure_migrate_generate_and_restore_guarded_workflow(
     capsys.readouterr()
     assert main([*migrate, "--apply"]) == 0
     migrated = json.loads(capsys.readouterr().out)
-    subprocess.run([str(wrapper), "safe argument"], check=True)
+    _run_wrapper(wrapper, ["safe argument"])
     assert captured.read_text(encoding="utf-8").splitlines() == ["--new-project", "safe argument"]
 
     generated_wrapper = fresh / ".agent-work" / "bin" / "agy-project"
@@ -784,10 +808,10 @@ def test_cli_restore_config_recovers_without_loading_an_unavailable_adapter(
         'runs_root = "runs"\n'
         'database = "runs/jobs.sqlite3"\n'
         'worktree_root = "worktrees"\n'
-        f'worktree_base = "{project}"\n'
+        f'worktree_base = "{project.as_posix()}"\n'
         'slot_root = "slots"\n'
         "[routes.main]\n"
-        f'path = "{project}"\n'
+        f'path = "{project.as_posix()}"\n'
         'required_branch = "main"\n'
     ).encode()
     config.write_bytes(original)
@@ -800,7 +824,7 @@ def test_cli_restore_config_recovers_without_loading_an_unavailable_adapter(
     configured = original.replace(
         b'slot_root = "slots"\n',
         b'slot_root = "slots"\nagy_launch_mode = "managed"\n'
-        + f'agy_proxy_launcher = "{missing_adapter}"\n'.encode(),
+        + f'agy_proxy_launcher = "{missing_adapter.as_posix()}"\n'.encode(),
     )
     config.write_bytes(configured)
     configured_hash = hashlib.sha256(configured).hexdigest()
@@ -884,7 +908,7 @@ def test_managed_config_rejects_adapter_and_parent_symlinks(tmp_path: Path) -> N
                     'worktree_base = "."',
                     'slot_root = "slots"',
                     'agy_launch_mode = "managed"',
-                    f'agy_proxy_launcher = "{adapter}"',
+                    f'agy_proxy_launcher = "{adapter.as_posix()}"',
                     "[routes.main]",
                     'path = "."',
                     'required_branch = "main"',
