@@ -177,9 +177,20 @@ def validate_migration_binding(
         raise AgyLauncherError("project path is not a configured ACP route or worktree_base")
     config_bytes, _ = _read_regular_file(config, "config")
     _require_hash(expected_config_sha256, _sha256(config_bytes), "config")
-    if actual_agy_command != expected_agy_command:
+    if not _commands_equivalent(actual_agy_command, expected_agy_command):
         raise AgyLauncherError("configured agy_command differs from the expected value")
     return project, config
+
+
+def _commands_equivalent(actual: str, expected: str) -> bool:
+    if actual == expected:
+        return True
+    if actual.replace("\\", "/") == expected.replace("\\", "/"):
+        return True
+    try:
+        return Path(actual) == Path(expected)
+    except (ValueError, TypeError, OSError):
+        return False
 
 
 def validate_configured_project(
@@ -678,7 +689,7 @@ def _create_wrapper(path: Path, content: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         written, mode = _read_regular_file(path, "generated project wrapper")
-        if written != content or not stat.S_IXUSR & mode:
+        if written != content or (os.name != "nt" and not (stat.S_IXUSR & mode)):
             raise AgyLauncherError("generated project wrapper failed read-back verification")
         _fsync_directory(path.parent)
     except OSError as exc:

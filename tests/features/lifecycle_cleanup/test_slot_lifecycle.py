@@ -1070,6 +1070,7 @@ def test_unowned_canonical_reachable_branches_audited_as_retained_unowned(tmp_pa
 def test_real_detached_worker_survives_caller_exit(tmp_path: Path) -> None:
     config, _route, _slot = _fixture(tmp_path)
 
+    src_dir = str((Path(__file__).resolve().parents[3] / "src").as_posix())
     caller_pid_file = tmp_path / "caller.pid"
     script_body = f"""import json
 import os
@@ -1078,17 +1079,18 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, r"{src_dir}")
+from agent_control_plane.shared.process_liveness import process_is_alive
+
 # Prove caller death (historical regression boundary: caller process exits, worker survives)
 caller_pid_path = Path(r"{caller_pid_file}")
 if caller_pid_path.exists():
     caller_pid = int(caller_pid_path.read_text().strip())
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
-        try:
-            os.kill(caller_pid, 0)
-            time.sleep(0.05)
-        except OSError:
+        if not process_is_alive(caller_pid):
             break
+        time.sleep(0.05)
 
 prompt = ""
 for i, arg in enumerate(sys.argv):
@@ -1134,17 +1136,8 @@ if verification_path is not None:
 
 sys.exit(0)
 """
-    if os.name == "nt":
-        fake_agy_py = tmp_path / "fake_agy_script.py"
-        fake_agy_py.write_text(script_body, encoding="utf-8")
-        fake_agy = tmp_path / "fake_agy.cmd"
-        fake_agy.write_text(
-            f'@echo off\r\n"{sys.executable}" "{fake_agy_py}" %*\r\n', encoding="utf-8"
-        )
-    else:
-        fake_agy = tmp_path / "fake_agy"
-        fake_agy.write_text(f"#!{sys.executable}\n" + script_body, encoding="utf-8")
-        fake_agy.chmod(0o755)
+    fake_agy = tmp_path / "fake_agy.py"
+    fake_agy.write_text(script_body, encoding="utf-8")
 
     toml_text = config.config_path.read_text(encoding="utf-8")
     toml_text = toml_text.replace(
@@ -1156,8 +1149,6 @@ sys.exit(0)
     task_dir = config.coordination_root / "tasks/task-real-detached"
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / "brief.md").write_text("# Brief\nDo something\n", encoding="utf-8")
-
-    src_dir = str((Path(__file__).resolve().parents[3] / "src").as_posix())
     caller_py = tmp_path / "caller.py"
     caller_py.write_text(
         f"""

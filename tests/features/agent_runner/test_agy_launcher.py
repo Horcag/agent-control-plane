@@ -135,7 +135,7 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
 
     _run_wrapper(
         wrapper,
-        ["space value", "$(not-a-command)", 'quote"value'],
+        ["space value", "$(not-a-command)", "quote'value"],
         env={"PATH": str(tmp_path / "hostile")},
     )
 
@@ -143,7 +143,7 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
         "--new-project",
         "space value",
         "$(not-a-command)",
-        'quote"value',
+        "quote'value",
     ]
 
 
@@ -454,7 +454,7 @@ def test_cli_migration_has_an_explicit_dry_run_and_apply_workflow(
         "--expected-config-sha256",
         config_digest,
         "--expected-agy-command",
-        str(launcher),
+        launcher.as_posix(),
         "--launch-mode",
         "unmanaged",
     ]

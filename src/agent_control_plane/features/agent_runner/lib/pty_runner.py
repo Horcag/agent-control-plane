@@ -4,6 +4,7 @@ import importlib
 import os
 import queue
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -212,9 +213,16 @@ class PtyAgyRunner:
         return last_activity_mono, current_signature
 
     @staticmethod
+    def _command_prefix(spec: AgyRunSpec) -> list[str]:
+        executable = spec.agy_launch.executable if spec.agy_launch is not None else spec.agy_command
+        if executable.endswith((".py", ".pyw")):
+            return [sys.executable, executable]
+        return [executable]
+
+    @staticmethod
     def _build_command(spec: AgyRunSpec) -> list[str]:
         launch = spec.agy_launch
-        command = [launch.executable if launch is not None else spec.agy_command]
+        command = PtyAgyRunner._command_prefix(spec)
         if launch is not None and launch.add_new_project:
             command.append("--new-project")
         if spec.yolo:
@@ -227,7 +235,7 @@ class PtyAgyRunner:
     @staticmethod
     def _display_command(spec: AgyRunSpec) -> str:
         launch = spec.agy_launch
-        command = [launch.executable if launch is not None else spec.agy_command]
+        command = PtyAgyRunner._command_prefix(spec)
         if launch is not None and launch.add_new_project:
             command.append("--new-project")
         if spec.yolo:
