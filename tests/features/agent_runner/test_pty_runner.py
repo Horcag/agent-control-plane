@@ -70,6 +70,25 @@ class PtyBackendSelectionTest(unittest.TestCase):
 
 
 class PtyRunnerCommandTest(unittest.TestCase):
+    def test_eligibility_refusal_is_blocked_without_leaking_verification_url(self) -> None:
+        proc = SimpleNamespace(isalive=lambda: False, exitstatus=1)
+        output = (
+            "Eligibility check failed: Your current account is not eligible for Antigravity.\n"
+            "Please verify your account: https://accounts.google.com/private-token\n"
+        )
+        with (
+            patch.object(PtyAgyRunner, "_drain_output", return_value=output),
+            patch.object(pty_runner, "inspect_result", return_value=SimpleNamespace(done=False, reason="missing")),
+        ):
+            result = PtyAgyRunner()._exited_result_if_dead(
+                proc, SimpleNamespace(), SimpleNamespace(), _spec(prompt="task", yolo=False), 0,
+            )
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("eligibility", result.message)
+        self.assertNotIn("private-token", result.message)
+
     def test_build_command_uses_non_interactive_print_mode(self) -> None:
         spec = _spec(
             prompt="do the task",

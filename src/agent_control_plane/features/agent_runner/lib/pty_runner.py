@@ -176,7 +176,7 @@ class PtyAgyRunner:
                 self._terminate_spawned(proc)
                 return self._stopped_result(proc, "cancelled", "Cancel requested")
 
-            exited = self._exited_result_if_dead(proc, output_queue, log, spec, started_wall)
+            exited = self._exited_result_if_dead(proc, output_queue, log, spec, started_wall, output_tail)
             if exited is not None:
                 return exited
 
@@ -267,13 +267,22 @@ class PtyAgyRunner:
         log: TextIO,
         spec: AgyRunSpec,
         started_wall: float,
+        output_tail: str = "",
     ) -> AgyRunResult | None:
         if proc.isalive():
             return None
-        self._drain_output(output_queue, log)
+        output_tail = (output_tail + self._drain_output(output_queue, log))[-TRUST_PROMPT_TAIL_LIMIT:]
         result_state = inspect_result(spec.result_path, started_wall)
         if result_state.done:
             return self._completed_result(proc, result_state.status)
+        if "Eligibility check failed: Your current account is not eligible for Antigravity" in output_tail:
+            return AgyRunResult(
+                status="blocked",
+                completed=False,
+                exit_code=proc.exitstatus,
+                result_status=None,
+                message="Antigravity CLI rejected the active account at its eligibility check; verify that account before retrying. The proxy account pool cannot repair this local CLI refusal.",
+            )
         return AgyRunResult(
             status="exited_without_result",
             completed=False,
