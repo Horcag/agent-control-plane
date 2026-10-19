@@ -483,6 +483,56 @@ agent-control lifecycle poll --passes 3 --interval-sec 30 --max-interval-sec 300
 
 #### Reusable slot auto-return and default branch contract
 
+Direct sessions use the same ownership boundary as ACP jobs. A claim in
+`<coordination_root>/direct-session-claims/<slot>.json` holds the slot until an
+explicit reviewed release; timestamps never expire a claim. Inventory exposes
+`direct_owner` and `live_process_cwds`, with `direct_owned`, `ownership_blocked`, or
+`process_owned` for inactive ACP slots. An ACP job's status and `active_job_id`
+remain visible if conflicting evidence exists. Malformed, mismatched, oversized,
+or symlinked claims block reuse. `force` and `allow_dirty` do not bypass these holds.
+
+Use `agent-control slots claim-direct <name> --claim-file <payload.json> --config <config>`
+to acquire a hold, and `slots release-direct <name> --claim-file <payload.json>`
+with the same config to release the exact reviewed payload. Preserve the original
+payload outside the worktree; release compares all fields before unlinking.
+
+For direct integrations, use the supported Python `SlotManager` API with the same
+loaded `ControlConfig` and `SlotStore` as the plane:
+
+```python
+from agent_control_plane.entities.slot import SlotStore
+from agent_control_plane.features.slot_lifecycle.lib.slot_manager import SlotManager
+from agent_control_plane.shared.config import load_config
+
+config = load_config(config_path)
+manager = SlotManager(config, SlotStore(config.database_path))
+slot = manager.inspect_slot(slot_name)
+claim = {
+    "schemaVersion": 1,
+    "slot": slot.name, "route": slot.route, "path": str(slot.path),
+    "chatId": chat_id, "task": task_name, "branch": task_branch,
+}
+manager.claim_direct_session(slot.name, claim=claim)
+# Independently verify authority before working in the claimed checkout.
+# After reviewing committed work and removing task-owned generated outputs:
+manager.release_direct_session(slot.name, expected_claim=claim)
+```
+
+Claim creation and exact-payload release share a per-slot interprocess lock with
+ACP acquisition, checkout, preparation, creation, deletion and lifecycle cleanup.
+The lock uses the existing `interprocess_config_lock` implementation keyed by the
+canonical claim JSON path (a SHA-256-named file under the system temporary
+`agent-control-plane/config-locks` directory); it is not a sibling `.json.lock` file.
+The process census reuses lifecycle cleanup's existing platform limits: unavailable
+platforms block reuse, while inaccessible individual `/proc` CWDs can be skipped.
+A claim remains necessary evidence for sessions whose process CWD is not observable.
+The claim is an ownership hold, never authorization for a privileged operation.
+Do not write/unlink claim files manually while a plane is running: external writers
+that ignore the common lock cannot participate in its race protection. Existing
+manual claims are still read and protected. A malformed claim needs operator review;
+never remove it by age or infer that its owner has exited. Slot inventory covers
+configured/registered slots; use lifecycle audit for unregistered Git worktrees.
+
 Configured reusable slots follow the canonical default branch contract `slot/<slot-name>`
 (for example, `slot/acp-local-1`). When a task finishes and its checkpoint handoff is
 root-accepted, the slot should return to its clean default branch at the freshly fetched

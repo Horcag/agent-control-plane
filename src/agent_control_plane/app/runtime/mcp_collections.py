@@ -156,6 +156,17 @@ def compact_slot(value: Any) -> dict[str, Any]:
     if isinstance(problems, Sequence) and not isinstance(problems, str):
         result["problems"] = [utf8_prefix(str(item), 256) for item in problems[:16]]
         result["problems_total_count"] = len(problems)
+    direct_owner = row.get("direct_owner")
+    if isinstance(direct_owner, Mapping):
+        result["direct_owner"] = {
+            key: _compact_scalar(direct_owner[key], limit=256)
+            for key in ("claim_path", "chatId", "task", "branch", "error")
+            if key in direct_owner
+        }
+    pids = row.get("live_process_cwds")
+    if isinstance(pids, Sequence) and not isinstance(pids, str):
+        result["live_process_cwds"] = list(pids[:16])
+        result["live_process_cwds_total_count"] = len(pids)
     return result
 
 

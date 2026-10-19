@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from agent_control_plane.entities.slot import SlotRecord, SlotStore, SlotStoreError
 from agent_control_plane.features.slot_lifecycle.lib.ide_inspections import (
@@ -29,6 +32,12 @@ from agent_control_plane.features.slot_lifecycle.lib.worktree_manager import (
     remove_worktree,
 )
 from agent_control_plane.shared.config import ControlConfig, SlotConfig, SlotPrepareCommand
+from agent_control_plane.shared.direct_session_claims import (
+    direct_session_claim_path,
+    direct_session_lock,
+    read_direct_session_claim,
+    read_direct_session_claim_bytes,
+)
 from agent_control_plane.shared.git_tools import (
     GitError,
     is_git_workspace,
@@ -36,6 +45,7 @@ from agent_control_plane.shared.git_tools import (
     workspace_state,
 )
 from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.process_cwds import live_process_cwds
 
 
 class SlotError(RuntimeError):
@@ -59,6 +69,8 @@ class SlotStatus:
     last_used_at: str | None
     note: str | None
     problems: tuple[str, ...]
+    direct_owner: dict[str, Any] | None = None
+    live_process_cwds: tuple[int, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -77,6 +89,8 @@ class SlotStatus:
             "last_used_at": self.last_used_at,
             "note": self.note,
             "problems": list(self.problems),
+            "direct_owner": self.direct_owner,
+            "live_process_cwds": list(self.live_process_cwds),
         }
 
 
@@ -96,6 +110,22 @@ class CleanupDecision:
             "action": self.action,
             "reason": self.reason,
         }
+
+
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def _slot_mutation(
+    method: Callable[Concatenate[SlotManager, str, _P], _T],
+) -> Callable[Concatenate[SlotManager, str, _P], _T]:
+    @wraps(method)
+    def guarded(self: SlotManager, name: str, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        with direct_session_lock(self._config.coordination_root, name):
+            self._ensure_no_external_owner(name)
+            return method(self, name, *args, **kwargs)
+
+    return guarded
 
 
 class SlotManager:
@@ -125,7 +155,8 @@ class SlotManager:
             for slot in self._config.slots.values():
                 if route is not None and slot.route != route:
                     continue
-                self._register_configured_slot(slot.name)
+                with direct_session_lock(self._config.coordination_root, slot.name):
+                    self._register_configured_slot(slot.name)
         return self.list_slots(route=route)
 
     def _register_configured_slot(self, name: str) -> SlotRecord:
@@ -138,6 +169,8 @@ class SlotManager:
             record.route != configured.route
             or record.path.resolve(strict=False) != configured.path.resolve(strict=False)
         )
+        if metadata_changed:
+            self._ensure_no_external_owner(name)
         if record is not None and record.active_job_id is not None and metadata_changed:
             raise SlotError(f"Cannot reconcile active slot {name} with current configuration")
         if record is not None and record.active_job_id is not None:
@@ -252,9 +285,23 @@ class SlotManager:
                 except GitError as exc:
                     problems.append(f"git status failed: {exc}")
 
+        direct_owner = read_direct_session_claim(self._config.coordination_root, name, route, path)
+        process_cwds = tuple(live_process_cwds(path)) if exists and active_job_id is None else ()
+        if direct_owner is not None:
+            problems.append("direct-session claim requires explicit release")
+        if process_cwds:
+            problems.append(f"live process CWDs or inspection uncertainty: {list(process_cwds)}")
         display_status = "stale" if slot_scope == "stale" else status
         if dirty and display_status == "available" and active_job_id is None:
             display_status = "dirty"
+
+        if active_job_id is None and display_status != "deleted":
+            if direct_owner is not None:
+                display_status = (
+                    "ownership_blocked" if direct_owner.get("error") else "direct_owned"
+                )
+            elif process_cwds:
+                display_status = "process_owned"
 
         return SlotStatus(
             name=name,
@@ -272,8 +319,11 @@ class SlotManager:
             last_used_at=last_used_at,
             note=note,
             problems=tuple(problems),
+            direct_owner=direct_owner,
+            live_process_cwds=process_cwds,
         )
 
+    @_slot_mutation
     def reconcile_clean_slot(self, name: str) -> SlotStatus:
         """Explicitly release a clean, inactive terminal-preservation status."""
         status = self.inspect_slot(name)
@@ -294,6 +344,17 @@ class SlotManager:
         branch: str | None = None,
         start_point: str | None = None,
     ) -> SlotStatus:
+        with direct_session_lock(self._config.coordination_root, name):
+            return self._create_slot(name, route=route, branch=branch, start_point=start_point)
+
+    def _create_slot(
+        self,
+        name: str,
+        *,
+        route: str | None = None,
+        branch: str | None = None,
+        start_point: str | None = None,
+    ) -> SlotStatus:
         configured = self._config.slots.get(name)
         slot_route: str
         if configured:
@@ -307,6 +368,7 @@ class SlotManager:
             slot_route = route
             path = self._config.slot_root_for(route) / _safe_slot_name(name)
 
+        self._ensure_no_external_owner(name, route=slot_route, path=path)
         self._ensure_slot_path_allowed(path, route=slot_route)
         route_key: str = str(slot_route)
         route_config = self._config.routes[route_key]
@@ -344,6 +406,7 @@ class SlotManager:
         self._store.mark_available(name, note="created")
         return self.inspect_slot(name)
 
+    @_slot_mutation
     def delete_slot(self, name: str, *, force: bool = False) -> SlotStatus:
         status = self.inspect_slot(name)
         if status.active_job_id and not force:
@@ -371,6 +434,7 @@ class SlotManager:
         self._store.mark_deleted(name, note="deleted", force=force)
         return self.inspect_slot(name)
 
+    @_slot_mutation
     def checkout_slot(
         self,
         name: str,
@@ -464,6 +528,7 @@ class SlotManager:
             raise SlotError(f"Slot {name} is not configured in workspaces.toml")
         return remove_slot_ide_module(self._config, name).as_dict()
 
+    @_slot_mutation
     def prepare_slot(self, name: str) -> list[dict[str, Any]]:
         status = self.inspect_slot(name)
         if not status.exists or not status.is_git_workspace:
@@ -485,12 +550,27 @@ class SlotManager:
         route: str,
         allow_dirty: bool = False,
     ) -> SlotRecord:
+        # Match configured-slot sync's lock order: config freshness, then slot ownership.
+        with (
+            self._configured_slots_sync_guard(),
+            direct_session_lock(self._config.coordination_root, name),
+        ):
+            self._ensure_no_external_owner(name)
+            return self._acquire_for_job(name, job_id=job_id, route=route, allow_dirty=allow_dirty)
+
+    def _acquire_for_job(
+        self,
+        name: str,
+        *,
+        job_id: str,
+        route: str,
+        allow_dirty: bool = False,
+    ) -> SlotRecord:
         configured = self._config.slots.get(name)
         if configured is not None:
             if configured.route != route:
                 raise SlotError(f"Slot {name} belongs to route {configured.route!r}, not {route!r}")
-            with self._configured_slots_sync_guard():
-                self._register_configured_slot(name)
+            self._register_configured_slot(name)
         status = self.inspect_slot(name)
         if status.route != route:
             raise SlotError(f"Slot {name} belongs to route {status.route!r}, not {route!r}")
@@ -557,6 +637,9 @@ class SlotManager:
             removable = sorted(route_slots, key=_cleanup_sort_key)
             excess = max(0, len(route_slots) - max_per_route)
             for status in removable[:excess]:
+                if status.direct_owner is not None or status.live_process_cwds:
+                    decisions.append(_decision(status, "skip", "slot has external ownership"))
+                    continue
                 if status.active_job_id:
                     decisions.append(_decision(status, "skip", "slot is active"))
                     continue
@@ -592,6 +675,75 @@ class SlotManager:
                 )
             return applied
         return decisions
+
+    def _ensure_no_external_owner(
+        self, name: str, *, route: str | None = None, path: Path | None = None
+    ) -> None:
+        if path is None or route is None:
+            configured = self._config.slots.get(name)
+            record = self._store.get_slot(name)
+            owner = configured or record
+            if owner is None:
+                raise SlotError(f"Unknown slot: {name}")
+            route, path = owner.route, owner.path
+        claim = read_direct_session_claim(self._config.coordination_root, name, route, path)
+        if claim is not None:
+            raise SlotError(
+                f"Slot {name} has direct-session ownership requiring explicit release: {claim}"
+            )
+        pids = live_process_cwds(path) if path.exists() else []
+        if pids:
+            raise SlotError(f"Slot {name} has live process CWDs or inspection uncertainty: {pids}")
+
+    def claim_direct_session(self, name: str, *, claim: dict[str, Any]) -> SlotStatus:
+        """Persist a hold; callers still need independent workspace/operation authority."""
+        with direct_session_lock(self._config.coordination_root, name):
+            status = self.inspect_slot(name)
+            if status.status != "available" or status.problems or status.dirty:
+                raise SlotError(f"Slot {name} is not available for a direct session")
+            claim_path = direct_session_claim_path(self._config.coordination_root, name)
+            claim_path.parent.mkdir(parents=True, exist_ok=True)
+            # Validate the payload without publishing a malformed claim.
+            expected = {"slot": name, "route": status.route, "path": str(status.path)}
+            if any(claim.get(key) != value for key, value in expected.items()) or any(
+                not isinstance(claim.get(key), str) or not claim[key].strip()
+                for key in ("chatId", "task", "branch")
+            ):
+                raise SlotError("Direct-session claim identity is invalid")
+            if claim.get("schemaVersion", 1) != 1 or (
+                claim.get("chat") is not None and claim["chat"] != claim["chatId"]
+            ):
+                raise SlotError("Direct-session claim schema or chat identity is invalid")
+            try:
+                payload = json.dumps(claim).encode("utf-8")
+            except (ValueError, TypeError) as exc:
+                raise SlotError(f"Direct-session claim is not JSON: {exc}") from exc
+            if len(payload) > 65536:
+                raise SlotError("Direct-session claim exceeds 64 KiB")
+            try:
+                with claim_path.open("xb") as output:
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except FileExistsError as exc:
+                raise SlotError(f"Slot {name} already has a direct-session claim") from exc
+            return self.inspect_slot(name)
+
+    def release_direct_session(self, name: str, *, expected_claim: dict[str, Any]) -> SlotStatus:
+        """Explicit reviewed release, comparing the entire original claim; never use age."""
+        with direct_session_lock(self._config.coordination_root, name):
+            self.inspect_slot(name)
+            claim_path = direct_session_claim_path(self._config.coordination_root, name)
+            if claim_path.is_symlink() or claim_path.parent.is_symlink():
+                raise SlotError("Refusing to release symlinked claim")
+            try:
+                current = json.loads(read_direct_session_claim_bytes(claim_path))
+            except (OSError, ValueError) as exc:
+                raise SlotError(f"Cannot verify claim for explicit release: {exc}") from exc
+            if current != expected_claim:
+                raise SlotError("Direct-session claim changed before release")
+            claim_path.unlink()
+            return self.inspect_slot(name)
 
     def _ensure_slot_path_allowed(self, path: Path, *, route: str | None = None) -> None:
         if route is not None and route in self._config.routes:

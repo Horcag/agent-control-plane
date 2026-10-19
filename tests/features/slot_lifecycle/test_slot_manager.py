@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import MappingProxyType
 from unittest.mock import patch
 
@@ -20,9 +24,200 @@ from agent_control_plane.shared.config import (
     SlotConfig,
     SlotPrepareCommand,
 )
+from agent_control_plane.shared.direct_session_claims import direct_session_lock
 
 
 class SlotManagerTest(unittest.TestCase):
+    def test_direct_claim_holds_clean_slot_until_explicit_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            claim = {
+                "slot": "main-1",
+                "route": "main",
+                "path": str(path),
+                "chatId": "chat-1",
+                "task": "task",
+                "branch": "slot/main-1",
+                "createdAt": 1,
+            }
+            held = manager.claim_direct_session("main-1", claim=claim)
+            self.assertEqual(held.status, "direct_owned")
+            self.assertEqual(manager.list_slots()[0].as_dict()["direct_owner"]["chatId"], "chat-1")
+            self.assertEqual(store.require_slot("main-1").status, "available")
+            for mutation in (
+                lambda: manager.acquire_for_job(
+                    "main-1", job_id="job-1", route="main", allow_dirty=True
+                ),
+                lambda: manager.checkout_slot("main-1", branch="main"),
+                lambda: manager.delete_slot("main-1", force=True),
+                lambda: manager.create_slot("main-1", route="main"),
+                lambda: manager.prepare_slot("main-1"),
+                lambda: manager.reconcile_clean_slot("main-1"),
+            ):
+                with (
+                    self.subTest(mutation=mutation),
+                    self.assertRaisesRegex(SlotError, "direct-session"),
+                ):
+                    mutation()
+            decisions = manager.cleanup(max_per_route=0, route="main", force=True, apply=True)
+            self.assertEqual(decisions[0].action, "skip")
+            with self.assertRaisesRegex(SlotError, "changed"):
+                manager.release_direct_session(
+                    "main-1", expected_claim={**claim, "chatId": "other"}
+                )
+            self.assertEqual(
+                manager.release_direct_session("main-1", expected_claim=claim).status, "available"
+            )
+            self.assertEqual(
+                manager.acquire_for_job("main-1", job_id="job-1", route="main").active_job_id,
+                "job-1",
+            )
+
+    def test_invalid_claims_fail_closed_and_do_not_hide_acp_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            claims = config.coordination_root / "direct-session-claims"
+            claims.mkdir(parents=True)
+            claim_path = claims / "main-1.json"
+            base = {
+                "slot": "main-1",
+                "route": "main",
+                "path": str(path),
+                "chatId": "chat",
+                "task": "task",
+                "branch": "main",
+            }
+            for payload in (
+                "{",
+                json.dumps({**base, "path": str(root / "wrong")}),
+                json.dumps({**base, "route": "other"}),
+                "[]",
+            ):
+                claim_path.write_text(payload)
+                with self.subTest(payload=payload):
+                    status = manager.inspect_slot("main-1")
+                    self.assertEqual(status.status, "ownership_blocked")
+                    self.assertIn("error", status.direct_owner)
+                    with self.assertRaisesRegex(SlotError, "direct-session"):
+                        manager.delete_slot("main-1", force=True)
+            store.acquire_slot("main-1", "job-existing")
+            status = manager.inspect_slot("main-1")
+            self.assertEqual(status.active_job_id, "job-existing")
+            self.assertEqual(status.status, "active")
+            with self.assertRaisesRegex(SlotError, "not available"):
+                manager.claim_direct_session("main-1", claim=base)
+
+    def test_legacy_chat_alias_is_visible_but_disagreeing_identity_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            claim_path = config.coordination_root / "direct-session-claims" / "main-1.json"
+            claim_path.parent.mkdir(parents=True)
+            claim = {
+                "slot": "main-1",
+                "route": "main",
+                "path": str(path),
+                "chat": "legacy-chat",
+                "task": "task",
+                "branch": "main",
+            }
+            claim_path.write_text(json.dumps(claim))
+            status = manager.inspect_slot("main-1")
+            self.assertEqual(status.status, "direct_owned")
+            self.assertEqual(status.direct_owner["chatId"], "legacy-chat")
+            claim_path.write_text(json.dumps({**claim, "chatId": "other-chat"}))
+            self.assertEqual(manager.inspect_slot("main-1").status, "ownership_blocked")
+            claim_path.unlink()
+            claim_path.symlink_to(root / "missing-claim")
+            self.assertEqual(manager.inspect_slot("main-1").status, "ownership_blocked")
+            with self.assertRaisesRegex(SlotError, "symlink"):
+                manager.release_direct_session("main-1", expected_claim=claim)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO support required")
+    def test_special_claim_file_is_a_nonblocking_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            claim_path = config.coordination_root / "direct-session-claims" / "main-1.json"
+            claim_path.parent.mkdir(parents=True)
+            os.mkfifo(claim_path)
+            self.assertEqual(manager.inspect_slot("main-1").status, "ownership_blocked")
+            with self.assertRaisesRegex(SlotError, "regular file"):
+                manager.release_direct_session("main-1", expected_claim={})
+
+    def test_mutation_rechecks_claim_after_waiting_for_owner_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            started = Event()
+
+            def checkout() -> None:
+                started.set()
+                manager.checkout_slot("main-1", branch="new-branch", start_point="HEAD")
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with direct_session_lock(config.coordination_root, "main-1"):
+                    future = executor.submit(checkout)
+                    self.assertTrue(started.wait(timeout=5))
+                    self.assertFalse(future.done())
+                    claim_path = config.coordination_root / "direct-session-claims" / "main-1.json"
+                    claim_path.parent.mkdir(parents=True)
+                    claim_path.write_text(
+                        json.dumps(
+                            {
+                                "slot": "main-1",
+                                "route": "main",
+                                "path": str(path),
+                                "chatId": "owner",
+                                "task": "task",
+                                "branch": "main",
+                            }
+                        )
+                    )
+                with self.assertRaisesRegex(SlotError, "direct-session"):
+                    future.result(timeout=5)
+            self.assertEqual(manager.inspect_slot("main-1").branch, "slot/main-1")
+
+    def test_unclaimed_process_cwd_holds_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            manager = SlotManager(_config(root, root / "slots"), SlotStore(root / "jobs.sqlite3"))
+            manager._store.register_slot("main-1", "main", path)
+            process = subprocess.Popen(["sleep", "30"], cwd=path)
+            try:
+                status = manager.inspect_slot("main-1")
+                self.assertEqual(status.status, "process_owned")
+                self.assertIn(process.pid, status.live_process_cwds)
+                with self.assertRaisesRegex(SlotError, "process CWDs"):
+                    manager.acquire_for_job("main-1", job_id="job-1", route="main")
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+            self.assertEqual(manager.inspect_slot("main-1").status, "available")
+
     def test_checkout_slot_switches_clean_inactive_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

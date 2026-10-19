@@ -1908,6 +1908,14 @@ class AgentControlPlane:
             )
         return payload
 
+    def claim_direct_session(self, name: str, *, claim: dict[str, Any]) -> dict[str, Any]:
+        return self.slots.claim_direct_session(name, claim=claim).as_dict()
+
+    def release_direct_session(
+        self, name: str, *, expected_claim: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self.slots.release_direct_session(name, expected_claim=expected_claim).as_dict()
+
     def delete_slot(self, name: str, *, force: bool = False) -> dict[str, Any]:
         return self.slots.delete_slot(name, force=force).as_dict()
 

@@ -21,8 +21,13 @@ from agent_control_plane.entities.review_inbox import ReviewInboxItem, ReviewInb
 from agent_control_plane.entities.slot import SlotRecord, SlotStore, SlotStoreError
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.config import ControlConfig
+from agent_control_plane.shared.direct_session_claims import (
+    direct_session_lock,
+    read_direct_session_claim,
+)
 from agent_control_plane.shared.git_tools import GitError, run_git, workspace_snapshot
 from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.process_cwds import live_process_cwds as _live_process_cwds
 from agent_control_plane.shared.process_liveness import (
     process_is_alive as shared_process_is_alive,
 )
@@ -142,7 +147,8 @@ class SlotLifecycleService:
         self.slots = slots
         self.jobs = jobs
         self.inbox = inbox
-        self.live_cwds = live_cwds or _live_process_cwds
+        self._process_cwds = live_cwds or _live_process_cwds
+        self.live_cwds = self._ownership_cwds
         self.clock = clock
         self.sleep = sleep
         self.process_is_alive = process_is_alive or shared_process_is_alive
@@ -952,6 +958,44 @@ class SlotLifecycleService:
         return True
 
     def apply(
+        self,
+        operation_id: str,
+        *,
+        crash_hook: Callable[[str], None] | None = None,
+        pre_mutation_hook: Callable[[str], None] | None = None,
+        executor_id: str | None = None,
+        owner_pid: int | None = None,
+    ) -> dict[str, Any]:
+        intent = self._intent(operation_id)
+        proof = intent["proof"] if intent else {}
+        if proof.get("kind") == "branch" or not proof.get("name"):
+            return self._apply_owned(
+                operation_id,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                owner_pid=owner_pid,
+            )
+        with direct_session_lock(self.config.coordination_root, proof["name"]):
+            claim = read_direct_session_claim(
+                self.config.coordination_root, proof["name"], proof["route"], Path(proof["path"])
+            )
+            if claim is not None:
+                return {
+                    **(intent or {}),
+                    "action": "quarantined",
+                    "reason": "direct-session claim requires explicit release",
+                    "direct_owner": claim,
+                }
+            return self._apply_owned(
+                operation_id,
+                crash_hook=crash_hook,
+                pre_mutation_hook=pre_mutation_hook,
+                executor_id=executor_id,
+                owner_pid=owner_pid,
+            )
+
+    def _apply_owned(
         self,
         operation_id: str,
         *,
@@ -2146,7 +2190,33 @@ class SlotLifecycleService:
             result["auto_returned"] = auto_returned
         return result
 
-    def auto_return_slot(
+    def _ownership_cwds(self, path: Path) -> list[int]:
+        for slot in self.slots.list_slots():
+            if slot.path.resolve(strict=False) == path.resolve(strict=False):
+                claim = read_direct_session_claim(
+                    self.config.coordination_root, slot.name, slot.route, slot.path
+                )
+                if claim is not None:
+                    raise OSError(f"direct-session ownership blocks slot: {claim}")
+        return self._process_cwds(path)
+
+    def auto_return_slot(self, slot_name: str, *, refresh: bool = True) -> dict[str, Any]:
+        with direct_session_lock(self.config.coordination_root, slot_name):
+            slot = self.slots.get_slot(slot_name)
+            if slot is not None:
+                claim = read_direct_session_claim(
+                    self.config.coordination_root, slot.name, slot.route, slot.path
+                )
+                if claim is not None:
+                    return {
+                        "slot": slot_name,
+                        "status": "skipped",
+                        "reason": "direct-session claim requires explicit release",
+                        "direct_owner": claim,
+                    }
+            return self._auto_return_slot(slot_name, refresh=refresh)
+
+    def _auto_return_slot(
         self,
         slot_name: str,
         *,
@@ -2598,6 +2668,18 @@ class SlotLifecycleService:
                 **base,
                 "classification": LifecycleClass.STALE.value,
                 "reasons": ["unknown route" if route is None else "registered path missing"],
+            }
+        claim = read_direct_session_claim(
+            self.config.coordination_root, slot.name, slot.route, slot.path
+        )
+        if claim is not None:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value
+                if claim.get("error")
+                else LifecycleClass.ACTIVE.value,
+                "reasons": ["direct-session claim requires explicit release"],
+                "direct_owner": claim,
             }
         if slot.active_job_id is not None or slot.status in {"active", "finalizing", "cleaning"}:
             return {
@@ -3397,29 +3479,6 @@ def _run_git_or_none(repo: Path, *args: str) -> str | None:
         return run_git(repo, *args)
     except GitError:
         return None
-
-
-def _live_process_cwds(root: Path) -> list[int]:
-    if os.name == "nt" or not Path("/proc").is_dir():
-        return [-1]
-    canonical = root.resolve(strict=False)
-    matches: list[int] = []
-    try:
-        entries = list(Path("/proc").iterdir())
-    except (PermissionError, OSError):
-        return [-2]
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            cwd = (entry / "cwd").resolve(strict=True)
-        except (FileNotFoundError, ProcessLookupError, PermissionError):
-            continue
-        except OSError:
-            return [-2]
-        if cwd == canonical or cwd.is_relative_to(canonical):
-            matches.append(int(entry.name))
-    return matches
 
 
 def _parse_worktrees(output: str) -> list[dict[str, str]]:

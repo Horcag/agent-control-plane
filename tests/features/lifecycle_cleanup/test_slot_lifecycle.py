@@ -40,6 +40,74 @@ from agent_control_plane.shared.native_quality import (
 from agent_control_plane.shared.process_liveness import process_is_alive
 
 
+@pytest.mark.parametrize("malformed", [False, True])
+def test_direct_session_hold_blocks_lifecycle_audit_apply_and_auto_return(
+    tmp_path: Path,
+    malformed: bool,
+) -> None:
+    config, _route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    record = slots.register_slot("app-1", "app", slot)
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/held"
+    run_git(slot, "update-ref", checkpoint_ref, accepted)
+    item = service.inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="held",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=record.generation,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    service.inbox.resolve(item.item_id, "accepted")
+    operation_id = service.reconcile()["enqueued"][0]
+    branch_before = run_git(slot, "branch", "--show-current")
+    claim_path = config.coordination_root / "direct-session-claims" / "app-1.json"
+    claim_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_path.write_text(
+        "{"
+        if malformed
+        else json.dumps(
+            {
+                "slot": "app-1",
+                "route": "app",
+                "path": str(slot),
+                "chatId": "live-chat",
+                "task": "live-task",
+                "branch": branch_before,
+                "createdAt": 1,
+            }
+        )
+    )
+    resource = service.audit()["resources"][0]
+    assert resource["classification"] == ("quarantined" if malformed else "active")
+    assert resource["direct_owner"]
+    assert service.auto_return_slot("app-1")["status"] == "skipped"
+    applied = service.apply(operation_id)
+    assert applied["action"] == "quarantined"
+    assert "direct-session" in applied["reason"]
+    assert slots.require_slot("app-1") == record
+    assert run_git(slot, "branch", "--show-current") == branch_before
+    claim_path.unlink()  # Explicit fixture-owned release.
+    assert service.apply(operation_id)["action"] == "completed"
+
+
 def test_audit_and_apply_are_exact_idempotent_and_return_slot_to_default_branch(
     tmp_path: Path,
 ) -> None:
