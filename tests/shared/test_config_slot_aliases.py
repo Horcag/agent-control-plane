@@ -19,8 +19,8 @@ def test_config_rejects_duplicate_physical_slot_paths(tmp_path: Path, symlink: b
         '[control]\ncoordination_root=".agent-work"\nruns_root="runs"\n'
         'database="db"\nworktree_root="worktrees"\nworktree_base="repo"\nslot_root="slots"\n'
         '[routes.app]\npath="repo"\nrequired_branch="main"\n'
-        f'[slots.first]\nroute="app"\npath="{slot}"\n'
-        f'[slots.second]\nroute="app"\npath="{alias}"\n'
+        f'[slots.first]\nroute="app"\npath="{slot.as_posix()}"\n'
+        f'[slots.second]\nroute="app"\npath="{alias.as_posix()}"\n'
     )
     with pytest.raises(ValueError, match="duplicates physical slot path"):
         load_config(config_path)
