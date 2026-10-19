@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -46,7 +47,7 @@ def test_lifecycle_quarantines_legacy_slot_path_aliases(tmp_path: Path) -> None:
     slots = SlotStore(config.database_path)
     slots.register_slot("app-1", "app", slot)
     slots.register_slot("legacy-alias", "app", tmp_path / "other")
-    with sqlite3.connect(config.database_path) as db:
+    with closing(sqlite3.connect(config.database_path)) as db, db:
         db.execute("update slots set path = ? where name = 'legacy-alias'", (str(slot),))
     before = slots.list_slots()
     service = SlotLifecycleService(

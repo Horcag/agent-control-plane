@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from threading import Event
 from types import MappingProxyType
@@ -274,7 +275,7 @@ class SlotManagerTest(unittest.TestCase):
             manager.claim_direct_session("owner", claim=claim)
             store.register_slot("alias", "main", other)
             # Seed a legacy duplicate without weakening current registration validation.
-            with sqlite3.connect(store.database_path) as db:
+            with closing(sqlite3.connect(store.database_path)) as db, db:
                 db.execute("update slots set path = ? where name = 'alias'", (str(path),))
             before = store.list_slots()
             self.assertEqual(manager.inspect_slot("alias").status, "ownership_blocked")
