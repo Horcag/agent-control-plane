@@ -47,7 +47,7 @@ def test_compact_mcp_inventory_preserves_bounded_direct_owner_evidence() -> None
                 "name": "app-1",
                 "status": "direct_owned",
                 "active_job_id": None,
-            "process_inspection_available": False,
+                "process_inspection_available": False,
                 "direct_owner": {
                     "chatId": "owner",
                     "task": "task",
