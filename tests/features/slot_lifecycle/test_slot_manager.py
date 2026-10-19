@@ -201,6 +201,9 @@ class SlotManagerTest(unittest.TestCase):
                     future.result(timeout=5)
             self.assertEqual(manager.inspect_slot("main-1").branch, "slot/main-1")
 
+    @unittest.skipIf(
+        os.name == "nt", "Live CWD census uses /proc; Windows unavailability is tested separately"
+    )
     def test_unclaimed_process_cwd_holds_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -219,6 +222,9 @@ class SlotManagerTest(unittest.TestCase):
                 process.wait(timeout=5)
             self.assertEqual(manager.inspect_slot("main-1").status, "available")
 
+    @unittest.skipIf(
+        os.name == "nt", "Live CWD census uses /proc; Windows unavailability is tested separately"
+    )
     def test_config_remap_preserves_old_workspace_with_live_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -312,6 +318,60 @@ class SlotManagerTest(unittest.TestCase):
             with self.assertRaisesRegex(SlotError, "duplicate physical"):
                 manager.sync_configured_slots()
             self.assertEqual(store.list_slots(), [])
+
+    def test_unavailable_process_census_preserves_ordinary_operations_and_direct_holds(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "main-1", "slot/main-1")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("main-1", "main", path)
+            manager = SlotManager(config, store)
+            with patch(
+                "agent_control_plane.features.slot_lifecycle.lib.slot_manager.live_process_cwds",
+                return_value=[-1],
+            ):
+                status = manager.inspect_slot("main-1")
+                self.assertEqual(status.status, "available")
+                self.assertFalse(status.as_dict()["process_inspection_available"])
+                self.assertEqual(status.live_process_cwds, (-1,))
+                manager.checkout_slot("main-1", branch="portable", start_point="HEAD")
+                self.assertEqual(manager.prepare_slot("main-1"), [])
+                claim = {
+                    "slot": "main-1",
+                    "route": "main",
+                    "path": str(path),
+                    "chatId": "owner",
+                    "task": "task",
+                    "branch": "portable",
+                }
+                self.assertEqual(
+                    manager.claim_direct_session("main-1", claim=claim).status, "direct_owned"
+                )
+                with self.assertRaisesRegex(SlotError, "direct-session"):
+                    manager.acquire_for_job("main-1", job_id="job", route="main")
+                with self.assertRaisesRegex(SlotError, "direct-session"):
+                    manager.checkout_slot("main-1", branch="slot/main-1")
+                manager.release_direct_session("main-1", expected_claim=claim)
+                self.assertEqual(
+                    manager.acquire_for_job("main-1", job_id="job", route="main").active_job_id,
+                    "job",
+                )
+                manager.release_for_job("main-1", job_id="job")
+                with self.assertRaisesRegex(SlotError, "inspection uncertainty"):
+                    manager.delete_slot("main-1", force=True)
+                self.assertEqual(
+                    manager.cleanup(max_per_route=0, route="main", force=True)[0].action,
+                    "would_delete",
+                )
+                self.assertEqual(
+                    manager.cleanup(max_per_route=0, route="main", force=True, apply=True)[
+                        0
+                    ].action,
+                    "skip",
+                )
 
     def test_checkout_slot_switches_clean_inactive_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

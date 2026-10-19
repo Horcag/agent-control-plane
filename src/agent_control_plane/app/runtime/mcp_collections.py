@@ -139,6 +139,7 @@ def compact_slot(value: Any) -> dict[str, Any]:
             "exists",
             "is_git_workspace",
             "active_job_id",
+            "process_inspection_available",
             "use_count",
             "last_used_at",
         )

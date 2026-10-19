@@ -71,6 +71,7 @@ class SlotStatus:
     problems: tuple[str, ...]
     direct_owner: dict[str, Any] | None = None
     live_process_cwds: tuple[int, ...] = ()
+    process_inspection_available: bool | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -91,6 +92,7 @@ class SlotStatus:
             "problems": list(self.problems),
             "direct_owner": self.direct_owner,
             "live_process_cwds": list(self.live_process_cwds),
+            "process_inspection_available": self.process_inspection_available,
         }
 
 
@@ -294,7 +296,10 @@ class SlotManager:
         process_cwds = tuple(live_process_cwds(path)) if exists and active_job_id is None else ()
         if direct_owner is not None:
             problems.append("direct-session claim requires explicit release")
-        if process_cwds:
+        process_inspection_available = (
+            process_cwds != (-1,) if exists and active_job_id is None else None
+        )
+        if process_cwds and process_inspection_available:
             problems.append(f"live process CWDs or inspection uncertainty: {list(process_cwds)}")
         display_status = "stale" if slot_scope == "stale" else status
         if dirty and display_status == "available" and active_job_id is None:
@@ -307,7 +312,7 @@ class SlotManager:
                 display_status = (
                     "ownership_blocked" if direct_owner.get("error") else "direct_owned"
                 )
-            elif process_cwds:
+            elif process_cwds and process_inspection_available:
                 display_status = "process_owned"
 
         return SlotStatus(
@@ -328,6 +333,7 @@ class SlotManager:
             problems=tuple(problems),
             direct_owner=direct_owner,
             live_process_cwds=process_cwds,
+            process_inspection_available=process_inspection_available,
         )
 
     @_slot_mutation
@@ -418,6 +424,7 @@ class SlotManager:
 
     @_slot_mutation
     def delete_slot(self, name: str, *, force: bool = False) -> SlotStatus:
+        self._ensure_no_external_owner(name, require_process_inspection=True)
         status = self.inspect_slot(name)
         if status.active_job_id and not force:
             raise SlotError(f"Slot {name} is active for job {status.active_job_id}")
@@ -647,9 +654,17 @@ class SlotManager:
             removable = sorted(route_slots, key=_cleanup_sort_key)
             excess = max(0, len(route_slots) - max_per_route)
             for status in removable[:excess]:
+                if apply and status.process_inspection_available is False:
+                    decisions.append(
+                        _decision(status, "skip", "process CWD inspection is unavailable")
+                    )
+                    continue
                 if (
                     status.direct_owner is not None
-                    or status.live_process_cwds
+                    or (
+                        status.live_process_cwds
+                        and status.process_inspection_available is not False
+                    )
                     or status.status == "ownership_blocked"
                 ):
                     decisions.append(_decision(status, "skip", "slot has external ownership"))
@@ -707,7 +722,12 @@ class SlotManager:
             raise SlotError(f"Slot {name} has duplicate physical slot path shared with: {aliases}")
 
     def _ensure_no_external_owner(
-        self, name: str, *, route: str | None = None, path: Path | None = None
+        self,
+        name: str,
+        *,
+        route: str | None = None,
+        path: Path | None = None,
+        require_process_inspection: bool = False,
     ) -> None:
         if path is None or route is None:
             configured = self._config.slots.get(name)
@@ -723,7 +743,7 @@ class SlotManager:
                 f"Slot {name} has direct-session ownership requiring explicit release: {claim}"
             )
         pids = live_process_cwds(path) if path.exists() else []
-        if pids:
+        if pids and (pids != [-1] or require_process_inspection):
             raise SlotError(f"Slot {name} has live process CWDs or inspection uncertainty: {pids}")
 
     def claim_direct_session(self, name: str, *, claim: dict[str, Any]) -> SlotStatus:

@@ -47,6 +47,7 @@ def test_compact_mcp_inventory_preserves_bounded_direct_owner_evidence() -> None
                 "name": "app-1",
                 "status": "direct_owned",
                 "active_job_id": None,
+            "process_inspection_available": False,
                 "direct_owner": {
                     "chatId": "owner",
                     "task": "task",
@@ -62,5 +63,6 @@ def test_compact_mcp_inventory_preserves_bounded_direct_owner_evidence() -> None
     row = result["items"][0]
     assert row["direct_owner"]["chatId"] == "owner"
     assert row["status"] == "direct_owned"
+    assert row["process_inspection_available"] is False
     assert len(row["live_process_cwds"]) == 16
     assert row["live_process_cwds_total_count"] == 30

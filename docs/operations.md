@@ -523,8 +523,13 @@ ACP acquisition, checkout, preparation, creation, deletion and lifecycle cleanup
 The lock uses the existing `interprocess_config_lock` implementation keyed by the
 canonical claim JSON path (a SHA-256-named file under the system temporary
 `agent-control-plane/config-locks` directory); it is not a sibling `.json.lock` file.
-The process census reuses lifecycle cleanup's existing platform limits: unavailable
-platforms block reuse, while inaccessible individual `/proc` CWDs can be skipped.
+The process census reuses lifecycle cleanup's existing platform limits. When no
+census is supported (including Windows), ordinary claim/acquire/checkout/prepare
+operations remain available and inventory exposes `process_inspection_available=false`
+plus the original `[-1]` sentinel; this is not evidence that no process is present.
+Deletion and destructive lifecycle cleanup still refuse unavailable inspection.
+Actual matching processes and census failures block ordinary reuse. Inaccessible
+individual `/proc` CWDs can be skipped.
 A claim remains necessary evidence for sessions whose process CWD is not observable.
 Configured and registered slot names must have unique canonical and physical paths.
 Existing legacy aliases remain in inventory and are blocked for mutation; review their
