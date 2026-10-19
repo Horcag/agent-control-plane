@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_control_plane.shared.clock import utc_now
+from agent_control_plane.shared.path_rules import same_workspace_path
 from agent_control_plane.shared.sqlite_runtime import apply_schema_migration, control_database
 
 
@@ -83,6 +84,12 @@ class SlotStore:
         now = utc_now()
         existing = self.get_slot(name)
         with self._connect() as db:
+            db.execute("begin immediate")
+            for other in db.execute("select name, path from slots where name != ?", (name,)):
+                if same_workspace_path(path, Path(other["path"])):
+                    raise SlotStoreError(
+                        f"Slot {name} duplicates physical slot path of {other['name']}: {path}"
+                    )
             if existing is None:
                 db.execute(
                     """

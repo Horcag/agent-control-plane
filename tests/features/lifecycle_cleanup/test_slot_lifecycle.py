@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -38,6 +39,29 @@ from agent_control_plane.shared.native_quality import (
     write_native_quality_contract,
 )
 from agent_control_plane.shared.process_liveness import process_is_alive
+
+
+def test_lifecycle_quarantines_legacy_slot_path_aliases(tmp_path: Path) -> None:
+    config, _route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    slots.register_slot("legacy-alias", "app", tmp_path / "other")
+    with sqlite3.connect(config.database_path) as db:
+        db.execute("update slots set path = ? where name = 'legacy-alias'", (str(slot),))
+    before = slots.list_slots()
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+    resources = service.audit()["resources"]
+    slot_resources = [item for item in resources if item["kind"] == "slot"]
+    assert len(slot_resources) == 2
+    assert all(item["classification"] == "quarantined" for item in slot_resources)
+    assert "duplicate physical" in service.auto_return_slot("app-1")["reason"]
+    assert slots.list_slots() == before
 
 
 @pytest.mark.parametrize("malformed", [False, True])
@@ -475,7 +499,9 @@ def test_stale_registrations_and_unmanaged_worktrees(tmp_path: Path) -> None:
     slots.register_slot("app-1", "app", slot)
     missing_path = tmp_path / "slots/nonexistent"
     slots.register_slot("missing-slot", "app", missing_path)
-    slots.register_slot("unknown-route-slot", "ghost-route", slot)
+    unknown_route_path = tmp_path / "unknown-route-slot"
+    unknown_route_path.mkdir()
+    slots.register_slot("unknown-route-slot", "ghost-route", unknown_route_path)
 
     extra_worktree = tmp_path / "extra-wt"
     run_git(route, "worktree", "add", "-b", "unmanaged-branch", str(extra_worktree), "main")

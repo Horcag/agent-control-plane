@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -217,6 +218,100 @@ class SlotManagerTest(unittest.TestCase):
                 process.terminate()
                 process.wait(timeout=5)
             self.assertEqual(manager.inspect_slot("main-1").status, "available")
+
+    def test_config_remap_preserves_old_workspace_with_live_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = _git_repo(root / "slots" / "old", "slot/old")
+            new = _git_repo(root / "slots" / "new", "slot/new")
+            config = _config(
+                root, root / "slots", slots={"main-1": SlotConfig("main-1", "main", new)}
+            )
+            store = SlotStore(root / "jobs.sqlite3")
+            before = store.register_slot("main-1", "main", old)
+            manager = SlotManager(config, store)
+            process = subprocess.Popen(["sleep", "30"], cwd=old)
+            try:
+                for operation in (
+                    lambda: manager.sync_configured_slots(),
+                    lambda: manager.acquire_for_job("main-1", job_id="job", route="main"),
+                ):
+                    with (
+                        self.subTest(operation=operation),
+                        self.assertRaisesRegex(SlotError, "process CWDs"),
+                    ):
+                        operation()
+                    self.assertEqual(store.require_slot("main-1"), before)
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+            manager.sync_configured_slots()
+            self.assertEqual(store.require_slot("main-1").path, new)
+
+    def test_existing_alias_records_cannot_bypass_another_names_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "owner", "slot/owner")
+            other = _git_repo(root / "slots" / "alias", "slot/alias")
+            config = _config(root, root / "slots")
+            store = SlotStore(root / "jobs.sqlite3")
+            store.register_slot("owner", "main", path)
+            manager = SlotManager(config, store)
+            claim = {
+                "slot": "owner",
+                "route": "main",
+                "path": str(path),
+                "chatId": "owner-chat",
+                "task": "task",
+                "branch": "slot/owner",
+            }
+            manager.claim_direct_session("owner", claim=claim)
+            store.register_slot("alias", "main", other)
+            # Seed a legacy duplicate without weakening current registration validation.
+            with sqlite3.connect(store.database_path) as db:
+                db.execute("update slots set path = ? where name = 'alias'", (str(path),))
+            before = store.list_slots()
+            self.assertEqual(manager.inspect_slot("alias").status, "ownership_blocked")
+            for operation in (
+                lambda: manager.checkout_slot("alias", branch="bypass", start_point="HEAD"),
+                lambda: manager.acquire_for_job(
+                    "alias", job_id="job", route="main", allow_dirty=True
+                ),
+                lambda: manager.delete_slot("alias", force=True),
+                lambda: manager.prepare_slot("alias"),
+                lambda: manager.create_slot("alias", route="main"),
+            ):
+                with (
+                    self.subTest(operation=operation),
+                    self.assertRaisesRegex(SlotError, "duplicate physical"),
+                ):
+                    operation()
+            self.assertTrue(
+                all(
+                    item.action == "skip"
+                    for item in manager.cleanup(
+                        max_per_route=0, route="main", force=True, apply=True
+                    )
+                )
+            )
+            self.assertEqual(store.list_slots(), before)
+            self.assertEqual(manager.inspect_slot("owner").branch, "slot/owner")
+            self.assertEqual(manager.inspect_slot("owner").direct_owner["chatId"], "owner-chat")
+
+    def test_duplicate_configured_paths_cannot_be_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = _git_repo(root / "slots" / "same", "slot/same")
+            config = _config(
+                root,
+                root / "slots",
+                slots={name: SlotConfig(name, "main", path) for name in ("first", "second")},
+            )
+            store = SlotStore(root / "jobs.sqlite3")
+            manager = SlotManager(config, store)
+            with self.assertRaisesRegex(SlotError, "duplicate physical"):
+                manager.sync_configured_slots()
+            self.assertEqual(store.list_slots(), [])
 
     def test_checkout_slot_switches_clean_inactive_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

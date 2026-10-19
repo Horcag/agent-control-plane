@@ -44,7 +44,7 @@ from agent_control_plane.shared.git_tools import (
     run_git,
     workspace_state,
 )
-from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.path_rules import is_same_or_child, same_workspace_path
 from agent_control_plane.shared.process_cwds import live_process_cwds
 
 
@@ -164,13 +164,15 @@ class SlotManager:
         if configured is None:
             raise SlotError(f"Slot {name} is not configured in workspaces.toml")
         self._ensure_slot_path_allowed(configured.path, route=configured.route)
+        self._ensure_unique_slot_path(name, configured.path)
         record = self._store.get_slot(name)
         metadata_changed = record is not None and (
             record.route != configured.route
             or record.path.resolve(strict=False) != configured.path.resolve(strict=False)
         )
-        if metadata_changed:
-            self._ensure_no_external_owner(name)
+        if metadata_changed and record is not None:
+            self._ensure_no_external_owner(name, route=record.route, path=record.path)
+            self._ensure_no_external_owner(name, route=configured.route, path=configured.path)
         if record is not None and record.active_job_id is not None and metadata_changed:
             raise SlotError(f"Cannot reconcile active slot {name} with current configuration")
         if record is not None and record.active_job_id is not None:
@@ -285,6 +287,9 @@ class SlotManager:
                 except GitError as exc:
                     problems.append(f"git status failed: {exc}")
 
+        aliases = self._slot_path_aliases(name, path)
+        if aliases:
+            problems.append(f"duplicate physical slot path shared with: {aliases}")
         direct_owner = read_direct_session_claim(self._config.coordination_root, name, route, path)
         process_cwds = tuple(live_process_cwds(path)) if exists and active_job_id is None else ()
         if direct_owner is not None:
@@ -296,7 +301,9 @@ class SlotManager:
             display_status = "dirty"
 
         if active_job_id is None and display_status != "deleted":
-            if direct_owner is not None:
+            if aliases:
+                display_status = "ownership_blocked"
+            elif direct_owner is not None:
                 display_status = (
                     "ownership_blocked" if direct_owner.get("error") else "direct_owned"
                 )
@@ -368,6 +375,9 @@ class SlotManager:
             slot_route = route
             path = self._config.slot_root_for(route) / _safe_slot_name(name)
 
+        existing = self._store.get_slot(name)
+        if existing is not None:
+            self._ensure_no_external_owner(name, route=existing.route, path=existing.path)
         self._ensure_no_external_owner(name, route=slot_route, path=path)
         self._ensure_slot_path_allowed(path, route=slot_route)
         route_key: str = str(slot_route)
@@ -637,7 +647,11 @@ class SlotManager:
             removable = sorted(route_slots, key=_cleanup_sort_key)
             excess = max(0, len(route_slots) - max_per_route)
             for status in removable[:excess]:
-                if status.direct_owner is not None or status.live_process_cwds:
+                if (
+                    status.direct_owner is not None
+                    or status.live_process_cwds
+                    or status.status == "ownership_blocked"
+                ):
                     decisions.append(_decision(status, "skip", "slot has external ownership"))
                     continue
                 if status.active_job_id:
@@ -676,6 +690,22 @@ class SlotManager:
             return applied
         return decisions
 
+    def _slot_path_aliases(self, name: str, path: Path) -> list[str]:
+        candidates = [(other.name, other.path) for other in self._config.slots.values()]
+        candidates.extend((other.name, other.path) for other in self._store.list_slots())
+        return sorted(
+            {
+                other_name
+                for other_name, other_path in candidates
+                if other_name != name and same_workspace_path(path, other_path)
+            }
+        )
+
+    def _ensure_unique_slot_path(self, name: str, path: Path) -> None:
+        aliases = self._slot_path_aliases(name, path)
+        if aliases:
+            raise SlotError(f"Slot {name} has duplicate physical slot path shared with: {aliases}")
+
     def _ensure_no_external_owner(
         self, name: str, *, route: str | None = None, path: Path | None = None
     ) -> None:
@@ -686,6 +716,7 @@ class SlotManager:
             if owner is None:
                 raise SlotError(f"Unknown slot: {name}")
             route, path = owner.route, owner.path
+        self._ensure_unique_slot_path(name, path)
         claim = read_direct_session_claim(self._config.coordination_root, name, route, path)
         if claim is not None:
             raise SlotError(

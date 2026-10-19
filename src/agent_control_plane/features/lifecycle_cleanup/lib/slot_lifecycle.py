@@ -26,7 +26,7 @@ from agent_control_plane.shared.direct_session_claims import (
     read_direct_session_claim,
 )
 from agent_control_plane.shared.git_tools import GitError, run_git, workspace_snapshot
-from agent_control_plane.shared.path_rules import is_same_or_child
+from agent_control_plane.shared.path_rules import is_same_or_child, same_workspace_path
 from agent_control_plane.shared.process_cwds import live_process_cwds as _live_process_cwds
 from agent_control_plane.shared.process_liveness import (
     process_is_alive as shared_process_is_alive,
@@ -977,6 +977,13 @@ class SlotLifecycleService:
                 owner_pid=owner_pid,
             )
         with direct_session_lock(self.config.coordination_root, proof["name"]):
+            aliases = self._slot_path_aliases(proof["name"], Path(proof["path"]))
+            if aliases:
+                return {
+                    **(intent or {}),
+                    "action": "quarantined",
+                    "reason": f"duplicate physical slot path shared with: {aliases}",
+                }
             claim = read_direct_session_claim(
                 self.config.coordination_root, proof["name"], proof["route"], Path(proof["path"])
             )
@@ -2190,6 +2197,17 @@ class SlotLifecycleService:
             result["auto_returned"] = auto_returned
         return result
 
+    def _slot_path_aliases(self, name: str, path: Path) -> list[str]:
+        candidates = [(other.name, other.path) for other in self.config.slots.values()]
+        candidates.extend((other.name, other.path) for other in self.slots.list_slots())
+        return sorted(
+            {
+                other_name
+                for other_name, other_path in candidates
+                if other_name != name and same_workspace_path(path, other_path)
+            }
+        )
+
     def _ownership_cwds(self, path: Path) -> list[int]:
         for slot in self.slots.list_slots():
             if slot.path.resolve(strict=False) == path.resolve(strict=False):
@@ -2204,6 +2222,13 @@ class SlotLifecycleService:
         with direct_session_lock(self.config.coordination_root, slot_name):
             slot = self.slots.get_slot(slot_name)
             if slot is not None:
+                aliases = self._slot_path_aliases(slot.name, slot.path)
+                if aliases:
+                    return {
+                        "slot": slot_name,
+                        "status": "skipped",
+                        "reason": f"duplicate physical slot path shared with: {aliases}",
+                    }
                 claim = read_direct_session_claim(
                     self.config.coordination_root, slot.name, slot.route, slot.path
                 )
@@ -2668,6 +2693,13 @@ class SlotLifecycleService:
                 **base,
                 "classification": LifecycleClass.STALE.value,
                 "reasons": ["unknown route" if route is None else "registered path missing"],
+            }
+        aliases = self._slot_path_aliases(slot.name, slot.path)
+        if aliases:
+            return {
+                **base,
+                "classification": LifecycleClass.QUARANTINED.value,
+                "reasons": [f"duplicate physical slot path shared with: {aliases}"],
             }
         claim = read_direct_session_claim(
             self.config.coordination_root, slot.name, slot.route, slot.path

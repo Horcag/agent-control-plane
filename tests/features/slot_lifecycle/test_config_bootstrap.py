@@ -4,11 +4,36 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_control_plane.features.slot_lifecycle.lib.config_bootstrap import bootstrap_slot_config
+from agent_control_plane.app.runtime.orchestrator import AgentControlPlane
+from agent_control_plane.entities.slot import SlotStore
+from agent_control_plane.features.slot_lifecycle.lib.config_bootstrap import (
+    ConfigBootstrapError,
+    bootstrap_slot_config,
+)
 from agent_control_plane.shared.config import load_config
 
 
 class ConfigBootstrapTest(unittest.TestCase):
+    def test_duplicate_bootstrap_does_not_change_config_with_create_disabled(self) -> None:
+        for configured in (False, True):
+            with self.subTest(configured=configured), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp).resolve()
+                config_path = _write_base_config(root)
+                config = load_config(config_path)
+                if configured:
+                    path = config.slots["dev-1"].path
+                else:
+                    path = root / "slots" / "registered-owner"
+                    SlotStore(config.database_path).register_slot("registered-owner", "dev", path)
+                original = config_path.read_bytes()
+                control = AgentControlPlane(config)
+                with self.assertRaisesRegex(ConfigBootstrapError, "duplicates physical"):
+                    control.bootstrap_slot(
+                        "alias", route="dev", slot_path=path, create=False, ensure_ide=False
+                    )
+                self.assertEqual(config_path.read_bytes(), original)
+                self.assertNotIn("alias", load_config(config_path).slots)
+
     def test_bootstrap_adds_slot_for_existing_route(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             # Resolved: on Windows the temp dir can be handed back in 8.3 form

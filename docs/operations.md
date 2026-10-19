@@ -526,6 +526,10 @@ canonical claim JSON path (a SHA-256-named file under the system temporary
 The process census reuses lifecycle cleanup's existing platform limits: unavailable
 platforms block reuse, while inaccessible individual `/proc` CWDs can be skipped.
 A claim remains necessary evidence for sessions whose process CWD is not observable.
+Configured and registered slot names must have unique canonical and physical paths.
+Existing legacy aliases remain in inventory and are blocked for mutation; review their
+ownership explicitly rather than deleting or remapping them. Configuration remaps inspect
+both the persisted old path and the new configured path before changing the registry.
 The claim is an ownership hold, never authorization for a privileged operation.
 Do not write/unlink claim files manually while a plane is running: external writers
 that ignore the common lock cannot participate in its race protection. Existing
