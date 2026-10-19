@@ -31,7 +31,7 @@ from agent_control_plane.shared.agent_backends import (
     normalize_backend,
 )
 from agent_control_plane.shared.git_tools import GitError, run_git
-from agent_control_plane.shared.path_rules import glob_matches_whole_tree
+from agent_control_plane.shared.path_rules import glob_matches_whole_tree, same_workspace_path
 
 
 @dataclass(frozen=True)
@@ -1363,6 +1363,11 @@ def load_config(
             raise ValueError(
                 f"[slots.{name}] path cannot be the canonical checkout of route {route}"
             )
+        for other_name, other in slots.items():
+            if same_workspace_path(slot_path, other.path):
+                raise ValueError(
+                    f"[slots.{name}] duplicates physical slot path of {other_name}: {slot_path}"
+                )
         slots[name] = SlotConfig(
             name=name,
             route=route,
