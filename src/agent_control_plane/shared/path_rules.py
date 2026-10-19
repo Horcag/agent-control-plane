@@ -92,3 +92,13 @@ def is_known_temporary_patch_artifact(path_text: str) -> bool:
     return name.endswith((".rej", ".orig")) or (
         name.endswith(".patch") and name.startswith(("tmp_", "single_"))
     )
+
+
+def same_workspace_path(first: Path, second: Path) -> bool:
+    """Compare canonical spelling and existing filesystem identity for slot ownership."""
+    if first.resolve(strict=False) == second.resolve(strict=False):
+        return True
+    try:
+        return first.samefile(second)
+    except FileNotFoundError:
+        return False

@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_control_plane.entities.slot import SlotStore
 from agent_control_plane.shared.config import ControlConfig
 from agent_control_plane.shared.git_tools import GitError, run_git
+from agent_control_plane.shared.path_rules import same_workspace_path
 
 
 class ConfigBootstrapError(RuntimeError):
@@ -83,6 +85,16 @@ def bootstrap_slot_config(
         config.slot_root_for(route_name) if route_config is not None else _sibling_slot_root(repo)
     )
     target_slot_path = (slot_path or (default_slot_root / slot_name)).resolve(strict=False)
+    candidates = [(other.name, other.path) for other in config.slots.values()]
+    candidates.extend(
+        (other.name, other.path) for other in SlotStore(config.database_path).list_slots()
+    )
+    for other_name, other_path in candidates:
+        if other_name != slot_name and same_workspace_path(target_slot_path, other_path):
+            raise ConfigBootstrapError(
+                f"Slot {slot_name} duplicates physical slot path of {other_name}: {target_slot_path}"
+            )
+
     layout = (
         RepoLayout(
             source_roots=route_config.source_roots,

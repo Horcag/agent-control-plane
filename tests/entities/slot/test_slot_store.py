@@ -9,6 +9,41 @@ from agent_control_plane.entities.slot import SlotStore, SlotStoreError
 
 
 class SlotStoreTest(unittest.TestCase):
+    def test_registration_rejects_canonical_and_symlink_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "slots" / "original"
+            path.mkdir(parents=True)
+            store = SlotStore(root / "jobs.sqlite3")
+            original = store.register_slot("owner", "main", path)
+            alias = root / "slots" / "alias"
+            alias.symlink_to(path, target_is_directory=True)
+            for candidate in (path, alias):
+                with (
+                    self.subTest(candidate=candidate),
+                    self.assertRaisesRegex(SlotStoreError, "duplicate"),
+                ):
+                    store.register_slot("other", "main", candidate)
+            self.assertEqual(store.list_slots(), [original])
+
+    def test_concurrent_alias_registration_has_only_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = SlotStore(root / "jobs.sqlite3")
+            store.initialize()
+
+            def register(name: str) -> bool:
+                try:
+                    store.register_slot(name, "main", root / "slot")
+                except SlotStoreError:
+                    return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(register, ("first", "second")))
+            self.assertEqual(sorted(results), [False, True])
+            self.assertEqual(len(store.list_slots()), 1)
+
     def test_slot_acquire_release_tracks_usage(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

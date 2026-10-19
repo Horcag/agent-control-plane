@@ -60,6 +60,7 @@ from agent_control_plane.shared.config import (
     resolve_config_for,
     wire_mcp_servers,
 )
+from agent_control_plane.shared.direct_session_claims import read_direct_session_claim_bytes
 
 # The only values a job may declare as expected_result_status (see
 # entities/job/model/store.py:_validate_controller_contract). A terminal status outside this
@@ -573,6 +574,20 @@ def main(argv: list[str] | None = None) -> int:
                         include_stale=args.include_stale,
                     )
                 )
+                return 0
+            if args.slot_command in {"claim-direct", "release-direct"}:
+                try:
+                    raw_claim = read_direct_session_claim_bytes(Path(args.claim_file))
+                    claim = json.loads(raw_claim)
+                except (OSError, ValueError) as exc:
+                    raise SlotError(f"Cannot read direct-session claim: {exc}") from exc
+                if not isinstance(claim, dict):
+                    raise SlotError("Direct-session claim must be a JSON object")
+                if args.slot_command == "claim-direct":
+                    result = control.claim_direct_session(args.name, claim=claim)
+                else:
+                    result = control.release_direct_session(args.name, expected_claim=claim)
+                _print_json(result)
                 return 0
             if args.slot_command == "create":
                 _print_json(
@@ -1225,6 +1240,13 @@ def _build_parser() -> argparse.ArgumentParser:
     list_scope = list_slots.add_mutually_exclusive_group(required=True)
     list_scope.add_argument("--route", help="Inspect slots for one configured route")
     list_scope.add_argument("--all-routes", action="store_true", help="Inspect every route")
+
+    for action in ("claim-direct", "release-direct"):
+        direct = slot_subparsers.add_parser(
+            action, parents=[common], help="Explicit direct-session claim lifecycle"
+        )
+        direct.add_argument("name")
+        direct.add_argument("--claim-file", required=True, help="Exact reviewed claim JSON payload")
 
     create = slot_subparsers.add_parser("create", parents=[common], help="Create a slot worktree")
     create.add_argument("name")

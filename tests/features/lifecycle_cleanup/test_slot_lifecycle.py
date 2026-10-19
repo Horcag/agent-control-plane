@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -38,6 +40,97 @@ from agent_control_plane.shared.native_quality import (
     write_native_quality_contract,
 )
 from agent_control_plane.shared.process_liveness import process_is_alive
+
+
+def test_lifecycle_quarantines_legacy_slot_path_aliases(tmp_path: Path) -> None:
+    config, _route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    slots.register_slot("app-1", "app", slot)
+    slots.register_slot("legacy-alias", "app", tmp_path / "other")
+    with closing(sqlite3.connect(config.database_path)) as db, db:
+        db.execute("update slots set path = ? where name = 'legacy-alias'", (str(slot),))
+    before = slots.list_slots()
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+    resources = service.audit()["resources"]
+    slot_resources = [item for item in resources if item["kind"] == "slot"]
+    assert len(slot_resources) == 2
+    assert all(item["classification"] == "quarantined" for item in slot_resources)
+    assert "duplicate physical" in service.auto_return_slot("app-1")["reason"]
+    assert slots.list_slots() == before
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_direct_session_hold_blocks_lifecycle_audit_apply_and_auto_return(
+    tmp_path: Path,
+    malformed: bool,
+) -> None:
+    config, _route, slot = _fixture(tmp_path)
+    slots = SlotStore(config.database_path)
+    record = slots.register_slot("app-1", "app", slot)
+    service = SlotLifecycleService(
+        config,
+        slots=slots,
+        jobs=JobStore(config.database_path),
+        inbox=ReviewInboxStore(config.database_path),
+        live_cwds=lambda _path: [],
+    )
+    accepted = run_git(slot, "rev-parse", "HEAD")
+    checkpoint_ref = "refs/agent-control-plane/jobs/held"
+    run_git(slot, "update-ref", checkpoint_ref, accepted)
+    item = service.inbox.upsert(
+        ReviewInboxDraft(
+            source_kind="agent_job",
+            source_id="held",
+            source_status="completed",
+            delivery_status="checkpointed",
+            route="app",
+            workspace_path=slot,
+            slot_name="app-1",
+            slot_generation=record.generation,
+            checkpoint_ref=checkpoint_ref,
+            checkpoint_sha=accepted,
+            result_text="Status: completed\n",
+            verification_bundle=_valid_bundle(),
+            slot_released=True,
+        )
+    )
+    service.inbox.resolve(item.item_id, "accepted")
+    operation_id = service.reconcile()["enqueued"][0]
+    branch_before = run_git(slot, "branch", "--show-current")
+    claim_path = config.coordination_root / "direct-session-claims" / "app-1.json"
+    claim_path.parent.mkdir(parents=True, exist_ok=True)
+    claim_path.write_text(
+        "{"
+        if malformed
+        else json.dumps(
+            {
+                "slot": "app-1",
+                "route": "app",
+                "path": str(slot),
+                "chatId": "live-chat",
+                "task": "live-task",
+                "branch": branch_before,
+                "createdAt": 1,
+            }
+        )
+    )
+    resource = service.audit()["resources"][0]
+    assert resource["classification"] == ("quarantined" if malformed else "active")
+    assert resource["direct_owner"]
+    assert service.auto_return_slot("app-1")["status"] == "skipped"
+    applied = service.apply(operation_id)
+    assert applied["action"] == "quarantined"
+    assert "direct-session" in applied["reason"]
+    assert slots.require_slot("app-1") == record
+    assert run_git(slot, "branch", "--show-current") == branch_before
+    claim_path.unlink()  # Explicit fixture-owned release.
+    assert service.apply(operation_id)["action"] == "completed"
 
 
 def test_audit_and_apply_are_exact_idempotent_and_return_slot_to_default_branch(
@@ -407,7 +500,9 @@ def test_stale_registrations_and_unmanaged_worktrees(tmp_path: Path) -> None:
     slots.register_slot("app-1", "app", slot)
     missing_path = tmp_path / "slots/nonexistent"
     slots.register_slot("missing-slot", "app", missing_path)
-    slots.register_slot("unknown-route-slot", "ghost-route", slot)
+    unknown_route_path = tmp_path / "unknown-route-slot"
+    unknown_route_path.mkdir()
+    slots.register_slot("unknown-route-slot", "ghost-route", unknown_route_path)
 
     extra_worktree = tmp_path / "extra-wt"
     run_git(route, "worktree", "add", "-b", "unmanaged-branch", str(extra_worktree), "main")
