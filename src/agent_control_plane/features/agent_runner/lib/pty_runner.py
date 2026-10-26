@@ -13,10 +13,17 @@ from typing import Protocol, TextIO
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import progress_signature
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
+from agent_control_plane.shared.result_envelope import (
+    RESULT_ENVELOPE_SECTION_PATTERN,
+    RESULT_ENVELOPE_SECTIONS,
+    result_envelope_section_key,
+)
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b].*?(?:\x07|\x1b\\)")
 TRUST_PROMPT_TAIL_LIMIT = 12_000
 DURABLE_PROGRESS_POLL_INTERVAL_SEC = 2.0
+FINAL_RESPONSE_LIMIT = 64_000
+READER_DRAIN_TIMEOUT_SEC = 1.0
 
 
 class PtyProcessLike(Protocol):
@@ -129,7 +136,10 @@ class PtyAgyRunner:
                 )
 
             pid_observed(getattr(proc, "pid", None))
-            reader = threading.Thread(target=self._reader, args=(proc, output_queue), daemon=True)
+            reader_done = threading.Event()
+            reader = threading.Thread(
+                target=self._reader, args=(proc, output_queue, reader_done), daemon=True
+            )
             reader.start()
 
             return self._monitor_process(
@@ -141,6 +151,7 @@ class PtyAgyRunner:
                 started_mono,
                 deadline_mono,
                 cancel_requested,
+                reader_done,
             )
 
     def _monitor_process(
@@ -153,6 +164,7 @@ class PtyAgyRunner:
         last_activity_mono: float,
         deadline_mono: float,
         cancel_requested: Callable[[], bool],
+        reader_done: threading.Event,
     ) -> AgyRunResult:
         output_tail = ""
         durable_signature, _ = progress_signature(spec)
@@ -161,7 +173,7 @@ class PtyAgyRunner:
             drained_output = self._drain_output(output_queue, log)
             if drained_output:
                 last_activity_mono = time.monotonic()
-                output_tail = (output_tail + drained_output)[-TRUST_PROMPT_TAIL_LIMIT:]
+                output_tail = (output_tail + drained_output)[-(FINAL_RESPONSE_LIMIT + 1) :]
 
             completed = self._completed_result_if_ready(proc, spec, started_wall, terminate=True)
             if completed is not None:
@@ -176,7 +188,9 @@ class PtyAgyRunner:
                 self._terminate_spawned(proc)
                 return self._stopped_result(proc, "cancelled", "Cancel requested")
 
-            exited = self._exited_result_if_dead(proc, output_queue, log, spec, started_wall, output_tail)
+            exited = self._exited_result_if_dead(
+                proc, output_queue, log, spec, started_wall, output_tail, reader_done
+            )
             if exited is not None:
                 return exited
 
@@ -268,14 +282,26 @@ class PtyAgyRunner:
         spec: AgyRunSpec,
         started_wall: float,
         output_tail: str = "",
+        reader_done: threading.Event | None = None,
     ) -> AgyRunResult | None:
         if proc.isalive():
             return None
-        output_tail = (output_tail + self._drain_output(output_queue, log))[-TRUST_PROMPT_TAIL_LIMIT:]
+        # Process death can precede the reader's final queue writes. Never recover
+        # from an incomplete stream, even when its prefix looks like a result.
+        drained = reader_done is not None and reader_done.wait(READER_DRAIN_TIMEOUT_SEC)
+        output_tail = (output_tail + self._drain_output(output_queue, log))[
+            -(FINAL_RESPONSE_LIMIT + 1) :
+        ]
         result_state = inspect_result(spec.result_path, started_wall)
         if result_state.done:
             return self._completed_result(proc, result_state.status)
-        if "Eligibility check failed: Your current account is not eligible for Antigravity" in output_tail:
+        trust_prompt_message = self._trust_prompt_message_if_needed(output_tail)
+        if trust_prompt_message is not None:
+            return self._stopped_result(proc, "blocked", trust_prompt_message)
+        if (
+            "Eligibility check failed: Your current account is not eligible for Antigravity"
+            in ANSI_RE.sub("", output_tail)
+        ):
             return AgyRunResult(
                 status="blocked",
                 completed=False,
@@ -283,6 +309,14 @@ class PtyAgyRunner:
                 result_status=None,
                 message="Antigravity CLI rejected the active account at its eligibility check; verify that account before retrying. The proxy account pool cannot repair this local CLI refusal.",
             )
+        if spec.read_only and proc.exitstatus == 0 and drained:
+            response = self._final_response(output_tail, spec.prompt)
+            if response is not None:
+                spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+                spec.result_path.write_text(response, encoding="utf-8")
+                recovered = inspect_result(spec.result_path, started_wall)
+                if recovered.done:
+                    return self._completed_result(proc, recovered.status)
         return AgyRunResult(
             status="exited_without_result",
             completed=False,
@@ -336,7 +370,16 @@ class PtyAgyRunner:
         )
 
     @staticmethod
-    def _reader(proc: PtyProcessLike, output_queue: queue.Queue[str]) -> None:
+    def _reader(
+        proc: PtyProcessLike, output_queue: queue.Queue[str], reader_done: threading.Event
+    ) -> None:
+        try:
+            PtyAgyRunner._read_output(proc, output_queue)
+        finally:
+            reader_done.set()
+
+    @staticmethod
+    def _read_output(proc: PtyProcessLike, output_queue: queue.Queue[str]) -> None:
         while True:
             try:
                 chunk = proc.read(4096)
@@ -360,12 +403,46 @@ class PtyAgyRunner:
             if text:
                 log.write(text)
                 log.flush()
-                drained.append(text)
+                drained.append(chunk)
         return "".join(drained)
 
     @staticmethod
+    def _final_response(output: str, prompt: str) -> str | None:
+        if len(output) > FINAL_RESPONSE_LIMIT:
+            return None
+        text = ANSI_RE.sub("", output).replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
+        text = re.sub(r"\n\[pty reader stopped: [^\n]*\]$", "", text).rstrip()
+        if prompt.strip() and prompt.strip() in text:
+            return None
+        if "```" in text or "~~~" in text:
+            return None
+        if not re.match(r"\AStatus: (completed|partial|blocked)\n", text):
+            return None
+        if len(re.findall(r"(?i)\b(?:status|статус)\s*:", text)) != 1:
+            return None
+        sections: list[str] = []
+        content: list[str] = []
+        for line in text.splitlines()[1:]:
+            match = RESULT_ENVELOPE_SECTION_PATTERN.fullmatch(line)
+            if match:
+                if sections and not any(part.strip() for part in content):
+                    return None
+                sections.append(result_envelope_section_key(match.group(1)))
+                content = [match.group(2)]
+            elif sections:
+                content.append(line)
+            elif line.strip() and not re.fullmatch(r"Escalation-Classification: [a-z_]+", line):
+                return None
+        if sections != list(RESULT_ENVELOPE_SECTIONS) or not any(part.strip() for part in content):
+            return None
+        return text + "\n"
+
+    @staticmethod
     def _trust_prompt_message_if_needed(output_tail: str) -> str | None:
-        normalized = " ".join(output_tail.lower().split())
+        normalized = " ".join(
+            ANSI_RE.sub("", output_tail[-TRUST_PROMPT_TAIL_LIMIT:]).lower().split()
+        )
         trust_question = "do you trust the contents of this project?"
         permission_text = "antigravity cli requires permission"
         if trust_question not in normalized or permission_text not in normalized:

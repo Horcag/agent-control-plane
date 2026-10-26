@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import io
+import os
+import queue
+import tempfile
+import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -78,10 +84,18 @@ class PtyRunnerCommandTest(unittest.TestCase):
         )
         with (
             patch.object(PtyAgyRunner, "_drain_output", return_value=output),
-            patch.object(pty_runner, "inspect_result", return_value=SimpleNamespace(done=False, reason="missing")),
+            patch.object(
+                pty_runner,
+                "inspect_result",
+                return_value=SimpleNamespace(done=False, reason="missing"),
+            ),
         ):
             result = PtyAgyRunner()._exited_result_if_dead(
-                proc, SimpleNamespace(), SimpleNamespace(), _spec(prompt="task", yolo=False), 0,
+                proc,
+                SimpleNamespace(),
+                SimpleNamespace(),
+                _spec(prompt="task", yolo=False),
+                0,
             )
         self.assertIsNotNone(result)
         assert result is not None
@@ -212,6 +226,236 @@ class PtyRunnerCommandTest(unittest.TestCase):
         self.assertEqual("idle_timeout", result.status if result else None)
         self.assertIn("terminal output or durable progress", result.message if result else "")
         self.assertTrue(proc.terminated)
+
+
+FINAL_RESPONSE = (
+    "Status: completed\n"
+    "Changed files: none\n"
+    "What changed: ACP_GEMINI_SHORT_20261026\n"
+    "Verification performed: pwd returned exact slot\n"
+    "Not verified / remaining risks: no exhaustive tests requested\n"
+)
+
+
+class PtyReadonlyRecoveryTest(unittest.TestCase):
+    def _recover(
+        self,
+        root: Path,
+        output: str,
+        *,
+        read_only: bool = True,
+        exit_code: int = 0,
+        drained: bool = True,
+        prompt: str = "Inspect the exact workspace; return the final result.",
+    ) -> pty_runner.AgyRunResult:
+        spec = replace(
+            _spec(prompt=prompt, yolo=False),
+            result_path=root / "result.md",
+            read_only=read_only,
+        )
+        chunks: queue.Queue[str] = queue.Queue()
+        chunks.put(output)
+        done = threading.Event()
+        if drained:
+            done.set()
+        proc = SimpleNamespace(isalive=lambda: False, exitstatus=exit_code)
+        with patch.object(pty_runner, "READER_DRAIN_TIMEOUT_SEC", 0.01):
+            result = PtyAgyRunner()._exited_result_if_dead(
+                proc, chunks, io.StringIO(), spec, 0, reader_done=done
+            )
+        assert result is not None
+        return result
+
+    def test_real_crlf_envelopes_recover_all_terminal_statuses(self) -> None:
+        for status in ("completed", "partial", "blocked"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "result.md").write_text("Awaiting `agy`\n", encoding="utf-8")
+                envelope = FINAL_RESPONSE.replace("completed", status)
+                output = "\x1b[32m" + envelope.replace("\n", "\r\n") + "\x1b[0m"
+                output += "\r\n[pty reader stopped: EOF]\r\n"
+
+                result = self._recover(root, output)
+
+                self.assertTrue(result.completed)
+                self.assertEqual(result.result_status, status)
+                self.assertEqual((root / "result.md").read_text(), envelope)
+                state = pty_runner.inspect_result(root / "result.md", 0)
+                self.assertTrue(state.done)
+                self.assertEqual(state.missing_sections, ())
+
+    def test_preserves_existing_fresh_valid_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            original = FINAL_RESPONSE.replace("completed", "partial")
+            (root / "result.md").write_text(original, encoding="utf-8")
+
+            result = self._recover(root, FINAL_RESPONSE)
+
+            self.assertEqual(result.result_status, "partial")
+            self.assertEqual((root / "result.md").read_text(), original)
+
+    def test_stale_result_is_replaced_only_by_fresh_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "result.md"
+            path.write_text(FINAL_RESPONSE.replace("completed", "blocked"), encoding="utf-8")
+            os.utime(path, (1, 1))
+            spec = replace(
+                _spec(prompt="Inspect only.", yolo=False), result_path=path, read_only=True
+            )
+            done = threading.Event()
+            done.set()
+            chunks: queue.Queue[str] = queue.Queue()
+            chunks.put(FINAL_RESPONSE)
+            result = PtyAgyRunner()._exited_result_if_dead(
+                SimpleNamespace(isalive=lambda: False, exitstatus=0),
+                chunks,
+                io.StringIO(),
+                spec,
+                2,
+                reader_done=done,
+            )
+            assert result is not None
+            self.assertTrue(result.completed)
+            self.assertEqual(path.read_text(), FINAL_RESPONSE)
+
+    def test_rejects_ambiguous_incomplete_or_oversized_stdout(self) -> None:
+        candidates = {
+            "missing": "",
+            "no envelope": "Agent finished successfully.",
+            "invalid status": FINAL_RESPONSE.replace("completed", "success"),
+            "malformed status": FINAL_RESPONSE.replace("completed", "completed later"),
+            "missing section": FINAL_RESPONSE.replace("Changed files: none\n", ""),
+            "empty section": FINAL_RESPONSE.replace("Changed files: none", "Changed files:"),
+            "truncated": FINAL_RESPONSE.split("Not verified")[0],
+            "empty last section": FINAL_RESPONSE.split("risks:")[0] + "risks:",
+            "oversized": "x" * pty_runner.FINAL_RESPONSE_LIMIT + FINAL_RESPONSE,
+            "oversized body": FINAL_RESPONSE + "x" * pty_runner.FINAL_RESPONSE_LIMIT,
+            "prompt echo": "Inspect the exact workspace; return the final result.\n"
+            + FINAL_RESPONSE,
+            "embedded prompt": FINAL_RESPONSE
+            + "Inspect the exact workspace; return the final result.",
+            "source snippet": "```python\n" + FINAL_RESPONSE + "```\n",
+            "embedded source": FINAL_RESPONSE + "```python\nprint('example')\n```\n",
+            "multiple": FINAL_RESPONSE + FINAL_RESPONSE,
+            "conflicting": FINAL_RESPONSE + "Status: blocked\n",
+            "earlier log": FINAL_RESPONSE + "[log] Status: completed\n",
+            "preamble": "Here is a source example:\n" + FINAL_RESPONSE,
+        }
+        for name, output in candidates.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result = self._recover(root, output)
+                self.assertEqual(result.status, "exited_without_result")
+                self.assertFalse((root / "result.md").exists())
+
+    def test_recovery_cannot_bypass_writable_exit_or_drain_contract(self) -> None:
+        for options in ({"read_only": False}, {"exit_code": 1}, {"drained": False}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                placeholder = "Awaiting `agy`\n"
+                (root / "result.md").write_text(placeholder, encoding="utf-8")
+                result = self._recover(root, FINAL_RESPONSE, **options)
+                self.assertFalse(result.completed)
+                self.assertEqual(result.status, "exited_without_result")
+                self.assertEqual((root / "result.md").read_text(), placeholder)
+
+    def test_exit_waits_for_split_final_reader_chunks(self) -> None:
+        release_reader = threading.Event()
+
+        class ExitingProcess:
+            pid = 123
+            exitstatus = 0
+
+            def __init__(self) -> None:
+                self.reads = 0
+
+            def read(self, size: int) -> str:
+                self.reads += 1
+                if self.reads == 1:
+                    return "\x1b[3"
+                if self.reads == 2:
+                    if not release_reader.wait(2):
+                        raise RuntimeError("test reader was not released")
+                    return "2m" + FINAL_RESPONSE[:30]
+                if self.reads == 3:
+                    return FINAL_RESPONSE[30:] + "\x1b[0m"
+                raise EOFError("EOF")
+
+            def isalive(self) -> bool:
+                release_reader.set()
+                return False
+
+            def terminate(self, force: bool = False) -> None:
+                raise AssertionError("dead read-only process must not be terminated")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = replace(
+                _spec(prompt="Inspect only.", yolo=False),
+                workspace_path=root,
+                result_path=root / "result.md",
+                log_path=root / "attempt.log",
+                read_only=True,
+            )
+            with patch.object(
+                pty_runner,
+                "_load_pty_process",
+                return_value=SimpleNamespace(spawn=lambda *args, **kwargs: ExitingProcess()),
+            ):
+                result = PtyAgyRunner().run(
+                    spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                )
+            self.assertTrue(result.completed)
+            self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+
+    def test_native_pty_recovers_print_output_and_rejects_nonzero_or_oversized_stream(self) -> None:
+        for prefix, exit_code, expected in (
+            ("", 0, "completed"),
+            ("", 1, "exited_without_result"),
+            ("x" * (pty_runner.FINAL_RESPONSE_LIMIT + 10), 0, "exited_without_result"),
+        ):
+            with (
+                self.subTest(exit_code=exit_code, prefix_length=len(prefix)),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                script = root / "fake_agy.py"
+                script.write_text(
+                    "import sys\n"
+                    f"sys.stdout.write({prefix + FINAL_RESPONSE!r})\n"
+                    "sys.stdout.flush()\n"
+                    f"sys.exit({exit_code})\n",
+                    encoding="utf-8",
+                )
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    agy_command=str(script),
+                    workspace_path=root,
+                    result_path=root / "result.md",
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                result = PtyAgyRunner().run(
+                    spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                )
+                self.assertEqual(result.status, expected)
+                self.assertEqual(spec.result_path.exists(), expected == "completed")
+                if expected == "completed":
+                    self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+
+    def test_late_trust_or_eligibility_failure_wins_over_envelope(self) -> None:
+        for refusal in (
+            "Do you trust the contents of this project? Antigravity CLI requires permission",
+            "Eligibility check failed: Your current account is not eligible for Antigravity",
+            "Eligibility check failed: Your current account is \x1b[31mnot eligible for Antigravity",
+        ):
+            with self.subTest(refusal=refusal), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                result = self._recover(root, FINAL_RESPONSE + refusal)
+                self.assertEqual(result.status, "blocked")
+                self.assertFalse((root / "result.md").exists())
 
 
 class _FakeProcess:
