@@ -19,6 +19,7 @@ from agent_control_plane.features.agent_runner.lib.agy_output import (
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import progress_signature
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
+from agent_control_plane.features.agent_runner.lib.windows_pipe import WindowsPipeProcess
 from agent_control_plane.shared.result_envelope import (
     RESULT_ENVELOPE_SECTION_PATTERN,
     RESULT_ENVELOPE_SECTIONS,
@@ -37,7 +38,9 @@ VENDOR_LOG_LIMIT = 8 * 1024 * 1024
 
 class PtyProcessLike(Protocol):
     pid: int | None
-    exitstatus: int | None
+
+    @property
+    def exitstatus(self) -> int | None: ...
 
     def read(self, size: int) -> str: ...
 
@@ -47,7 +50,7 @@ class PtyProcessLike(Protocol):
 
 
 class PtyProcessFactory(Protocol):
-    """The class object a PTY backend exposes, as opposed to one of its processes.
+    """The spawn factory shared by POSIX PTY and Windows structured pipes.
 
     `spawn` is a classmethod on both backends, so what the loader returns is a
     class rather than an instance, and `PtyProcessLike` -- which describes an
@@ -64,27 +67,15 @@ class PtyProcessFactory(Protocol):
 
 
 def _load_pty_process() -> PtyProcessFactory:
-    """Return the PTY backend for this platform.
+    """Return the configured platform transport, preserving dependency preflight.
 
-    agy is a TUI: it has to be driven through a terminal, not a pipe, so the
-    runner needs a real PTY on every platform it supports. Windows has one
-    implementation of that (ConPTY through pywinpty) and POSIX has another
-    (openpty through ptyprocess), and the two are separate packages -- neither
-    installs on the other platform, which is why the dependency is split by
-    marker in pyproject.
-
-    They agree closely enough to sit behind `PtyProcessLike`: both expose
-    `spawn(argv, cwd=..., dimensions=(rows, cols))`, a `read(size)` that hands
-    back text, `isalive()`, `terminate(force=...)`, `pid` and `exitstatus`. The
-    one thing to get right is text: ptyprocess splits bytes and str across two
-    classes, so this asks for `PtyProcessUnicode`, whose `read` returns str like
-    pywinpty\'s does. The reader accepts EOFError or an empty read as clean EOF;
-    other backend exceptions must prevent recovery from incomplete output.
+    Windows print-mode uses pipes because ConPTY adds VT bytes to NDJSON and
+    can keep its reader blocked after child exit. Keep the declared pywinpty
+    availability check for existing Windows environments. POSIX continues to
+    use ptyprocess's Unicode PTY backend. Both expose the same spawn/read/exit
+    contract; unexpected read errors never count as clean EOF.
     """
-    if os.name == "nt":
-        attribute, distribution = "PtyProcess", "pywinpty"
-    else:
-        attribute, distribution = "PtyProcessUnicode", "ptyprocess"
+    distribution = "pywinpty" if os.name == "nt" else "ptyprocess"
     try:
         module = (
             importlib.import_module("winpty")
@@ -93,7 +84,9 @@ def _load_pty_process() -> PtyProcessFactory:
         )
     except ImportError as exc:
         raise ImportError(f"{distribution} is not installed or cannot be imported: {exc}") from exc
-    factory: PtyProcessFactory = getattr(module, attribute)
+    if os.name == "nt":
+        return WindowsPipeProcess
+    factory: PtyProcessFactory = module.PtyProcessUnicode
     return factory
 
 
@@ -134,7 +127,7 @@ class PtyAgyRunner:
         )
 
         with spec.log_path.open("w", encoding="utf-8", errors="replace") as log:
-            log.write("# agy ConPTY run\n")
+            log.write("# agy structured stream run\n")
             log.write(f"workspace: {spec.workspace_path}\n")
             log.write(f"command: {self._display_command(spec)}\n\n")
             log.flush()
@@ -152,7 +145,7 @@ class PtyAgyRunner:
                     completed=False,
                     exit_code=None,
                     result_status=None,
-                    message=f"Failed to spawn agy through ConPTY: {type(exc).__name__}",
+                    message=f"Failed to spawn agy stream: {type(exc).__name__}",
                 )
 
             pid_observed(getattr(proc, "pid", None))
@@ -186,6 +179,8 @@ class PtyAgyRunner:
                 reader_stop.set()
                 self._terminate_spawned(proc)
                 reader.join(READER_JOIN_TIMEOUT_SEC)
+                if isinstance(proc, WindowsPipeProcess) and not reader.is_alive():
+                    proc.close()
                 if not capture.closed:
                     if reader.is_alive():
                         capture.invalid = True

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -96,13 +97,16 @@ def test_live_activity_excludes_private_content_and_final_usage_is_not_doubled(
     assert "PRIVATE" not in log.getvalue()
     for artifact in tmp_path.iterdir():
         assert "PRIVATE" not in artifact.read_text()
-        assert artifact.stat().st_mode & 0o777 == 0o600
+        if os.name != "nt":  # Windows mode bits do not describe filesystem ACLs.
+            assert artifact.stat().st_mode & 0o777 == 0o600
     events = read_agy_activity_events(path, job_id="job-1")
     assert len([event for event in events["events"] if event["kind"] == "tool"]) == 2
 
 
 @pytest.mark.parametrize(
-    "bad", ["malformed\n", '{"event":"result"}', "x" * (LINE_LIMIT + 1) + "\n"]
+    "bad",
+    ["malformed\n", '{"event":"result"}', "x" * (LINE_LIMIT + 1) + "\n"],
+    ids=["malformed", "truncated", "oversized"],
 )
 def test_split_lines_and_invalid_eof_fail_closed(tmp_path: Path, bad: str) -> None:
     output = AgyOutput(tmp_path / "attempt.log", "job")

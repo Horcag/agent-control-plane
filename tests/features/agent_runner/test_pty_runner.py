@@ -4,6 +4,8 @@ import io
 import json
 import os
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -12,8 +14,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from agent_control_plane.features.agent_runner.lib import pty_runner
+from agent_control_plane.features.agent_runner.lib import pty_runner, windows_pipe
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
+from agent_control_plane.features.agent_runner.lib.windows_pipe import WindowsPipeProcess
 from agent_control_plane.shared.agy_activity import read_agy_activity
 
 
@@ -37,10 +40,10 @@ class PtyBackendSelectionTest(unittest.TestCase):
         ):
             return pty_runner._load_pty_process()
 
-    def test_windows_uses_pywinpty(self) -> None:
+    def test_windows_checks_pywinpty_and_uses_structured_pipes(self) -> None:
         winpty = SimpleNamespace(PtyProcess="conpty-backend")
 
-        self.assertEqual(self._load_with("nt", {"winpty": winpty}), "conpty-backend")
+        self.assertIs(self._load_with("nt", {"winpty": winpty}), WindowsPipeProcess)
 
     def test_posix_uses_the_unicode_ptyprocess_class(self) -> None:
         # PtyProcessUnicode, not PtyProcess: the reader thread and the trust-prompt
@@ -75,6 +78,137 @@ class PtyBackendSelectionTest(unittest.TestCase):
         self.assertEqual(result.status, "blocked")
         self.assertFalse(result.completed)
         self.assertIn("ptyprocess", result.message)
+
+
+class WindowsPipeProcessTest(unittest.TestCase):
+    def test_failed_construction_reaps_only_the_spawned_child_and_closes_its_pipe(self) -> None:
+        for missing_pipe in (True, False):
+            with self.subTest(missing_pipe=missing_pipe):
+                process = Mock(stdout=None if missing_pipe else Mock())
+                process.poll.return_value = None
+                process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 2), 0]
+                with (
+                    patch.object(windows_pipe.subprocess, "Popen", return_value=process),
+                    patch.object(
+                        windows_pipe.codecs,
+                        "getincrementaldecoder",
+                        side_effect=RuntimeError("decoder unavailable"),
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError, "stdout pipe" if missing_pipe else "decoder unavailable"
+                    ),
+                ):
+                    WindowsPipeProcess.spawn(["synthetic-agent"])
+                process.terminate.assert_called_once_with()
+                process.kill.assert_called_once_with()
+                self.assertEqual(process.wait.call_count, 2)
+                if process.stdout is not None:
+                    process.stdout.close.assert_called_once_with()
+
+    def test_spawn_preserves_argv_and_hides_the_console(self) -> None:
+        process = Mock(pid=123)
+        command = ["python", "fixture with spaces.py", "--print", "synthetic prompt"]
+        with (
+            patch.object(windows_pipe.subprocess, "Popen", return_value=process) as popen,
+            patch.object(windows_pipe.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True),
+            patch.object(windows_pipe.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True),
+        ):
+            proc = WindowsPipeProcess.spawn(command, cwd="fixture directory")
+        popen.assert_called_once_with(
+            command,
+            cwd="fixture directory",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            creationflags=0x08000200,
+        )
+        self.assertEqual(proc.pid, 123)
+        proc.close()
+        process.stdout.close.assert_called_once_with()
+
+    def test_partial_utf8_is_decoded_strictly_across_reads(self) -> None:
+        text = "Ж🙂\n"
+        encoded = text.encode("utf-8")
+        process = Mock()
+        process.stdout.read1.side_effect = [encoded[:1], encoded[1:3], encoded[3:], b""]
+        proc = WindowsPipeProcess(process)
+        chunks = []
+        try:
+            with self.assertRaises(EOFError):
+                while True:
+                    chunks.append(proc.read(4096))
+            self.assertEqual("".join(chunks), text)
+            self.assertNotIn("", chunks)
+        finally:
+            proc.close()
+
+    def test_truncated_utf8_and_pipe_errors_remain_reader_failures(self) -> None:
+        for ending in ([b"\xf0", b""], [b"\xff"], [OSError("pipe read failed")]):
+            with self.subTest(ending=ending):
+                process = Mock()
+                process.stdout.read1.side_effect = [_stream(FINAL_RESPONSE).encode(), *ending]
+                proc = WindowsPipeProcess(process)
+                output: queue.Queue[str] = queue.Queue()
+                done = threading.Event()
+                errors: queue.Queue[str] = queue.Queue()
+                try:
+                    PtyAgyRunner._reader(proc, output, done, errors)
+                    self.assertTrue(done.is_set())
+                    self.assertEqual(output.get_nowait(), _stream(FINAL_RESPONSE))
+                    self.assertIn(
+                        "OSError" if isinstance(ending[0], OSError) else "UnicodeDecodeError",
+                        errors.get_nowait(),
+                    )
+                finally:
+                    proc.close()
+
+    def test_forced_termination_kills_and_waits_only_for_the_spawned_process(self) -> None:
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 2), 0]
+        proc = WindowsPipeProcess(process)
+        try:
+            proc.terminate(force=True)
+            process.terminate.assert_called_once_with()
+            process.kill.assert_called_once_with()
+            self.assertEqual(process.wait.call_count, 2)
+            self.assertFalse(process.stdout.close.called)
+        finally:
+            proc.close()
+
+    def test_partial_event_is_available_before_the_child_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            proc = WindowsPipeProcess.spawn(
+                [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-c",
+                    "import sys,time; print('synthetic event'); sys.stdout.flush(); time.sleep(10)",
+                ],
+                cwd=directory,
+            )
+            output: queue.Queue[str] = queue.Queue()
+            done = threading.Event()
+            errors: queue.Queue[str] = queue.Queue()
+            stop = threading.Event()
+            reader = threading.Thread(
+                target=PtyAgyRunner._reader, args=(proc, output, done, errors, stop)
+            )
+            reader.start()
+            try:
+                self.assertIn("synthetic event", output.get(timeout=3))
+                self.assertTrue(proc.isalive())
+                self.assertFalse(done.is_set())
+            finally:
+                stop.set()
+                proc.terminate(force=True)
+                reader.join(3)
+                if not reader.is_alive():
+                    proc.close()
+            self.assertFalse(reader.is_alive())
+            self.assertFalse(proc.isalive())
 
 
 class PtyRunnerCommandTest(unittest.TestCase):
@@ -128,7 +262,7 @@ class PtyRunnerCommandTest(unittest.TestCase):
                 "--output-format",
                 "stream-json",
                 "--log-file",
-                "D:/repo/runs/job-1/attempt-001.agy-vendor.log",
+                str(spec.log_path.with_suffix(".agy-vendor.log")),
             ],
         )
         self.assertNotIn("--prompt-interactive", command)
@@ -145,7 +279,7 @@ class PtyRunnerCommandTest(unittest.TestCase):
         self.assertEqual(
             display,
             "agy --model Gemini 3.5 Flash (High) --print <prompt> --print-timeout 10s "
-            "--output-format stream-json --log-file D:/repo/runs/job-1/attempt-001.agy-vendor.log",
+            f"--output-format stream-json --log-file {spec.log_path.with_suffix('.agy-vendor.log')}",
         )
         self.assertNotIn("secret prompt", display)
 
@@ -847,7 +981,17 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 result = PtyAgyRunner().run(
                     spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
                 )
-                self.assertEqual(result.status, expected)
+                activity = read_agy_activity(spec.log_path)
+                capture_state = {
+                    key: activity.get(key)
+                    for key in ("available", "stream_state", "event_count", "current_state")
+                }
+                self.assertEqual(
+                    result.status,
+                    expected,
+                    f"status={result.status}, message={result.message!r}, "
+                    f"exit_code={result.exit_code}, capture={capture_state}",
+                )
                 self.assertEqual(spec.result_path.exists(), expected == "completed")
                 if expected == "completed":
                     self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
