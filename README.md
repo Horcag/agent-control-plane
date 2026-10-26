@@ -16,6 +16,11 @@ ACP is useful for repeatable, auditable delegation across repositories or parall
 It is overkill for one short prompt in one clean checkout, and it is not a hosted queue,
 cloud scheduler, or unattended merge service.
 
+Use `agent-control watch <job-id> --events` for live AGY progress summaries and separate
+agent idle/resumed advisories. `summary <job-id>` includes bounded activity ages and token
+usage; `tail <job-id>` reads the assigned attempt log. See
+[watching jobs](docs/operations.md#watching-jobs-as-an-event-stream).
+
 ## Architecture
 
 ```mermaid

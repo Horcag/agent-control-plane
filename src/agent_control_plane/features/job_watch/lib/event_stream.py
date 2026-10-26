@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from agent_control_plane.entities.job import TERMINAL_STATUSES, JobRecord, JobStore
+from agent_control_plane.shared.agent_backends import AGY_BACKEND
+from agent_control_plane.shared.agy_activity import read_agy_activity, read_agy_activity_events
 from agent_control_plane.shared.clock import utc_now
 from agent_control_plane.shared.sqlite_runtime import control_database
 
@@ -26,8 +28,25 @@ TERMINAL = "terminal"
 STALE = "stale"
 RESUMED = "resumed"
 WATCH_ERROR = "watch_error"
+ACTIVITY = "activity"
+ACTIVITY_STATUS = "activity_status"
+AGENT_IDLE = "agent_idle"
+AGENT_RESUMED = "agent_resumed"
 
-EVENT_KINDS = frozenset({START, TRANSITION, TERMINAL, STALE, RESUMED, WATCH_ERROR})
+EVENT_KINDS = frozenset(
+    {
+        START,
+        TRANSITION,
+        TERMINAL,
+        STALE,
+        RESUMED,
+        WATCH_ERROR,
+        ACTIVITY,
+        ACTIVITY_STATUS,
+        AGENT_IDLE,
+        AGENT_RESUMED,
+    }
+)
 
 # Bumped whenever the cursor payload stops being readable by the previous decoder.
 CURSOR_VERSION = 1
@@ -100,6 +119,8 @@ class WatchEvent:
     last_error: str | None = None
     heartbeat_age_sec: float | None = None
     message: str | None = None
+    activity: dict[str, Any] | None = None
+    progress_age_sec: float | None = None
     at: str = field(default_factory=utc_now)
 
 
@@ -122,6 +143,10 @@ class _JobWatchState:
     settled: bool = False
     stale_emitted_heartbeat: str | None = None
     consecutive_failures: int = 0
+    activity_attempt: str | None = None
+    activity_seq: int = 0
+    activity_issue: str | None = None
+    idle_progress: str | None = None
 
 
 class WatchEventStream:
@@ -193,6 +218,10 @@ class WatchEventStream:
                     "status": state.last_status,
                     "settled": state.settled,
                     "stale_beat": state.stale_emitted_heartbeat,
+                    "activity_attempt": state.activity_attempt,
+                    "activity_seq": state.activity_seq,
+                    "activity_issue": state.activity_issue,
+                    "idle_progress": state.idle_progress,
                 }
                 for job_id, state in sorted(self._states.items())
             },
@@ -228,6 +257,14 @@ class WatchEventStream:
             state.settled = bool(raw_state.get("settled", False))
             stale_beat = raw_state.get("stale_beat")
             state.stale_emitted_heartbeat = None if stale_beat is None else str(stale_beat)
+
+            state.activity_attempt = _optional_text(raw_state.get("activity_attempt"))
+            seq = raw_state.get("activity_seq", 0)
+            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+                raise ValueError("watch cursor activity_seq must be a non-negative integer")
+            state.activity_seq = seq
+            state.activity_issue = _optional_text(raw_state.get("activity_issue"))
+            state.idle_progress = _optional_text(raw_state.get("idle_progress"))
 
     def all_settled(self) -> bool:
         return bool(self._states) and all(state.settled for state in self._states.values())
@@ -302,8 +339,65 @@ class WatchEventStream:
         state.last_status = job.status
         if settled_now:
             state.settled = True
+        events.extend(self._activity_events(job, state, active=not is_terminal_status))
         if not is_terminal_status:
             events.extend(self._heartbeat_events(job, state))
+        return events
+
+    def _activity_events(
+        self, job: JobRecord, state: _JobWatchState, *, active: bool
+    ) -> list[WatchEvent]:
+        if job.backend != AGY_BACKEND or job.log_path is None:
+            return []
+        attempt = str(job.log_path)
+        if state.activity_attempt != attempt:
+            state.activity_attempt = attempt
+            state.activity_seq = 0
+            state.activity_issue = None
+            state.idle_progress = None
+        snapshot = read_agy_activity(job.log_path, job_id=job.job_id)
+        batch = read_agy_activity_events(
+            job.log_path, job_id=job.job_id, after_seq=state.activity_seq, limit=20
+        )
+        events: list[WatchEvent] = []
+        for item in batch["events"]:
+            message = item["summary"]
+            if item.get("tool_name"):
+                message += f" ({item['tool_name']})"
+            if item.get("state"):
+                message += f" [{item['state']}]"
+            events.append(self._event(ACTIVITY, job, message=message, activity=item))
+        state.activity_seq = batch["next_seq"]
+        issue = batch.get("error") or snapshot.get("error")
+        if not snapshot.get("available") and not issue:
+            issue = "AGY activity telemetry unavailable; agent progress is unknown"
+        if batch.get("truncated"):
+            truncation = "AGY activity history truncated; bounded event window returned"
+            issue = f"{truncation}; {issue}" if issue else truncation
+        if issue and issue != state.activity_issue:
+            events.append(self._event(ACTIVITY_STATUS, job, message=str(issue)[:240]))
+        state.activity_issue = str(issue) if issue else None
+        progress = snapshot.get("last_progress_at") if snapshot.get("available") else None
+        age = self._heartbeat_age_sec(progress) if isinstance(progress, str) else None
+        if not active or age is None:
+            return events
+        if state.idle_progress is not None and progress != state.idle_progress:
+            events.append(
+                self._event(
+                    AGENT_RESUMED, job, message="AGY progress resumed", progress_age_sec=age
+                )
+            )
+            state.idle_progress = None
+        if age >= self._stale_after_sec and state.idle_progress is None:
+            state.idle_progress = progress
+            events.append(
+                self._event(
+                    AGENT_IDLE,
+                    job,
+                    message=f"No AGY progress for {age:.0f}s; advisory only, worker heartbeat is independent",
+                    progress_age_sec=age,
+                )
+            )
         return events
 
     def _heartbeat_events(self, job: JobRecord, state: _JobWatchState) -> list[WatchEvent]:
@@ -370,6 +464,9 @@ class WatchEventStream:
         job: JobRecord,
         *,
         heartbeat_age_sec: float | None = None,
+        message: str | None = None,
+        activity: dict[str, Any] | None = None,
+        progress_age_sec: float | None = None,
     ) -> WatchEvent:
         settled = is_settled(job)
         return WatchEvent(
@@ -379,9 +476,12 @@ class WatchEventStream:
             status=job.status,
             expected_result_status=job.expected_result_status,
             finalization_status=job.finalization_status,
-            on_contract=is_on_contract(job) if settled else None,
+            on_contract=is_on_contract(job) if settled and kind == TERMINAL else None,
             last_error=job.last_error,
             heartbeat_age_sec=heartbeat_age_sec,
+            message=message,
+            activity=activity,
+            progress_age_sec=progress_age_sec,
         )
 
     def _selection_error_event(self, exc: Exception) -> WatchEvent:
@@ -426,3 +526,7 @@ def _job_ids_matching_task_glob(store: JobStore, pattern: str) -> frozenset[str]
     with control_database(store.database_path) as db:
         rows = db.execute("select job_id from jobs where task_id glob ?", (pattern,)).fetchall()
     return frozenset(str(row["job_id"]) for row in rows)
+
+
+def _optional_text(value: Any) -> str | None:
+    return value if isinstance(value, str) else None

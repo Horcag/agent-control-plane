@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import queue
 import tempfile
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from agent_control_plane.features.agent_runner.lib import pty_runner
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
+from agent_control_plane.shared.agy_activity import read_agy_activity
 
 
 class PtyBackendSelectionTest(unittest.TestCase):
@@ -123,6 +125,10 @@ class PtyRunnerCommandTest(unittest.TestCase):
                 "do the task",
                 "--print-timeout",
                 "10s",
+                "--output-format",
+                "stream-json",
+                "--log-file",
+                "D:/repo/runs/job-1/attempt-001.agy-vendor.log",
             ],
         )
         self.assertNotIn("--prompt-interactive", command)
@@ -138,9 +144,73 @@ class PtyRunnerCommandTest(unittest.TestCase):
 
         self.assertEqual(
             display,
-            "agy --model Gemini 3.5 Flash (High) --print <prompt> --print-timeout 10s",
+            "agy --model Gemini 3.5 Flash (High) --print <prompt> --print-timeout 10s "
+            "--output-format stream-json --log-file D:/repo/runs/job-1/attempt-001.agy-vendor.log",
         )
         self.assertNotIn("secret prompt", display)
+
+    def test_vendor_log_budget_stops_only_spawned_child_and_caps_owned_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            spec = replace(_spec(prompt="task", yolo=False), log_path=Path(temp) / "attempt.log")
+            vendor_path = pty_runner.vendor_log_path(spec.log_path)
+            vendor_path.write_bytes(b"x" * 100)
+            capture = pty_runner.AgyOutput(spec.log_path, "job")
+            proc = _FakeProcess()
+            with patch.object(pty_runner, "VENDOR_LOG_LIMIT", 64):
+                result = PtyAgyRunner()._monitor_process(
+                    proc,
+                    queue.Queue(),
+                    io.StringIO(),
+                    spec,
+                    0,
+                    0,
+                    100,
+                    lambda: False,
+                    threading.Event(),
+                    queue.Queue(),
+                    capture,
+                )
+            self.assertEqual(result.status, "blocked")
+            self.assertTrue(proc.terminated)
+            self.assertEqual(vendor_path.stat().st_size, 64)
+            capture.finish(clean=False)
+
+    def test_vendor_log_missing_or_live_writer_fails_closed(self) -> None:
+        for missing in (False, True):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as temp:
+                spec = replace(
+                    _spec(prompt="task", yolo=False), log_path=Path(temp) / "attempt.log"
+                )
+                vendor_path = pty_runner.vendor_log_path(spec.log_path)
+                if not missing:
+                    vendor_path.write_bytes(b"x" * 100)
+                capture = pty_runner.AgyOutput(spec.log_path, "job")
+                proc = _FakeProcess()
+                proc.terminate = (
+                    Mock()
+                )  # A failed termination must not allow live-writer truncation.
+                with patch.object(pty_runner, "VENDOR_LOG_LIMIT", 64):
+                    result = PtyAgyRunner()._monitor_process(
+                        proc,
+                        queue.Queue(),
+                        io.StringIO(),
+                        spec,
+                        0,
+                        0,
+                        100,
+                        lambda: False,
+                        threading.Event(),
+                        queue.Queue(),
+                        capture,
+                    )
+                self.assertEqual(result.status, "blocked")
+                proc.terminate.assert_called_once_with(force=True)
+                if missing:
+                    self.assertIn("unavailable", result.message)
+                else:
+                    self.assertIn("preserved", result.message)
+                    self.assertEqual(vendor_path.stat().st_size, 100)
+                capture.finish(clean=False)
 
     def test_detects_workspace_trust_prompt(self) -> None:
         output = """
@@ -361,6 +431,185 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 self.assertEqual(result.status, "exited_without_result")
                 self.assertEqual((root / "result.md").read_text(), placeholder)
 
+    def test_exit_drains_a_full_bounded_queue_before_waiting_for_reader_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = replace(
+                _spec(prompt="Inspect only.", yolo=False),
+                result_path=root / "result.md",
+                log_path=root / "attempt.log",
+                read_only=True,
+            )
+            output: queue.Queue[str] = queue.Queue(maxsize=256)
+            for _ in range(256):
+                output.put(json.dumps({"event": "heartbeat"}) + "\n")
+            done = threading.Event()
+            errors: queue.Queue[str] = queue.Queue()
+            reached = threading.Event()
+
+            def read(size: int) -> str:
+                del size
+                reached.set()
+                return _stream(FINAL_RESPONSE)
+
+            proc = SimpleNamespace(
+                isalive=lambda: False,
+                exitstatus=0,
+                read=Mock(side_effect=[read(4096), EOFError("done")]),
+            )
+            capture = pty_runner.AgyOutput(spec.log_path, "job")
+            reader = threading.Thread(
+                target=PtyAgyRunner._reader, args=(proc, output, done, errors)
+            )
+            reader.start()
+            self.assertTrue(reached.wait(1))
+            try:
+                result = PtyAgyRunner()._exited_result_if_dead(
+                    proc,
+                    output,
+                    io.StringIO(),
+                    spec,
+                    0,
+                    reader_done=done,
+                    reader_errors=errors,
+                    capture=capture,
+                )
+                assert result is not None
+                self.assertTrue(result.completed)
+                self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+                self.assertTrue(done.is_set())
+            finally:
+                reader.join(1)
+            self.assertFalse(reader.is_alive())
+
+    def test_queue_backpressure_reader_can_be_stopped_without_hanging(self) -> None:
+        output: queue.Queue[str] = queue.Queue(maxsize=1)
+        output.put("already full")
+        stop = threading.Event()
+        done = threading.Event()
+        errors: queue.Queue[str] = queue.Queue()
+        proc = SimpleNamespace(read=Mock(return_value="private chunk"))
+        reader = threading.Thread(
+            target=PtyAgyRunner._reader, args=(proc, output, done, errors, stop)
+        )
+        reader.start()
+        stop.set()
+        reader.join(1)
+        self.assertFalse(reader.is_alive())
+        self.assertTrue(done.is_set())
+        self.assertEqual(errors.get_nowait(), "PTY reader stopped before clean EOF")
+
+    def test_quoted_tool_refusals_are_not_cli_diagnostics(self) -> None:
+        refusals = (
+            "Do you trust the contents of this project? Antigravity CLI requires permission",
+            "Eligibility check failed: Your current account is not eligible for Antigravity",
+        )
+        for refusal in refusals:
+            with self.subTest(refusal=refusal), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    workspace_path=root,
+                    result_path=root / "result.md",
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                tool = {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": "tool",
+                        "step_index": 1,
+                        "state": "done",
+                        "tool_name": "read_file",
+                        "tool_info": {"output": refusal},
+                    },
+                }
+                proc = SimpleNamespace(
+                    pid=123,
+                    exitstatus=0,
+                    isalive=lambda: False,
+                    read=Mock(
+                        side_effect=[json.dumps(tool) + "\n" + _stream(FINAL_RESPONSE), EOFError()]
+                    ),
+                )
+                with patch.object(
+                    pty_runner,
+                    "_load_pty_process",
+                    return_value=SimpleNamespace(spawn=Mock(return_value=proc)),
+                ):
+                    result = PtyAgyRunner().run(
+                        spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                    )
+                self.assertTrue(result.completed)
+                self.assertNotIn(refusal, spec.log_path.read_text())
+
+    def test_streaming_plain_cli_refusals_remain_blocked(self) -> None:
+        for refusal in (
+            "Do you trust the contents of this project? Antigravity CLI requires permission",
+            "Eligibility check failed: Your current account is not eligible for Antigravity",
+        ):
+            with self.subTest(refusal=refusal), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    workspace_path=root,
+                    result_path=root / "result.md",
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                proc = SimpleNamespace(
+                    pid=123,
+                    exitstatus=0,
+                    isalive=lambda: False,
+                    read=Mock(side_effect=[refusal, EOFError()]),
+                )
+                with patch.object(
+                    pty_runner,
+                    "_load_pty_process",
+                    return_value=SimpleNamespace(spawn=Mock(return_value=proc)),
+                ):
+                    result = PtyAgyRunner().run(
+                        spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                    )
+                self.assertEqual(result.status, "blocked")
+                self.assertFalse(spec.result_path.exists())
+
+    def test_durable_writable_completion_closes_capture_without_fabricating_stream_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = replace(
+                _spec(prompt="Write result.", yolo=False),
+                workspace_path=root,
+                result_path=root / "result.md",
+                log_path=root / "attempt.log",
+            )
+            proc = _FakeProcess()
+            proc.read = Mock(return_value="")
+            with (
+                patch.object(
+                    pty_runner,
+                    "_load_pty_process",
+                    return_value=SimpleNamespace(spawn=Mock(return_value=proc)),
+                ),
+                patch.object(
+                    pty_runner,
+                    "inspect_result",
+                    return_value=SimpleNamespace(done=True, status="completed"),
+                ),
+            ):
+                result = PtyAgyRunner().run(
+                    spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                )
+            self.assertTrue(result.completed)
+            activity = read_agy_activity(spec.log_path)
+            self.assertEqual(activity["stream_state"], "closed")
+            self.assertEqual(
+                activity["current_action"], "Controller stopped AGY after durable result"
+            )
+            self.assertIsNone(activity["conversation_id"])
+
     def test_exit_waits_for_split_final_reader_chunks(self) -> None:
         release_reader = threading.Event()
 
@@ -374,13 +623,13 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
             def read(self, size: int) -> str:
                 self.reads += 1
                 if self.reads == 1:
-                    return "\x1b[3"
+                    return _stream(FINAL_RESPONSE)[:20]
                 if self.reads == 2:
                     if not release_reader.wait(2):
                         raise RuntimeError("test reader was not released")
-                    return "2m" + FINAL_RESPONSE[:30]
+                    return _stream(FINAL_RESPONSE)[20:40]
                 if self.reads == 3:
-                    return FINAL_RESPONSE[30:] + "\x1b[0m"
+                    return _stream(FINAL_RESPONSE)[40:]
                 raise EOFError("EOF")
 
             def isalive(self) -> bool:
@@ -426,7 +675,7 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 proc = SimpleNamespace(
                     pid=123,
                     exitstatus=0,
-                    read=Mock(side_effect=[FINAL_RESPONSE, ending]),
+                    read=Mock(side_effect=[_stream(FINAL_RESPONSE), ending]),
                     isalive=lambda: False,
                 )
                 spec = replace(
@@ -455,8 +704,7 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 )
                 if not clean_eof:
                     self.assertIn(type(ending).__name__, result.message)
-                    self.assertIn(str(ending), result.message)
-                    self.assertIn(result.message, spec.log_path.read_text())
+                    self.assertNotIn("backend read failed", spec.log_path.read_text())
 
     def test_native_pty_recovers_print_output_and_rejects_nonzero_or_oversized_stream(self) -> None:
         for prefix, exit_code, expected in (
@@ -472,7 +720,7 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 script = root / "fake_agy.py"
                 script.write_text(
                     "import sys\n"
-                    f"sys.stdout.write({prefix + FINAL_RESPONSE!r})\n"
+                    f"sys.stdout.write({prefix + _stream(FINAL_RESPONSE)!r})\n"
                     "sys.stdout.flush()\n"
                     f"sys.exit({exit_code})\n",
                     encoding="utf-8",
@@ -504,6 +752,13 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 result = self._recover(root, FINAL_RESPONSE + refusal)
                 self.assertEqual(result.status, "blocked")
                 self.assertFalse((root / "result.md").exists())
+
+
+def _stream(response: str) -> str:
+    return (
+        json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": response}})
+        + "\n"
+    )
 
 
 class _FakeProcess:

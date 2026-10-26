@@ -557,3 +557,70 @@ def test_print_statuses_json_matches_payload(capsys: pytest.CaptureFixture[str])
 
     out = capsys.readouterr().out
     assert json.loads(out) == _statuses_payload()
+
+
+@pytest.mark.parametrize("kind", ["activity", "activity_status", "agent_idle", "agent_resumed"])
+def test_agy_activity_messages_are_rendered(kind: str) -> None:
+    event = WatchEvent(
+        kind=kind,
+        job_id="job",
+        task_id="task",
+        status="running",
+        expected_result_status="completed",
+        finalization_status="not_started",
+        message="Model activity\nnext line " + "x" * 500,
+    )
+    out = io.StringIO()
+    _write_event_line(out, event)
+    assert "message=Model activity" in out.getvalue()
+    assert len(out.getvalue().splitlines()) == 1
+    assert len(out.getvalue()) < 450
+
+
+def test_agy_summary_and_compact_summary_preserve_bounded_activity(tmp_path: Path) -> None:
+    from agent_control_plane.shared.agy_activity import agy_activity_paths
+
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "activity-summary")
+    control.store.update_job(job.job_id, log_path=tmp_path / "attempt.log")
+    snapshot, _ = agy_activity_paths(tmp_path / "attempt.log")
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "job_id": job.job_id,
+                "attempt_ref": "attempt",
+                "seq": 2,
+                "last_event_at": "2026-10-26T00:00:00+00:00",
+                "last_progress_at": "2026-10-26T00:00:00+00:00",
+                "current_action": "Tool activity",
+                "current_tool_name": "read_file",
+                "current_state": "active",
+                "current_step_index": 2,
+                "action_started_at": "2026-10-26T00:00:00+00:00",
+                "event_count": 2,
+                "tool_calls": 0,
+                "model_responses": 1,
+                "usage": {"available": True, "thinking_tokens": 42},
+                "stream_state": "running",
+                "conversation_id": None,
+            }
+        )
+    )
+    for summary in (control.summary_job(job.job_id), control.mcp_summary_job(job.job_id)):
+        activity = summary["agy_activity"]
+        assert activity["available"] is True
+        assert activity["current_action"] == "Tool activity"
+        assert activity["current_tool_name"] == "read_file"
+        assert activity["current_state"] == "active"
+        assert activity["current_step_index"] == 2
+        assert activity["usage"] == {"available": True, "thinking_tokens": 42}
+        assert activity["progress_age_sec"] >= 0
+        assert activity["action_age_sec"] >= 0
+        assert len(json.dumps(activity)) < 1500
+    snapshot.write_text("{}")
+    activity = control.summary_job(job.job_id)["agy_activity"]
+    assert activity["available"] is False
+    assert activity["progress_state"] == "unknown"
+    codex = _create_job(control.store, tmp_path, "codex-summary", backend="codex")
+    assert "agy_activity" not in control.summary_job(codex.job_id)

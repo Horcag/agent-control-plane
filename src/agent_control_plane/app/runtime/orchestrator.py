@@ -103,6 +103,7 @@ from agent_control_plane.features.slot_lifecycle import (
     SlotManager,
     bootstrap_slot_config,
 )
+from agent_control_plane.shared.agy_activity import read_agy_activity
 from agent_control_plane.shared.config import ControlConfig, load_config
 from agent_control_plane.shared.git_tools import (
     GitError,
@@ -1230,6 +1231,7 @@ class AgentControlPlane:
             "result_path": str(job.result_path),
             "run_dir": str(job.run_dir),
             "latest_attempt_metrics": metrics[0] if metrics else None,
+            **({"agy_activity": _agy_activity_summary(job)} if job.backend == AGY_BACKEND else {}),
         }
 
     def analytics(
@@ -2136,3 +2138,66 @@ def _tail(path: Path, lines: int) -> str:
         raise ValueError("lines must be positive")
     content = path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(content[-lines:])
+
+
+def _agy_activity_summary(job: JobRecord) -> dict[str, Any]:
+    snapshot = (
+        read_agy_activity(job.log_path, job_id=job.job_id)
+        if job.log_path is not None
+        else {"available": False, "error": "No AGY activity log assigned; progress unknown"}
+    )
+    summary: dict[str, Any] = {"available": bool(snapshot.get("available"))}
+    for key in (
+        "error",
+        "attempt_ref",
+        "last_event_at",
+        "last_progress_at",
+        "current_action",
+        "current_tool_name",
+        "current_state",
+        "action_started_at",
+        "stream_state",
+        "conversation_id",
+    ):
+        value = snapshot.get(key)
+        summary[key] = value[:240] if isinstance(value, str) else None
+    for key in ("seq", "event_count", "tool_calls", "model_responses", "current_step_index"):
+        value = snapshot.get(key)
+        summary[key] = value if isinstance(value, int) and not isinstance(value, bool) else None
+    usage = snapshot.get("usage")
+    summary["usage"] = (
+        {
+            str(key)[:64]: value
+            for key, value in list(usage.items())[:16]
+            if isinstance(value, int | float | bool)
+        }
+        if isinstance(usage, dict)
+        else {}
+    )
+    now = datetime.now(UTC)
+    for key, timestamp_key in (
+        ("event_age_sec", "last_event_at"),
+        ("progress_age_sec", "last_progress_at"),
+        ("action_age_sec", "action_started_at"),
+    ):
+        timestamp = summary[timestamp_key]
+        try:
+            summary[key] = (
+                max(
+                    0.0,
+                    (
+                        now - datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    ).total_seconds(),
+                )
+                if timestamp
+                else None
+            )
+        except (TypeError, ValueError):
+            summary[key] = None
+    if not summary["available"] or summary["progress_age_sec"] is None:
+        summary["progress_state"] = "unknown"
+    elif summary["progress_age_sec"] >= DEFAULT_STALE_AFTER_SEC:
+        summary["progress_state"] = "idle"
+    else:
+        summary["progress_state"] = "working"
+    return summary
