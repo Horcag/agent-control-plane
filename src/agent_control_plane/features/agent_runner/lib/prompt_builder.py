@@ -50,15 +50,34 @@ def build_task_prompt(
         if read_only:
             coordination_rules = f"""- This is a READ-ONLY job.
 - You are FORBIDDEN from editing any files in the workspace or updating the progress file.
-- You MUST write your final response beginning with exactly one of: Status: completed, Status: partial, Status: blocked.
-- For Status: partial, emit exactly one machine-readable line `Escalation-Classification: model_capability` only when the remaining issue is a model capability or task-reasoning limitation likely to benefit from the next configured model. Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or `guardrail` for other blockers. Omit the line for unclassified results. Never classify an environment blocker as model_capability. Status: blocked never escalates.
-- The response itself will be recovered and written to: {result_path}"""
+- Do not create, modify, or delete files, write result.md or verification.json, mutate Git state, or terminate processes.
+- Progress and result placeholders are controller-owned and do not indicate task incompleteness. Do not read or monitor them.
+- Return the mandatory final result format below in your response. The controller persists it; the response itself will be recovered and written to: {result_path}"""
+            result_rules = ""
+            final_result_action = "Return your final response"
+            native_execution_rules = """- Use native read-only shell commands and native search (for example `rg`) only for the inspection requested by the brief.
+- The brief defines the bounded scope. Do not investigate controller implementation or result recovery unless the brief explicitly requests it.
+- Run only checks requested by the brief, synchronously; no additional tests, linters, Git checks, or diff review are required.
+- Once the requested inspection and checks are complete, immediately return the final response and stop. Do not present a plan or ask how to proceed."""
         else:
+            final_result_action = "Write the final result"
             coordination_rules = f"""- Maintain live progress/state in: {progress_path}
 - Your first coordination action MUST be to update the progress file: {progress_path} with: Current phase, Confirmed facts, Target files, Next action, Changed files, and Open risks.
 - Write the final result file to: {result_path} only after all work and verification are actually complete."""
+            result_rules = f"""Write the final result to:
+- {result_path}
 
-        native_quality_rules = _native_quality_rules(quality_contract)
+{verification_rules}"""
+            native_execution_rules = f"""- Use native shell commands, native search (for example `rg`), and native file-edit tools (for example `apply_patch`).
+- Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
+- Preserve user changes. Keep changes narrow, task-scoped, and minimal.
+- Run verification (tests, linters, long checks) synchronously and wait for it to finish; backgrounding it and ending your turn ends the session and reports exited_without_result. Workers do not get background watchers — watching delegated jobs is the root's job via `agent-control watch --events`.
+{_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
+{_native_quality_rules(quality_contract)}
+- Inspect the final diff before claiming completion.
+- You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
+- When a commit is explicitly requested, never add a `Co-Authored-By`, `Generated with Claude Code`, or any AI/model-attribution trailer to the commit message; use only the requested message.
+- You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID."""
         return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
@@ -73,26 +92,14 @@ Read before acting:
 Execute the task only in:
 - {workspace_path}
 
-Write the final result to:
-- {result_path}
-
-{verification_rules}
+{result_rules}
 
 {coordination_rules}
 
 Mandatory execution rules:
-- Use native shell commands, native search (for example `rg`), and native file-edit tools (for example `apply_patch`).
 - You are FORBIDDEN from using or discovering AgentBridge, IntelliJ IDEA, or DataSpell MCP servers or tools.
-- Before making edits, check the current Git branch and dirty state. Require the branch to match expected: {expected_branch}.
-- Preserve user changes. Keep changes narrow, task-scoped, and minimal.
-- Run verification (tests, linters, long checks) synchronously and wait for it to finish; backgrounding it and ending your turn ends the session and reports exited_without_result. Workers do not get background watchers — watching delegated jobs is the root's job via `agent-control watch --events`.
-{_budget_phase_rules(codex_tool_call_budget, expected_result_status, controller_gate_mode)}
-{native_quality_rules}
-- Inspect the final diff before claiming completion.
-- You are FORBIDDEN from committing, pushing, or performing Git operations that mutate the remote repository unless explicitly requested.
-- When a commit is explicitly requested, never add a `Co-Authored-By`, `Generated with Claude Code`, or any AI/model-attribution trailer to the commit message; use only the requested message.
-- You are STRICTLY FORBIDDEN from terminating processes by name (such as Node, Chrome, Firefox). Only terminate processes by verified PID.
-- Write the final result in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
+{native_execution_rules}
+- {final_result_action} in the mandatory format: Start with exactly one of: Status: completed, Status: partial, Status: blocked, followed by Changed files, What changed, Verification performed, and Not verified / remaining risks.
 - For Status: partial, emit exactly one machine-readable line `Escalation-Classification: model_capability` only when the remaining issue is a model capability or task-reasoning limitation likely to benefit from the next configured model. Use `infrastructure`, `workspace`, `dependency`, `quota`, `spawn`, `tooling`, or `guardrail` for other blockers. Omit the line for unclassified results. Never classify an environment blocker as model_capability. Status: blocked never escalates.
 """
     protocol_path = _protocol_path(config.coordination_root)

@@ -74,11 +74,15 @@ def _load_pty_process() -> PtyProcessFactory:
     other backend exceptions must prevent recovery from incomplete output.
     """
     if os.name == "nt":
-        module_name, attribute, distribution = "winpty", "PtyProcess", "pywinpty"
+        attribute, distribution = "PtyProcess", "pywinpty"
     else:
-        module_name, attribute, distribution = "ptyprocess", "PtyProcessUnicode", "ptyprocess"
+        attribute, distribution = "PtyProcessUnicode", "ptyprocess"
     try:
-        module = importlib.import_module(module_name)
+        module = (
+            importlib.import_module("winpty")
+            if os.name == "nt"
+            else importlib.import_module("ptyprocess")
+        )
     except ImportError as exc:
         raise ImportError(f"{distribution} is not installed or cannot be imported: {exc}") from exc
     factory: PtyProcessFactory = getattr(module, attribute)

@@ -571,6 +571,84 @@ class PromptBuilderTest(unittest.TestCase):
             )
             self.assertNotIn("Maintain live progress/state in:", native_readonly)
             self.assertNotIn("mcp__agentbridge_idea_", native_readonly)
+            self.assertNotIn("Run relevant tests and linters", native_readonly)
+
+            for backend in ("agy", "codex", "claude"):
+                for read_only in (False, True):
+                    with self.subTest(backend=backend, read_only=read_only):
+                        prompt = build_task_prompt(
+                            config=controller_config,
+                            task_id="task-1",
+                            route="main",
+                            workspace_path=workspace,
+                            expected_branch="review/pr",
+                            result_path=Path("D:/repo/.agent-work/tasks/task-1/result.md"),
+                            backend=backend,
+                            workspace_access="native",
+                            read_only=read_only,
+                            codex_tool_call_budget=120,
+                        )
+                        self.assertIn("Status: completed, Status: partial, Status: blocked", prompt)
+                        self.assertIn(
+                            "Changed files, What changed, Verification performed, and Not verified / remaining risks",
+                            prompt,
+                        )
+                        if read_only:
+                            self.assertIn("native read-only shell commands", prompt)
+                            self.assertIn("The brief defines the bounded scope", prompt)
+                            self.assertIn("Run only checks requested by the brief", prompt)
+                            self.assertIn("immediately return the final response and stop", prompt)
+                            self.assertIn("Do not investigate controller implementation", prompt)
+                            self.assertIn("unless the brief explicitly requests it", prompt)
+                            self.assertIn("The controller persists it", prompt)
+                            self.assertIn(
+                                "Return your final response in the mandatory format", prompt
+                            )
+                            self.assertIn("the response itself will be recovered", prompt)
+                            self.assertIn("do not indicate task incompleteness", prompt)
+                            self.assertIn("Do not read or monitor them", prompt)
+                            self.assertIn("write result.md or verification.json", prompt)
+                            self.assertIn("mutate Git state, or terminate processes", prompt)
+                            for omitted in (
+                                "Write the final result to:",
+                                "Write the final result file to:",
+                                "Write the final result in the mandatory format",
+                                "Write the machine-readable verification bundle",
+                                "Maintain live progress/state",
+                                "Your first coordination action",
+                                "native file-edit tools",
+                                "Before making edits",
+                                "Run verification (tests, linters, long checks)",
+                                "Run relevant tests and linters",
+                                "Native quality policy:",
+                                "Worker-required gates",
+                                "Controller-stage gates",
+                                "Inspect the final diff",
+                                "Budget phases are discovery, edit",
+                                "reserve calls only for result.md",
+                                "unless explicitly requested",
+                            ):
+                                self.assertNotIn(omitted, prompt)
+                        else:
+                            for required in (
+                                "Write the final result to:",
+                                "Write the final result file to:",
+                                "Write the machine-readable verification bundle",
+                                "Maintain live progress/state",
+                                "Your first coordination action",
+                                "native file-edit tools",
+                                "Before making edits",
+                                "Run verification (tests, linters, long checks)",
+                                "Native quality policy: controller",
+                                "Worker-required gates",
+                                "Controller-stage gates",
+                                "Inspect the final diff",
+                                "Budget phases are discovery, edit",
+                                "reserve calls only for result.md",
+                                "unless explicitly requested",
+                                "never add a `Co-Authored-By`",
+                            ):
+                                self.assertIn(required, prompt)
 
             # IDE mode keeps the host-specific terminal and edit safety rules.
             self.assertIn("Set-Location -LiteralPath", ide_prompt)

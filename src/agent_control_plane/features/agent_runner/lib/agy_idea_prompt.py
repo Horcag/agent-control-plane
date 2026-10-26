@@ -45,7 +45,7 @@ def build_agy_task_prompt(
     )
     verification_rules = _verification_rules(result_path.with_name("verification.json"))
 
-    return """Task ID: {task_id}
+    return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 Expected IDEA host project root: {expected_idea_project_root}
@@ -167,7 +167,7 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-""".format_map(locals())
+"""
 
 
 def _build_agentbridge_task_prompt(
@@ -193,7 +193,7 @@ def _build_agentbridge_task_prompt(
     )
     verification_rules = _verification_rules(result_path.with_name("verification.json"))
 
-    return """Task ID: {task_id}
+    return f"""Task ID: {task_id}
 Workspace route: {route}
 Workspace path: {workspace_path}
 AgentBridge create root: {workspace_create_root}
@@ -287,7 +287,7 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-""".format_map(locals())
+"""
 
 
 def _verification_rules(path: Path) -> str:

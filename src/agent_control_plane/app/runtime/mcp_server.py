@@ -1482,7 +1482,7 @@ def _rebuild_fastmcp_settings(fast_mcp: type[Any]) -> None:
     generic lifespan annotation is still a forward reference. At this boundary
     the FastMCP module is fully imported, so Pydantic can safely complete it.
     """
-    module = importlib.import_module(fast_mcp.__module__)
+    module = sys.modules.get(fast_mcp.__module__)
     settings = getattr(module, "Settings", None)
     if settings is None or getattr(settings, "__pydantic_complete__", True):
         return
