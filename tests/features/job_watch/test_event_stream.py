@@ -637,3 +637,68 @@ def test_agy_event_window_truncation_is_explicit_and_drains_without_replay(tmp_p
     restored.load_cursor(stream.export_cursor())
     assert sum(event.kind == "activity" for event in restored.tick()) == 5
     assert restored.tick() == []
+
+
+def test_terminal_agy_watch_drains_activity_across_cursor_roundtrips(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "terminal-backlog")
+    store.update_job(job.job_id, log_path=tmp_path / "terminal.log")
+    _write_agy_activity(store.get_job(job.job_id), datetime.now(UTC).isoformat(), count=45)
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_completed(job.job_id)
+    selection = WatchSelection(job_ids=frozenset({job.job_id}))
+    stream = _stream(store, selection)
+    events = stream.tick()
+    delivered = [event.activity["seq"] for event in events if event.activity]
+    assert len(delivered) == 20
+    assert sum(event.on_contract is True for event in events) == 1
+    assert not stream.all_settled()
+    for expected_done in (False, True):
+        restored = _stream(store, selection)
+        restored.load_cursor(stream.export_cursor())
+        batch = restored.tick()
+        assert all(event.on_contract is None for event in batch)
+        delivered.extend(event.activity["seq"] for event in batch if event.activity)
+        assert restored.all_settled() is expected_done
+        stream = restored
+    assert delivered == list(range(1, 46))
+
+
+def test_terminal_agy_retention_gap_does_not_leave_watch_pending(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "terminal-gap")
+    store.update_job(job.job_id, log_path=tmp_path / "gap.log")
+    _write_agy_activity(store.get_job(job.job_id), datetime.now(UTC).isoformat(), seq=501, count=5)
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_completed(job.job_id)
+    stream = _stream(store, WatchSelection(job_ids=frozenset({job.job_id})))
+    events = stream.tick()
+    assert len([event for event in events if event.activity]) == 5
+    assert any(
+        event.kind == "activity_status" and "truncated" in (event.message or "") for event in events
+    )
+    assert stream.all_settled()
+
+
+def test_terminal_agy_backlog_read_error_settles_with_diagnostic(tmp_path: Path) -> None:
+    from agent_control_plane.shared.agy_activity import agy_activity_paths
+
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    job = _create_job(store, tmp_path, "terminal-error")
+    store.update_job(job.job_id, log_path=tmp_path / "error.log")
+    job = store.get_job(job.job_id)
+    _write_agy_activity(job, datetime.now(UTC).isoformat(), count=45)
+    store.mark_finished(job.job_id, "completed")
+    store.mark_finalization_completed(job.job_id)
+    selection = WatchSelection(job_ids=frozenset({job.job_id}))
+    stream = _stream(store, selection)
+    stream.tick()
+    assert not stream.all_settled()
+    assert job.log_path is not None
+    agy_activity_paths(job.log_path)[1].write_text("{invalid")
+    restored = _stream(store, selection)
+    restored.load_cursor(stream.export_cursor())
+    events = restored.tick()
+    assert [event.kind for event in events] == ["activity_status"]
+    assert "invalid" in (events[0].message or "")
+    assert restored.all_settled()

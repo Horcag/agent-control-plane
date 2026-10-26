@@ -287,3 +287,45 @@ def test_rolling_retention_keeps_current_progress_and_explicit_gap(tmp_path: Pat
     )
     assert output.snapshot["usage"]["available"]
     assert output.snapshot["usage"]["input_tokens"] == 1234
+
+
+def test_native_captured_uppercase_states_publish_live_tool_and_model_activity(
+    tmp_path: Path,
+) -> None:
+    # Sanitized native probe captured on 2026-10-26; enums remain vendor-authored.
+    steps = [
+        {"step_index": 0, "state": "DONE", "step_type": "user_input", "tool_name": None},
+        {"step_index": 1, "state": "DONE", "step_type": "agent_response", "tool_name": None},
+        {"step_index": 2, "state": "ACTIVE", "step_type": "tool", "tool_name": "run_command"},
+        {"step_index": 2, "state": "DONE", "step_type": "tool", "tool_name": "run_command"},
+        {"step_index": 3, "state": "ACTIVE", "step_type": "agent_response", "tool_name": None},
+        {"step_index": 3, "state": "DONE", "step_type": "agent_response", "tool_name": None},
+    ]
+    path = tmp_path / "attempt.log"
+    output = AgyOutput(path, "native-probe")
+    log = io.StringIO()
+    for step in steps:
+        emit(output, log, {"event": "step_update", "step_update": step})
+        if step["step_type"] == "user_input":
+            continue
+        live = read_agy_activity(path, job_id="native-probe")
+        assert live["available"] and live["stream_state"] == "running"
+        assert live["current_state"] == str(step["state"]).lower()
+        assert live["current_step_index"] == step["step_index"]
+        if step["step_type"] == "tool":
+            assert live["current_tool_name"] == "run_command"
+            assert live["tool_calls"] == 1
+    assert live["tool_calls"] == 1
+    assert live["model_responses"] == 2
+    events = read_agy_activity_events(path, job_id="native-probe")["events"]
+    assert [(event["kind"], event.get("state")) for event in events] == [
+        ("started", None),
+        ("model", "done"),
+        ("tool", "active"),
+        ("tool", "done"),
+        ("model", "active"),
+        ("model", "done"),
+    ]
+    assert "Tool activity (run_command): active" in log.getvalue()
+    assert "Model activity: active" in log.getvalue()
+    assert output.results == 0

@@ -233,6 +233,7 @@ class AgyOutput:
                 or not 0 <= index <= STEP_INDEX_LIMIT
             ):
                 return
+            state = state.lower() if isinstance(state, str) else None
             if state not in ("active", "done"):
                 return
             key = (step_type, index)

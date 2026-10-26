@@ -516,7 +516,18 @@ class PtyAgyRunner:
                 error = f"PTY reader failed: {type(exc).__name__}"
                 return error
             if not chunk:
-                return None
+                try:
+                    eof = getattr(proc, "eof", None)
+                    if not callable(eof) or eof() is not False:
+                        return None
+                except Exception as exc:  # noqa: BLE001 - EOF checks are backend operations
+                    return f"PTY reader failed: {type(exc).__name__}"
+                # pywinpty can return an empty poll before its socket reaches EOF.
+                if stop_requested is None:
+                    time.sleep(READER_QUEUE_WAIT_SEC)
+                elif stop_requested.wait(READER_QUEUE_WAIT_SEC):
+                    return "PTY reader stopped before clean EOF"
+                continue
             while True:
                 if stop_requested is not None and stop_requested.is_set():
                     return "PTY reader stopped before clean EOF"

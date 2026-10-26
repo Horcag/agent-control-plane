@@ -17,6 +17,7 @@ DEFAULT_STALE_AFTER_SEC = 300.0
 DEFAULT_READ_RETRIES = 3
 DEFAULT_READ_RETRY_BACKOFF_SEC = 0.05
 DEFAULT_ERROR_SURFACE_THRESHOLD = 3
+_ACTIVITY_EVENT_LIMIT = 20
 
 # finalization_status values that mean the checkpoint/gate battery has been decided,
 # as opposed to "not_started"/"pending" which are still in flight.
@@ -145,6 +146,7 @@ class _JobWatchState:
     consecutive_failures: int = 0
     activity_attempt: str | None = None
     activity_seq: int = 0
+    activity_pending: bool = False
     activity_issue: str | None = None
     idle_progress: str | None = None
 
@@ -220,6 +222,7 @@ class WatchEventStream:
                     "stale_beat": state.stale_emitted_heartbeat,
                     "activity_attempt": state.activity_attempt,
                     "activity_seq": state.activity_seq,
+                    "activity_pending": state.activity_pending,
                     "activity_issue": state.activity_issue,
                     "idle_progress": state.idle_progress,
                 }
@@ -263,11 +266,14 @@ class WatchEventStream:
             if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
                 raise ValueError("watch cursor activity_seq must be a non-negative integer")
             state.activity_seq = seq
+            state.activity_pending = bool(raw_state.get("activity_pending", False))
             state.activity_issue = _optional_text(raw_state.get("activity_issue"))
             state.idle_progress = _optional_text(raw_state.get("idle_progress"))
 
     def all_settled(self) -> bool:
-        return bool(self._states) and all(state.settled for state in self._states.values())
+        return bool(self._states) and all(
+            state.settled and not state.activity_pending for state in self._states.values()
+        )
 
     def tick(self) -> list[WatchEvent]:
         """Poll every watched job once and return the events observed this tick."""
@@ -348,16 +354,29 @@ class WatchEventStream:
         self, job: JobRecord, state: _JobWatchState, *, active: bool
     ) -> list[WatchEvent]:
         if job.backend != AGY_BACKEND or job.log_path is None:
+            state.activity_pending = False
             return []
         attempt = str(job.log_path)
         if state.activity_attempt != attempt:
             state.activity_attempt = attempt
             state.activity_seq = 0
+            state.activity_pending = False
             state.activity_issue = None
             state.idle_progress = None
         snapshot = read_agy_activity(job.log_path, job_id=job.job_id)
         batch = read_agy_activity_events(
-            job.log_path, job_id=job.job_id, after_seq=state.activity_seq, limit=20
+            job.log_path,
+            job_id=job.job_id,
+            after_seq=state.activity_seq,
+            limit=_ACTIVITY_EVENT_LIMIT,
+        )
+        # Truncation can also mean a retention gap. Only a full, advancing window
+        # proves that another bounded read is needed; errors/empty reads settle.
+        state.activity_pending = bool(
+            batch.get("truncated")
+            and len(batch["events"]) == _ACTIVITY_EVENT_LIMIT
+            and batch["next_seq"] > state.activity_seq
+            and not batch.get("error")
         )
         events: list[WatchEvent] = []
         for item in batch["events"]:

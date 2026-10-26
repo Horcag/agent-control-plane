@@ -706,6 +706,117 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                     self.assertIn(type(ending).__name__, result.message)
                     self.assertNotIn("backend read failed", spec.log_path.read_text())
 
+    def test_empty_non_eof_poll_preserves_later_response_and_read_failures(self) -> None:
+        for ending in (EOFError("closed"), OSError("unexpected socket failure")):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    workspace_path=root,
+                    result_path=root / "result.md",
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                proc = SimpleNamespace(
+                    pid=123,
+                    exitstatus=0,
+                    read=Mock(side_effect=["", _stream(FINAL_RESPONSE), ending]),
+                    eof=Mock(return_value=False),
+                    isalive=lambda: False,
+                )
+                with patch.object(
+                    pty_runner,
+                    "_load_pty_process",
+                    return_value=SimpleNamespace(spawn=Mock(return_value=proc)),
+                ):
+                    result = PtyAgyRunner().run(
+                        spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                    )
+                self.assertEqual(proc.read.call_count, 3)
+                self.assertEqual(result.completed, isinstance(ending, EOFError))
+                self.assertEqual(spec.result_path.exists(), isinstance(ending, EOFError))
+                if result.completed:
+                    self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+                else:
+                    self.assertIn("OSError", result.message)
+
+    def test_empty_poll_with_eof_or_noncallable_eof_stops(self) -> None:
+        for eof in (Mock(return_value=True), False):
+            with self.subTest(eof=eof):
+                proc = SimpleNamespace(read=Mock(return_value=""), eof=eof)
+                output: queue.Queue[str] = queue.Queue()
+                self.assertIsNone(PtyAgyRunner._read_output(proc, output))
+                self.assertEqual(proc.read.call_count, 1)
+                self.assertTrue(output.empty())
+
+    def test_eof_check_errors_after_valid_prefix_prevent_recovery(self) -> None:
+        for error in (
+            EOFError("invalid check"),
+            OSError("check failed"),
+            RuntimeError("bad check"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    result_path=root / "result.md",
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                proc = SimpleNamespace(
+                    isalive=lambda: False,
+                    exitstatus=0,
+                    read=Mock(side_effect=[_stream(FINAL_RESPONSE), ""]),
+                    eof=Mock(side_effect=error),
+                )
+                output: queue.Queue[str] = queue.Queue()
+                done = threading.Event()
+                errors: queue.Queue[str] = queue.Queue()
+                PtyAgyRunner._reader(proc, output, done, errors)
+                capture = pty_runner.AgyOutput(spec.log_path, "job")
+                result = PtyAgyRunner()._exited_result_if_dead(
+                    proc,
+                    output,
+                    io.StringIO(),
+                    spec,
+                    0,
+                    reader_done=done,
+                    reader_errors=errors,
+                    capture=capture,
+                )
+                assert result is not None
+                self.assertEqual(result.status, "exited_without_result")
+                self.assertIn(type(error).__name__, result.message)
+                self.assertFalse(spec.result_path.exists())
+
+    def test_empty_non_eof_poll_wait_can_be_interrupted(self) -> None:
+        entered = threading.Event()
+        stop = threading.Event()
+        done = threading.Event()
+        errors: queue.Queue[str] = queue.Queue()
+
+        def eof() -> bool:
+            entered.set()
+            return False
+
+        proc = SimpleNamespace(read=Mock(return_value=""), eof=eof)
+        with patch.object(pty_runner, "READER_QUEUE_WAIT_SEC", 10):
+            reader = threading.Thread(
+                target=PtyAgyRunner._reader, args=(proc, queue.Queue(), done, errors, stop)
+            )
+            reader.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                stop.set()
+                reader.join(1)
+                self.assertFalse(reader.is_alive())
+                self.assertTrue(done.is_set())
+                self.assertEqual(errors.get_nowait(), "PTY reader stopped before clean EOF")
+                self.assertEqual(proc.read.call_count, 1)
+            finally:
+                stop.set()
+                reader.join(1)
+
     def test_native_pty_recovers_print_output_and_rejects_nonzero_or_oversized_stream(self) -> None:
         for prefix, exit_code, expected in (
             ("", 0, "completed"),

@@ -1380,7 +1380,8 @@ class AgentControlPlane:
         the returned cursor.
 
         ``done`` is true once every watched job is *settled* - terminal status and
-        finalization decided - which is the same predicate the CLI exit code uses.
+        finalization decided - and its known bounded activity backlog is drained.
+        CLI termination uses the same predicate.
         Jobs that are neither settled nor progressing are listed in ``pending`` with
         their last status, so a caller can tell "still running" apart from a status
         such as ``cancel_requested`` that will never become terminal on its own.
@@ -1408,9 +1409,13 @@ class AgentControlPlane:
             "cursor": next_cursor,
             "done": stream.all_settled(),
             "pending": [
-                {"job_id": job_id, "status": state["status"]}
+                {
+                    "job_id": job_id,
+                    "status": state["status"],
+                    **({"activity_pending": True} if state.get("activity_pending") else {}),
+                }
                 for job_id, state in next_cursor["jobs"].items()
-                if not state["settled"]
+                if not state["settled"] or state.get("activity_pending")
             ],
             "terminal_statuses": sorted(TERMINAL_STATUSES),
         }
@@ -2194,7 +2199,9 @@ def _agy_activity_summary(job: JobRecord) -> dict[str, Any]:
             )
         except (TypeError, ValueError):
             summary[key] = None
-    if not summary["available"] or summary["progress_age_sec"] is None:
+    if summary["available"] and summary["stream_state"] in {"closed", "error"}:
+        summary["progress_state"] = summary["stream_state"]
+    elif not summary["available"] or summary["progress_age_sec"] is None:
         summary["progress_state"] = "unknown"
     elif summary["progress_age_sec"] >= DEFAULT_STALE_AFTER_SEC:
         summary["progress_state"] = "idle"

@@ -197,11 +197,15 @@ for `--stale-after-sec`; a healthy worker heartbeat does not reset that clock.
 `ACTIVITY-STATUS` (progress unknown), never proof of a hung agent. Event windows are
 bounded, with truncation and read errors surfaced explicitly. MCP watch cursors retain
 the event sequence per job and exact attempt, so repeated calls do not replay activity.
+A terminal job remains pending while a known finite activity backlog is drained;
+`done` becomes true afterwards. An unreadable backlog settles with a diagnostic rather
+than keeping the watch open indefinitely.
 
 Use `agent-control summary <job-id>` for the AGY `agy_activity` snapshot: current action,
 last event/progress timestamps and ages, action age, counts, stream state and usage
 (including thinking token counts when reported). `progress_state` is advisory and uses
-the default 300-second threshold. `agent-control tail <job-id>` reads that job's assigned
+the default 300-second threshold for a running stream; closed/error streams expose
+`closed`/`error`. `agent-control tail <job-id>` reads that job's assigned
 attempt log. Activity summaries expose safe progress categories, never raw hidden
 reasoning, prompts, tool arguments or tool output.
 
