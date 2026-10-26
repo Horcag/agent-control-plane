@@ -185,10 +185,29 @@ payload the plain `watch <job-id>` form still prints:
 ```
 
 `KIND` is one of `START`, `TRANSITION`, `TERMINAL`, `STALE`, `RESUMED`, `WATCH-ERROR`,
-`SUMMARY` — uppercase and first after the timestamp so a consumer can filter with a
-single grep alternation. A `SUMMARY` line is always printed last. `--stale-after-sec`
+`ACTIVITY`, `ACTIVITY-STATUS`, `AGENT-IDLE`, `AGENT-RESUMED`, `SUMMARY` — uppercase
+and first after the timestamp so a consumer can filter with a single grep alternation. A `SUMMARY` line is always printed last. `--stale-after-sec`
 (default 300) controls how long a running job may go without a heartbeat before it is
 reported `STALE`.
+
+For AGY, `ACTIVITY` lines also carry bounded `message=` summaries while the job is
+running. `AGENT-IDLE` is a separate advisory when no genuine AGY progress has arrived
+for `--stale-after-sec`; a healthy worker heartbeat does not reset that clock.
+`AGENT-RESUMED` reports fresh progress. Missing or invalid telemetry produces
+`ACTIVITY-STATUS` (progress unknown), never proof of a hung agent. Event windows are
+bounded, with truncation and read errors surfaced explicitly. MCP watch cursors retain
+the event sequence per job and exact attempt, so repeated calls do not replay activity.
+A terminal job remains pending while a known finite activity backlog is drained;
+`done` becomes true afterwards. An unreadable backlog settles with a diagnostic rather
+than keeping the watch open indefinitely.
+
+Use `agent-control summary <job-id>` for the AGY `agy_activity` snapshot: current action,
+last event/progress timestamps and ages, action age, counts, stream state and usage
+(including thinking token counts when reported). `progress_state` is advisory and uses
+the default 300-second threshold for a running stream; closed/error streams expose
+`closed`/`error`. `agent-control tail <job-id>` reads that job's assigned
+attempt log. Activity summaries expose safe progress categories, never raw hidden
+reasoning, prompts, tool arguments or tool output.
 
 The exit code is the point: it tells a caller what happened without parsing output.
 

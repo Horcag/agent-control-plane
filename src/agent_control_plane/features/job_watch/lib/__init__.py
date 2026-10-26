@@ -1,4 +1,8 @@
 from agent_control_plane.features.job_watch.lib.event_stream import (
+    ACTIVITY,
+    ACTIVITY_STATUS,
+    AGENT_IDLE,
+    AGENT_RESUMED,
     CURSOR_VERSION,
     DEFAULT_STALE_AFTER_SEC,
     EVENT_KINDS,
@@ -21,6 +25,10 @@ from agent_control_plane.features.job_watch.lib.event_stream import (
 )
 
 __all__ = [
+    "ACTIVITY",
+    "ACTIVITY_STATUS",
+    "AGENT_IDLE",
+    "AGENT_RESUMED",
     "CURSOR_VERSION",
     "DEFAULT_STALE_AFTER_SEC",
     "EVENT_KINDS",

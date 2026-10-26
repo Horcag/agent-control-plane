@@ -40,6 +40,10 @@ from agent_control_plane.features.agent_runner import (
 )
 from agent_control_plane.features.antigravity_accounts import AntigravityManagerError
 from agent_control_plane.features.job_watch import (
+    ACTIVITY,
+    ACTIVITY_STATUS,
+    AGENT_IDLE,
+    AGENT_RESUMED,
     DEFAULT_STALE_AFTER_SEC,
     RESUMED,
     STALE,
@@ -68,6 +72,10 @@ from agent_control_plane.shared.direct_session_claims import read_direct_session
 _ON_CONTRACT_CAPABLE_STATUSES = frozenset({"completed", "partial", "blocked"})
 
 _WATCH_EVENT_KIND_LABELS = {
+    ACTIVITY: "ACTIVITY",
+    ACTIVITY_STATUS: "ACTIVITY-STATUS",
+    AGENT_IDLE: "AGENT-IDLE",
+    AGENT_RESUMED: "AGENT-RESUMED",
     START: "START",
     TRANSITION: "TRANSITION",
     TERMINAL: "TERMINAL",
@@ -1538,6 +1546,8 @@ def _write_event_line(out: TextIO, event: WatchEvent) -> None:
         parts.append(f"status={event.status}")
     if event.finalization_status:
         parts.append(f"finalization={event.finalization_status}")
+    if event.kind in {ACTIVITY, ACTIVITY_STATUS, AGENT_IDLE, AGENT_RESUMED} and event.message:
+        parts.append(f"message={_compact_multiline(event.message, limit=_WATCH_ERROR_MAX_LEN)}")
     error_text = _error_text_for_event(event)
     if error_text:
         parts.append(f"error={_compact_multiline(error_text, limit=_WATCH_ERROR_MAX_LEN)}")

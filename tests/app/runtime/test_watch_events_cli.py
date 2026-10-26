@@ -557,3 +557,144 @@ def test_print_statuses_json_matches_payload(capsys: pytest.CaptureFixture[str])
 
     out = capsys.readouterr().out
     assert json.loads(out) == _statuses_payload()
+
+
+@pytest.mark.parametrize("kind", ["activity", "activity_status", "agent_idle", "agent_resumed"])
+def test_agy_activity_messages_are_rendered(kind: str) -> None:
+    event = WatchEvent(
+        kind=kind,
+        job_id="job",
+        task_id="task",
+        status="running",
+        expected_result_status="completed",
+        finalization_status="not_started",
+        message="Model activity\nnext line " + "x" * 500,
+    )
+    out = io.StringIO()
+    _write_event_line(out, event)
+    assert "message=Model activity" in out.getvalue()
+    assert len(out.getvalue().splitlines()) == 1
+    assert len(out.getvalue()) < 450
+
+
+def test_agy_summary_and_compact_summary_preserve_bounded_activity(tmp_path: Path) -> None:
+    from agent_control_plane.shared.agy_activity import agy_activity_paths
+
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "activity-summary")
+    control.store.update_job(job.job_id, log_path=tmp_path / "attempt.log")
+    snapshot, _ = agy_activity_paths(tmp_path / "attempt.log")
+    snapshot.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "job_id": job.job_id,
+                "attempt_ref": "attempt",
+                "seq": 2,
+                "last_event_at": "2026-10-26T00:00:00+00:00",
+                "last_progress_at": "2026-10-26T00:00:00+00:00",
+                "current_action": "Tool activity",
+                "current_tool_name": "read_file",
+                "current_state": "active",
+                "current_step_index": 2,
+                "action_started_at": "2026-10-26T00:00:00+00:00",
+                "event_count": 2,
+                "tool_calls": 0,
+                "model_responses": 1,
+                "usage": {"available": True, "thinking_tokens": 42},
+                "stream_state": "running",
+                "conversation_id": None,
+            }
+        )
+    )
+    for summary in (control.summary_job(job.job_id), control.mcp_summary_job(job.job_id)):
+        activity = summary["agy_activity"]
+        assert activity["available"] is True
+        assert activity["current_action"] == "Tool activity"
+        assert activity["current_tool_name"] == "read_file"
+        assert activity["current_state"] == "active"
+        assert activity["current_step_index"] == 2
+        assert activity["usage"] == {"available": True, "thinking_tokens": 42}
+        assert activity["progress_age_sec"] >= 0
+        assert activity["action_age_sec"] >= 0
+        assert len(json.dumps(activity)) < 1500
+    terminal_activity = json.loads(snapshot.read_text())
+    terminal_activity.update(
+        current_action="AGY stream closed",
+        current_tool_name=None,
+        current_state="done",
+        current_step_index=None,
+    )
+    for state in ("closed", "error"):
+        terminal_activity["stream_state"] = state
+        snapshot.write_text(json.dumps(terminal_activity))
+        assert control.summary_job(job.job_id)["agy_activity"]["progress_state"] == state
+        assert control.mcp_summary_job(job.job_id)["agy_activity"]["progress_state"] == state
+    snapshot.write_text("{}")
+    activity = control.summary_job(job.job_id)["agy_activity"]
+    assert activity["available"] is False
+    assert activity["progress_state"] == "unknown"
+    codex = _create_job(control.store, tmp_path, "codex-summary", backend="codex")
+    assert "agy_activity" not in control.summary_job(codex.job_id)
+
+
+def test_terminal_agy_mcp_and_cli_drain_backlog_without_counting_terminal_twice(
+    tmp_path: Path,
+) -> None:
+    from agent_control_plane.shared.agy_activity import agy_activity_paths
+
+    control = AgentControlPlane(_config(tmp_path))
+    job = _create_job(control.store, tmp_path, "terminal-activity")
+    log_path = tmp_path / "terminal.log"
+    control.store.update_job(job.job_id, log_path=log_path)
+    _, events_path = agy_activity_paths(log_path)
+    events_path.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "job_id": job.job_id,
+                    "attempt_ref": log_path.stem,
+                    "seq": seq,
+                    "at": "2026-10-26T00:00:00+00:00",
+                    "kind": "model",
+                    "summary": "Model activity",
+                }
+            )
+            for seq in range(1, 46)
+        )
+        + "\n"
+    )
+    control.store.mark_finished(job.job_id, "completed")
+    control.store.mark_finalization_completed(job.job_id)
+    cursor = None
+    delivered: list[int] = []
+    on_contract = 0
+    for expected_done in (False, False, True):
+        snapshot = control.watch_events(job_ids=[job.job_id], cursor=cursor)
+        cursor = snapshot["cursor"]
+        assert snapshot["done"] is expected_done
+        assert snapshot["pending"] == (
+            []
+            if expected_done
+            else [
+                {
+                    "job_id": job.job_id,
+                    "status": "completed",
+                    "activity_pending": True,
+                }
+            ]
+        )
+        for event in snapshot["events"]:
+            on_contract += event["on_contract"] is True
+            if event["activity"]:
+                delivered.append(event["activity"]["seq"])
+    assert on_contract == 1
+    assert delivered == list(range(1, 46))
+    out = io.StringIO()
+    fake = _FakeMonotonic()
+    args = _parse_watch([job.job_id, "--events", "--poll-interval-sec", "1", "--timeout-sec", "5"])
+    assert _handle_watch_events(control, args, out=out, clock=fake.clock, sleep=fake.sleep) == 0
+    lines = out.getvalue().splitlines()
+    assert sum(" ACTIVITY " in line for line in lines) == 45
+    assert sum(" TERMINAL " in line for line in lines) == 1
+    assert "jobs=1 on_contract=1 off_contract=0 non_terminal=0 timed_out=false" in lines[-1]

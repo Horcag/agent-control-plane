@@ -167,7 +167,22 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-""".format_map(locals())
+""".format_map(
+        {
+            "task_id": task_id,
+            "route": route,
+            "workspace_path": workspace_path,
+            "expected_idea_project_root": expected_idea_project_root,
+            "expected_branch": expected_branch,
+            "protocol_path": protocol_path,
+            "routing_path": routing_path,
+            "brief_path": brief_path,
+            "result_path": result_path,
+            "verification_rules": verification_rules,
+            "progress_path": progress_path,
+            "access_rule": access_rule,
+        }
+    )
 
 
 def _build_agentbridge_task_prompt(
@@ -287,7 +302,24 @@ Mandatory result file format:
   Not verified / remaining risks.
 - State the exact physical workspace, branch, and HEAD/commit SHA.
 - If blocked or partial, include the exact blocker and next concrete action.
-""".format_map(locals())
+""".format_map(
+        {
+            "task_id": task_id,
+            "route": route,
+            "workspace_path": workspace_path,
+            "workspace_create_root": workspace_create_root,
+            "expected_idea_project_root": expected_idea_project_root,
+            "expected_branch": expected_branch,
+            "protocol_path": protocol_path,
+            "routing_path": routing_path,
+            "brief_path": brief_path,
+            "result_path": result_path,
+            "verification_rules": verification_rules,
+            "progress_path": progress_path,
+            "access_rule": access_rule,
+            "mcp_server": mcp_server,
+        }
+    )
 
 
 def _verification_rules(path: Path) -> str:

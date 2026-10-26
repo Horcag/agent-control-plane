@@ -3,8 +3,10 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import sys
 import time
 import warnings
+from types import ModuleType
 from typing import Any
 from unittest.mock import Mock, patch
 
@@ -25,7 +27,25 @@ from agent_control_plane.app.runtime.mcp_response_budget import (
     response_for,
     serialized_bytes,
 )
-from agent_control_plane.app.runtime.mcp_server import _validate_tool_policies, build_server
+from agent_control_plane.app.runtime.mcp_server import (
+    _rebuild_fastmcp_settings,
+    _validate_tool_policies,
+    build_server,
+)
+
+
+@pytest.mark.parametrize("complete", [True, False])
+def test_rebuild_fastmcp_settings_uses_loaded_module(complete: bool) -> None:
+    class StubFastMCP:
+        pass
+
+    module = ModuleType(StubFastMCP.__module__)
+    settings = Mock(__pydantic_complete__=complete)
+    module.Settings = settings  # type: ignore[attr-defined]
+    with patch.dict(sys.modules, {StubFastMCP.__module__: module}):
+        _rebuild_fastmcp_settings(StubFastMCP)
+
+    assert settings.model_rebuild.call_count == (0 if complete else 1)
 
 
 def test_every_registered_tool_is_coroutine_function() -> None:
