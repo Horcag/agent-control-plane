@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Protocol, TextIO
 
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import progress_signature
@@ -69,8 +70,8 @@ def _load_pty_process() -> PtyProcessFactory:
     back text, `isalive()`, `terminate(force=...)`, `pid` and `exitstatus`. The
     one thing to get right is text: ptyprocess splits bytes and str across two
     classes, so this asks for `PtyProcessUnicode`, whose `read` returns str like
-    pywinpty\'s does. Reading at EOF raises on both, in backend-specific ways --
-    the reader thread already catches broadly for that reason.
+    pywinpty\'s does. The reader accepts EOFError or an empty read as clean EOF;
+    other backend exceptions must prevent recovery from incomplete output.
     """
     if os.name == "nt":
         module_name, attribute, distribution = "winpty", "PtyProcess", "pywinpty"
@@ -137,8 +138,11 @@ class PtyAgyRunner:
 
             pid_observed(getattr(proc, "pid", None))
             reader_done = threading.Event()
+            reader_errors: queue.Queue[str] = queue.Queue()
             reader = threading.Thread(
-                target=self._reader, args=(proc, output_queue, reader_done), daemon=True
+                target=self._reader,
+                args=(proc, output_queue, reader_done, reader_errors),
+                daemon=True,
             )
             reader.start()
 
@@ -152,6 +156,7 @@ class PtyAgyRunner:
                 deadline_mono,
                 cancel_requested,
                 reader_done,
+                reader_errors,
             )
 
     def _monitor_process(
@@ -165,6 +170,7 @@ class PtyAgyRunner:
         deadline_mono: float,
         cancel_requested: Callable[[], bool],
         reader_done: threading.Event,
+        reader_errors: queue.Queue[str],
     ) -> AgyRunResult:
         output_tail = ""
         durable_signature, _ = progress_signature(spec)
@@ -189,7 +195,7 @@ class PtyAgyRunner:
                 return self._stopped_result(proc, "cancelled", "Cancel requested")
 
             exited = self._exited_result_if_dead(
-                proc, output_queue, log, spec, started_wall, output_tail, reader_done
+                proc, output_queue, log, spec, started_wall, output_tail, reader_done, reader_errors
             )
             if exited is not None:
                 return exited
@@ -283,6 +289,7 @@ class PtyAgyRunner:
         started_wall: float,
         output_tail: str = "",
         reader_done: threading.Event | None = None,
+        reader_errors: queue.Queue[str] | None = None,
     ) -> AgyRunResult | None:
         if proc.isalive():
             return None
@@ -309,7 +316,11 @@ class PtyAgyRunner:
                 result_status=None,
                 message="Antigravity CLI rejected the active account at its eligibility check; verify that account before retrying. The proxy account pool cannot repair this local CLI refusal.",
             )
-        if spec.read_only and proc.exitstatus == 0 and drained:
+        reader_error = None
+        if reader_errors is not None:
+            with suppress(queue.Empty):
+                reader_error = reader_errors.get_nowait()
+        if spec.read_only and proc.exitstatus == 0 and drained and reader_error is None:
             response = self._final_response(output_tail, spec.prompt)
             if response is not None:
                 spec.result_path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +333,7 @@ class PtyAgyRunner:
             completed=False,
             exit_code=proc.exitstatus,
             result_status=None,
-            message=result_state.reason or "agy exited without a valid result file",
+            message=reader_error or result_state.reason or "agy exited without a valid result file",
         )
 
     def _timeout_result_if_needed(
@@ -371,24 +382,33 @@ class PtyAgyRunner:
 
     @staticmethod
     def _reader(
-        proc: PtyProcessLike, output_queue: queue.Queue[str], reader_done: threading.Event
+        proc: PtyProcessLike,
+        output_queue: queue.Queue[str],
+        reader_done: threading.Event,
+        reader_errors: queue.Queue[str],
     ) -> None:
         try:
-            PtyAgyRunner._read_output(proc, output_queue)
+            error = PtyAgyRunner._read_output(proc, output_queue)
+            if error is not None:
+                reader_errors.put(error)
         finally:
             reader_done.set()
 
     @staticmethod
-    def _read_output(proc: PtyProcessLike, output_queue: queue.Queue[str]) -> None:
+    def _read_output(proc: PtyProcessLike, output_queue: queue.Queue[str]) -> str | None:
         while True:
             try:
                 chunk = proc.read(4096)
-            except Exception as exc:  # noqa: BLE001 - pywinpty reader exceptions are backend-specific
-                output_queue.put(f"\n[pty reader stopped: {exc}]\n")
-                return
+            except EOFError:
+                output_queue.put("\n[pty reader stopped: EOF]\n")
+                return None
+            except Exception as exc:  # noqa: BLE001 - report unexpected backend read failures
+                error = f"PTY reader failed: {type(exc).__name__}: {exc}"
+                output_queue.put(f"\n[{error}]\n")
+                return error
             if not chunk:
                 output_queue.put("\n[pty reader stopped: empty read]\n")
-                return
+                return None
             output_queue.put(chunk)
 
     @staticmethod
@@ -412,7 +432,7 @@ class PtyAgyRunner:
             return None
         text = ANSI_RE.sub("", output).replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
-        text = re.sub(r"\n\[pty reader stopped: [^\n]*\]$", "", text).rstrip()
+        text = re.sub(r"\n\[pty reader stopped: (?:EOF|empty read)\]$", "", text).rstrip()
         if prompt.strip() and prompt.strip() in text:
             return None
         if "```" in text or "~~~" in text:

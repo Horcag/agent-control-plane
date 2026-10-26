@@ -9,7 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from agent_control_plane.features.agent_runner.lib import pty_runner
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
@@ -409,6 +409,54 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 )
             self.assertTrue(result.completed)
             self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+
+    def test_reader_recovers_only_after_clean_eof(self) -> None:
+        for ending in (
+            EOFError("backend EOF"),
+            "",
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+            OSError("backend read failed"),
+            RuntimeError("backend crashed"),
+        ):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                placeholder = "Awaiting `agy`\n"
+                result_path = root / "result.md"
+                result_path.write_text(placeholder, encoding="utf-8")
+                proc = SimpleNamespace(
+                    pid=123,
+                    exitstatus=0,
+                    read=Mock(side_effect=[FINAL_RESPONSE, ending]),
+                    isalive=lambda: False,
+                )
+                spec = replace(
+                    _spec(prompt="Inspect only.", yolo=False),
+                    workspace_path=root,
+                    result_path=result_path,
+                    log_path=root / "attempt.log",
+                    read_only=True,
+                )
+                with patch.object(
+                    pty_runner,
+                    "_load_pty_process",
+                    return_value=SimpleNamespace(spawn=Mock(return_value=proc)),
+                ):
+                    result = PtyAgyRunner().run(
+                        spec, cancel_requested=lambda: False, pid_observed=lambda pid: None
+                    )
+
+                clean_eof = isinstance(ending, EOFError) or ending == ""
+                self.assertEqual(result.completed, clean_eof)
+                self.assertEqual(
+                    result.status, "completed" if clean_eof else "exited_without_result"
+                )
+                self.assertEqual(
+                    result_path.read_text(), FINAL_RESPONSE if clean_eof else placeholder
+                )
+                if not clean_eof:
+                    self.assertIn(type(ending).__name__, result.message)
+                    self.assertIn(str(ending), result.message)
+                    self.assertIn(result.message, spec.log_path.read_text())
 
     def test_native_pty_recovers_print_output_and_rejects_nonzero_or_oversized_stream(self) -> None:
         for prefix, exit_code, expected in (
