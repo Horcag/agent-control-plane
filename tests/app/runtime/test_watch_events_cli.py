@@ -597,6 +597,8 @@ def test_agy_summary_and_compact_summary_preserve_bounded_activity(tmp_path: Pat
                 "current_tool_name": "read_file",
                 "current_state": "active",
                 "current_step_index": 2,
+                "native_step_index": 114,
+                "native_step_count": 115,
                 "action_started_at": "2026-10-26T00:00:00+00:00",
                 "event_count": 2,
                 "tool_calls": 0,
@@ -614,6 +616,8 @@ def test_agy_summary_and_compact_summary_preserve_bounded_activity(tmp_path: Pat
         assert activity["current_tool_name"] == "read_file"
         assert activity["current_state"] == "active"
         assert activity["current_step_index"] == 2
+        assert activity["native_step_index"] == 114
+        assert activity["native_step_count"] == 115
         assert activity["usage"] == {"available": True, "thinking_tokens": 42}
         assert activity["progress_age_sec"] >= 0
         assert activity["action_age_sec"] >= 0

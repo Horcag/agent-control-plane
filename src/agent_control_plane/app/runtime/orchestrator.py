@@ -2166,7 +2166,15 @@ def _agy_activity_summary(job: JobRecord) -> dict[str, Any]:
     ):
         value = snapshot.get(key)
         summary[key] = value[:240] if isinstance(value, str) else None
-    for key in ("seq", "event_count", "tool_calls", "model_responses", "current_step_index"):
+    for key in (
+        "seq",
+        "event_count",
+        "tool_calls",
+        "model_responses",
+        "current_step_index",
+        "native_step_index",
+        "native_step_count",
+    ):
         value = snapshot.get(key)
         summary[key] = value if isinstance(value, int) and not isinstance(value, bool) else None
     usage = snapshot.get("usage")

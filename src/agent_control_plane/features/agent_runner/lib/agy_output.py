@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import time
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +18,8 @@ from agent_control_plane.shared.agy_activity import EVENT_LIMIT, SAFE_SUMMARIES,
 LINE_LIMIT = 262_144
 STEP_INDEX_LIMIT = 1_000_000_000
 DIAGNOSTIC_LIMIT = 12_000
+PROGRESS_EVENT_INTERVAL_SEC = 2.0
+PROGRESS_FILTER_BYTES = 8192
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b].*?(?:\x07|\x1b\\)")
 USAGE_KEYS = (
     "input_tokens",
@@ -41,6 +45,8 @@ class AgyOutput:
         self.snapshot_path, self.events_path = agy_activity_paths(log_path)
         private_file(self.events_path)
         self.closed = False
+        self.turn_in_flight = False
+        self.native_cwd: str | None = None
         self.discarding = False
         self.buffer = ""
         self.invalid = False
@@ -53,6 +59,10 @@ class AgyOutput:
         self.highest_step: dict[str, int] = {}
         self.results = 0
         self.steps: dict[tuple[str, int], str] = {}
+        self.progress_sequence = 0
+        self.progress_filters: dict[tuple[str, int], bytearray] = {}
+        self.last_progress_event_mono = 0.0
+        self.quiet = False
         self.step_usage: dict[int, dict[str, int]] = {}
         self.snapshot: dict[str, Any] = {
             "schema": 1,
@@ -82,24 +92,32 @@ class AgyOutput:
         state: str | None = None,
         tool: str | None = None,
         step_index: int | None = None,
+        continuing: bool = False,
     ) -> str:
         now = datetime.now(UTC).isoformat()
         self.snapshot["seq"] += 1
         self.snapshot["last_event_at"] = now
-        if kind in ("tool", "model", "result"):
-            self.snapshot["last_progress_at"] = now
+        if kind in ("tool", "model", "result", "native_history"):
+            if not continuing:
+                self._progress()
+            self.last_progress_event_mono = time.monotonic()
         self.snapshot["current_action"] = SAFE_SUMMARIES[kind]
         self.snapshot["current_tool_name"] = tool
         self.snapshot["current_state"] = (
             "done" if kind in ("result", "closed", "controller_stopped") else state
         )
         self.snapshot["current_step_index"] = step_index
-        self.snapshot["action_started_at"] = now
+        if not continuing:
+            self.snapshot["action_started_at"] = now
         event = {key: self.snapshot[key] for key in ("seq", "job_id", "attempt_ref")}
         event.update(at=now, kind=kind, summary=SAFE_SUMMARIES[kind])
-        if state is not None:
+        if kind == "native_history":
+            event.update(
+                {key: self.snapshot[key] for key in ("native_step_index", "native_step_count")}
+            )
+        if state is not None and kind != "native_history":
             event["state"] = state
-        if tool is not None:
+        if tool is not None and kind != "native_history":
             event["tool_name"] = tool
         self.events.append(event)
         if self.snapshot["seq"] <= EVENT_LIMIT:
@@ -119,6 +137,80 @@ class AgyOutput:
             + (f": {state}" if state else "")
             + "\n"
         )
+
+    def _progress(self) -> None:
+        self.progress_sequence += 1
+        self.snapshot["last_progress_at"] = datetime.now(UTC).isoformat()
+        self.quiet = False
+
+    @property
+    def has_active_operation(self) -> bool:
+        return self.results == 0 and self.snapshot["current_state"] == "active"
+
+    @property
+    def has_inflight_turn(self) -> bool:
+        # Native AGY can omit ACTIVE while thinking between DONE steps.
+        return self.turn_in_flight and not self.closed
+
+    def note_quiet(self, log: TextIO) -> None:
+        if self.quiet or not self.has_inflight_turn:
+            return
+        self.quiet = True
+        log.write(
+            self._publish(
+                "quiet",
+                state=self.snapshot["current_state"],
+                tool=self.snapshot["current_tool_name"],
+                step_index=self.snapshot["current_step_index"],
+                continuing=True,
+            )
+        )
+        log.flush()
+
+    def note_native_history(self, index: int, count: int, log: TextIO) -> None:
+        if (
+            not self.has_inflight_turn
+            or type(index) is not int
+            or type(count) is not int
+            or not 0 < count <= index + 1 <= STEP_INDEX_LIMIT + 1
+            or index <= self.snapshot.get("native_step_index", -1)
+            or count <= self.snapshot.get("native_step_count", 0)
+        ):
+            return
+        self.snapshot.update(native_step_index=index, native_step_count=count)
+        self._progress()
+        log.write(
+            self._publish(
+                "native_history",
+                state=self.snapshot["current_state"],
+                tool=self.snapshot["current_tool_name"],
+                step_index=self.snapshot["current_step_index"],
+                continuing=True,
+            )
+        )
+        log.flush()
+
+    def _content_progress(self, key: tuple[str, int], step: dict[str, Any]) -> bool:
+        content = step.get("text_delta")
+        if key[0] == "tool":
+            info = step.get("tool_info")
+            content = info.get("output") if isinstance(info, dict) else None
+        if not content or not isinstance(content, (str, dict, list)):
+            return False
+        # Fixed 65,536-bit seen filter, never cleared within a retained step. Collisions
+        # can conservatively suppress progress; replay never becomes fresh after eviction.
+        fingerprint = hashlib.sha256(json.dumps(content, sort_keys=True).encode()).digest()
+        seen = self.progress_filters.setdefault(key, bytearray(PROGRESS_FILTER_BYTES))
+        positions: list[int] = []
+        for offset in range(0, 8, 2):
+            position = int.from_bytes(fingerprint[offset : offset + 2], "big")
+            while position in positions:
+                position = (position + 1) & 0xFFFF
+            positions.append(position)
+        fresh = any(not seen[position // 8] & (1 << (position % 8)) for position in positions)
+        for position in positions:
+            seen[position // 8] |= 1 << (position % 8)
+        return fresh
 
     def _save(self) -> None:
         temporary = self.snapshot_path.with_suffix(".tmp")
@@ -151,19 +243,20 @@ class AgyOutput:
             partial = ""
         return (self.diagnostics + partial)[-DIAGNOSTIC_LIMIT:]
 
-    def _conversation(self, value: Any) -> None:
+    def _conversation(self, value: Any) -> bool:
         if value is None:
-            return
+            return True
         try:
             conversation = str(UUID(value))
         except (ValueError, TypeError, AttributeError):
             self.invalid = True
-            return
+            return False
         previous = self.snapshot["conversation_id"]
         if previous is not None and previous != conversation:
             self.invalid = True
-        else:
-            self.snapshot["conversation_id"] = conversation
+            return False
+        self.snapshot["conversation_id"] = conversation
+        return True
 
     @staticmethod
     def _usage(value: Any) -> dict[str, int] | None:
@@ -193,24 +286,47 @@ class AgyOutput:
             log.truncate()
             log.write("[agy] Earlier safe activity omitted\n")
         self.snapshot["event_count"] += 1
+        if (
+            event.get("job_id", self.snapshot["job_id"]) != self.snapshot["job_id"]
+            or event.get("attempt_ref", self.snapshot["attempt_ref"])
+            != self.snapshot["attempt_ref"]
+            or not self._conversation(event.get("conversation_id"))
+        ):
+            self.invalid = True
+            return
         kind = event.get("event")
         if kind == "init":
-            self._conversation(event.get("conversation_id"))
+            if event.get("conversation_id") is None or self.results or self.closed:
+                self.invalid = True
+                return
+            self.turn_in_flight = True
+            init = event.get("init")
+            self.native_cwd = (
+                init.get("cwd")
+                if isinstance(init, dict) and isinstance(init.get("cwd"), str)
+                else None
+            )
         elif kind == "result":
-            self.results += 1
             result = event.get("result")
+            if isinstance(result, dict) and not self._conversation(result.get("conversation_id")):
+                return
+            # An identity-checked terminal event ends idle suppression even when malformed.
+            self.turn_in_flight = False
+            self.results += 1
             if not isinstance(result, dict):
                 self.invalid = True
                 return
-            self._conversation(result.get("conversation_id"))
             response = result.get("response")
-            if (
-                self.results != 1
-                or not isinstance(result.get("status"), str)
-                or not result["status"]
-                or not isinstance(response, str)
-                or len(response) > 64_000
-            ):
+            if not isinstance(response, str):
+                self.invalid = True
+                return
+            valid_result = (
+                self.results == 1
+                and isinstance(result.get("status"), str)
+                and bool(result["status"])
+                and len(response) <= 64_000
+            )
+            if not valid_result:
                 self.invalid = True
             elif result["status"] != "SUCCESS":
                 self.result_error = "AGY CLI returned a non-success result status"
@@ -222,14 +338,15 @@ class AgyOutput:
             usage = self._usage(result.get("usage"))
             if usage is not None:
                 self.snapshot["usage"] = {"available": True, **usage}
-            if self.results == 1:
+            if valid_result:
                 log.write(self._publish("result"))
         elif kind == "step_update":
             step = event.get("step_update")
             if not isinstance(step, dict):
                 self.invalid = True
                 return
-            self._conversation(step.get("conversation_id"))
+            if not self._conversation(step.get("conversation_id")):
+                return
             step_type, index, state = (
                 step.get("step_type"),
                 step.get("step_index"),
@@ -246,17 +363,27 @@ class AgyOutput:
                 return
             key = (step_type, index)
             previous = self.steps.get(key)
-            if previous is None and index <= self.highest_step.get(step_type, -1):
+            if (
+                self.results
+                or previous == "done"
+                or index < max(self.highest_step.values(), default=-1)
+                or (previous is None and index <= self.highest_step.get(step_type, -1))
+            ):
                 return
             self.highest_step[step_type] = max(index, self.highest_step.get(step_type, -1))
             usage = self._usage(step.get("usage"))
-            if usage is not None and usage != self.step_usage.get(index):
-                self.snapshot["last_event_at"] = datetime.now(UTC).isoformat()
+            previous_usage = self.step_usage.get(index, dict.fromkeys(USAGE_KEYS, 0))
+            usage_progress = usage is not None and any(
+                usage[name] > previous_usage[name] for name in USAGE_KEYS
+            )
+            content_progress = self._content_progress(key, step)
             if usage is not None and self.results == 0:
                 if index not in self.step_usage and len(self.step_usage) >= EVENT_LIMIT:
                     self.usage_history_complete = False
                     self.step_usage.pop(next(iter(self.step_usage)))
-                self.step_usage[index] = usage
+                self.step_usage[index] = {
+                    name: max(usage[name], previous_usage[name]) for name in USAGE_KEYS
+                }
                 self.snapshot["usage"] = {
                     "available": self.usage_history_complete,
                     **{
@@ -264,18 +391,31 @@ class AgyOutput:
                         for name in USAGE_KEYS
                     },
                 }
-            if previous == state or previous == "done":
-                self._save()
-                return
+            continuing = previous == state
+            if continuing:
+                if not usage_progress and not content_progress:
+                    return
+                was_quiet = self.quiet
+                self._progress()
+                if (
+                    not was_quiet
+                    and time.monotonic() - self.last_progress_event_mono
+                    < PROGRESS_EVENT_INTERVAL_SEC
+                ):
+                    self._save()
+                    return
             if key not in self.steps and len(self.steps) >= EVENT_LIMIT:
-                self.steps.pop(next(iter(self.steps)))
+                evicted = next(iter(self.steps))
+                self.steps.pop(evicted)
+                self.progress_filters.pop(evicted, None)
             self.steps[key] = state
             tool = step.get("tool_name")
-            tool = (
-                tool
-                if isinstance(tool, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", tool)
-                else "tool"
-            )
+            if not (isinstance(tool, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", tool)):
+                tool = (
+                    self.snapshot["current_tool_name"] or "tool"
+                    if continuing and self.snapshot["current_step_index"] == index
+                    else "tool"
+                )
             category = "tool" if step_type == "tool" else "model"
             if previous is None:
                 self.snapshot["tool_calls" if category == "tool" else "model_responses"] += 1
@@ -289,6 +429,7 @@ class AgyOutput:
                     state=state,
                     tool=tool if category == "tool" else None,
                     step_index=index,
+                    continuing=continuing,
                 )
             )
         self._save()

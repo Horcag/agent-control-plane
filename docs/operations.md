@@ -209,6 +209,28 @@ the default 300-second threshold for a running stream; closed/error streams expo
 attempt log. Activity summaries expose safe progress categories, never raw hidden
 reasoning, prompts, tool arguments or tool output.
 
+Native updates within an already active step also count as progress when content
+changes or token counters increase. Replayed updates and worker heartbeats do not.
+Opaque content is deduplicated with a bounded 8 KiB monotonic seen filter per
+retained step; hash collisions may conservatively omit an update, never invent
+progress. No model text, tool output, or fingerprints are persisted.
+After an identity-validated native init starts a turn, silence beyond the idle
+threshold produces an advisory until the result or EOF. This includes gaps between
+a completed tool step and the next model event: Antigravity may not announce an
+ACTIVE model step before thinking. A turn in flight does not prove work continues.
+The total deadline and explicit cancellation still stop the job. Startup without
+a valid native init remains subject to the idle timeout.
+
+On supported POSIX profiles, ACP can also observe the current conversation's native
+SQLite history when CLI events are delayed. After validating the init workspace,
+conversation identity, file ownership and schema, it reads only step index/count
+metadata every two seconds. Both counters must advance to credit progress. It never
+reads message, reasoning or tool payload columns and never obtains a result from
+this database. `native_step_index` and `native_step_count` are separate from the
+streamed tool/model counters. Missing, locked, replaced or unsupported histories
+leave the normal stream and quiet advisory in effect. This optional observer requires
+POSIX ownership checks; native Windows continues to use the stream and turn tracking.
+
 AGY has three separate deadlines: the controller's total `--timeout-sec`, its
 no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print
 deadline can end an actively progressing turn. Native CLI versions may then exit
