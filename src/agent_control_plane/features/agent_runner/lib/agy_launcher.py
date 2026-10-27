@@ -13,7 +13,7 @@ from pathlib import Path
 
 from agent_control_plane.features.agent_runner.lib.runner import AgyLaunchSpec
 
-WRAPPER_VERSION = "v2"
+WRAPPER_VERSION = "v3"
 WRAPPER_RELATIVE_PATH = Path(".agent-work/bin/agy-project")
 LEGACY_PROJECT_WRAPPER = (
     b'#!/usr/bin/env bash\nset -euo pipefail\nexec /home/nikit/.local/bin/agy --new-project "$@"\n'
@@ -25,6 +25,10 @@ _OWNED_V1_RE = re.compile(
 _OWNED_V2_RE = re.compile(
     rb"\A#!/bin/sh\n# agent-control-plane agy-project-wrapper: v2\n"
     rb"exec ('(?:[^']|'\"'\"')+') --new-project \"\$@\"\n\Z"
+)
+_OWNED_V3_RE = re.compile(
+    rb"\A#!/bin/sh\n# agent-control-plane agy-project-wrapper: v3\n"
+    rb"exec ('(?:[^']|'\"'\"')+') \"\$@\"\n\Z"
 )
 
 
@@ -132,7 +136,7 @@ def build_agy_launch(
     return AgyLaunchSpec(
         executable=str(selected),
         managed=True,
-        add_new_project=True,
+        add_new_project=False,
         adapter_path=selected,
         adapter_sha256=_file_sha256(selected),
         launch_id=f"agy:{job_id}:{attempt_ref}",
@@ -153,7 +157,7 @@ def render_project_wrapper(launcher: Path | str) -> bytes:
     return (
         "#!/bin/sh\n"
         f"# agent-control-plane agy-project-wrapper: {WRAPPER_VERSION}\n"
-        f'exec {_shell_quote(str(resolved))} --new-project "$@"\n'
+        f'exec {_shell_quote(str(resolved))} "$@"\n'
     ).encode()
 
 
@@ -775,6 +779,10 @@ def _is_recognized_wrapper(content: bytes) -> bool:
     if match is not None:
         return Path(match.group(1).decode("utf-8")).is_absolute()
     match = _OWNED_V2_RE.fullmatch(content)
+    if match is not None:
+        decoded = match.group(1)[1:-1].replace(b"'\"'\"'", b"'")
+        return Path(decoded.decode("utf-8")).is_absolute()
+    match = _OWNED_V3_RE.fullmatch(content)
     if match is None:
         return False
     decoded = match.group(1)[1:-1].replace(b"'\"'\"'", b"'")

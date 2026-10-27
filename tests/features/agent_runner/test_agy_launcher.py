@@ -16,6 +16,7 @@ from agent_control_plane.app.runtime.job_execution_service import JobExecutionSe
 from agent_control_plane.features.agent_runner.lib import agy_launcher
 from agent_control_plane.features.agent_runner.lib.agy_launcher import (
     LEGACY_PROJECT_WRAPPER,
+    WRAPPER_VERSION,
     AgyLauncherError,
     build_agy_launch,
     migrate_project_wrapper,
@@ -88,7 +89,7 @@ def test_managed_mode_never_falls_back_and_receipt_is_not_conversation_proof(
     )
 
     assert launch.executable == str(adapter)
-    assert launch.add_new_project is True
+    assert launch.add_new_project is False
     assert launch.receipt()["managed"] is True
     assert "conversation_id" not in launch.receipt()
     with pytest.raises(AgyLauncherError, match="requires an explicit adapter"):
@@ -123,7 +124,7 @@ def test_unmanaged_mode_preserves_explicit_command_without_managed_claim() -> No
     assert launch.receipt()["adapter_path"] is None
 
 
-def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path: Path) -> None:
+def test_project_wrapper_preserves_argument_boundaries(tmp_path: Path) -> None:
     captured = tmp_path / "captured.txt"
     launcher = _executable(
         tmp_path / "launcher",
@@ -140,7 +141,6 @@ def test_project_wrapper_preserves_new_project_and_argument_boundaries(tmp_path:
     )
 
     assert captured.read_text(encoding="utf-8").splitlines() == [
-        "--new-project",
         "space value",
         "$(not-a-command)",
         "semi;colon",
@@ -165,7 +165,6 @@ def test_project_wrapper_safely_quotes_hostile_executable_path(tmp_path: Path) -
     _run_wrapper(wrapper, ["$(not-a-command)"])
 
     assert captured.read_text(encoding="utf-8").splitlines() == [
-        "--new-project",
         "$(not-a-command)",
     ]
 
@@ -611,7 +610,7 @@ def test_public_config_service_and_pty_share_managed_launch_contract(tmp_path: P
 
     assert spec.agy_launch is not None
     assert spec.agy_launch.receipt()["adapter_path"] == str(adapter)
-    assert PtyAgyRunner._build_command(spec).count("--new-project") == 1
+    assert PtyAgyRunner._build_command(spec).count("--new-project") == 0
     assert PtyAgyRunner._build_command(spec)[0] == str(adapter)
 
     config.write_text(
@@ -732,7 +731,7 @@ def test_cli_configure_migrate_generate_and_restore_guarded_workflow(
     assert main([*migrate, "--apply"]) == 0
     migrated = json.loads(capsys.readouterr().out)
     _run_wrapper(wrapper, ["safe argument"])
-    assert captured.read_text(encoding="utf-8").splitlines() == ["--new-project", "safe argument"]
+    assert captured.read_text(encoding="utf-8").splitlines() == ["safe argument"]
 
     generated_wrapper = fresh / ".agent-work" / "bin" / "agy-project"
     generate = [
@@ -816,7 +815,7 @@ def test_cli_restore_config_recovers_without_loading_an_unavailable_adapter(
     ).encode()
     config.write_bytes(original)
     backup = config.with_name(
-        f"{config.name}.acp-agy-v2-{hashlib.sha256(original).hexdigest()[:12]}.bak"
+        f"{config.name}.acp-agy-{WRAPPER_VERSION}-{hashlib.sha256(original).hexdigest()[:12]}.bak"
     )
     backup.write_bytes(original)
     missing_adapter = tmp_path / "missing-adapter"
@@ -868,12 +867,12 @@ def test_restore_managed_config_binds_backup_name_to_content_digest(
     original = b"[control]\ncoordination_root = '.acp'\n"
     config.write_bytes(original)
     digest = hashlib.sha256(original).hexdigest()
-    backup = config.with_name(f"{config.name}.acp-agy-v2-{digest[:12]}.bak")
+    backup = config.with_name(f"{config.name}.acp-agy-{WRAPPER_VERSION}-{digest[:12]}.bak")
     backup.write_bytes(original)
     configured = b"[control]\ncoordination_root = 'changed'\n"
     config.write_bytes(configured)
     if tamper == "rename":
-        renamed = config.with_name(f"{config.name}.acp-agy-v2-backup.bak")
+        renamed = config.with_name(f"{config.name}.acp-agy-{WRAPPER_VERSION}-backup.bak")
         backup.rename(renamed)
         backup = renamed
     else:

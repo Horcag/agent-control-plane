@@ -26,7 +26,7 @@ ACP preserves the operator's configured `agy_command` (including existing Window
 installations) and makes no claim that an adapter mediated the launch. `managed` requires an
 explicit absolute, regular, non-symlink `[control].agy_proxy_launcher`; ACP validates it at
 launch and fails closed when it is missing or invalid. Managed mode never falls back to the
-real AGY command, and it adds `--new-project` once at the typed PTY launch boundary. The adapter
+real AGY command, and it invokes the adapter at the typed PTY launch boundary without polluting the project registry. The adapter
 path and digest, mode, job, and attempt reference are recorded in a versioned launch receipt;
 the receipt's local launch identifier is not a conversation identifier or CONNECT proof.
 
