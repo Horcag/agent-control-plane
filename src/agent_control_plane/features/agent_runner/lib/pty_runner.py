@@ -427,12 +427,21 @@ class PtyAgyRunner:
                 recovered = inspect_result(spec.result_path, started_wall)
                 if recovered.done:
                     return self._completed_result(proc, recovered.status)
+        cli_failure = (
+            f"{capture.failure_message} (configured --print-timeout {spec.print_timeout}); "
+            "no valid result file"
+            if capture is not None and capture.failure_message is not None
+            else None
+        )
         return AgyRunResult(
             status="exited_without_result",
             completed=False,
             exit_code=proc.exitstatus,
             result_status=None,
-            message=reader_error or result_state.reason or "agy exited without a valid result file",
+            message=reader_error
+            or cli_failure
+            or result_state.reason
+            or "agy exited without a valid result file",
         )
 
     def _timeout_result_if_needed(

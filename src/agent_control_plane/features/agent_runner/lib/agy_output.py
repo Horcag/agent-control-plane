@@ -45,6 +45,8 @@ class AgyOutput:
         self.buffer = ""
         self.invalid = False
         self.response: str | None = None
+        self.result_error: str | None = None
+        self.failure_message: str | None = None
         self.diagnostics = ""
         self.events: deque[dict[str, Any]] = deque(maxlen=EVENT_LIMIT)
         self.usage_history_complete = True
@@ -204,11 +206,17 @@ class AgyOutput:
             response = result.get("response")
             if (
                 self.results != 1
-                or result.get("status") != "SUCCESS"
+                or not isinstance(result.get("status"), str)
+                or not result["status"]
                 or not isinstance(response, str)
                 or len(response) > 64_000
             ):
                 self.invalid = True
+            elif result["status"] != "SUCCESS":
+                self.result_error = "AGY CLI returned a non-success result status"
+            elif not response.strip():
+                # Native print-timeout probes can exit zero with SUCCESS and no response.
+                self.result_error = "AGY CLI returned SUCCESS with an empty final response"
             else:
                 self.response = response
             usage = self._usage(result.get("usage"))
@@ -290,8 +298,13 @@ class AgyOutput:
         self.closed = True
         if self.buffer.strip() and not controller_stopped:
             self.invalid = True
+        self.failure_message = (
+            self.result_error if clean and not self.invalid and self.results == 1 else None
+        )
         self.snapshot["stream_state"] = (
-            "closed" if (clean or controller_stopped) and not self.invalid else "error"
+            "closed"
+            if (clean or controller_stopped) and not self.invalid and self.result_error is None
+            else "error"
         )
         self._publish("controller_stopped" if controller_stopped else "closed")
         return self.response if clean and not self.invalid and self.results == 1 else None

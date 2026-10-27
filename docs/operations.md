@@ -209,6 +209,16 @@ the default 300-second threshold for a running stream; closed/error streams expo
 attempt log. Activity summaries expose safe progress categories, never raw hidden
 reasoning, prompts, tool arguments or tool output.
 
+AGY has three separate deadlines: the controller's total `--timeout-sec`, its
+no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print
+deadline can end an actively progressing turn. Native CLI versions may then exit
+zero and emit `SUCCESS` with an empty response; ACP rejects that as
+`exited_without_result` and reports the empty final response and configured print
+deadline. This diagnostic does not prove a timeout by itself. For controller-owned
+deadlines, pass `--print-timeout 0` to let ACP enforce total and idle limits while
+the CLI waits for the turn. Scope audits into bounded batches rather than treating
+an idle advisory as proof that more time is needed.
+
 The exit code is the point: it tells a caller what happened without parsing output.
 
 | Exit | Meaning |
