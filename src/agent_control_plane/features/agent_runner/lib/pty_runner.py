@@ -435,6 +435,10 @@ class PtyAgyRunner:
         cli_failure_reason = capture.failure_message if capture is not None else None
         if capture is not None and authoritative is not None and response is None:
             cli_failure_reason = "AGY CLI returned SUCCESS without the required final result format"
+        if capture is not None and cli_failure_reason is None:
+            cli_failure_reason = (
+                "AGY structured stream did not provide a single complete valid final result"
+            )
         cli_failure = (
             f"{cli_failure_reason} (configured --print-timeout {spec.print_timeout}); "
             "no valid result file"

@@ -1086,6 +1086,9 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                     self.assertNotIn("PRIVATE", result.message)
                     if reader_error:
                         self.assertEqual(result.message, reader_error)
+                    else:
+                        self.assertIn("single complete valid final result", result.message)
+                        self.assertIn("configured --print-timeout 10s", result.message)
                     self.assertFalse(spec.result_path.exists())
 
     def test_late_trust_or_eligibility_failure_wins_over_envelope(self) -> None:

@@ -214,8 +214,10 @@ no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print
 deadline can end an actively progressing turn. Native CLI versions may then exit
 zero and emit `SUCCESS` with an empty response; ACP rejects that as
 `exited_without_result` and reports the empty final response and configured print
-deadline. This diagnostic does not prove a timeout by itself. For controller-owned
-deadlines, pass `--print-timeout 0` to let ACP enforce total and idle limits while
+deadline. This diagnostic does not prove a timeout by itself. Malformed streams
+or provisional text also remain failures with a safe
+diagnostic; an old controller placeholder is not the explanation for a CLI failure.
+For controller-owned deadlines, pass `--print-timeout 0` to let ACP enforce total and idle limits while
 the CLI waits for the turn. Scope audits into bounded batches rather than treating
 an idle advisory as proof that more time is needed.
 
