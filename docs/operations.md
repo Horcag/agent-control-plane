@@ -214,11 +214,12 @@ changes or token counters increase. Replayed updates and worker heartbeats do no
 Opaque content is deduplicated with a bounded 8 KiB monotonic seen filter per
 retained step; hash collisions may conservatively omit an update, never invent
 progress. No model text, tool output, or fingerprints are persisted.
-When a verified model/tool operation stays active beyond the idle threshold, ACP
-reports that no new progress has been observed instead of terminating the operation.
-That last-known active state does not prove that work continues. The total deadline
-and explicit cancellation still stop the job; startup without an active operation
-remains subject to the idle timeout.
+After an identity-validated native init starts a turn, silence beyond the idle
+threshold produces an advisory until the result or EOF. This includes gaps between
+a completed tool step and the next model event: Antigravity may not announce an
+ACTIVE model step before thinking. A turn in flight does not prove work continues.
+The total deadline and explicit cancellation still stop the job. Startup without
+a valid native init remains subject to the idle timeout.
 
 AGY has three separate deadlines: the controller's total `--timeout-sec`, its
 no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print

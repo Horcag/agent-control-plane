@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from agent_control_plane.features.agent_runner.lib import pty_runner, windows_pipe
 from agent_control_plane.features.agent_runner.lib.pty_runner import AgyRunSpec, PtyAgyRunner
@@ -439,6 +440,10 @@ class PtyRunnerCommandTest(unittest.TestCase):
             ("terminal_backlog", "tool", "done", False, "idle_timeout", False),
             ("hard_deadline", "tool", "active", False, "timeout", True),
             ("startup_noise", "user_input", "done", False, "idle_timeout", False),
+            ("active_without_init", "tool", "active", False, "idle_timeout", False),
+            ("missing_init", "user_input", "done", False, "idle_timeout", False),
+            ("malformed_init", "user_input", "done", False, "idle_timeout", False),
+            ("foreign_init", "user_input", "done", False, "idle_timeout", False),
         )
         for name, step_type, state, changing, expected, quiet in scenarios:
             with self.subTest(name=name):
@@ -461,6 +466,15 @@ class PtyRunnerCommandTest(unittest.TestCase):
             capture = pty_runner.AgyOutput(spec.log_path, "job")
             output: queue.Queue[str] = queue.Queue()
             clock = [0.0]
+            if expected != "idle_timeout":
+                output.put(json.dumps({"event": "init", "conversation_id": str(uuid4())}) + "\n")
+            elif name in ("missing_init", "malformed_init", "foreign_init"):
+                init = {"event": "init"}
+                if name == "malformed_init":
+                    init["conversation_id"] = "not-a-uuid"
+                elif name == "foreign_init":
+                    init.update(conversation_id=str(uuid4()), job_id="another-job")
+                output.put(json.dumps(init) + "\n")
 
             def enqueue() -> None:
                 event = {
@@ -522,6 +536,84 @@ class PtyRunnerCommandTest(unittest.TestCase):
                 self.assertGreater(capture.progress_sequence, 10)
             self.assertNotIn("PRIVATE", capture.snapshot_path.read_text())
             capture.finish(clean=False)
+
+    def test_initialized_turn_completes_after_done_gap_longer_than_idle_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = replace(
+                _spec(prompt="task", yolo=False),
+                log_path=root / "attempt.log",
+                result_path=root / "result.md",
+                idle_timeout_sec=3,
+                read_only=True,
+            )
+            pty_runner.vendor_log_path(spec.log_path).write_text("")
+            capture = pty_runner.AgyOutput(spec.log_path, "job")
+            output: queue.Queue[str] = queue.Queue()
+            output.put(json.dumps({"event": "init", "conversation_id": str(uuid4())}) + "\n")
+            output.put(
+                json.dumps(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "tool",
+                            "step_index": 1,
+                            "state": "DONE",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            clock = [0.0]
+            proc = _FakeProcess()
+            done = threading.Event()
+            observed_quiet = []
+
+            def tick(_delay: float) -> None:
+                clock[0] += 1
+                if clock[0] == 7:
+                    observed_quiet.append(capture.quiet)
+                    output.put(
+                        json.dumps(
+                            {
+                                "event": "step_update",
+                                "step_update": {
+                                    "step_type": "agent_response",
+                                    "step_index": 2,
+                                    "state": "DONE",
+                                },
+                            }
+                        )
+                        + "\n"
+                        + _stream(FINAL_RESPONSE)
+                    )
+                    proc.terminated = True
+                    proc.exitstatus = 0
+                    done.set()
+
+            with (
+                patch.object(
+                    pty_runner, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=tick)
+                ),
+                patch.object(pty_runner, "progress_signature", return_value=(None, False)),
+            ):
+                result = PtyAgyRunner()._monitor_process(
+                    proc,
+                    output,
+                    io.StringIO(),
+                    spec,
+                    0,
+                    0,
+                    30,
+                    lambda: False,
+                    done,
+                    queue.Queue(),
+                    capture,
+                )
+            self.assertEqual(observed_quiet, [True])
+            self.assertEqual(result.status, "completed")
+            self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
+            self.assertFalse(capture.has_inflight_turn)
 
 
 FINAL_RESPONSE = (

@@ -511,6 +511,7 @@ def test_replays_usage_regressions_terminal_backlog_and_input_are_not_progress(
 def test_quiet_active_operation_is_unknown_until_genuine_progress(tmp_path: Path) -> None:
     output = AgyOutput(tmp_path / "attempt.log", "job")
     log = io.StringIO()
+    emit(output, log, {"event": "init", "conversation_id": str(uuid4())})
     step = {"step_type": "tool", "step_index": 1, "state": "ACTIVE", "tool_name": "run_command"}
     emit(output, log, {"event": "step_update", "step_update": step})
     previous = output.progress_sequence
@@ -666,3 +667,101 @@ def test_step_eviction_bounds_filters_and_stale_step_cannot_recreate_one(tmp_pat
     )
     assert output.progress_sequence == previous
     assert ("tool", 0) not in output.progress_filters
+
+
+@pytest.mark.parametrize("ending", ["result", "eof"])
+def test_initialized_turn_survives_done_gap_and_ends_at_result_or_eof(
+    tmp_path: Path, ending: str
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, {"event": "init", "conversation_id": str(uuid4())})
+    emit(
+        output,
+        log,
+        {
+            "event": "step_update",
+            "step_update": {
+                "step_type": "tool",
+                "step_index": 1,
+                "state": "DONE",
+                "tool_name": "run_command",
+            },
+        },
+    )
+    assert output.has_inflight_turn
+    assert not output.has_active_operation
+    previous = output.progress_sequence
+    output.note_quiet(log)
+    assert output.quiet
+    assert output.snapshot["current_state"] == "done"
+    assert output.progress_sequence == previous
+    if ending == "result":
+        emit(output, log, {"event": "result", "result": {"status": "SUCCESS", "response": "final"}})
+    else:
+        output.finish(clean=True)
+    assert not output.has_inflight_turn
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "init"},
+        {"event": "init", "conversation_id": "not-a-uuid"},
+        {"event": "init", "conversation_id": str(uuid4()), "job_id": "foreign-job"},
+        {"event": "init", "conversation_id": str(uuid4()), "attempt_ref": "foreign-attempt"},
+    ],
+)
+def test_missing_malformed_or_foreign_init_cannot_arm_inflight_turn(
+    tmp_path: Path, event: dict
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, event)
+    output.note_quiet(log)
+    assert not output.has_inflight_turn
+    assert not output.quiet
+    assert output.invalid
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        None,
+        {},
+        {"status": "SUCCESS"},
+        {"status": "SUCCESS", "response": 1},
+        {"status": False, "response": "final"},
+    ],
+)
+def test_malformed_current_result_ends_inflight_turn_without_crediting_progress(
+    tmp_path: Path, result: object
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, {"event": "init", "conversation_id": str(uuid4())})
+    assert output.has_inflight_turn
+    emit(output, log, {"event": "result", "result": result})
+    assert not output.has_inflight_turn
+    assert output.progress_sequence == 0
+    assert output.invalid
+    assert output.finish(clean=True) is None
+
+
+@pytest.mark.parametrize("foreign", ["job", "attempt", "conversation"])
+def test_foreign_result_cannot_end_current_inflight_turn(tmp_path: Path, foreign: str) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, {"event": "init", "conversation_id": str(uuid4())})
+    event = {"event": "result", "result": {"status": "SUCCESS", "response": "final"}}
+    if foreign == "conversation":
+        event["result"]["conversation_id"] = str(uuid4())
+    elif foreign == "job":
+        event["job_id"] = "foreign-job"
+    else:
+        event["attempt_ref"] = "foreign-attempt"
+    emit(output, log, event)
+    assert output.has_inflight_turn
+    assert output.results == 0
+    assert output.progress_sequence == 0
+    assert output.invalid

@@ -279,10 +279,7 @@ class PtyAgyRunner:
                     now=now,
                 )
                 next_progress_poll_mono = now + DURABLE_PROGRESS_POLL_INTERVAL_SEC
-            if (
-                0 < spec.idle_timeout_sec <= now - last_activity_mono
-                and capture.has_active_operation
-            ):
+            if 0 < spec.idle_timeout_sec <= now - last_activity_mono and capture.has_inflight_turn:
                 capture.note_quiet(log)
             stopped = self._timeout_result_if_needed(
                 proc,
@@ -290,7 +287,7 @@ class PtyAgyRunner:
                 now,
                 deadline_mono,
                 last_activity_mono,
-                active_operation=capture.has_active_operation,
+                active_operation=capture.has_inflight_turn,
             )
             if stopped is not None:
                 return stopped

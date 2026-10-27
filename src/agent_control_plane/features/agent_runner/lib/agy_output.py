@@ -45,6 +45,7 @@ class AgyOutput:
         self.snapshot_path, self.events_path = agy_activity_paths(log_path)
         private_file(self.events_path)
         self.closed = False
+        self.turn_in_flight = False
         self.discarding = False
         self.buffer = ""
         self.invalid = False
@@ -141,14 +142,19 @@ class AgyOutput:
     def has_active_operation(self) -> bool:
         return self.results == 0 and self.snapshot["current_state"] == "active"
 
+    @property
+    def has_inflight_turn(self) -> bool:
+        # Native AGY can omit ACTIVE while thinking between DONE steps.
+        return self.turn_in_flight and not self.closed
+
     def note_quiet(self, log: TextIO) -> None:
-        if self.quiet or not self.has_active_operation:
+        if self.quiet or not self.has_inflight_turn:
             return
         self.quiet = True
         log.write(
             self._publish(
                 "quiet",
-                state="active",
+                state=self.snapshot["current_state"],
                 tool=self.snapshot["current_tool_name"],
                 step_index=self.snapshot["current_step_index"],
                 continuing=True,
@@ -261,13 +267,20 @@ class AgyOutput:
             self.invalid = True
             return
         kind = event.get("event")
-        if kind == "result":
-            self.results += 1
-            result = event.get("result")
-            if not isinstance(result, dict):
+        if kind == "init":
+            if event.get("conversation_id") is None or self.results or self.closed:
                 self.invalid = True
                 return
-            if not self._conversation(result.get("conversation_id")):
+            self.turn_in_flight = True
+        elif kind == "result":
+            result = event.get("result")
+            if isinstance(result, dict) and not self._conversation(result.get("conversation_id")):
+                return
+            # An identity-checked terminal event ends idle suppression even when malformed.
+            self.turn_in_flight = False
+            self.results += 1
+            if not isinstance(result, dict):
+                self.invalid = True
                 return
             response = result.get("response")
             if not isinstance(response, str):
