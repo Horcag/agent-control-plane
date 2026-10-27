@@ -209,6 +209,17 @@ the default 300-second threshold for a running stream; closed/error streams expo
 attempt log. Activity summaries expose safe progress categories, never raw hidden
 reasoning, prompts, tool arguments or tool output.
 
+Native updates within an already active step also count as progress when content
+changes or token counters increase. Replayed updates and worker heartbeats do not.
+Opaque content is deduplicated with a bounded 8 KiB monotonic seen filter per
+retained step; hash collisions may conservatively omit an update, never invent
+progress. No model text, tool output, or fingerprints are persisted.
+When a verified model/tool operation stays active beyond the idle threshold, ACP
+reports that no new progress has been observed instead of terminating the operation.
+That last-known active state does not prove that work continues. The total deadline
+and explicit cancellation still stop the job; startup without an active operation
+remains subject to the idle timeout.
+
 AGY has three separate deadlines: the controller's total `--timeout-sec`, its
 no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print
 deadline can end an actively progressing turn. Native CLI versions may then exit

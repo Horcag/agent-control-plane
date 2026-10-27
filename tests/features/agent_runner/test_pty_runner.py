@@ -416,7 +416,7 @@ class PtyRunnerCommandTest(unittest.TestCase):
         self.assertEqual("timeout", result.status if result else None)
         self.assertTrue(proc.terminated)
 
-    def test_idle_timeout_mentions_terminal_and_durable_progress(self) -> None:
+    def test_idle_timeout_mentions_verified_stream_and_durable_progress(self) -> None:
         proc = _FakeProcess()
         result = PtyAgyRunner()._timeout_result_if_needed(
             proc,
@@ -428,8 +428,100 @@ class PtyRunnerCommandTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual("idle_timeout", result.status if result else None)
-        self.assertIn("terminal output or durable progress", result.message if result else "")
+        self.assertIn("verified AGY stream or durable progress", result.message if result else "")
         self.assertTrue(proc.terminated)
+
+    def test_monitor_uses_verified_progress_and_marks_quiet_active_operations(self) -> None:
+        scenarios = (
+            ("changing_model", "agent_response", "active", True, "cancelled", False),
+            ("silent_tool", "tool", "active", False, "cancelled", True),
+            ("silent_model", "agent_response", "active", False, "cancelled", True),
+            ("terminal_backlog", "tool", "done", False, "idle_timeout", False),
+            ("hard_deadline", "tool", "active", False, "timeout", True),
+            ("startup_noise", "user_input", "done", False, "idle_timeout", False),
+        )
+        for name, step_type, state, changing, expected, quiet in scenarios:
+            with self.subTest(name=name):
+                self._verify_monitor_progress_case(
+                    name, step_type, state, changing, expected, quiet
+                )
+
+    def _verify_monitor_progress_case(
+        self, name: str, step_type: str, state: str, changing: bool, expected: str, quiet: bool
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = replace(
+                _spec(prompt="task", yolo=False),
+                log_path=root / "attempt.log",
+                result_path=root / "result.md",
+                idle_timeout_sec=3,
+            )
+            pty_runner.vendor_log_path(spec.log_path).write_text("")
+            capture = pty_runner.AgyOutput(spec.log_path, "job")
+            output: queue.Queue[str] = queue.Queue()
+            clock = [0.0]
+
+            def enqueue() -> None:
+                event = {
+                    "event": "step_update",
+                    "step_update": {
+                        "step_type": step_type,
+                        "step_index": 10,
+                        "state": state,
+                        "text_delta": f"PRIVATE{clock[0] if changing else 0}",
+                        "usage": {"output_tokens": int(clock[0]) if changing else 0},
+                    },
+                }
+                output.put(json.dumps(event) + "\n")
+                output.put(json.dumps({"event": "heartbeat"}) + "\n")
+                output.put(
+                    json.dumps(
+                        {
+                            "event": "step_update",
+                            "step_update": {
+                                "step_type": "tool",
+                                "step_index": 1,
+                                "state": "done",
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+            def tick(_delay: float) -> None:
+                clock[0] += 1.0
+                enqueue()
+
+            enqueue()
+            proc = _FakeProcess()
+            with (
+                patch.object(
+                    pty_runner, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=tick)
+                ),
+                patch.object(pty_runner, "progress_signature", return_value=(None, False)),
+            ):
+                result = PtyAgyRunner()._monitor_process(
+                    proc,
+                    output,
+                    io.StringIO(),
+                    spec,
+                    0,
+                    0,
+                    8 if name == "hard_deadline" else 30,
+                    lambda: clock[0] >= 12,
+                    threading.Event(),
+                    queue.Queue(),
+                    capture,
+                )
+            self.assertEqual(result.status, expected)
+            self.assertEqual(capture.quiet, quiet)
+            if expected == "idle_timeout":
+                self.assertLess(clock[0], 12)
+            if changing:
+                self.assertGreater(capture.progress_sequence, 10)
+            self.assertNotIn("PRIVATE", capture.snapshot_path.read_text())
+            capture.finish(clean=False)
 
 
 FINAL_RESPONSE = (

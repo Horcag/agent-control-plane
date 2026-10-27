@@ -16,6 +16,7 @@ SAFE_SUMMARIES = {
     "tool": "Tool activity",
     "model": "Model activity",
     "result": "AGY result received",
+    "quiet": "No recent progress observed; last known operation remains active",
     "closed": "AGY stream closed",
     "controller_stopped": "Controller stopped AGY after durable result",
 }

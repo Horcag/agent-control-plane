@@ -206,6 +206,7 @@ class PtyAgyRunner:
         capture: AgyOutput,
     ) -> AgyRunResult:
         output_tail = ""
+        progress_sequence = capture.progress_sequence
         durable_signature, _ = progress_signature(spec)
         next_progress_poll_mono = last_activity_mono + DURABLE_PROGRESS_POLL_INTERVAL_SEC
         while True:
@@ -237,8 +238,10 @@ class PtyAgyRunner:
                 )
             drained_output = self._drain_output(output_queue, log, capture)
             if drained_output:
-                last_activity_mono = time.monotonic()
                 output_tail = capture.diagnostic_tail
+            if capture.progress_sequence != progress_sequence:
+                last_activity_mono = time.monotonic()
+                progress_sequence = capture.progress_sequence
 
             completed = self._completed_result_if_ready(proc, spec, started_wall, terminate=True)
             if completed is not None:
@@ -276,8 +279,18 @@ class PtyAgyRunner:
                     now=now,
                 )
                 next_progress_poll_mono = now + DURABLE_PROGRESS_POLL_INTERVAL_SEC
+            if (
+                0 < spec.idle_timeout_sec <= now - last_activity_mono
+                and capture.has_active_operation
+            ):
+                capture.note_quiet(log)
             stopped = self._timeout_result_if_needed(
-                proc, spec, now, deadline_mono, last_activity_mono
+                proc,
+                spec,
+                now,
+                deadline_mono,
+                last_activity_mono,
+                active_operation=capture.has_active_operation,
             )
             if stopped is not None:
                 return stopped
@@ -463,6 +476,8 @@ class PtyAgyRunner:
         now: float,
         deadline_mono: float,
         last_activity_mono: float,
+        *,
+        active_operation: bool = False,
     ) -> AgyRunResult | None:
         if now >= deadline_mono:
             self._terminate_spawned(proc)
@@ -471,12 +486,12 @@ class PtyAgyRunner:
                 "timeout",
                 f"Timed out after {spec.timeout_sec} seconds",
             )
-        if 0 < spec.idle_timeout_sec <= now - last_activity_mono:
+        if not active_operation and 0 < spec.idle_timeout_sec <= now - last_activity_mono:
             self._terminate_spawned(proc)
             return self._stopped_result(
                 proc,
                 "idle_timeout",
-                (f"No AGY terminal output or durable progress for {spec.idle_timeout_sec} seconds"),
+                (f"No verified AGY stream or durable progress for {spec.idle_timeout_sec} seconds"),
             )
         return None
 
