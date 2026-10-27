@@ -204,6 +204,7 @@ def test_tool_payload_with_result_status_cannot_be_a_final(tmp_path: Path) -> No
         },
     )
     assert output.finish(clean=True) is None
+    assert output.failure_message is None
 
 
 def test_current_tool_fields_and_unknown_events_do_not_create_progress(tmp_path: Path) -> None:
@@ -333,3 +334,73 @@ def test_native_captured_uppercase_states_publish_live_tool_and_model_activity(
     assert "Tool activity (run_command): active" in log.getvalue()
     assert "Model activity: active" in log.getvalue()
     assert output.results == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "response", "message"),
+    [
+        # Sanitized native print-timeout probe on 2026-10-27: exit zero, SUCCESS, empty response.
+        ("SUCCESS", "", "AGY CLI returned SUCCESS with an empty final response"),
+        ("SUCCESS", " \r\n", "AGY CLI returned SUCCESS with an empty final response"),
+        ("PRIVATE_STATUS", "PRIVATE_RESPONSE", "AGY CLI returned a non-success result status"),
+    ],
+)
+def test_structured_failure_diagnostic_requires_clean_eof_and_excludes_payloads(
+    tmp_path: Path, status: str, response: str, message: str
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, {"event": "result", "result": {"status": status, "response": response}})
+    assert output.failure_message is None
+    assert output.finish(clean=True) is None
+    assert output.failure_message == message
+    assert output.snapshot["stream_state"] == "error"
+    assert "PRIVATE" not in log.getvalue()
+    for artifact in tmp_path.iterdir():
+        assert "PRIVATE" not in artifact.read_text()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "malformed\n",
+        '{"event":"result"',
+        json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": ""}}) + "\n",
+        json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "final"}})
+        + "\n",
+    ],
+    ids=["malformed", "truncated", "duplicate", "conflicting"],
+)
+def test_invalid_stream_cannot_supply_structured_failure_diagnostic(
+    tmp_path: Path, suffix: str
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(output, log, {"event": "result", "result": {"status": "SUCCESS", "response": ""}})
+    output.feed(suffix, log)
+    assert output.finish(clean=True) is None
+    assert output.failure_message is None
+
+
+@pytest.mark.parametrize(
+    "result",
+    [{"status": "", "response": ""}, {"status": False, "response": ""}, {"status": "FAILURE"}],
+)
+def test_malformed_result_cannot_supply_structured_failure_diagnostic(
+    tmp_path: Path, result: dict
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    emit(output, io.StringIO(), {"event": "result", "result": result})
+    assert output.finish(clean=True) is None
+    assert output.failure_message is None
+
+
+def test_unclean_eof_cannot_supply_structured_failure_diagnostic(tmp_path: Path) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    emit(
+        output,
+        io.StringIO(),
+        {"event": "result", "result": {"status": "SUCCESS", "response": ""}},
+    )
+    assert output.finish(clean=False) is None
+    assert output.failure_message is None
