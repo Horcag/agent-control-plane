@@ -4,6 +4,7 @@ import io
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -614,6 +615,83 @@ class PtyRunnerCommandTest(unittest.TestCase):
             self.assertEqual(result.status, "completed")
             self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
             self.assertFalse(capture.has_inflight_turn)
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "native profile ownership proof requires POSIX uid")
+    def test_native_history_progress_is_visible_when_child_stdout_stalls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = root / "home"
+            cid = str(uuid4())
+            path = home / ".gemini/antigravity-cli/conversations" / f"{cid}.db"
+            path.parent.mkdir(parents=True)
+            with sqlite3.connect(path) as db:
+                db.executescript(
+                    "CREATE TABLE trajectory_meta(cascade_id TEXT); CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_payload BLOB);"
+                )
+                db.execute("INSERT INTO trajectory_meta VALUES (?)", (cid,))
+                db.execute("INSERT INTO steps VALUES (0, ?)", (b"PRIVATE",))
+            spec = replace(
+                _spec(prompt="task", yolo=False),
+                workspace_path=root,
+                log_path=root / "attempt.log",
+                result_path=root / "result.md",
+                idle_timeout_sec=3,
+            )
+            pty_runner.vendor_log_path(spec.log_path).write_text("")
+            capture = pty_runner.AgyOutput(spec.log_path, "job")
+            output: queue.Queue[str] = queue.Queue()
+            output.put(
+                json.dumps({"event": "init", "conversation_id": cid, "init": {"cwd": str(root)}})
+                + "\n"
+            )
+            output.put(
+                json.dumps(
+                    {
+                        "event": "step_update",
+                        "step_update": {
+                            "step_type": "tool",
+                            "step_index": 1,
+                            "state": "ACTIVE",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            clock = [0.0]
+
+            def tick(_delay: float) -> None:
+                clock[0] += 1
+                with sqlite3.connect(path) as db:
+                    db.execute("INSERT INTO steps VALUES (?, ?)", (int(clock[0]), b"PRIVATE"))
+
+            with (
+                patch.object(Path, "home", return_value=home),
+                patch.object(
+                    pty_runner, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=tick)
+                ),
+                patch.object(pty_runner, "progress_signature", return_value=(None, False)),
+            ):
+                result = PtyAgyRunner()._monitor_process(
+                    _FakeProcess(),
+                    output,
+                    io.StringIO(),
+                    spec,
+                    0,
+                    0,
+                    30,
+                    lambda: clock[0] >= 10,
+                    threading.Event(),
+                    queue.Queue(),
+                    capture,
+                )
+            self.assertEqual(result.status, "cancelled")
+            self.assertTrue(output.empty())
+            self.assertGreaterEqual(capture.snapshot["native_step_index"], 6)
+            self.assertGreater(capture.progress_sequence, 1)
+            self.assertEqual(capture.snapshot["current_action"], "Native history advanced")
+            self.assertNotIn("PRIVATE", capture.events_path.read_text())
+            self.assertFalse(spec.result_path.exists())
+            capture.finish(clean=False)
 
 
 FINAL_RESPONSE = (

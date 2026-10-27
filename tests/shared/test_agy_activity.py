@@ -66,3 +66,16 @@ def test_reader_rejects_invalid_current_fields(tmp_path: Path) -> None:
         payload = {**output.snapshot, key: invalid}
         agy_activity_paths(path)[0].write_text(json.dumps(payload))
         assert not read_agy_activity(path, job_id="job")["available"]
+
+
+def test_native_counters_are_optional_paired_and_bounded(tmp_path: Path) -> None:
+    path = tmp_path / "attempt.log"
+    output = AgyOutput(path, "job")
+    for counters in (
+        {"native_step_index": 1},
+        {"native_step_index": True, "native_step_count": 1},
+        {"native_step_index": 1, "native_step_count": 3},
+        {"native_step_index": 1_000_000_001, "native_step_count": 1},
+    ):
+        agy_activity_paths(path)[0].write_text(json.dumps({**output.snapshot, **counters}))
+        assert not read_agy_activity(path, job_id="job")["available"]

@@ -17,6 +17,7 @@ from agent_control_plane.features.agent_runner.lib.agy_output import (
     vendor_log_path,
 )
 from agent_control_plane.features.agent_runner.lib.codex_watchdog import progress_signature
+from agent_control_plane.features.agent_runner.lib.native_agy_history import NativeAgyHistory
 from agent_control_plane.features.agent_runner.lib.result_detector import inspect_result
 from agent_control_plane.features.agent_runner.lib.runner import AgentRunResult, AgentRunSpec
 from agent_control_plane.features.agent_runner.lib.windows_pipe import WindowsPipeProcess
@@ -207,6 +208,7 @@ class PtyAgyRunner:
     ) -> AgyRunResult:
         output_tail = ""
         progress_sequence = capture.progress_sequence
+        native_history = NativeAgyHistory(spec.workspace_path, started_wall)
         durable_signature, _ = progress_signature(spec)
         next_progress_poll_mono = last_activity_mono + DURABLE_PROGRESS_POLL_INTERVAL_SEC
         while True:
@@ -272,6 +274,15 @@ class PtyAgyRunner:
 
             now = time.monotonic()
             if now >= next_progress_poll_mono:
+                if capture.has_inflight_turn:
+                    native = native_history.poll(
+                        capture.snapshot["conversation_id"], capture.native_cwd, now
+                    )
+                    if native is not None:
+                        capture.note_native_history(native.step_index, native.step_count, log)
+                        if capture.progress_sequence != progress_sequence:
+                            last_activity_mono = now
+                            progress_sequence = capture.progress_sequence
                 last_activity_mono, durable_signature = self._refresh_durable_activity(
                     spec,
                     previous_signature=durable_signature,

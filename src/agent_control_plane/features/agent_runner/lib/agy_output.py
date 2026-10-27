@@ -46,6 +46,7 @@ class AgyOutput:
         private_file(self.events_path)
         self.closed = False
         self.turn_in_flight = False
+        self.native_cwd: str | None = None
         self.discarding = False
         self.buffer = ""
         self.invalid = False
@@ -96,7 +97,7 @@ class AgyOutput:
         now = datetime.now(UTC).isoformat()
         self.snapshot["seq"] += 1
         self.snapshot["last_event_at"] = now
-        if kind in ("tool", "model", "result"):
+        if kind in ("tool", "model", "result", "native_history"):
             if not continuing:
                 self._progress()
             self.last_progress_event_mono = time.monotonic()
@@ -110,9 +111,13 @@ class AgyOutput:
             self.snapshot["action_started_at"] = now
         event = {key: self.snapshot[key] for key in ("seq", "job_id", "attempt_ref")}
         event.update(at=now, kind=kind, summary=SAFE_SUMMARIES[kind])
-        if state is not None:
+        if kind == "native_history":
+            event.update(
+                {key: self.snapshot[key] for key in ("native_step_index", "native_step_count")}
+            )
+        if state is not None and kind != "native_history":
             event["state"] = state
-        if tool is not None:
+        if tool is not None and kind != "native_history":
             event["tool_name"] = tool
         self.events.append(event)
         if self.snapshot["seq"] <= EVENT_LIMIT:
@@ -154,6 +159,29 @@ class AgyOutput:
         log.write(
             self._publish(
                 "quiet",
+                state=self.snapshot["current_state"],
+                tool=self.snapshot["current_tool_name"],
+                step_index=self.snapshot["current_step_index"],
+                continuing=True,
+            )
+        )
+        log.flush()
+
+    def note_native_history(self, index: int, count: int, log: TextIO) -> None:
+        if (
+            not self.has_inflight_turn
+            or type(index) is not int
+            or type(count) is not int
+            or not 0 < count <= index + 1 <= STEP_INDEX_LIMIT + 1
+            or index <= self.snapshot.get("native_step_index", -1)
+            or count <= self.snapshot.get("native_step_count", 0)
+        ):
+            return
+        self.snapshot.update(native_step_index=index, native_step_count=count)
+        self._progress()
+        log.write(
+            self._publish(
+                "native_history",
                 state=self.snapshot["current_state"],
                 tool=self.snapshot["current_tool_name"],
                 step_index=self.snapshot["current_step_index"],
@@ -272,6 +300,12 @@ class AgyOutput:
                 self.invalid = True
                 return
             self.turn_in_flight = True
+            init = event.get("init")
+            self.native_cwd = (
+                init.get("cwd")
+                if isinstance(init, dict) and isinstance(init.get("cwd"), str)
+                else None
+            )
         elif kind == "result":
             result = event.get("result")
             if isinstance(result, dict) and not self._conversation(result.get("conversation_id")):

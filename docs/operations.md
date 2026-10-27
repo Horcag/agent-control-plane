@@ -221,6 +221,16 @@ ACTIVE model step before thinking. A turn in flight does not prove work continue
 The total deadline and explicit cancellation still stop the job. Startup without
 a valid native init remains subject to the idle timeout.
 
+On supported POSIX profiles, ACP can also observe the current conversation's native
+SQLite history when CLI events are delayed. After validating the init workspace,
+conversation identity, file ownership and schema, it reads only step index/count
+metadata every two seconds. Both counters must advance to credit progress. It never
+reads message, reasoning or tool payload columns and never obtains a result from
+this database. `native_step_index` and `native_step_count` are separate from the
+streamed tool/model counters. Missing, locked, replaced or unsupported histories
+leave the normal stream and quiet advisory in effect. This optional observer requires
+POSIX ownership checks; native Windows continues to use the stream and turn tracking.
+
 AGY has three separate deadlines: the controller's total `--timeout-sec`, its
 no-progress `--idle-timeout-sec`, and the CLI's `--print-timeout`. A short print
 deadline can end an actively progressing turn. Native CLI versions may then exit

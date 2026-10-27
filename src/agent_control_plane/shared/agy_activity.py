@@ -16,6 +16,7 @@ SAFE_SUMMARIES = {
     "tool": "Tool activity",
     "model": "Model activity",
     "result": "AGY result received",
+    "native_history": "Native history advanced",
     "quiet": "No recent progress observed; turn remains in flight",
     "closed": "AGY stream closed",
     "controller_stopped": "Controller stopped AGY after durable result",
@@ -40,6 +41,18 @@ def _identity(value: Any, log_path: Path, job_id: str | None) -> dict[str, Any]:
     if job_id is not None and value.get("job_id") != job_id:
         raise ValueError("activity job identity mismatch")
     return value
+
+
+def _native_fields(value: dict[str, Any]) -> None:
+    if "native_step_index" not in value and "native_step_count" not in value:
+        return
+    index, count = value.get("native_step_index"), value.get("native_step_count")
+    if (
+        type(index) is not int
+        or type(count) is not int
+        or not 0 < count <= index + 1 <= 1_000_000_001
+    ):
+        raise ValueError("invalid native progress counters")
 
 
 def read_agy_activity(log_path: Path, *, job_id: str | None = None) -> dict[str, Any]:
@@ -67,8 +80,10 @@ def read_agy_activity(log_path: Path, *, job_id: str | None = None) -> dict[str,
             "stream_state",
             "conversation_id",
         }
-        if set(value) != fields:
+        optional = {"native_step_index", "native_step_count"}
+        if set(value) - optional != fields:
             raise ValueError("invalid activity fields")
+        _native_fields(value)
         if value["current_action"] not in SAFE_SUMMARIES.values():
             raise ValueError("invalid activity summary")
         if value["current_tool_name"] is not None and (
@@ -127,9 +142,23 @@ def read_agy_activity_events(
                 or value.get("summary") != SAFE_SUMMARIES[value["kind"]]
                 or type(value.get("seq")) is not int
                 or set(value)
-                - {"seq", "at", "kind", "summary", "job_id", "attempt_ref", "tool_name", "state"}
+                - {
+                    "seq",
+                    "at",
+                    "kind",
+                    "summary",
+                    "job_id",
+                    "attempt_ref",
+                    "tool_name",
+                    "state",
+                    "native_step_index",
+                    "native_step_count",
+                }
             ):
                 raise ValueError("invalid activity event")
+            _native_fields(value)
+            if value["kind"] == "native_history" and "native_step_index" not in value:
+                raise ValueError("missing native counters")
             datetime.fromisoformat(value["at"])
             if value.get("state") not in (None, "active", "done"):
                 raise ValueError("invalid event state")

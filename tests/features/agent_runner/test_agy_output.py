@@ -765,3 +765,36 @@ def test_foreign_result_cannot_end_current_inflight_turn(tmp_path: Path, foreign
     assert output.results == 0
     assert output.progress_sequence == 0
     assert output.invalid
+
+
+def test_native_history_publishes_only_bounded_counters_and_never_supplies_result(
+    tmp_path: Path,
+) -> None:
+    output = AgyOutput(tmp_path / "attempt.log", "job")
+    log = io.StringIO()
+    emit(
+        output,
+        log,
+        {
+            "event": "init",
+            "conversation_id": str(uuid4()),
+            "init": {"cwd": str(tmp_path), "model": "PRIVATE"},
+        },
+    )
+    assert output.native_cwd == str(tmp_path)
+    output.note_native_history(4, 5, log)
+    previous = output.progress_sequence
+    for index, count in ((4, 5), (3, 4), (5, 5), (False, 2), (1_000_000_001, 1)):
+        output.note_native_history(index, count, log)
+    assert output.progress_sequence == previous
+    live = read_agy_activity(tmp_path / "attempt.log", job_id="job")
+    assert live["available"] and live["current_action"] == "Native history advanced"
+    assert (live["native_step_index"], live["native_step_count"]) == (4, 5)
+    events = read_agy_activity_events(tmp_path / "attempt.log", job_id="job")["events"]
+    assert events[-1]["kind"] == "native_history"
+    assert events[-1]["native_step_count"] == 5
+    assert "tool_name" not in events[-1] and "state" not in events[-1]
+    assert "PRIVATE" not in log.getvalue()
+    assert output.finish(clean=True) is None
+    output.note_native_history(6, 7, log)
+    assert output.progress_sequence == previous
