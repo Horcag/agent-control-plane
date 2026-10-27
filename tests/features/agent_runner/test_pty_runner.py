@@ -996,10 +996,17 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 if expected == "completed":
                     self.assertEqual(spec.result_path.read_text(), FINAL_RESPONSE)
 
-    def test_native_empty_success_explains_missing_result_without_accepting_it(self) -> None:
+    def test_native_success_without_final_format_explains_missing_result_without_accepting_it(
+        self,
+    ) -> None:
         # Native 2s print-timeout probe emitted SUCCESS with an empty response at exit zero.
         for status, response, expected in (
             ("SUCCESS", "", "SUCCESS with an empty final response"),
+            (
+                "SUCCESS",
+                "PRIVATE_PROVISIONAL_RESPONSE",
+                "SUCCESS without the required final result format",
+            ),
             ("PRIVATE_STATUS", FINAL_RESPONSE, "a non-success result status"),
         ):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as temp:
@@ -1031,51 +1038,55 @@ class PtyReadonlyRecoveryTest(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0)
                 self.assertIn(expected, result.message)
                 self.assertIn("configured --print-timeout 10s", result.message)
-                self.assertNotIn("PRIVATE_STATUS", result.message)
+                self.assertNotIn("PRIVATE", result.message)
+                self.assertNotIn("PRIVATE", spec.log_path.read_text())
                 self.assertEqual(result_path.read_text(), placeholder)
 
     def test_structured_failure_does_not_override_reader_error_or_invalid_stream(self) -> None:
-        for suffix, reader_error in (
-            ("", "PTY reader failed: OSError"),
-            ("malformed\n", None),
-            (_stream(FINAL_RESPONSE), None),
-            ('{"event":"result"', None),
-        ):
-            with (
-                self.subTest(suffix=suffix, reader_error=reader_error),
-                tempfile.TemporaryDirectory() as temp,
+        for initial_response in ("", "PRIVATE_PROVISIONAL_RESPONSE"):
+            for suffix, reader_error in (
+                ("", "PTY reader failed: OSError"),
+                ("malformed\n", None),
+                (_stream(FINAL_RESPONSE), None),
+                ('{"event":"result"', None),
             ):
-                root = Path(temp)
-                spec = replace(
-                    _spec(prompt="Inspect only.", yolo=False),
-                    result_path=root / "result.md",
-                    log_path=root / "attempt.log",
-                    read_only=True,
-                )
-                output: queue.Queue[str] = queue.Queue()
-                output.put(_stream("") + suffix)
-                done = threading.Event()
-                done.set()
-                errors: queue.Queue[str] = queue.Queue()
-                if reader_error:
-                    errors.put(reader_error)
-                result = PtyAgyRunner()._exited_result_if_dead(
-                    SimpleNamespace(isalive=lambda: False, exitstatus=0),
-                    output,
-                    io.StringIO(),
-                    spec,
-                    0,
-                    reader_done=done,
-                    reader_errors=errors,
-                    capture=pty_runner.AgyOutput(spec.log_path, "job"),
-                )
-                assert result is not None
-                self.assertEqual(result.status, "exited_without_result")
-                self.assertFalse(result.completed)
-                self.assertNotIn("empty final response", result.message)
-                if reader_error:
-                    self.assertEqual(result.message, reader_error)
-                self.assertFalse(spec.result_path.exists())
+                with (
+                    self.subTest(suffix=suffix, reader_error=reader_error),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
+                    root = Path(temp)
+                    spec = replace(
+                        _spec(prompt="Inspect only.", yolo=False),
+                        result_path=root / "result.md",
+                        log_path=root / "attempt.log",
+                        read_only=True,
+                    )
+                    output: queue.Queue[str] = queue.Queue()
+                    output.put(_stream(initial_response) + suffix)
+                    done = threading.Event()
+                    done.set()
+                    errors: queue.Queue[str] = queue.Queue()
+                    if reader_error:
+                        errors.put(reader_error)
+                    result = PtyAgyRunner()._exited_result_if_dead(
+                        SimpleNamespace(isalive=lambda: False, exitstatus=0),
+                        output,
+                        io.StringIO(),
+                        spec,
+                        0,
+                        reader_done=done,
+                        reader_errors=errors,
+                        capture=pty_runner.AgyOutput(spec.log_path, "job"),
+                    )
+                    assert result is not None
+                    self.assertEqual(result.status, "exited_without_result")
+                    self.assertFalse(result.completed)
+                    self.assertNotIn("empty final response", result.message)
+                    self.assertNotIn("required final result format", result.message)
+                    self.assertNotIn("PRIVATE", result.message)
+                    if reader_error:
+                        self.assertEqual(result.message, reader_error)
+                    self.assertFalse(spec.result_path.exists())
 
     def test_late_trust_or_eligibility_failure_wins_over_envelope(self) -> None:
         for refusal in (

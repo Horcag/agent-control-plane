@@ -417,20 +417,28 @@ class PtyAgyRunner:
         authoritative = (
             capture.finish(clean=drained and reader_error is None) if capture else output_tail
         )
-        if spec.read_only and proc.exitstatus == 0 and drained and reader_error is None:
-            response = self._final_response(authoritative or "", spec.prompt)
-            if response is not None:
-                spec.result_path.parent.mkdir(parents=True, exist_ok=True)
-                spec.result_path.write_text(response, encoding="utf-8")
-                log.write(response)
-                log.flush()
-                recovered = inspect_result(spec.result_path, started_wall)
-                if recovered.done:
-                    return self._completed_result(proc, recovered.status)
+        response = self._final_response(authoritative or "", spec.prompt)
+        if (
+            spec.read_only
+            and proc.exitstatus == 0
+            and drained
+            and reader_error is None
+            and response is not None
+        ):
+            spec.result_path.parent.mkdir(parents=True, exist_ok=True)
+            spec.result_path.write_text(response, encoding="utf-8")
+            log.write(response)
+            log.flush()
+            recovered = inspect_result(spec.result_path, started_wall)
+            if recovered.done:
+                return self._completed_result(proc, recovered.status)
+        cli_failure_reason = capture.failure_message if capture is not None else None
+        if capture is not None and authoritative is not None and response is None:
+            cli_failure_reason = "AGY CLI returned SUCCESS without the required final result format"
         cli_failure = (
-            f"{capture.failure_message} (configured --print-timeout {spec.print_timeout}); "
+            f"{cli_failure_reason} (configured --print-timeout {spec.print_timeout}); "
             "no valid result file"
-            if capture is not None and capture.failure_message is not None
+            if cli_failure_reason is not None
             else None
         )
         return AgyRunResult(
